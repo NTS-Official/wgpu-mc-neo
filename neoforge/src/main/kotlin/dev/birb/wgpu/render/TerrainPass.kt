@@ -298,32 +298,110 @@ object TerrainPass {
 	private var lastWalk = 0.0f
 
 	/**
-	 * Diagnostics: what the pass drew with, for the line the takeover logs.
+	 * Diagnostics: what the pass drew with, for the line the takeover logs - or `null` when the frame
+	 * is not worth a line.
 	 *
-	 * The section count says the pass had a world to draw; the fluid counts say whether the fluid
-	 * mesher has anything at all - blocks counted with no faces drawn is a fluid whose sprite is not in
-	 * the atlas, and no blocks at all is a fluid that never reached the baker; and the bob is what says
-	 * the camera this pass draws with is the one the rest of the world bobs with, which is the whole of
-	 * the last fix. Read here rather than from the Rust log because the Rust log does not reach the
-	 * game's log file.
+	 * The pass is taken over on **every frame of a world**, so a line per frame is eight hundred lines
+	 * and half a megabyte in thirty seconds: enough to bury everything else the game says, which is
+	 * what it did. So there are three answers here, and only one of them is per frame:
+	 *
+	 *  - **the first frame of a session, and any frame where something changed** - a frame the pass
+	 *    could not draw, the arena starting to refuse sections (geometry that is baked and not on
+	 *    screen), or the arena growing, which is the answer to that - says everything, once;
+	 *  - **any other frame** says the arena and the two counters and nothing else, and only once a
+	 *    second at that.
+	 *
+	 * The numbers themselves are the ones this path is checked with. The section count says the pass
+	 * has had a world to draw; the fluid counts say whether the fluid mesher has anything at all -
+	 * blocks counted with no faces drawn is a fluid whose sprite is not in the atlas, and no blocks at
+	 * all is a fluid that never reached the baker; the arena numbers say whether the geometry fits, and
+	 * the largest section says what has to fit; and the bob is what says the camera this pass draws
+	 * with is the one the rest of the world bobs with. Read here rather than from the Rust log because
+	 * the Rust log does not reach the game's log file.
+	 *
+	 * `drawn` is whether the pass recorded anything this frame - the one thing in here that is about
+	 * this frame rather than about the session - and a change in it is a change worth a full line.
 	 */
-	fun describeFrame(): String = try {
+	fun describeFrame(drawn: Boolean): String? = try {
 		val sections = WmNative.terrainSectionsDrawn.invokeExact() as Int
 		val fluidBlocks = WmNative.terrainFluidBlocks.invokeExact() as Int
 		val fluidQuads = WmNative.terrainFluidQuads.invokeExact() as Int
 		val refused = WmNative.terrainSectionsRefused.invokeExact() as Int
+		val slots = WmNative.terrainArenaSlots.invokeExact() as Int
+		val used = WmNative.terrainArenaUsed.invokeExact() as Int
+		val largest = WmNative.terrainArenaLargestSection.invokeExact() as Int
+		val watched = WgpuNative.watchedBlockFaces()
 
-		"; $sections section draw(s) - the solid and cutout layers of one pass -, " +
-			"$fluidBlocks fluid block(s) in the bakes, " +
-			"$fluidQuads fluid face(s), $refused section(s) refused by the arena, " +
-			"bob (%.2f, %.2f)".format(lastBobX, lastBobY) +
-			", bobView=$lastBobView player=$lastIsPlayer walk=%.2f".format(lastWalk) +
-			"; ${RustChunkBake.fluidDiagnostics}" +
-			"; ${RustChunkBake.refusedDiagnostics}" +
-			"; ${describeCamera()}"
+		// A *moving* watched count is worth the full line - under a second apart, so the loop while the
+		// world is meshed says what the watched blocks did and then stops: once they hold still, the
+		// compact line is the only one left, and the last full line carries the final numbers.
+		val due = reportDue(drawn, refused, slots, watched != reportedWatched)
+		reportedWatched = watched
+
+		val share = if (slots <= 0) 0L else used.toLong() * 100 / slots
+		val megabytes = used.toLong() * 4 / (1024 * 1024)
+
+		val arena = "arena %,d of %,d slot(s) handed out (%d%%, %d MB), the largest section %,d slot(s)"
+			.format(used, slots, share, megabytes, largest)
+
+		when (due) {
+			null -> null
+			false -> "; %,d section draw(s), %s, %,d refused".format(sections, arena, refused)
+			true ->
+				"; %,d section draw(s) - the solid and cutout layers of one pass -, ".format(sections) +
+					"%,d fluid block(s) in the bakes, ".format(fluidBlocks) +
+					"%,d fluid face(s), %,d section(s) refused by the arena, ".format(fluidQuads, refused) +
+					arena +
+					", bob (%.2f, %.2f)".format(lastBobX, lastBobY) +
+					", bobView=$lastBobView player=$lastIsPlayer walk=%.2f".format(lastWalk) +
+					"; ${RustChunkBake.fluidDiagnostics}" +
+					"; ${RustChunkBake.refusedDiagnostics}" +
+					(watched.takeIf { it.isNotEmpty() }?.let { "; watched $it" } ?: "") +
+					"; ${describeCamera()}"
+		}
 	} catch (error: Throwable) {
-		"; the native counters could not be read: $error"
+		if (reportDue(drawn, -1, -1, false) == null) null else "; the native counters could not be read: $error"
 	}
+
+	/** When the pass last said what it drew, and the numbers that line carried. See [describeFrame]. */
+	private var reportedAt = 0L
+	private var reportedRefused = -1
+	private var reportedPool = -1
+	private var reportedDrawn: Boolean? = null
+	private var reportedWatched = ""
+
+	/**
+	 * Whether this frame is one to report, and whether it is a full report: `true` for the first frame
+	 * and for a change in something that has no business changing, `false` for the once-a-second
+	 * sample, `null` for a frame with nothing to say.
+	 *
+	 * The watched counts are in here rather than in the compact line because they stop moving: while
+	 * the world is being meshed they change every frame and the full line says so once a second, and
+	 * when they hold still the last full line is the answer and nothing more is printed about them.
+	 */
+	private fun reportDue(drawn: Boolean, refused: Int, pool: Int, watchMoved: Boolean): Boolean? {
+		val changed = refused != reportedRefused ||
+			pool != reportedPool ||
+			reportedDrawn != drawn ||
+			reportedAt == 0L
+
+		val now = System.nanoTime()
+		val overdue = now - reportedAt >= REPORT_INTERVAL_NANOS
+
+		if (!changed && !overdue) {
+			return null
+		}
+
+		reportedAt = now
+		reportedRefused = refused
+		reportedPool = pool
+		reportedDrawn = drawn
+
+		return changed || watchMoved
+	}
+
+	/** How often the pass says what it drew when nothing has changed. See [describeFrame]. */
+	private const val REPORT_INTERVAL_NANOS = 1_000_000_000L
 
 	/**
 	 * The damage tilt and the view bob, which `GameRenderer.renderLevel` multiplies into the level

@@ -70,6 +70,15 @@ pub struct BlockModelFace {
     pub normal: Vec3,
     pub tint_index: i32,
     pub animation_uv_offset: u32,
+    /// The direction the model declared for this face's `cullface`, already turned by the variant's
+    /// rotation - or `None`, which is the common case and means the face is **never** culled.
+    ///
+    /// Minecraft's rule is exactly that split: a face with a `cullface` is handed to
+    /// `Block#shouldRenderFace` for that direction, and one without is added as an *unculled* face
+    /// (`UnbakedCuboidGeometry`). A face that declares nothing is a face the model wants drawn
+    /// whatever is next to it - a plant's cross, a pane's edge, the inside of a mushroom cap - and a
+    /// baker that culls it anyway is a hole in the world that no log line explains.
+    pub cull: Option<Direction>,
     /// The layer this face is baked into, from two answers the game also asks separately: what the
     /// model says (`force_translucent`, `render_type` - `declared_layer`) and what the *sprite* it
     /// samples says (`Atlas::sprite_layer`, which is where ice, leaves and every plant are decided -
@@ -127,6 +136,334 @@ impl FaceFlags {
     pub fn hides_same_state(self, dir: Direction) -> bool {
         java_mask_has(self.self_hide, dir)
     }
+}
+
+/// A blockstate variant's rotation of the model it names: `x` first, then `y`, each a multiple of 90°.
+///
+/// Both are part of the *variant*, not of the model - the same model file is baked once per variant
+/// that names it, with its own rotation - which is why everything here is applied per
+/// `ModelProperties` and before the faces of several properties are merged into one mesh.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ModelRotation {
+    pub x: i32,
+    pub y: i32,
+}
+
+impl ModelRotation {
+    pub fn new(x: i32, y: i32) -> ModelRotation {
+        ModelRotation { x, y }
+    }
+
+    /// Whether this rotation leaves everything where it was, in which case the uv-lock machinery has
+    /// nothing to do and the faces are built exactly as the model writes them.
+    pub fn is_identity(self) -> bool {
+        self.x % 360 == 0 && self.y % 360 == 0
+    }
+
+    /// A position inside the block's unit cube, rotated: `x` first, then `y`.
+    ///
+    /// The constants are not a rotation matrix's - each quarter turn is about the *middle of the
+    /// block*, so a rotation that maps a corner out of the cube is folded back in. This is the form
+    /// Minecraft's blockstate rotations are written in, and the one the model baker has always used.
+    ///
+    /// `x` is a **negative** quarter turn about X. That is not a guess: `x: 90` is
+    /// `OctahedralGroup.BLOCK_ROT_X_90 = ROT_90_X_NEG`, which is `diag(1, 1, -1) * P132`, and it takes
+    /// the model's up direction to **north**. The clearest place it shows is `amethyst_cluster`, whose
+    /// model points up and whose `facing=north` variant is `{"x": 90}` - and the same turn is what puts
+    /// a huge mushroom's cap skin on the side the `up`/`down` property names. This used to be written
+    /// the other way round, which is why a mushroom cap had no top: the `up` piece was drawn at the
+    /// bottom of the cube facing down, and the block below it (being a mushroom block, and so
+    /// occluding) then culled it.
+    ///
+    /// `y` is the opposite sign to `x` in the same sense - `y: 90` is `ROT_90_Y_NEG`, which takes the
+    /// model's north direction to **east** - and that one was already right.
+    ///
+    /// Anything that is not a quarter turn - the `360` a model may spell out for "no rotation", and
+    /// any angle the game would have refused at load time - leaves the position where it was. That is
+    /// a deliberate change from the `panic!("invalid rotation")` this used to be: a panic here happens
+    /// inside a section bake, and a block that is drawn in its unrotated orientation is a far better
+    /// outcome than a section that never finishes baking.
+    pub fn position(self, v: Vec3) -> Vec3 {
+        let v = match self.x {
+            0 => v,
+            90 => vec3(v.x, v.z, 1.0 - v.y),
+            180 => vec3(v.x, 1.0 - v.y, 1.0 - v.z),
+            270 => vec3(v.x, 1.0 - v.z, v.y),
+            _ => v,
+        };
+
+        match self.y {
+            0 => v,
+            90 => vec3(1.0 - v.z, v.y, v.x),
+            180 => vec3(1.0 - v.x, v.y, 1.0 - v.z),
+            270 => vec3(v.z, v.y, 1.0 - v.x),
+            _ => v,
+        }
+    }
+
+    /// A direction, rotated - the same rotation with its translations dropped.
+    ///
+    /// A normal is not a position: the `1.0 -` in [`Self::position`] is where the block's middle is,
+    /// and a direction has no position to be folded about. A matrix built this way stays axis-aligned
+    /// for quarter turns, which is what the vertex packing needs - it writes the normal into three
+    /// bits and panics on anything else.
+    ///
+    /// The branches are [`Self::position`]'s with the translations dropped, and the two have to be
+    /// changed together: `x: 90` takes up to north here and up to the bottom of the cube there.
+    pub fn direction(self, n: Vec3) -> Vec3 {
+        let n = match self.x {
+            0 => n,
+            90 => vec3(n.x, n.z, -n.y),
+            180 => vec3(n.x, -n.y, -n.z),
+            270 => vec3(n.x, -n.z, n.y),
+            _ => n,
+        };
+
+        match self.y {
+            0 => n,
+            90 => vec3(-n.z, n.y, n.x),
+            180 => vec3(-n.x, n.y, -n.z),
+            270 => vec3(n.z, n.y, -n.x),
+            _ => n,
+        }
+    }
+
+    /// The rotation as a 3×3 matrix, which is what the uv-lock transform below is composed from.
+    pub fn matrix(self) -> Mat3 {
+        Mat3::from_cols(
+            self.direction(Vec3::X),
+            self.direction(Vec3::Y),
+            self.direction(Vec3::Z),
+        )
+    }
+
+    /// The direction a face's declared `cullface` names once the model is rotated.
+    ///
+    /// Minecraft does the same to it - `Direction.rotate(modelState.transformation().getMatrix(),
+    /// face.cullForDirection())` - so a rotated model is culled against the neighbour it now touches
+    /// rather than the one it was written against.
+    pub fn rotate_direction(self, dir: Direction) -> Direction {
+        nearest_direction(self.direction(dir.to_vec().as_vec3()))
+    }
+}
+
+/// The face a direction vector points at, for vectors that are axis-aligned: the axis it runs
+/// furthest along, and the way it points.
+fn nearest_direction(v: Vec3) -> Direction {
+    let abs = v.abs();
+
+    if abs.x >= abs.y && abs.x >= abs.z {
+        if v.x >= 0.0 { Direction::East } else { Direction::West }
+    } else if abs.y >= abs.z {
+        if v.y >= 0.0 { Direction::Up } else { Direction::Down }
+    } else if v.z >= 0.0 {
+        Direction::South
+    } else {
+        Direction::North
+    }
+}
+
+/// The frame a face's UVs live in, as a rotation of the south face's frame - Minecraft's
+/// `BlockMath.VANILLA_UV_TRANSFORM_LOCAL_TO_GLOBAL`.
+fn uv_frame(dir: Direction) -> Mat3 {
+    let quarter = std::f32::consts::FRAC_PI_2;
+
+    match dir {
+        // The anchor: the south face's `u` runs west to east and its `v` runs bottom to top, and the
+        // other five faces are this frame turned to face where they face.
+        Direction::South => Mat3::IDENTITY,
+        Direction::East => Mat3::from_rotation_y(quarter),
+        Direction::West => Mat3::from_rotation_y(-quarter),
+        Direction::North => Mat3::from_rotation_y(std::f32::consts::PI),
+        Direction::Up => Mat3::from_rotation_x(-quarter),
+        Direction::Down => Mat3::from_rotation_x(quarter),
+    }
+}
+
+/// The matrix a face's UVs are put through when the variant sets `uvlock`.
+///
+/// `uvlock` means "the texture does not turn with the model": the geometry is rotated either way, and
+/// this is the transform that turns the texture *back*, so a locked face looks the same however its
+/// variant is rotated. Minecraft's own is
+/// `GLOBAL_TO_LOCAL[newSide] * rotation * LOCAL_TO_GLOBAL[declared]`, where `newSide` is the face the
+/// rotated normal ends up pointing at and the UV is transformed as the point `(u - 0.5, v - 0.5, 0)`
+/// in sprite-normalized coordinates.
+///
+/// Without `uvlock` this is the identity, and the UVs simply stay attached to the corners the rotation
+/// moves - which is what a player sees as the texture turning with the block.
+fn uv_lock_matrix(rotation: ModelRotation, declared: Direction) -> Mat3 {
+    if rotation.is_identity() {
+        return Mat3::IDENTITY;
+    }
+
+    // The face this one *becomes*: Minecraft takes the rotated normal of the declared face and asks
+    // which direction that is nearest - `faceAction` is `rotation ∘ LOCAL_TO_GLOBAL[declared]`, and
+    // the local `(0, 0, 1)` is the declared face's own normal in that frame, not the south one.
+    let turned = rotation.rotate_direction(declared);
+    let matrix = rotation.matrix();
+
+    uv_frame(turned).transpose() * matrix * uv_frame(declared)
+}
+
+/// Textures a model named and the resource provider could not read, over the whole run.
+///
+/// The step before [`MISSING_SPRITES`]: a texture that cannot be read is a sprite that is never packed
+/// into the atlas, so every face that samples it is dropped a moment later. Both are counted
+/// separately because the two have different causes - a missing file in a resource pack against a
+/// sprite the atlas never allocated - and the same symptom: a block with a hole, or with nothing in it
+/// at all. See `blockBakeDiagnostics`, which reports both to the game's own log.
+pub static UNREADABLE_TEXTURES: MissingSprites = MissingSprites::new();
+
+/// Sprites a face asked the atlas for and did not find, over the whole run.
+///
+/// A face whose sprite is missing is **dropped**, and that is deliberate: a block with one bad texture
+/// reference must not take the block registry down with it. What it costs is a hole in a block - or a
+/// block drawn as nothing at all, when the face that was dropped was the only one the model had - and
+/// *nothing in any log*, which is the part that is not deliberate. A state that baked to an empty mesh
+/// is a state with a perfectly good key, so it is also a state that still occludes its neighbours: the
+/// block is invisible and the block behind it loses the face between them, and the two together look
+/// like a hole in the world rather than like a texture that could not be found.
+///
+/// That is what a mushroom cap did for a whole session of looking at the wrong thing. Counting the
+/// drops and remembering the first few names is what makes the next one a line instead of a hunt; the
+/// JVM side logs the answer after the block cache, where its own log lives. See `blockBakeDiagnostics`.
+pub static MISSING_SPRITES: MissingSprites = MissingSprites::new();
+
+/// How many sprites [`MISSING_SPRITES`] remembers by name, so a broken pack cannot grow it forever.
+const MISSING_SPRITE_NAMES: usize = 24;
+
+#[derive(Debug)]
+pub struct MissingSprites {
+    faces: std::sync::atomic::AtomicU64,
+    names: parking_lot::Mutex<Vec<String>>,
+}
+
+impl MissingSprites {
+    const fn new() -> Self {
+        Self {
+            faces: std::sync::atomic::AtomicU64::new(0),
+            names: parking_lot::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Notes one dropped face, and the sprite it wanted.
+    pub fn note(&self, sprite: &ResourcePath) {
+        self.faces
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        let mut names = self.names.lock();
+
+        if names.len() < MISSING_SPRITE_NAMES && !names.iter().any(|name| name == &sprite.0) {
+            names.push(sprite.0.clone());
+        }
+    }
+
+    /// How many faces have been dropped for a sprite the atlas does not have.
+    pub fn faces(&self) -> u64 {
+        self.faces.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The first few sprites that went missing, by name.
+    pub fn names(&self) -> Vec<String> {
+        self.names.lock().clone()
+    }
+}
+
+/// One element face, as the baker needs it: the sprite's corners in the atlas, the animation offset,
+/// the tint index, the layer the sprite puts it in, and the direction it declared for culling.
+struct FaceData {
+    uv: UV,
+    animation_uv_offset: u32,
+    tint_index: i32,
+    layer: RenderLayer,
+    cull: Option<Direction>,
+}
+
+/// Reads one element face: its atlas UVs, and everything that is not geometry.
+///
+/// The UVs are the one part of a face that can be turned twice - once by the face's own `rotation`
+/// (in [`get_atlas_uv`]) and once by the variant's `uvlock` - and both are applied here, in that
+/// order, because that is the order Minecraft applies them in. The `cullface` is turned too, by the
+/// variant's rotation alone.
+fn face_data(
+    tex: &schemas::models::ElementFace,
+    declared: Direction,
+    atlas: &Atlas,
+    rotation: ModelRotation,
+    uv_lock: bool,
+) -> Option<FaceData> {
+    let Some(uv) = get_atlas_uv(tex, atlas) else {
+        // The one silent way this baker can fail, and the reason `MISSING_SPRITES` exists: the face is
+        // gone, and whether the block is drawn with a hole in it or not at all is not something any
+        // other line in the log can tell you.
+        MISSING_SPRITES.note(&(&tex.texture.0).into());
+
+        return None;
+    };
+
+    let texture: ResourcePath = (&tex.texture.0).into();
+
+    let uv = if uv_lock {
+        // `get_atlas_uv` above already found this sprite in the same map under the same key, so this
+        // cannot be what makes a locked face disappear - it is here so that the sprite's rectangle is
+        // read from one place rather than threaded through.
+        let Some(sprite) = atlas.uv_map.read().get(&texture).copied() else {
+            return None;
+        };
+
+        lock_uv(uv, sprite, uv_lock_matrix(rotation, declared))
+    } else {
+        uv
+    };
+
+    Some(FaceData {
+        uv,
+        animation_uv_offset: *atlas
+            .animated_texture_offsets
+            .read()
+            .get(&texture)
+            .unwrap_or(&0),
+        tint_index: tex.tint_index,
+        layer: atlas.sprite_layer(&texture).unwrap_or(RenderLayer::Solid),
+        // Rotated as Minecraft rotates it, so the direction that comes out is the neighbour this face
+        // now touches rather than the one the model file was written against. The culling loop tests
+        // this one against the world as baked.
+        cull: tex.cull_face.map(|face| {
+            rotation.rotate_direction(match face {
+                schemas::models::BlockFace::Down => Direction::Down,
+                schemas::models::BlockFace::Up => Direction::Up,
+                schemas::models::BlockFace::North => Direction::North,
+                schemas::models::BlockFace::South => Direction::South,
+                schemas::models::BlockFace::West => Direction::West,
+                schemas::models::BlockFace::East => Direction::East,
+            })
+        }),
+    })
+}
+
+/// Turns a face's four atlas corners by a uv-lock transform.
+///
+/// The transform is Minecraft's, which works in *sprite-normalized* coordinates: `(0, 0)` is one
+/// corner of the sprite and `(1, 1)` the other, whatever the sprite's pixel size. So the corners are
+/// taken out of atlas space, turned about the middle of the sprite, and put back - which is why the
+/// sprite's own rectangle is needed and not just the face's.
+fn lock_uv(uv: UV, sprite: UV, matrix: Mat3) -> UV {
+    let width = (sprite.1.0 as f32 - sprite.0.0 as f32).max(1.0);
+    let height = (sprite.1.1 as f32 - sprite.0.1 as f32).max(1.0);
+
+    let turn = |corner: (u16, u16)| {
+        let u = (corner.0 as f32 - sprite.0.0 as f32) / width - 0.5;
+        let v = (corner.1 as f32 - sprite.0.1 as f32) / height - 0.5;
+
+        let turned = matrix * vec3(u, v, 0.0);
+
+        (
+            (sprite.0.0 as f32 + (turned.x + 0.5) * width).round() as u16,
+            (sprite.0.1 as f32 + (turned.y + 0.5) * height).round() as u16,
+        )
+    };
+
+    (turn(uv.0), turn(uv.1))
 }
 
 /// Parses a model file, allowing for the object form of a texture that 26.1 introduced.
@@ -410,6 +747,21 @@ pub struct ModelMesh {
 }
 
 impl ModelMesh {
+    /// Whether this mesh has no faces at all: a block that is baked, keyed, drawn - and invisible.
+    ///
+    /// Worth asking because it is the shape of a whole class of failure: the state has a mesh (so it
+    /// culls its neighbours like any other block) and the mesh has nothing in it. A model whose cases
+    /// did not match, a model whose every face was dropped for a sprite the atlas does not have - both
+    /// end here, and both look like a hole in the world rather than like a missing texture.
+    pub fn is_empty(&self) -> bool {
+        self.north.is_empty()
+            && self.south.is_empty()
+            && self.west.is_empty()
+            && self.east.is_empty()
+            && self.up.is_empty()
+            && self.down.is_empty()
+            && self.any.is_empty()
+    }
     pub fn bake<'a>(
         model_properties: impl IntoIterator<Item = &'a ModelProperties>,
         resource_provider: &dyn ResourceProvider,
@@ -444,6 +796,13 @@ impl ModelMesh {
                 // put it in a stronger layer than this, and does for everything the model says
                 // nothing about.
                 let model_layer = layer.unwrap_or(RenderLayer::Solid);
+
+                // The variant's own rotation and its `uvlock`, which belong to *this* model property
+                // and are applied to its faces before they are merged with the others'. A multipart
+                // model is several properties, each with its own rotation - and the mesh of a state
+                // is merged, so the turn has to happen here rather than on a shared unrotated model.
+                let rotation = ModelRotation::new(model_properties.x, model_properties.y);
+                let uv_lock = model_properties.uv_lock;
 
                 // A `#name` that survived resolution is a face about to be looked up in the atlas as
                 // a sprite called `#name` - which is not there, so the face is dropped and the block
@@ -489,6 +848,8 @@ impl ModelMesh {
                             match resource_provider.get_bytes(&texture_path) {
                                 Some(data) => Some((path, data)),
                                 None => {
+                                    UNREADABLE_TEXTURES.note(&texture_path);
+
                                     log::warn!(
                                         "wgpu-mc: {texture_path} is named by a model but cannot \
                                         be read; the faces using it are left untextured"
@@ -515,161 +876,39 @@ impl ModelMesh {
                     .flatten()
                     .flat_map(|element| {
                         //Face textures
+                        // Each face is handed to `face_data`, which reads its UVs, its layer and the
+                        // direction it declared for culling, and applies the face's own rotation
+                        // followed by the variant's `uvlock` to the UVs.
                         let north = element
                             .faces
                             .get(&schemas::models::BlockFace::North)
-                            .as_ref()
-                            .and_then(|tex| {
-                                get_atlas_uv(tex, block_atlas).map(|uv| {
-                                    (
-                                        //The default UV for this texture
-                                        uv,
-                                        //If this texture has an animation, get the offset, otherwise default to 0
-                                        *block_atlas
-                                            .animated_texture_offsets
-                                            .read()
-                                            .get(&(&tex.texture.0).into())
-                                            .unwrap_or(&0),
-                                        tex.tint_index,
-                                        //What the sprite's own pixels say about the face that samples
-                                        //them: this is where ice, leaves and every plant are decided,
-                                        //because none of them declares anything in its model.
-                                        block_atlas
-                                            .sprite_layer(&(&tex.texture.0).into())
-                                            .unwrap_or(RenderLayer::Solid),
-                                    )
-                                })
-                            });
+                            .and_then(|tex| face_data(tex, Direction::North, block_atlas, rotation, uv_lock));
 
                         let east = element
                             .faces
                             .get(&schemas::models::BlockFace::East)
-                            .as_ref()
-                            .and_then(|tex| {
-                                get_atlas_uv(tex, block_atlas).map(|uv| {
-                                    (
-                                        //The default UV for this texture
-                                        uv,
-                                        //If this texture has an animation, get the offset, otherwise default to 0
-                                        *block_atlas
-                                            .animated_texture_offsets
-                                            .read()
-                                            .get(&(&tex.texture.0).into())
-                                            .unwrap_or(&0),
-                                        tex.tint_index,
-                                        //What the sprite's own pixels say about the face that samples
-                                        //them: this is where ice, leaves and every plant are decided,
-                                        //because none of them declares anything in its model.
-                                        block_atlas
-                                            .sprite_layer(&(&tex.texture.0).into())
-                                            .unwrap_or(RenderLayer::Solid),
-                                    )
-                                })
-                            });
+                            .and_then(|tex| face_data(tex, Direction::East, block_atlas, rotation, uv_lock));
 
                         let south = element
                             .faces
                             .get(&schemas::models::BlockFace::South)
-                            .as_ref()
-                            .and_then(|tex| {
-                                get_atlas_uv(tex, block_atlas).map(|uv| {
-                                    (
-                                        //The default UV for this texture
-                                        uv,
-                                        //If this texture has an animation, get the offset, otherwise default to 0
-                                        *block_atlas
-                                            .animated_texture_offsets
-                                            .read()
-                                            .get(&(&tex.texture.0).into())
-                                            .unwrap_or(&0),
-                                        tex.tint_index,
-                                        //What the sprite's own pixels say about the face that samples
-                                        //them: this is where ice, leaves and every plant are decided,
-                                        //because none of them declares anything in its model.
-                                        block_atlas
-                                            .sprite_layer(&(&tex.texture.0).into())
-                                            .unwrap_or(RenderLayer::Solid),
-                                    )
-                                })
-                            });
+                            .and_then(|tex| face_data(tex, Direction::South, block_atlas, rotation, uv_lock));
 
                         let west = element
                             .faces
                             .get(&schemas::models::BlockFace::West)
-                            .as_ref()
-                            .and_then(|tex| {
-                                get_atlas_uv(tex, block_atlas).map(|uv| {
-                                    (
-                                        //The default UV for this texture
-                                        uv,
-                                        //If this texture has an animation, get the offset, otherwise default to 0
-                                        *block_atlas
-                                            .animated_texture_offsets
-                                            .read()
-                                            .get(&(&tex.texture.0).into())
-                                            .unwrap_or(&0),
-                                        tex.tint_index,
-                                        //What the sprite's own pixels say about the face that samples
-                                        //them: this is where ice, leaves and every plant are decided,
-                                        //because none of them declares anything in its model.
-                                        block_atlas
-                                            .sprite_layer(&(&tex.texture.0).into())
-                                            .unwrap_or(RenderLayer::Solid),
-                                    )
-                                })
-                            });
+                            .and_then(|tex| face_data(tex, Direction::West, block_atlas, rotation, uv_lock));
 
                         let up = element
                             .faces
                             .get(&schemas::models::BlockFace::Up)
-                            .as_ref()
-                            .and_then(|tex| {
-                                get_atlas_uv(tex, block_atlas).map(|uv| {
-                                    (
-                                        //The default UV for this texture
-                                        uv,
-                                        //If this texture has an animation, get the offset, otherwise default to 0
-                                        *block_atlas
-                                            .animated_texture_offsets
-                                            .read()
-                                            .get(&(&tex.texture.0).into())
-                                            .unwrap_or(&0),
-                                        tex.tint_index,
-                                        //What the sprite's own pixels say about the face that samples
-                                        //them: this is where ice, leaves and every plant are decided,
-                                        //because none of them declares anything in its model.
-                                        block_atlas
-                                            .sprite_layer(&(&tex.texture.0).into())
-                                            .unwrap_or(RenderLayer::Solid),
-                                    )
-                                })
-                            });
+                            .and_then(|tex| face_data(tex, Direction::Up, block_atlas, rotation, uv_lock));
 
                         let down = element
                             .faces
                             .get(&schemas::models::BlockFace::Down)
-                            .as_ref()
-                            .and_then(|tex| {
-                                get_atlas_uv(tex, block_atlas).map(|uv| {
-                                    (
-                                        //The default UV for this texture
-                                        uv,
-                                        //If this texture has an animation, get the offset, otherwise default to 0
-                                        *block_atlas
-                                            .animated_texture_offsets
-                                            .read()
-                                            .get(&(&tex.texture.0).into())
-                                            .unwrap_or(&0),
-                                        tex.tint_index,
-                                        //What the sprite's own pixels say about the face that samples
-                                        //them: this is where ice, leaves and every plant are decided,
-                                        //because none of them declares anything in its model.
-                                        block_atlas
-                                            .sprite_layer(&(&tex.texture.0).into())
-                                            .unwrap_or(RenderLayer::Solid),
-                                    )
-                                })
-                            });
+                            .and_then(|tex| face_data(tex, Direction::Down, block_atlas, rotation, uv_lock));
+
                         let rot = &element.rotation;
                         let matrix = match rot.axis {
                             schemas::models::Axis::X => {
@@ -685,22 +924,13 @@ impl ModelMesh {
                         let vec_origin = Vec3::from_array(rot.origin) / 16.0;
 
                         let vertex_transform = |v: Vec3| {
-                            let v = match model_properties.x {
-                                0 => v,
-                                90 => vec3(v.x, 1.0 - v.z, v.y),
-                                180 => vec3(v.x, 1.0 - v.y, 1.0 - v.z),
-                                270 => vec3(v.x, v.z, 1.0 - v.y),
-                                _ => panic!("invalid rotation"),
-                            };
+                            // The element's own rotation first, then the variant's - which is the
+                            // order Minecraft applies them in, and the reason the variant's rotation
+                            // is per model property rather than per model: the same model file baked
+                            // under two variants is two different meshes.
                             let v = matrix * (v - vec_origin) + vec_origin;
 
-                            match model_properties.y {
-                                0 => v,
-                                90 => vec3(1.0 - v.z, v.y, v.x),
-                                180 => vec3(1.0 - v.x, v.y, 1.0 - v.z),
-                                270 => vec3(v.z, v.y, 1.0 - v.x),
-                                _ => panic!("invalid rotation"),
-                            }
+                            rotation.position(v)
                         };
 
                         let p000 = vertex_transform(vec3(
@@ -749,146 +979,152 @@ impl ModelMesh {
                             vertices: [
                                 BlockMeshVertex {
                                     position: p101,
-                                    tex_coords: [south_face.0.1.0, south_face.0.1.1],
+                                    tex_coords: [south_face.uv.1.0, south_face.uv.1.1],
                                 },
                                 BlockMeshVertex {
                                     position: p111,
-                                    tex_coords: [south_face.0.1.0, south_face.0.0.1],
+                                    tex_coords: [south_face.uv.1.0, south_face.uv.0.1],
                                 },
                                 BlockMeshVertex {
                                     position: p011,
-                                    tex_coords: [south_face.0.0.0, south_face.0.0.1],
+                                    tex_coords: [south_face.uv.0.0, south_face.uv.0.1],
                                 },
                                 BlockMeshVertex {
                                     position: p001,
-                                    tex_coords: [south_face.0.0.0, south_face.0.1.1],
+                                    tex_coords: [south_face.uv.0.0, south_face.uv.1.1],
                                 },
                             ],
-                            normal: vec3(0.0, 0.0, 1.0),
-                            tint_index: south_face.2,
-                            animation_uv_offset: south_face.1,
-                            layer: model_layer.stronger(south_face.3),
+                            normal: rotation.direction(vec3(0.0, 0.0, 1.0)),
+                            tint_index: south_face.tint_index,
+                            animation_uv_offset: south_face.animation_uv_offset,
+                            layer: model_layer.stronger(south_face.layer),
+                            cull: south_face.cull,
                         }));
                         faces.extend(west.map(|west_face| BlockModelFace {
                             vertices: [
                                 BlockMeshVertex {
                                     position: p001,
-                                    tex_coords: [west_face.0.1.0, west_face.0.1.1],
+                                    tex_coords: [west_face.uv.1.0, west_face.uv.1.1],
                                 },
                                 BlockMeshVertex {
                                     position: p011,
-                                    tex_coords: [west_face.0.1.0, west_face.0.0.1],
+                                    tex_coords: [west_face.uv.1.0, west_face.uv.0.1],
                                 },
                                 BlockMeshVertex {
                                     position: p010,
-                                    tex_coords: [west_face.0.0.0, west_face.0.0.1],
+                                    tex_coords: [west_face.uv.0.0, west_face.uv.0.1],
                                 },
                                 BlockMeshVertex {
                                     position: p000,
-                                    tex_coords: [west_face.0.0.0, west_face.0.1.1],
+                                    tex_coords: [west_face.uv.0.0, west_face.uv.1.1],
                                 },
                             ],
-                            normal: vec3(-1.0, 0.0, 0.0),
-                            tint_index: west_face.2,
-                            animation_uv_offset: west_face.1,
-                            layer: model_layer.stronger(west_face.3),
+                            normal: rotation.direction(vec3(-1.0, 0.0, 0.0)),
+                            tint_index: west_face.tint_index,
+                            animation_uv_offset: west_face.animation_uv_offset,
+                            layer: model_layer.stronger(west_face.layer),
+                            cull: west_face.cull,
                         }));
                         faces.extend(north.map(|north_face| BlockModelFace {
                             vertices: [
                                 BlockMeshVertex {
                                     position: p000,
-                                    tex_coords: [north_face.0.1.0, north_face.0.1.1],
+                                    tex_coords: [north_face.uv.1.0, north_face.uv.1.1],
                                 },
                                 BlockMeshVertex {
                                     position: p010,
-                                    tex_coords: [north_face.0.1.0, north_face.0.0.1],
+                                    tex_coords: [north_face.uv.1.0, north_face.uv.0.1],
                                 },
                                 BlockMeshVertex {
                                     position: p110,
-                                    tex_coords: [north_face.0.0.0, north_face.0.0.1],
+                                    tex_coords: [north_face.uv.0.0, north_face.uv.0.1],
                                 },
                                 BlockMeshVertex {
                                     position: p100,
-                                    tex_coords: [north_face.0.0.0, north_face.0.1.1],
+                                    tex_coords: [north_face.uv.0.0, north_face.uv.1.1],
                                 },
                             ],
-                            normal: vec3(0.0, 0.0, -1.0),
-                            tint_index: north_face.2,
-                            animation_uv_offset: north_face.1,
-                            layer: model_layer.stronger(north_face.3),
+                            normal: rotation.direction(vec3(0.0, 0.0, -1.0)),
+                            tint_index: north_face.tint_index,
+                            animation_uv_offset: north_face.animation_uv_offset,
+                            layer: model_layer.stronger(north_face.layer),
+                            cull: north_face.cull,
                         }));
                         faces.extend(east.map(|east_face| BlockModelFace {
                             vertices: [
                                 BlockMeshVertex {
                                     position: p100,
-                                    tex_coords: [east_face.0.1.0, east_face.0.1.1],
+                                    tex_coords: [east_face.uv.1.0, east_face.uv.1.1],
                                 },
                                 BlockMeshVertex {
                                     position: p110,
-                                    tex_coords: [east_face.0.1.0, east_face.0.0.1],
+                                    tex_coords: [east_face.uv.1.0, east_face.uv.0.1],
                                 },
                                 BlockMeshVertex {
                                     position: p111,
-                                    tex_coords: [east_face.0.0.0, east_face.0.0.1],
+                                    tex_coords: [east_face.uv.0.0, east_face.uv.0.1],
                                 },
                                 BlockMeshVertex {
                                     position: p101,
-                                    tex_coords: [east_face.0.0.0, east_face.0.1.1],
+                                    tex_coords: [east_face.uv.0.0, east_face.uv.1.1],
                                 },
                             ],
-                            normal: vec3(1.0, 0.0, 0.0),
-                            tint_index: east_face.2,
-                            animation_uv_offset: east_face.1,
-                            layer: model_layer.stronger(east_face.3),
+                            normal: rotation.direction(vec3(1.0, 0.0, 0.0)),
+                            tint_index: east_face.tint_index,
+                            animation_uv_offset: east_face.animation_uv_offset,
+                            layer: model_layer.stronger(east_face.layer),
+                            cull: east_face.cull,
                         }));
                         faces.extend(up.map(|up_face| BlockModelFace {
                             vertices: [
                                 BlockMeshVertex {
                                     position: p010,
-                                    tex_coords: [up_face.0.1.0, up_face.0.1.1],
+                                    tex_coords: [up_face.uv.1.0, up_face.uv.1.1],
                                 },
                                 BlockMeshVertex {
                                     position: p011,
-                                    tex_coords: [up_face.0.1.0, up_face.0.0.1],
+                                    tex_coords: [up_face.uv.1.0, up_face.uv.0.1],
                                 },
                                 BlockMeshVertex {
                                     position: p111,
-                                    tex_coords: [up_face.0.0.0, up_face.0.0.1],
+                                    tex_coords: [up_face.uv.0.0, up_face.uv.0.1],
                                 },
                                 BlockMeshVertex {
                                     position: p110,
-                                    tex_coords: [up_face.0.0.0, up_face.0.1.1],
+                                    tex_coords: [up_face.uv.0.0, up_face.uv.1.1],
                                 },
                             ],
-                            normal: vec3(0.0, 1.0, 0.0),
-                            tint_index: up_face.2,
-                            animation_uv_offset: up_face.1,
-                            layer: model_layer.stronger(up_face.3),
+                            normal: rotation.direction(vec3(0.0, 1.0, 0.0)),
+                            tint_index: up_face.tint_index,
+                            animation_uv_offset: up_face.animation_uv_offset,
+                            layer: model_layer.stronger(up_face.layer),
+                            cull: up_face.cull,
                         }));
 
                         faces.extend(down.map(|down_face| BlockModelFace {
                             vertices: [
                                 BlockMeshVertex {
                                     position: p000,
-                                    tex_coords: [down_face.0.1.0, down_face.0.1.1],
+                                    tex_coords: [down_face.uv.1.0, down_face.uv.1.1],
                                 },
                                 BlockMeshVertex {
                                     position: p100,
-                                    tex_coords: [down_face.0.1.0, down_face.0.0.1],
+                                    tex_coords: [down_face.uv.1.0, down_face.uv.0.1],
                                 },
                                 BlockMeshVertex {
                                     position: p101,
-                                    tex_coords: [down_face.0.0.0, down_face.0.0.1],
+                                    tex_coords: [down_face.uv.0.0, down_face.uv.0.1],
                                 },
                                 BlockMeshVertex {
                                     position: p001,
-                                    tex_coords: [down_face.0.0.0, down_face.0.1.1],
+                                    tex_coords: [down_face.uv.0.0, down_face.uv.1.1],
                                 },
                             ],
-                            normal: vec3(0.0, -1.0, 0.0),
-                            tint_index: down_face.2,
-                            animation_uv_offset: down_face.1,
-                            layer: model_layer.stronger(down_face.3),
+                            normal: rotation.direction(vec3(0.0, -1.0, 0.0)),
+                            tint_index: down_face.tint_index,
+                            animation_uv_offset: down_face.animation_uv_offset,
+                            layer: model_layer.stronger(down_face.layer),
+                            cull: down_face.cull,
                         }));
                         faces
                     })
@@ -1056,5 +1292,286 @@ mod texture_resolution_tests {
             described.contains("nothing_defines_this"),
             "the description has to name it: {described}"
         );
+    }
+}
+
+/// The variant rotation, and the uv-lock that undoes it for the texture. See [`ModelRotation`] and
+/// [`uv_lock_matrix`].
+#[cfg(test)]
+mod rotation_tests {
+    use super::*;
+
+    /// A quarter turn about Y takes the model's north face to face east - "90° clockwise seen from
+    /// above", which is what the blockstate field means.
+    #[test]
+    fn a_quarter_turn_about_y_takes_north_to_east() {
+        let turn = ModelRotation::new(0, 90);
+
+        assert_eq!(turn.rotate_direction(Direction::North), Direction::East);
+        assert_eq!(turn.rotate_direction(Direction::East), Direction::South);
+        assert_eq!(turn.rotate_direction(Direction::Up), Direction::Up, "the axis it turns about");
+    }
+
+    /// A quarter turn about X tips the model's top towards -z: the up face ends up pointing **north**.
+    ///
+    /// The sign is the whole reason this test exists, and it was written the other way round once. The
+    /// model that says which is right is `amethyst_cluster`: its model points up, and its
+    /// `facing=north` variant is `{"x": 90}`.
+    #[test]
+    fn a_quarter_turn_about_x_takes_up_to_north() {
+        let tip = ModelRotation::new(90, 0);
+
+        assert_eq!(tip.rotate_direction(Direction::Up), Direction::North);
+        assert_eq!(tip.rotate_direction(Direction::South), Direction::Up);
+        assert_eq!(tip.rotate_direction(Direction::East), Direction::East, "the axis it turns about");
+
+        // And the position form has to agree with it, both ways round: the quad a single-face model
+        // draws on `up` ends at the north boundary, and the one it draws on `north` ends at the bottom.
+        assert_eq!(
+            tip.position(vec3(0.5, 1.0, 0.5)),
+            vec3(0.5, 0.5, 0.0),
+            "the up quad goes to the north boundary, which is where `north` is"
+        );
+        assert_eq!(
+            tip.position(vec3(0.5, 0.5, 0.0)),
+            vec3(0.5, 0.0, 0.5),
+            "and the north quad goes to the bottom of the cube, which is where `down` is"
+        );
+    }
+
+    /// The wall variant of a cluster, end to end: up, then turned about Y onto the wall it names.
+    ///
+    /// `facing=east` is `{"x": 90, "y": 90}` in vanilla, so the model has to come out pointing east -
+    /// and it only does with both signs right.
+    #[test]
+    fn a_wall_cluster_points_at_the_wall_it_names() {
+        for (facing, y) in [
+            (Direction::East, 90),
+            (Direction::South, 180),
+            (Direction::West, 270),
+            (Direction::North, 0),
+        ] {
+            let turn = ModelRotation::new(90, y);
+
+            assert_eq!(
+                turn.rotate_direction(Direction::Up),
+                facing,
+                "facing={facing:?} is {{\"x\": 90, \"y\": {y}}}"
+            );
+        }
+    }
+
+    /// A huge mushroom's cap, which is what found the `x` sign and is the shape it costs most.
+    ///
+    /// `brown_mushroom_block.json` is six copies of one model - a single quad on `north`, from
+    /// `template_single_face` - each turned so that the quad lands on the side its `when` names, with
+    /// `uvlock` because the skin must not turn with it. So for each of the six: the quad has to lie on
+    /// that boundary, and the turned normal has to point out of it. When `x: 270` was read as the
+    /// other quarter turn, the `up` piece ended up on the *bottom* of the cube facing down - and
+    /// because the block below a cap is another mushroom block, which occludes, that piece was then
+    /// culled: a mushroom cap with no top.
+    #[test]
+    fn a_mushroom_cap_skin_lands_on_the_side_it_names() {
+        let quad = [
+            vec3(0.0, 0.0, 0.0),
+            vec3(1.0, 0.0, 0.0),
+            vec3(1.0, 1.0, 0.0),
+            vec3(0.0, 1.0, 0.0),
+        ];
+
+        for (named, x, y) in [
+            (Direction::North, 0, 0),
+            (Direction::East, 0, 90),
+            (Direction::South, 0, 180),
+            (Direction::West, 0, 270),
+            (Direction::Up, 270, 0),
+            (Direction::Down, 90, 0),
+        ] {
+            let rotation = ModelRotation::new(x, y);
+
+            assert_eq!(
+                nearest_direction(rotation.direction(vec3(0.0, 0.0, -1.0))),
+                named,
+                "{named:?} is {{\"x\": {x}, \"y\": {y}}}: the quad faces away from the side it names"
+            );
+
+            // How far the turned quad is off the boundary it has to sit on.
+            let off = |v: Vec3| {
+                let p = rotation.position(v);
+
+                match named {
+                    Direction::North => p.z,
+                    Direction::South => p.z - 1.0,
+                    Direction::West => p.x,
+                    Direction::East => p.x - 1.0,
+                    Direction::Down => p.y,
+                    Direction::Up => p.y - 1.0,
+                }
+            };
+
+            for corner in quad {
+                let distance = off(corner);
+
+                assert!(
+                    distance.abs() < 1e-5,
+                    "{named:?} is {{\"x\": {x}, \"y\": {y}}}: {corner} landed {distance} off the \
+                     {named:?} boundary"
+                );
+            }
+        }
+    }
+
+    /// A direction is turned by the rotation's matrix, not by its position form: the `1.0 -` in the
+    /// position form is where the middle of the block is, and a normal has no position to be folded
+    /// about. The two agree only by accident - here on a corner of the cube that both leave at a
+    /// corner.
+    #[test]
+    fn a_direction_is_not_a_position() {
+        let turn = ModelRotation::new(0, 90);
+
+        assert_eq!(turn.position(vec3(0.0, 1.0, 0.0)), vec3(1.0, 1.0, 0.0));
+        assert_eq!(
+            turn.direction(vec3(0.0, 1.0, 0.0)),
+            vec3(0.0, 1.0, 0.0),
+            "the up direction is along the axis of the turn and cannot move"
+        );
+    }
+
+    /// The uv-lock case worth writing down, hand-derived from Minecraft's own formula.
+    ///
+    /// A **north** face of a model turned 90° about X becomes the **up** face. The transform is
+    /// `GLOBAL_TO_LOCAL[up] * rotX(90) * LOCAL_TO_GLOBAL[north]`, and with those frames -
+    /// `rotX(-90)` and `rotY(180)` - it is `rotX(180) * rotY(180)`: the sprite is turned half way
+    /// round, `(u, v)` becoming `(1 - u, 1 - v)`.
+    #[test]
+    fn a_locked_face_turns_its_texture_by_what_the_model_turns() {
+        let matrix = uv_lock_matrix(ModelRotation::new(90, 0), Direction::North);
+
+        let turned = |u: f32, v: f32| {
+            let out = matrix * vec3(u - 0.5, v - 0.5, 0.0);
+            (out.x + 0.5, out.y + 0.5)
+        };
+
+        for (u, v, want_u, want_v) in [
+            (0.0, 0.0, 1.0, 1.0),
+            (1.0, 0.0, 0.0, 1.0),
+            (0.25, 1.0, 0.75, 0.0),
+        ] {
+            let (got_u, got_v) = turned(u, v);
+
+            assert!(
+                (got_u - want_u).abs() < 1e-5 && (got_v - want_v).abs() < 1e-5,
+                "({u}, {v}) landed on ({got_u}, {got_v}), not ({want_u}, {want_v})"
+            );
+        }
+    }
+
+    /// And the case that is *not* a turn: a north face turned 90° about Y becomes the east face, and
+    /// those two frames compose with the rotation to the identity - the texture keeps every corner it
+    /// had. It is still locked: the face it is on has turned, and the numbers on it have not.
+    ///
+    /// Compared by what it does rather than by `==`: a product of three rotations is the identity in
+    /// exact arithmetic and not in `f32`.
+    #[test]
+    fn a_lock_that_comes_out_as_no_change_at_all() {
+        let matrix = uv_lock_matrix(ModelRotation::new(0, 90), Direction::North);
+
+        for corner in [
+            vec3(-0.5, -0.5, 0.0),
+            vec3(0.5, -0.5, 0.0),
+            vec3(0.5, 0.5, 0.0),
+            vec3(-0.5, 0.5, 0.0),
+        ] {
+            let out = matrix * corner;
+
+            assert!(
+                (out - corner).length() < 1e-5,
+                "{corner} landed on {out}"
+            );
+        }
+    }
+
+    /// No rotation, no transform: an unrotated model's UVs are the ones the model writes, whether
+    /// `uvlock` is set or not. The flag is about what a rotation does to them.
+    #[test]
+    fn a_model_that_is_not_turned_has_its_uvs_left_alone() {
+        for declared in [
+            Direction::North,
+            Direction::South,
+            Direction::East,
+            Direction::West,
+            Direction::Up,
+            Direction::Down,
+        ] {
+            assert_eq!(
+                uv_lock_matrix(ModelRotation::new(0, 0), declared),
+                Mat3::IDENTITY,
+                "{declared:?} with no rotation"
+            );
+            assert_eq!(
+                uv_lock_matrix(ModelRotation::new(360, 0), declared),
+                Mat3::IDENTITY,
+                "{declared:?} with a full turn, which is no turn"
+            );
+        }
+    }
+
+    /// The transform stays in the sprite's plane and maps its unit square onto itself, with no
+    /// scaling - which is what keeps a locked texture the same size as an unlocked one.
+    #[test]
+    fn a_lock_transform_is_a_rotation_of_the_sprite() {
+        for x in [0, 90, 180, 270] {
+            for y in [0, 90, 180, 270] {
+                for declared in [Direction::North, Direction::East, Direction::Up, Direction::Down] {
+                    let matrix = uv_lock_matrix(ModelRotation::new(x, y), declared);
+
+                    for corner in [
+                        vec3(-0.5, -0.5, 0.0),
+                        vec3(0.5, -0.5, 0.0),
+                        vec3(0.5, 0.5, 0.0),
+                        vec3(-0.5, 0.5, 0.0),
+                    ] {
+                        let out = matrix * corner;
+
+                        assert!(
+                            out.z.abs() < 1e-5,
+                            "x={x} y={y} {declared:?}: the transform left the sprite's plane"
+                        );
+                        assert!(
+                            out.x.abs() <= 0.5001 && out.y.abs() <= 0.5001,
+                            "x={x} y={y} {declared:?}: {out} is outside the sprite"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Which sprite corners the lock transform lands on, for every rotation the blockstate format can
+    /// write: the corners have to stay corners, however the sprite is turned.
+    #[test]
+    fn the_corners_stay_the_corners() {
+        for x in [0, 90, 180, 270] {
+            for y in [0, 90, 180, 270] {
+                for declared in [Direction::North, Direction::South, Direction::Up, Direction::Down] {
+                    let matrix = uv_lock_matrix(ModelRotation::new(x, y), declared);
+                    let mut landed: Vec<(i32, i32)> =
+                        [(-0.5, -0.5), (0.5, -0.5), (0.5, 0.5), (-0.5, 0.5)]
+                            .iter()
+                            .map(|(u, v)| {
+                                let out = matrix * vec3(*u, *v, 0.0);
+                                (out.x.round() as i32, out.y.round() as i32)
+                            })
+                            .collect();
+
+                    landed.sort();
+                    assert_eq!(
+                        landed,
+                        vec![(-1, -1), (-1, 1), (1, -1), (1, 1)],
+                        "x={x} y={y} {declared:?}: the transform is not a turn of the sprite"
+                    );
+                }
+            }
+        }
     }
 }

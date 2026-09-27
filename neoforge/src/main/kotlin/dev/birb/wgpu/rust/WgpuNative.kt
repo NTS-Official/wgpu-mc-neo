@@ -346,6 +346,29 @@ object WgpuNative {
 	external fun cacheBlockStates()
 
 	/**
+	 * What the model baker could not draw, as a sentence - empty when it drew everything.
+	 *
+	 * The two ways a block is baked into nothing while looking perfectly registered: a face dropped for
+	 * a sprite the atlas does not have, and a state whose mesh came out with no faces at all. Both
+	 * leave a block that has a key, that occludes its neighbours - so the block behind it loses the
+	 * face between them - and that is never drawn. Read once, right after [cacheBlockStates], which is
+	 * where both are decided, and logged from there because the native log does not reach this file.
+	 */
+	@JvmStatic
+	external fun blockBakeDiagnostics(): String
+
+	/**
+	 * What the watched blocks have been seen, drawn and culled for - empty until one of them is baked.
+	 *
+	 * The one line that says why a block is invisible: `seen 0` is a state that never reached a bake,
+	 * `drawn 0 culled N` is a model whose every face a neighbour test removed, and `drawn N` is faces
+	 * that are in the section mesh - which puts the fault after the bake rather than in it. The blocks
+	 * watched are named in `chunk::WATCHED_BLOCKS` on the native side.
+	 */
+	@JvmStatic
+	external fun watchedBlockFaces(): String
+
+	/**
 	 * Offers one section rebuild, in one call.
 	 *
 	 * `address` is the base of a payload `RustChunkBake` wrote into reusable off-heap memory and

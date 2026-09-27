@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU32;
 
 use arc_swap::ArcSwap;
 use chunk::SectionStorage;
@@ -43,6 +44,14 @@ pub struct BlockManager {
     /// reads: a neighbour's *state* decides whether a face is drawn, not its model - see
     /// `chunk::face_is_hidden`.
     pub face_flags: HashMap<u32, block::FaceFlags>,
+
+    /// `(block index, slot in the watched list)` for each name in [`chunk::WATCHED_BLOCKS`] this
+    /// registry has, resolved once when it is built.
+    ///
+    /// The baker counts a watched block's faces as it draws them - see [`chunk::WATCHED_BLOCKS`] for
+    /// the four answers the three numbers tell apart - and this is how a block *index*, which is all a
+    /// baked section carries, is recognised as one of the names somebody asked about.
+    pub watched: Vec<(u16, u8)>,
 }
 
 impl BlockManager {
@@ -50,6 +59,7 @@ impl BlockManager {
         Self {
             blocks: IndexMap::new(),
             face_flags: HashMap::new(),
+            watched: Vec::new(),
         }
     }
 }
@@ -226,7 +236,14 @@ pub struct RenderEffectsData {
 /// One constant rather than the same four flags at both creation sites - the pool and the buffer are
 /// resized together by [`Scene::set_arena_slots`], and the second of those sites is where a missing
 /// flag would be a validation error at the first draw.
-const ARENA_USAGE: wgpu::BufferUsages = wgpu::BufferUsages::COPY_DST
+///
+/// `COPY_SRC` is there for the fifth: an arena that a section did not fit in is grown rather than left
+/// full (`WmRenderer::grow_arena`), and growing it is one `copy_buffer_to_buffer` of the old contents
+/// into the new buffer - every range keeps its offset, so the world does not have to be meshed again.
+/// Without the flag that copy is a validation error, and a validation error on this path ends the
+/// process.
+pub(crate) const ARENA_USAGE: wgpu::BufferUsages = wgpu::BufferUsages::COPY_DST
+    .union(wgpu::BufferUsages::COPY_SRC)
     .union(wgpu::BufferUsages::VERTEX)
     .union(wgpu::BufferUsages::STORAGE)
     .union(wgpu::BufferUsages::INDEX);
@@ -248,6 +265,21 @@ pub struct Scene {
     /// drawing from the old buffer keeps it alive: the recorded pass holds its own reference to it.
     /// See [`Scene::set_arena_slots`], which is the only thing that replaces it.
     pub chunk_buffer: ArcSwap<BindableBuffer>,
+
+    /// The pool size a section did not fit into asked to be grown to, or zero.
+    ///
+    /// A request rather than a growth, because the two happen in different places: the refusal is
+    /// noticed while a frame's bakes are being written into the buffer that is bound right now, and
+    /// growing has to happen before that load - a drain that swapped buffers halfway through would
+    /// write the rest of its sections into the wrong one. See `WmRenderer::grow_arena`.
+    pub pending_arena_growth: AtomicU32,
+
+    /// The largest pool this device can have in one buffer, in u32 slots: `max_buffer_size / 4`.
+    ///
+    /// Read once, from the device the arena's buffer is created on. It is the ceiling `grow_arena`
+    /// stops at, and a ceiling rather than a policy: growth only happens because a section did not fit,
+    /// so a session that never refuses never reaches it.
+    pub arena_cap_slots: u32,
 
     pub indirect_buffer: Arc<wgpu::Buffer>,
 
@@ -281,6 +313,8 @@ impl Scene {
                 ARENA_USAGE,
                 "ssbo",
             )),
+            pending_arena_growth: AtomicU32::new(0),
+            arena_cap_slots: (wm.gpu.device.limits().max_buffer_size / 4).min(u32::MAX as u64) as u32,
             indirect_buffer: Arc::new(indirect_buffer),
 
             entity_instances: Default::default(),

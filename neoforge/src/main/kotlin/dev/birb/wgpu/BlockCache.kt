@@ -98,6 +98,18 @@ object BlockCache {
 		// them the baker draws every face of every block.
 		BlockFaceFlags.report()
 
+		// The two ways a block was baked into nothing, which the native side counts as it bakes: a face
+		// dropped for a sprite the atlas does not have, and a state whose mesh came out with no faces in
+		// it at all. Both leave a block that is registered, keyed, culling its neighbours - and
+		// invisible, which is a hole in the world with no visible cause. The count lives on the native
+		// side because that is where the baking happens, and it is logged here because the native log
+		// does not reach this file.
+		val missed = WgpuNative.blockBakeDiagnostics()
+
+		if (missed.isNotEmpty()) {
+			WgpuMcMod.LOGGER.warn("wgpu: the block models did not all bake: {}", missed)
+		}
+
 		val client = Minecraft.getInstance()
 		WgpuMcMod.LOGGER.info("wgpu: block states cached; asking Minecraft to mesh its sections again so the feed sees them")
 

@@ -423,11 +423,19 @@ public class WgpuRenderPass implements RenderPassBackend {
 
         boolean drawn = (boolean) invoke(WmNative.renderTerrainPass, device.renderer(), colorView, depthView);
 
-        dev.birb.wgpu.WgpuMcMod.LOGGER.info(
-                "wgpu: {} is drawn by the render graph now{}{}",
-                label,
-                drawn ? "" : "; nothing was drawn, so this frame has no ground in it",
-                TerrainPass.INSTANCE.describeFrame());
+        // Null on most frames: the pass is taken over every frame of a world, and a line per frame is
+        // half a megabyte of log in thirty seconds. It answers when there is something to say - the
+        // first frame, a frame that drew nothing, or a change in the arena - and once a second
+        // otherwise. See `TerrainPass.describeFrame`.
+        String report = TerrainPass.INSTANCE.describeFrame(drawn);
+
+        if (report != null) {
+            dev.birb.wgpu.WgpuMcMod.LOGGER.info(
+                    "wgpu: {} is drawn by the render graph now{}{}",
+                    label,
+                    drawn ? "" : "; nothing was drawn, so this frame has no ground in it",
+                    report);
+        }
     }
 
     /** Plans already described by [reportPlanOnce]. */

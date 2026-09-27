@@ -82,6 +82,13 @@ pub struct Atlas {
     /// model is the other half, and the only one that can be read from JSON - so this is the table the
     /// block model baker asks when it fills in a face's layer. See [`Atlas::sprite_layer`].
     pub sprite_layers: RwLock<HashMap<ResourcePath, RenderLayer>>,
+    /// How many sprites have been added to the image since the texture on the GPU was last written.
+    ///
+    /// The one thing that makes [`Atlas::allocate`] and [`Atlas::upload`] two calls rather than one:
+    /// the atlas is composed on the CPU by whoever bakes a model, and copied to the GPU by whoever
+    /// knows the frame's structure. A sprite that is allocated and never uploaded is a block that is
+    /// invisible - see [`Atlas::allocate`] - so the count is what [`Atlas::upload_if_dirty`] reads.
+    sprites_since_upload: std::sync::atomic::AtomicU64,
     size: u32,
 }
 
@@ -118,6 +125,7 @@ impl Atlas {
             animated_textures: RwLock::new(Vec::new()),
             animated_texture_offsets: Default::default(),
             sprite_layers: Default::default(),
+            sprites_since_upload: std::sync::atomic::AtomicU64::new(0),
             size: ATLAS_DIMENSIONS,
         }
     }
@@ -137,6 +145,20 @@ impl Atlas {
     }
 
     /// Add multiple textures to the atlas. This automatically handles .mcmeta files when dealing with block textures
+    ///
+    /// This writes the **CPU image** and the maps, and nothing else: the texture the pass samples is
+    /// whatever the last [`Atlas::upload`] put there. A sprite allocated after that upload is a sprite
+    /// whose rectangle is in `uv_map` - so `get_atlas_uv` finds it, the faces that name it are baked -
+    /// and whose texels are not on the GPU at all, where wgpu's zero-initialization makes them
+    /// `(0, 0, 0, 0)`. A face that samples that is discarded by the shader's alpha test, so the block
+    /// is **baked, keyed, culled against its neighbours, and invisible**, with nothing in any log.
+    ///
+    /// That is not hypothetical: the block models are baked in two passes, and the second one - the
+    /// multipart models, which are generated lazily as each state is mapped - runs *after*
+    /// `bake_blocks` uploads the atlas. Every sprite that only a multipart model names was therefore
+    /// never uploaded, and the mushroom blocks are exactly that: their two textures belong to
+    /// `template_single_face` models that nothing else in the game names. See
+    /// [`Atlas::upload_if_dirty`], which is what closes it.
     pub fn allocate<'a, T>(
         &self,
         images: impl IntoIterator<Item = (&'a ResourcePath, &'a T)>,
@@ -152,6 +174,8 @@ impl Atlas {
         let mut sprite_layers = self.sprite_layers.write();
         // let mut animated_texture_offsets = self.animated_texture_offsets.write();
 
+        let before = map.len();
+
         images.into_iter().for_each(|(name, slice)| {
             self.allocate_one(
                 &mut image_buffer,
@@ -164,6 +188,15 @@ impl Atlas {
                 resource_provider,
             );
         });
+
+        // Only the sprites that actually landed: a texture that could not be decoded, or that does not
+        // fit the atlas, is skipped above and is not a reason to copy the texture again.
+        let added = map.len() - before;
+
+        if added != 0 {
+            self.sprites_since_upload
+                .fetch_add(added as u64, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -284,7 +317,50 @@ impl Atlas {
             }
         }
 
+        // Everything the image holds is on the GPU now, whenever it was allocated. Clearing the count
+        // here rather than in the caller is what makes it a fact about the texture instead of a promise
+        // the caller has to keep.
+        self.sprites_since_upload
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+
         false
+    }
+
+    /// Uploads the atlas if sprites have been added since the last upload, and answers whether it did.
+    ///
+    /// The gap this closes is the one between the two passes that bake block models. `bake_blocks`
+    /// bakes every `variants` model, allocates the sprites they name, and uploads - and then the JVM
+    /// asks for a mesh per block *state*, which is what bakes the `multipart` models, one state at a
+    /// time. A sprite that only a multipart model names is allocated into the image by that second pass
+    /// and, without this call, copied to the GPU never: its faces are baked and sample `(0, 0, 0, 0)`,
+    /// and the shader's alpha test discards them.
+    ///
+    /// What that looked like was a mushroom block that was completely invisible while every number in
+    /// the renderer said it was there - it had a key, it had a mesh, it drew a thousand faces, it
+    /// culled the faces of the blocks around it - and the two textures that went missing were exactly
+    /// the two nothing else in the game names. See [`Atlas::allocate`].
+    ///
+    /// The whole texture is copied, because a partial upload would have to track which rectangles
+    /// changed and the mip chain makes that a per-level problem; it is a few milliseconds, once per
+    /// batch of late sprites, against a block that is not drawn at all.
+    pub fn upload_if_dirty(&self, wm: &WmRenderer) -> bool {
+        if self
+            .sprites_since_upload
+            .load(std::sync::atomic::Ordering::Relaxed)
+            == 0
+        {
+            return false;
+        }
+
+        self.upload(wm);
+
+        true
+    }
+
+    /// How many sprites are waiting for an upload. See [`Atlas::upload_if_dirty`].
+    pub fn sprites_since_upload(&self) -> u64 {
+        self.sprites_since_upload
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn clear(&self) {
@@ -293,6 +369,8 @@ impl Atlas {
         self.animated_textures.write().clear();
         self.sprite_layers.write().clear();
         *self.image.write() = ImageBuffer::new(self.size, self.size);
+        self.sprites_since_upload
+            .store(0, std::sync::atomic::Ordering::Relaxed);
     }
 }
 

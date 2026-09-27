@@ -57,6 +57,7 @@ use crate::mc::MinecraftState;
 use crate::mc::resource::ResourceProvider;
 use crate::render::atlas::Atlas;
 use crate::render::pipeline::{BLOCK_ATLAS, ENTITY_ATLAS, create_bind_group_layouts};
+use crate::util::BindableBuffer;
 
 pub mod mc;
 pub mod render;
@@ -237,6 +238,7 @@ impl WmRenderer {
     /// back into is baked again, because Minecraft re-meshes what it unloads.
     pub fn tick_scene(&self, scene: &Scene) {
         self.submit_chunk_updates(scene);
+        self.upload_late_sprites();
 
         let camera = *scene.camera_section_pos.read();
 
@@ -252,7 +254,40 @@ impl WmRenderer {
         scene.section_storage.write().trim(camera);
     }
 
+    /// Uploads any sprite the atlas has gained since its texture was last written.
+    ///
+    /// A net under the two places that bake block models: the seam between them is where the mushroom
+    /// blocks went missing (`cacheBlockStates` uploads it), and a resource reload, a mod that registers
+    /// a block later, or anything else that allocates a sprite outside that seam lands here instead -
+    /// once, on the frame after it was allocated, before the frame is recorded. The check is one atomic
+    /// load per frame and the upload is a few milliseconds when it happens, which is the trade against
+    /// a block that is not on screen at all. See `Atlas::upload_if_dirty`.
+    fn upload_late_sprites(&self) {
+        let atlases = self.mc.texture_manager.atlases.read();
+
+        for (name, atlas) in atlases.iter() {
+            let pending = atlas.sprites_since_upload();
+
+            if pending == 0 {
+                continue;
+            }
+
+            atlas.upload_if_dirty(self);
+
+            log::warn!(
+                "wgpu-mc: {name} was uploaded again after the frame: {pending} sprite(s) had been added \
+                 to it since the last upload"
+            );
+        }
+    }
+
     pub fn submit_chunk_updates(&self, scene: &Scene) {
+        // Growing the arena, if a section did not fit in it last frame, happens *here* - before the
+        // buffer this drain writes into is loaded. The two cannot overlap: the ranges being written
+        // below were handed out by the pool, and a pool that grew halfway through a frame would leave
+        // the rest of the frame's writes aimed at the old buffer. See `grow_arena`.
+        self.grow_arena_if_asked(scene);
+
         let receiver = self.chunk_update_queue.1.lock();
         let updates = receiver.try_iter();
 
@@ -283,6 +318,16 @@ impl WmRenderer {
             // section that cannot be baked is stale ground, which is a wrong picture; replacing it
             // with nothing is a hole, which is not a picture at all.
             let Some((section, freed)) = storage.allocate(pos, &layers) else {
+                // Ask for a bigger arena rather than only counting the refusal. A fixed pool sized from
+                // a guess about what a section costs is a pool that a real world outgrows, and the
+                // failure mode of that is the worst one this path has: a section that is never replaced
+                // keeps the geometry it had, so the terrain it is part of stops changing - the player
+                // breaks a block and nothing happens. Doubling is the request; the next frame's drain
+                // applies it, and the JVM re-offers this section (see `RustChunkBake.forgetRefused`).
+                scene.pending_arena_growth.store(
+                    storage.pool_slots().saturating_mul(2),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
                 return;
             };
 
@@ -314,6 +359,76 @@ impl WmRenderer {
                 scene.section_storage.read().len()
             );
         }
+    }
+
+    /// Grows the section arena to the size a refusal asked for, if one did.
+    ///
+    /// The pool is sized from the render distance and a per-section estimate, and an estimate is
+    /// exactly the thing a real world is entitled to beat: sections are different sizes, and the pool
+    /// has to hold all of them at once. When one does not fit, the arena used to record the refusal and
+    /// stop there - the section kept the geometry it already had, and the next rebuild of it was refused
+    /// too. A world in that state draws its past: the player breaks a block and the ground does not
+    /// change, and the sections that were never baked at all stay holes.
+    ///
+    /// So the arena grows instead, and the growth is cheap because of what it is: `RangeAllocator`
+    /// grows at the *end*, so every range that is already handed out keeps its offset and the buffer's
+    /// contents stay exactly where they are. What is left is one device-to-device copy into a bigger
+    /// buffer, a swap of the bind group the terrain pass reads, and the pool number. Nothing is meshed
+    /// again, and the frame that is already recorded keeps drawing from the old buffer until it is done
+    /// with it - `BindableBuffer` is held by that frame's pass, and this only drops our reference.
+    ///
+    /// The doubling means a session pays a copy per growth rather than one per refusal, and the cap is
+    /// the device's own `max_buffer_size`: a request past it is clamped rather than attempted, because
+    /// a buffer that cannot be created is a validation error and a validation error here ends the
+    /// process. Reaching the cap leaves the refusals to the return channel, which is the state this
+    /// path was in before it could grow at all.
+    fn grow_arena_if_asked(&self, scene: &Scene) {
+        let asked = scene
+            .pending_arena_growth
+            .swap(0, std::sync::atomic::Ordering::Relaxed);
+
+        if asked == 0 {
+            return;
+        }
+
+        let wanted = asked.min(scene.arena_cap_slots);
+        let old = scene.chunk_buffer.load_full();
+
+        // The pool first: it is the thing that decides whether this helped, and a buffer without the
+        // pool would be memory reserved for ranges no one can be handed.
+        if !scene.section_storage.write().grow_pool(wanted) {
+            return;
+        }
+
+        let grown = Arc::new(BindableBuffer::new_deferred(
+            self,
+            wanted as u64 * 4,
+            mc::ARENA_USAGE,
+            "ssbo",
+        ));
+
+        // The whole old buffer, not the used prefix: the copy is a copy of a buffer, and what is in the
+        // tail is not this code's business - the pool is what says which offsets mean anything.
+        let mut encoder = self
+            .gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        encoder.copy_buffer_to_buffer(&old.buffer, 0, &grown.buffer, 0, old.size);
+        self.gpu.queue.submit([encoder.finish()]);
+
+        scene.chunk_buffer.store(grown);
+
+        let stored = scene.section_storage.read();
+
+        log::warn!(
+            "wgpu-mc: the section arena was full, so it grew to {} slot(s), {} MB ({} slot(s) handed \
+             out, the largest section meshed so far {} slot(s), cap {} slot(s))",
+            wanted,
+            wanted as u64 * 4 / (1024 * 1024),
+            stored.used_slots(),
+            mc::chunk::largest_section_slots(),
+            scene.arena_cap_slots,
+        );
     }
 
     /// The wgpu version this build was compiled against, as the build script saw it.

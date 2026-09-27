@@ -80,13 +80,40 @@ pub trait BlockStateProvider {
 ///
 /// The margin is the ring [`SectionStorage::trim`] keeps beyond the view, so that a section the game
 /// has just meshed is not refused before the camera even sees it.
+///
+/// ## What the constants are worth
+///
+/// `SLOTS_PER_SECTION` was **8 000** and that was too small, by a factor this run measured rather than
+/// guessed. One quad is twenty-two slots - four vertices of four words, then six indices - so 8 000 is
+/// 364 quads, and a section of ordinary surface geometry is an order of magnitude past that: the shell
+/// of a full cube alone is 1 536 quads, 33 792 slots, before the cutout layer draws a single plant. A
+/// session at 16 chunks (which asks for 32.9M slots, 131 MB, by the old numbers) filled the arena up
+/// within seconds of joining, refused **231** sections in the next twenty, and - because a refused
+/// section keeps the geometry it had rather than being replaced - stopped updating the terrain
+/// altogether. 16 000 is that measurement's first correction and not the last word on it: the honest
+/// number is what a session reports, which is why `WmRenderer::grow_arena` doubles the pool when a
+/// section does not fit and the diagnostic line carries the used-slot count. See [`LARGEST_SECTION`].
+///
+/// The first session run against the corrected numbers, 16 chunks, same world:
+///
+/// ```text
+/// arena 51,753,658 of 65,712,000 slot(s) handed out (79%, 197 MB), the largest section 168,014 slot(s)
+/// ```
+///
+/// Three things that says. The pool is the size the world needs, with a fifth of it spare - and the
+/// `used` count is the *sum* over every section the arena holds, so the two constants above are only
+/// ever right together, as a product: 1 369 columns × 48 000 slots came out at 79% of the pool. The
+/// largest section is 168 014 slots, 672 KB, **ten times** the per-section constant - a section is not
+/// "about 16 000 slots", it is whatever its geometry is, and one dense enough (a jungle canopy, a
+/// leaf-covered hillside) is an order of magnitude past the average. And the refusal count is zero,
+/// which is the number this is all for.
 pub const fn arena_slots(render_distance: u32) -> u32 {
     /// The ring beyond the view the trim keeps.
     const RING: u32 = 2;
     /// How many sections deep a column of an ordinary world is meshed.
     const SECTIONS_PER_COLUMN: u32 = 3;
-    /// One section's vertices and indices, in u32 slots: about 32 KB.
-    const SLOTS_PER_SECTION: u32 = 8_000;
+    /// One section's vertices and indices, in u32 slots: about 64 KB, or 727 quads.
+    const SLOTS_PER_SECTION: u32 = 16_000;
 
     let capped = if render_distance > 64 { 64 } else { render_distance };
     let width = capped * 2 + 1 + RING * 2;
@@ -96,9 +123,13 @@ pub const fn arena_slots(render_distance: u32) -> u32 {
 
 /// The arena's pool in u32 slots, as the pool [`Scene`](crate::mc::Scene) starts with.
 ///
-/// Sized for a large render distance so that a session which never reports one still works; the pool is
-/// narrowed to the reported distance by [`SectionStorage::set_pool`] before anything is baked.
-pub const ARENA_SLOTS: u32 = arena_slots(32);
+/// A placeholder, and deliberately a small one: the pool is sized to the render distance the game
+/// reports, and that report arrives a frame or two after the window opens - long before the world has
+/// anything to bake. Sizing this generously instead is how a session came to allocate 457 MB of arena
+/// at startup for a world that was going to ask for a fraction of it. A session that never gets a
+/// report at all is one with no world in it, and one whose report arrives late is covered by
+/// `WmRenderer::grow_arena`.
+pub const ARENA_SLOTS: u32 = arena_slots(8);
 
 #[derive(Debug, Copy, Clone, Hash, Eq, PartialEq)]
 pub enum RenderLayer {
@@ -202,6 +233,42 @@ impl SectionStorage {
     /// How many slots the pool has.
     pub fn pool_slots(&self) -> u32 {
         self.pool
+    }
+
+    /// How many slots of the pool are handed out right now.
+    ///
+    /// The number that says how close the arena is to refusing: `pool_slots - used_slots` is what a
+    /// section has to fit into, and a run that is refusing sections is one where that is small or
+    /// fragmented. Reported on the terrain line beside the refusal count - see [`LARGEST_SECTION`] for
+    /// the other half of the same question.
+    pub fn used_slots(&self) -> u32 {
+        self.pool.saturating_sub(self.free_slots())
+    }
+
+    /// How many slots of the pool are free, counted across the free list rather than as one run.
+    pub fn free_slots(&self) -> u32 {
+        self.allocator.total_available()
+    }
+
+    /// Widens the pool, keeping every range that is already handed out where it is.
+    ///
+    /// Growing is the one resize a range allocator *can* do under live allocations, and the only reason
+    /// this is possible at all: the new pool is the old one with more space after it, so every offset
+    /// already handed out stays valid - which is what makes a bigger arena a buffer *copy* rather than
+    /// a re-bake of the world. [`SectionStorage::set_pool`] replaces the pool and can therefore only run
+    /// while it is empty; this one is the opposite trade, and `WmRenderer::grow_arena` does the copy.
+    ///
+    /// `false` when the pool is already at least this large: a growth request that arrives twice for one
+    /// refusal must not count as one.
+    pub fn grow_pool(&mut self, slots: u32) -> bool {
+        if slots <= self.pool {
+            return false;
+        }
+
+        self.allocator.grow_to(slots);
+        self.pool = slots;
+
+        true
     }
 
     /// Drops every stored section, for a world the renderer is no longer drawing.
@@ -404,52 +471,84 @@ impl SectionStorage {
         // through a native frame), which is not a trade a renderer gets to make.
         self.refused = false;
 
-        let section = Section {
-            layers: baked_layers
-                .iter()
-                .map(|layer| {
-                    if layer.indices.is_empty() {
-                        return None;
-                    }
+        let mut layers: Vec<Option<SectionRanges>> = Vec::with_capacity(baked_layers.len());
 
-                    let vertices = match self
-                        .allocator
-                        .allocate_range(layer.vertices.len() as u32 / 4)
-                    {
-                        Ok(range) => range,
-                        Err(_) => {
-                            self.refused = true;
-                            return None;
-                        }
-                    };
+        for layer in baked_layers {
+            // An empty layer is one that draws nothing; `allocate_range(0)` is not a no-op either, it
+            // is an assertion, so the two halves of a layer are checked together.
+            if layer.vertices.is_empty() || layer.indices.is_empty() {
+                layers.push(None);
+                continue;
+            }
 
-                    let indices = match self
-                        .allocator
-                        .allocate_range(layer.indices.len() as u32 / 4)
-                    {
-                        Ok(range) => range,
-                        Err(_) => {
-                            // Give the vertices back: a layer with no indices draws nothing, and
-                            // holding them would leak the range for as long as the section is stored.
-                            self.allocator.free_range(vertices);
-                            self.refused = true;
-                            return None;
-                        }
-                    };
+            let vertices = match self
+                .allocator
+                .allocate_range(layer.vertices.len() as u32 / 4)
+            {
+                Ok(range) => range,
+                Err(_) => {
+                    self.refuse(&mut layers);
+                    return Section { layers };
+                }
+            };
 
-                    Some(SectionRanges {
-                        vertex_range: vertices,
-                        index_range: indices,
-                    })
-                })
-                .collect(),
-        };
+            let indices = match self.allocator.allocate_range(layer.indices.len() as u32 / 4) {
+                Ok(range) => range,
+                Err(_) => {
+                    // Give the vertices back before the section is abandoned: they are part of what
+                    // `refuse` hands over, and a range the allocator still believes is handed out is
+                    // a piece of the pool that never comes back.
+                    self.allocator.free_range(vertices);
+                    self.refuse(&mut layers);
+                    return Section { layers };
+                }
+            };
 
-        if self.refused {
-            report_full_arena();
+            layers.push(Some(SectionRanges {
+                vertex_range: vertices,
+                index_range: indices,
+            }));
         }
 
-        section
+        // What one section of this world costs at its worst, which is the number `arena_slots` is
+        // guessing at: a pool has to hold *every* section it keeps at once, and the constant in there is
+        // per section. One quad is twenty-two slots - four vertices of four words and six indices - so a
+        // section whose shell is a thousand quads is twenty-two thousand, three times the constant this
+        // path was written with.
+        let slots = layers
+            .iter()
+            .flatten()
+            .map(|ranges| {
+                (ranges.vertex_range.end - ranges.vertex_range.start)
+                    + (ranges.index_range.end - ranges.index_range.start)
+            })
+            .sum::<u32>();
+
+        if slots > LARGEST_SECTION.load(std::sync::atomic::Ordering::Relaxed) {
+            LARGEST_SECTION.store(slots, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        Section { layers }
+    }
+
+    /// Gives back everything a refused section's allocation had already taken, and marks the refusal.
+    ///
+    /// This is the difference between a full arena and a shrinking one. The layers allocated before
+    /// the one that failed used to be dropped along with the section, and their ranges were never
+    /// freed - so every refusal cost the pool the geometry of the layers that *did* fit, permanently.
+    /// The arena filled, refused, and got fuller; a run that had been refusing a section here and there
+    /// ended up refusing everything, which is exactly what a world whose terrain has stopped updating
+    /// looks like from the player's side.
+    fn refuse(&mut self, layers: &mut Vec<Option<SectionRanges>>) {
+        for layer in layers.iter_mut() {
+            if let Some(ranges) = layer.take() {
+                self.allocator.free_range(ranges.vertex_range);
+                self.allocator.free_range(ranges.index_range);
+            }
+        }
+
+        self.refused = true;
+        report_full_arena(self.pool, self.used_slots());
     }
     pub fn iter(&self) -> std::collections::hash_map::Iter<IVec3, Section> {
         self.storage.iter()
@@ -504,6 +603,20 @@ pub fn sections_refused() -> u64 {
     REFUSED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// The most slots any one section has ever taken, over the whole run.
+///
+/// The measurement `arena_slots`' `SLOTS_PER_SECTION` is a guess at, and the reason a pool can be full
+/// while holding fewer sections than that constant times the number of columns would suggest: what a
+/// section costs is its geometry, and geometry does not care about the estimate. Read on the same
+/// diagnostic line as the used-slot count, so a run that refuses sections says both how full the arena
+/// was and how big the thing that did not fit was.
+static LARGEST_SECTION: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// See [LARGEST_SECTION].
+pub fn largest_section_slots() -> u32 {
+    LARGEST_SECTION.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// How many refusals have been handed to the JVM. See [REFUSED_REPORTED].
 pub fn sections_refused_reported() -> u64 {
     REFUSED_REPORTED.load(std::sync::atomic::Ordering::Relaxed)
@@ -514,19 +627,26 @@ pub fn sections_refused_dropped() -> u64 {
     REFUSED_DROPPED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-fn report_full_arena() {
+fn report_full_arena(pool: u32, used: u32) {
     let refused = REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if refused < 4 || refused.is_multiple_of(512) {
-        // The two numbers beside the count are the return channel: what the JVM has been told, and
-        // what was lost on the way. `handed + dropped == refused` is the invariant, and the JVM
+        // What is printed is the whole diagnosis, because the Rust log is the only place these numbers
+        // exist: how much of the pool is handed out against how much there is, how big the largest
+        // section ever meshed was, and the return channel's two counters - what the JVM has been told
+        // and what was lost on the way. `handed + dropped == refused` is the invariant, and the JVM
         // checks its own drained total against the first of them.
+        //
+        // A refusal is not fatal to the section: `SectionStorage::allocate` leaves the section it could
+        // not replace exactly as it was, so the world keeps the geometry it had - stale ground rather
+        // than a hole - and `WmRenderer::grow_arena` doubles the pool on the next frame.
         log::warn!(
-            "wgpu-mc: the section arena is full, so this section was left without geometry \
-             ({refused} section(s) refused so far, {} handed to the JVM, {} dropped before it could \
-             be); the arena is a fixed pool and the render distance is not - see \
-             `SectionStorage::replace`",
+            "wgpu-mc: the section arena is full, so this section was left without new geometry \
+             ({refused} section(s) refused so far, {used} of {pool} slot(s) handed out, the largest \
+             section meshed so far {largest} slot(s), {} handed to the JVM, {} dropped before it \
+             could be)",
             sections_refused_reported(),
-            sections_refused_dropped()
+            sections_refused_dropped(),
+            largest = largest_section_slots(),
         );
     }
 }
@@ -583,6 +703,10 @@ fn face_flags(block_manager: &BlockManager, state: ChunkBlockState) -> FaceFlags
 /// Whether Minecraft would leave this face out of the mesh: `Block.shouldRenderFace`, as far as two
 /// per-state masks and the model can carry it.
 ///
+/// Only called for a face that *declared* a `cullface`: a face without one is never culled, which is
+/// the model's own answer and the one `add_face` checks before it gets here. `dir` is that declared
+/// direction, turned with the model, rather than the plane the face's geometry ended up in.
+///
 /// The neighbour's *state* is what decides, and that is the difference this replaced. Reading the
 /// neighbour's model instead - a full-size quad on the side facing us - culls the face of every block
 /// next to a full-cube model that does not occlude anything: glass, ice, leaves, stained glass, every
@@ -631,6 +755,31 @@ fn face_is_hidden(
     }
 
     state == neighbour && face_flags(block_manager, state).hides_same_state(dir)
+}
+
+/// Whether a face is left out of the mesh, by the model's own declaration first.
+///
+/// A face without a `cullface` is one the game adds as *unculled* (`UnbakedCuboidGeometry`): it is
+/// drawn whatever is beside it, and that is the whole answer for it. Only a face that names a
+/// direction is handed to the neighbour test - and that direction, not the plane the geometry ended
+/// up in, is the one tested.
+fn face_is_culled<Provider: BlockStateProvider>(
+    face: &BlockModelFace,
+    block_manager: &BlockManager,
+    state: ChunkBlockState,
+    provider: &Provider,
+    pos: IVec3,
+) -> bool {
+    let Some(declared) = face.cull else {
+        return false;
+    };
+
+    face_is_hidden(
+        block_manager,
+        state,
+        provider.get_state(pos + declared.to_vec()),
+        declared,
+    )
 }
 
 pub fn bake_section<Provider: BlockStateProvider>(pos: IVec3, wm: &WmRenderer, bsp: &Provider) {
@@ -810,6 +959,102 @@ fn direction_of(normal: glam::Vec3) -> Option<Direction> {
     .find(|direction| direction.to_vec().as_vec3() == normal)
 }
 
+/// The blocks whose faces the baker counts by name: seen, drawn, culled.
+///
+/// A block that is invisible has four explanations, and they are one number apart:
+///
+/// ```text
+/// seen 0                    the state never reached a bake - the section was not baked, or the
+///                           palette decoded this position as something else
+/// seen > 0, drawn+culled 0  the state was there and had no mesh - the model lookup failed
+/// culled > 0, drawn 0       every face was culled - a neighbour test, not a model
+/// drawn > 0                 the faces are in the section mesh, and something after the bake
+///                           dropped them: the arena, the draw, or the vertex itself
+/// ```
+///
+/// Nothing else in the logs can tell those apart. The per-section numbers are dominated by the
+/// terrain around the block, the model builder's numbers say what was *baked* rather than what was
+/// drawn, and the arena's say what was stored rather than what was asked for. Watching a few blocks
+/// by name - the ones a report is about - is what turns four possibilities into one line.
+///
+/// By name because that is what a person has, and the indices are resolved once, when the registry is
+/// built: a name the registry does not have is simply never counted. The list is short on purpose;
+/// the lookup is per block per bake.
+pub static WATCHED_BLOCKS: [(&str, BlockFaces); 4] = [
+    ("minecraft:brown_mushroom_block", BlockFaces::new()),
+    ("minecraft:red_mushroom_block", BlockFaces::new()),
+    ("minecraft:mushroom_stem", BlockFaces::new()),
+    ("minecraft:oak_leaves", BlockFaces::new()),
+];
+
+/// How many faces one watched block has been seen, drawn and culled for. See [`WATCHED_BLOCKS`].
+#[derive(Debug)]
+pub struct BlockFaces {
+    pub seen: std::sync::atomic::AtomicU64,
+    pub drawn: std::sync::atomic::AtomicU64,
+    pub culled: std::sync::atomic::AtomicU64,
+}
+
+impl BlockFaces {
+    const fn new() -> Self {
+        Self {
+            seen: std::sync::atomic::AtomicU64::new(0),
+            drawn: std::sync::atomic::AtomicU64::new(0),
+            culled: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    fn note(&self, drawn: u32, culled: u32) {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        self.seen.fetch_add(1, Relaxed);
+        self.drawn.fetch_add(drawn as u64, Relaxed);
+        self.culled.fetch_add(culled as u64, Relaxed);
+    }
+}
+
+/// What the watched blocks have been seen, drawn and culled for, as one line - or empty when there is
+/// nothing to say. Read by the JVM side and put on the terrain line.
+pub fn watched_faces() -> String {
+    use std::sync::atomic::Ordering::Relaxed;
+
+    let mut report = String::new();
+
+    for (name, faces) in WATCHED_BLOCKS.iter() {
+        let seen = faces.seen.load(Relaxed);
+
+        if seen == 0 {
+            continue;
+        }
+
+        if !report.is_empty() {
+            report.push_str(", ");
+        }
+
+        report.push_str(&format!(
+            "{} seen {seen} drawn {} culled {}",
+            name.trim_start_matches("minecraft:"),
+            faces.drawn.load(Relaxed),
+            faces.culled.load(Relaxed),
+        ));
+    }
+
+    report
+}
+
+/// The slot in [`WATCHED_BLOCKS`] a block index is watched under, or `None`.
+#[inline]
+pub fn watched_slot(watched: &[(u16, u8)], state: ChunkBlockState) -> Option<usize> {
+    let ChunkBlockState::State(key) = state else {
+        return None;
+    };
+
+    watched
+        .iter()
+        .find(|(index, _)| *index == key.block)
+        .map(|(_, slot)| *slot as usize)
+}
+
 /// Says what one bake produced, without flooding the log with a world's worth of sections.
 ///
 /// While the render graph does not draw these sections yet, these numbers are the only thing that
@@ -875,6 +1120,13 @@ fn bake_layers<Provider: BlockStateProvider>(
         let fpos = vec3(pos.x as f32, pos.y as f32, pos.z as f32);
 
         let block_state: ChunkBlockState = state_provider.get_state(pos);
+
+        // Which watched block this is, if any: counted per block rather than per face, so the cost is
+        // one short scan and three atomics for the handful of blocks in the list. See
+        // [`WATCHED_BLOCKS`] for what the three numbers are for.
+        let watched = watched_slot(&block_manager.watched, block_state);
+        let mut faces_drawn = 0u32;
+        let mut faces_culled = 0u32;
 
         if let Some(model_mesh) = get_block(block_manager, block_state) {
             // The winding, and the one thing about a baked quad that nothing else can tell you is
@@ -999,15 +1251,17 @@ fn bake_layers<Provider: BlockStateProvider>(
                     0xffffffff
                 };
 
-                if face_is_hidden(
-                    block_manager,
-                    block_state,
-                    state_provider.get_state(pos + dir.to_vec()),
-                    dir,
-                ) {
+                // Culling is the *model's* decision before it is the neighbour's - see
+                // `face_is_culled`, which is where the declared `cullface` is read.
+                if face_is_culled(face, block_manager, block_state, state_provider, pos) {
+                    faces_culled += 1;
                     return;
                 }
 
+                faces_drawn += 1;
+
+                // The light comes from the plane the face is *on*, which is what the bucket direction
+                // is for; it is not a culling question.
                 let light_level: LightLevel = state_provider.get_light_level(pos + dir.to_vec());
                 add_quad(face, light_level, dir, color);
             };
@@ -1041,6 +1295,12 @@ fn bake_layers<Provider: BlockStateProvider>(
 
                 add_quad(face, light_level, Direction::Up, color);
             });
+        }
+
+        // One entry per *block*, whether or not it had a mesh: a watched state with no mesh at all is
+        // one of the four answers this exists to tell apart. See [`WATCHED_BLOCKS`].
+        if let Some(slot) = watched {
+            WATCHED_BLOCKS[slot].1.note(faces_drawn, faces_culled);
         }
     }
 
@@ -1582,7 +1842,7 @@ mod winding_tests {
 mod face_culling_tests {
     use super::*;
     use crate::mc::Block;
-    use crate::mc::block::BlockstateKey;
+    use crate::mc::block::{BlockMeshVertex, BlockstateKey};
     use indexmap::map::IndexMap;
 
     /// A full cube's worth of bits, which is what a model whose every face sits on the block boundary
@@ -1748,6 +2008,120 @@ mod face_culling_tests {
             "block 7 has no model, so there is no geometry to cull against"
         );
     }
+
+    /// A world for one face at the origin: the block it belongs to, air above it, and stone in every
+    /// other direction - so "which neighbour was tested" is readable off the answer.
+    struct OneBlock {
+        id: u16,
+    }
+
+    impl BlockStateProvider for OneBlock {
+        fn get_state(&self, pos: IVec3) -> ChunkBlockState {
+            if pos == IVec3::ZERO || pos == IVec3::Y {
+                ChunkBlockState::Air
+            } else {
+                state(self.id)
+            }
+        }
+
+        fn get_light_level(&self, _pos: IVec3) -> LightLevel {
+            LightLevel::from_sky_and_block(15, 0)
+        }
+
+        fn is_section_empty(&self, _rel_pos: IVec3) -> bool {
+            false
+        }
+
+        fn get_block_color(&self, _pos: IVec3, _tint_index: i32) -> u32 {
+            0xffff_ffff
+        }
+    }
+
+    /// A face's own declaration comes first: one with no `cullface` is drawn whatever is beside it.
+    ///
+    /// That is the model asking to be seen - a plant's cross, a pane's edge, the inside of a mushroom
+    /// cap - and a baker that culls it because the neighbour happens to be a full block is a hole in
+    /// the world with nothing in the log to explain it.
+    #[test]
+    fn a_face_with_no_cullface_is_never_culled() {
+        let manager = registry(&[(0, FULL_CUBE), (1, FULL_CUBE)], &[(1, stone())]);
+        let provider = OneBlock { id: 1 };
+
+        let face = BlockModelFace {
+            vertices: [BlockMeshVertex {
+                position: glam::Vec3::ZERO,
+                tex_coords: [0, 0],
+            }; 4],
+            normal: glam::Vec3::Y,
+            tint_index: -1,
+            animation_uv_offset: 0,
+            cull: None,
+            layer: RenderLayer::Solid,
+        };
+
+        assert!(
+            !face_is_culled(&face, &manager, state(0), &provider, IVec3::ZERO),
+            "the model declared nothing to cull it against, and stone is right there to the north"
+        );
+
+        // And the same face, declaring the direction the stone is in, *is* culled - which is what
+        // says the difference above is the declaration and not the state flags.
+        let declared = BlockModelFace {
+            cull: Some(Direction::North),
+            ..face
+        };
+
+        assert!(face_is_culled(
+            &declared,
+            &manager,
+            state(0),
+            &provider,
+            IVec3::ZERO
+        ));
+    }
+
+    /// The direction tested is the one the face *declared*, not the plane its geometry is on: a face
+    /// on a block boundary has both the same, and everything else does not.
+    #[test]
+    fn the_declared_direction_is_the_one_tested() {
+        let manager = registry(&[(0, FULL_CUBE), (1, FULL_CUBE)], &[(1, stone())]);
+        let provider = OneBlock { id: 1 };
+
+        // North is stone and up is air, so a face that declares `up` has nothing to be culled by -
+        // where the same face would be hidden if the direction were read off its geometry.
+        let face = BlockModelFace {
+            vertices: [BlockMeshVertex {
+                position: glam::Vec3::ZERO,
+                tex_coords: [0, 0],
+            }; 4],
+            normal: glam::Vec3::Y,
+            tint_index: -1,
+            animation_uv_offset: 0,
+            cull: Some(Direction::Up),
+            layer: RenderLayer::Solid,
+        };
+
+        assert!(!face_is_culled(
+            &face,
+            &manager,
+            state(0),
+            &provider,
+            IVec3::ZERO
+        ));
+
+        let north = BlockModelFace {
+            cull: Some(Direction::North),
+            ..face
+        };
+
+        assert!(face_is_culled(
+            &north,
+            &manager,
+            state(0),
+            &provider,
+            IVec3::ZERO
+        ));
+    }
 }
 
 /// Sizing the arena, and the refusals that come out of it. See [`SectionStorage::set_pool`] and
@@ -1850,20 +2224,95 @@ mod arena_tests {
         assert_eq!(storage.len(), 0, "and the arena is empty as well");
     }
 
-    /// The pool follows the render distance, up to the cap the buffer is willing to hold.
+    /// The pool follows the render distance, and the render distance is capped.
     #[test]
     fn a_pool_grows_with_the_render_distance() {
         assert!(arena_slots(8) < arena_slots(16));
         assert!(arena_slots(16) < arena_slots(24));
         assert_eq!(
-            arena_slots(32),
-            ARENA_SLOTS,
-            "the cap is the size a session that never reports one gets"
+            arena_slots(64),
+            arena_slots(200),
+            "the const fn caps its own input, so the slider's far end is one arena"
         );
+        assert!(
+            ARENA_SLOTS < arena_slots(16),
+            "the pool a session starts with is a placeholder for a world that has not reported its \
+             render distance yet, not the size of a real one"
+        );
+    }
+
+    /// Growing the pool keeps every range that is already handed out.
+    ///
+    /// That is the whole reason the arena can grow at all: the new pool is the old one with more space
+    /// after it, so a bigger arena is a buffer copy rather than a re-bake of the world - and a section
+    /// that did not fit is one whose geometry is otherwise stuck at whatever it was. See
+    /// [`SectionStorage::grow_pool`].
+    #[test]
+    fn growing_the_pool_keeps_what_is_already_allocated() {
+        let mut storage = SectionStorage::new(pool_for(1));
+
+        assert!(put(&mut storage, IVec3::new(0, 0, 0), 1));
+
+        let stored = |storage: &SectionStorage| {
+            storage
+                .iter()
+                .next()
+                .and_then(|(_, section)| section.layers[0].clone())
+                .expect("the section that fits is in the arena")
+        };
+
+        let before = stored(&storage);
+
+        assert!(
+            !put(&mut storage, IVec3::new(1, 0, 0), 1),
+            "one quad of pool, one quad in it"
+        );
+
+        assert!(storage.grow_pool(pool_for(4)));
+        assert_eq!(storage.pool_slots(), pool_for(4));
+
+        assert!(
+            !storage.grow_pool(pool_for(4)),
+            "a request that does not widen the pool is not a growth"
+        );
+
+        let after = stored(&storage);
+
+        assert_eq!(after.vertex_range, before.vertex_range);
+        assert_eq!(after.index_range, before.index_range);
+
+        assert!(
+            put(&mut storage, IVec3::new(1, 0, 0), 1),
+            "and the section that did not fit now does"
+        );
+    }
+
+    /// A refused section does not cost the pool the layers of itself that *did* fit.
+    ///
+    /// The leak this used to be: a two-layer section whose first layer found room and whose second did
+    /// not was dropped whole, and the ranges the first layer had taken were never given back - so a
+    /// full arena got fuller with every refusal, which is the one failure mode this whole mechanism
+    /// exists to survive.
+    #[test]
+    fn a_refused_allocation_gives_back_what_it_took() {
+        // Room for one quad in the solid layer and none at all for the cutout one: the first layer
+        // allocates, the second is refused.
+        let mut storage = SectionStorage::new(pool_for(1));
+
+        let free_before = storage.free_slots();
+
+        let layers = [layer(1), layer(1)];
+
+        assert!(
+            storage.allocate(IVec3::new(0, 0, 0), &layers).is_none(),
+            "the cutout layer has nowhere to go"
+        );
+
         assert_eq!(
-            arena_slots(64),
-            arena_slots(64),
-            "and the const fn caps its own input"
+            storage.free_slots(),
+            free_before,
+            "the solid layer's range came back with the refusal"
         );
+        assert_eq!(storage.used_slots(), 0);
     }
 }

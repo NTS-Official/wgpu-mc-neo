@@ -4551,6 +4551,53 @@ pub extern "C" fn terrain_arena_sections(wm: &WmRenderer) -> u32 {
         .map_or(0, |scene| scene.section_storage.read().len() as u32)
 }
 
+/// How many slots the arena's pool has, and how many of them are handed out.
+///
+/// The pair is the diagnosis a full arena needs and the one thing the refusal count cannot say: a
+/// refusal means "this section did not fit", and these say whether that is because the arena is nearly
+/// full, because it is fragmented, or because the section that did not fit is enormous. Read on the
+/// terrain line, where a run that is refusing sections can be sized from what it reports rather than
+/// from the constant `arena_slots` guesses with.
+#[unsafe(no_mangle)]
+pub extern "C" fn terrain_arena_slots() -> u32 {
+    RENDERER
+        .get()
+        .and_then(|wm| wm.scene())
+        .map_or(0, |scene| scene.section_storage.read().pool_slots())
+}
+
+/// See [terrain_arena_slots].
+#[unsafe(no_mangle)]
+pub extern "C" fn terrain_arena_used() -> u32 {
+    RENDERER
+        .get()
+        .and_then(|wm| wm.scene())
+        .map_or(0, |scene| scene.section_storage.read().used_slots())
+}
+
+/// The largest number of slots any one section has taken, which is what a pool has to fit one of.
+///
+/// See [terrain_arena_used]: this is the other half of "why did it not fit".
+#[unsafe(no_mangle)]
+pub extern "C" fn terrain_arena_largest_section() -> u32 {
+    wgpu_mc::mc::chunk::largest_section_slots()
+}
+
+/// Whether the arena can still be grown, which is whether a refused section is worth rebuilding.
+///
+/// A refusal is undone by two things: the arena grows (see `WmRenderer::grow_arena`), and the JVM asks
+/// the game to rebuild the section that did not fit. The second is only worth doing while the first is
+/// still possible - at the device's own `max_buffer_size` there is no room to grow into, and a rebuild
+/// would be refused exactly as the last one was, once per tick, for as long as the player stands there.
+/// So the JVM asks this before it dirties anything.
+#[unsafe(no_mangle)]
+pub extern "C" fn terrain_arena_can_grow() -> bool {
+    RENDERER
+        .get()
+        .and_then(|wm| wm.scene())
+        .is_some_and(|scene| scene.section_storage.read().pool_slots() < scene.arena_cap_slots)
+}
+
 /// Whether the graph has a terrain pipeline, building it if it does not.
 ///
 /// The graph is built by a shader reload, and a shader reload is gated on the renderer being up *and*
@@ -4630,23 +4677,26 @@ pub fn setRenderDistance(_env: JNIEnv, _class: JClass, chunks: jint) {
 
     let Some(scene) = wm.scene() else {
         // No scene yet, so nothing to size - and this report is not sent again, because the JVM's
-        // side of it fires on a change: the arena keeps the default, large size it was created with.
-        // That is the direction to fail in: a session whose arena was never sized to the game's
-        // render distance has more room than it needs, not less.
+        // side of it fires on a change. The arena then keeps the size it was made with, which is a
+        // placeholder for a world that has not reported one: a session in that state grows the arena
+        // when a section does not fit (`WmRenderer::grow_arena`), so it converges on the size the world
+        // needs rather than on a number guessed here.
         return;
     };
 
     let chunks = chunks.max(0);
     let previous = scene.section_storage.read().width();
-    // Capped, because a render distance is a slider and the arena is a buffer: `arena_slots` asks for
-    // about 1.7 GB at 64 chunks, and an arena that cannot be created is a renderer that cannot draw.
-    let wanted = wgpu_mc::mc::chunk::arena_slots(chunks as u32).min(wgpu_mc::mc::chunk::ARENA_SLOTS);
+    // Capped by the device, not by a constant of this renderer's: `arena_slots` asks for 1.9 GB at 64
+    // chunks, which is a request for a buffer that may be larger than the device is willing to make -
+    // and a buffer that cannot be created is a validation error on the first write, which ends the
+    // process. `arena_cap_slots` is this device's own `max_buffer_size` in slots, read when the scene
+    // was made; past it the arena stops growing as well (see `WmRenderer::grow_arena`).
+    let wanted = wgpu_mc::mc::chunk::arena_slots(chunks as u32).min(scene.arena_cap_slots);
 
     // The pool *and* the buffer it lives in, in one call, and only while the arena is empty - see
     // `Scene::set_arena_slots`. The report arrives when a world is joined, which is the moment the
     // arena was just cleared for, so this is where a session's arena is sized: to what the game says
-    // it is drawing, rather than to the largest render distance it might have been set to. A later
-    // change is refused rather than resizing under live sections, with a line saying so.
+    // it is drawing, rather than to the largest render distance it might have been set to.
     let sized = scene.set_arena_slots(wm, wanted);
 
     scene.section_storage.write().set_width(chunks);
@@ -4657,12 +4707,31 @@ pub fn setRenderDistance(_env: JNIEnv, _class: JClass, chunks: jint) {
             wanted,
             wanted as u64 * 4 / (1024 * 1024)
         );
-    } else if previous != chunks {
-        warn!(
-            "wgpu-mc: the render distance is now {chunks} chunk(s), which the arena cannot be resized \
-             for while it holds sections; it keeps the {} slot(s) it was built with",
-            scene.section_storage.read().pool_slots()
-        );
+    } else {
+        // The report lost the race with the first bake, so the arena cannot be re-created under the
+        // sections it is holding. It can still be *grown*, which is the same change made without moving
+        // anything: every range keeps its offset, so the report is honoured by the next frame's growth
+        // instead of being dropped - and without this, a session whose first report arrived a frame late
+        // ran at the arena's placeholder size and grew to the right one by doubling, one buffer copy at
+        // a time. Only upwards: a report that asks for less than the pool already has is not a reason to
+        // move it.
+        let pool = scene.section_storage.read().pool_slots();
+        let target = wanted.max(pool.saturating_mul(2)).min(scene.arena_cap_slots);
+
+        if target > pool {
+            scene
+                .pending_arena_growth
+                .store(target, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        if previous != chunks {
+            warn!(
+                "wgpu-mc: the render distance is now {chunks} chunk(s), which the arena cannot be \
+                 re-created for while it holds sections; it holds {} slot(s) and will grow to {target} \
+                 on the next frame",
+                pool
+            );
+        }
     }
 }
 

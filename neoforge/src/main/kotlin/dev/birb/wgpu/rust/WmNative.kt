@@ -550,6 +550,36 @@ object WmNative {
         handle("terrain_sections_refused_dropped", FunctionDescriptor.of(INT))
 
     /**
+     * How many slots the section arena's pool has, and how many of them are handed out.
+     *
+     * The pair a full arena has to be diagnosed with, and the one thing the refusal count cannot say:
+     * a refusal means "this section did not fit", and these say whether the arena is nearly full,
+     * fragmented, or the section that did not fit is enormous. Printed on the terrain line so a run
+     * that refuses sections can be sized from what it reports.
+     */
+    @JvmField val terrainArenaSlots: MethodHandle =
+        handle("terrain_arena_slots", FunctionDescriptor.of(INT))
+
+    /** See [terrainArenaSlots]. */
+    @JvmField val terrainArenaUsed: MethodHandle =
+        handle("terrain_arena_used", FunctionDescriptor.of(INT))
+
+    /** The largest number of slots one section has taken, which is what the pool has to fit. */
+    @JvmField val terrainArenaLargestSection: MethodHandle =
+        handle("terrain_arena_largest_section", FunctionDescriptor.of(INT))
+
+    /**
+     * Whether the arena can still grow, which is whether a refused section is worth rebuilding.
+     *
+     * A refusal is undone by the arena growing and by the game rebuilding the section; the second is
+     * only worth asking for while the first is still possible, because at the device's own buffer limit
+     * a rebuild is refused exactly as the last one was - once a tick, for as long as the player stands
+     * there.
+     */
+    @JvmField val terrainArenaCanGrow: MethodHandle =
+        handle("terrain_arena_can_grow", FunctionDescriptor.of(ValueLayout.JAVA_BOOLEAN))
+
+    /**
      * Restricts drawing in [createRenderPass]'s pass to a rectangle of its colour target.
      *
      * Coordinates are OpenGL's - measured from the target's origin row - which is the convention

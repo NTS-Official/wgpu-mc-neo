@@ -149,6 +149,57 @@ static BLOCK_STATES: Mutex<Vec<BlockStateRegistration>> = Mutex::new(Vec::new())
 /// the two masks mean and why they come from the JVM rather than from the block's model.
 static BLOCK_STATE_FACE_FLAGS: Mutex<Vec<(u32, FaceFlags)>> = Mutex::new(Vec::new());
 
+/// The blocks whose states baked to a mesh with no faces in it, over the whole run.
+///
+/// A block state with an empty mesh is drawn as nothing while still occluding its neighbours - see
+/// [`note_empty_mesh`] - and it is the shape of failure this renderer has spent the most time on, so
+/// the names are kept for the JVM to log rather than left in the Rust log, which the game's log file
+/// does not carry.
+static EMPTY_MESH_BLOCKS: Mutex<Vec<(String, u64)>> = Mutex::new(Vec::new());
+
+/// How many blocks that baked to nothing are remembered by name.
+const EMPTY_MESH_NAMES: usize = 24;
+
+/// Notes that one state of `block` baked to a mesh with no faces in it.
+fn note_empty_mesh(block: &str) {
+    let mut blocks = EMPTY_MESH_BLOCKS.lock();
+
+    if let Some(entry) = blocks.iter_mut().find(|(name, _)| name == block) {
+        entry.1 += 1;
+        return;
+    }
+
+    if blocks.len() < EMPTY_MESH_NAMES {
+        blocks.push((block.to_string(), 1));
+    }
+}
+
+/// The blocks whose states had to take the bedrock fallback, by name, over the whole run.
+///
+/// A state whose *block* is not in the registry at all - its blockstate file could not be read, or its
+/// models did not bake - is drawn as bedrock, and the count of them has always been printed. Which
+/// blocks they are is the part that was missing, and it is the part that says what to look at: a
+/// resource pack whose copy of one file is malformed, a block this renderer cannot read, a model whose
+/// texture is nowhere. Kept for [`blockBakeDiagnostics`], which the JVM logs.
+static UNMODELLED_BLOCKS: Mutex<Vec<(String, u64)>> = Mutex::new(Vec::new());
+
+/// How many unmodelled blocks are remembered by name.
+const UNMODELLED_NAMES: usize = 24;
+
+/// Notes that one state of `block` had no model and took the bedrock fallback.
+fn note_unmodelled(block: &str) {
+    let mut blocks = UNMODELLED_BLOCKS.lock();
+
+    if let Some(entry) = blocks.iter_mut().find(|(name, _)| name == block) {
+        entry.1 += 1;
+        return;
+    }
+
+    if blocks.len() < UNMODELLED_NAMES {
+        blocks.push((block.to_string(), 1));
+    }
+}
+
 /// Set once [`cacheBlockStates`] has built the block manager from the game's resources.
 ///
 /// Everything that bakes geometry needs it: `AIR` and the model lookup behind [`bake_layers`] are
@@ -436,8 +487,7 @@ pub fn getAdapterInfo(env: JNIEnv, _class: JClass) -> jstring {
 }
 
 #[jni_fn("dev.birb.wgpu.rust.WgpuNative")]
-pub fn registerBlockState(
-    mut env: JNIEnv,
+pub fn registerBlockState(    mut env: JNIEnv,
     _class: JClass,
     block_state: JObject,
     block_name: JString,
@@ -980,6 +1030,7 @@ pub fn cacheBlockStates(mut env: JNIEnv, _class: JClass) {
             // meaning nothing downstream, including the Rust terrain baker, ever saw a registry.
             let Some(id_key) = block_manager.blocks.get_index_of(block_name.as_str()) else {
                 unmodelled += 1;
+                note_unmodelled(block_name);
                 mappings.push((
                     BlockstateKey {
                         block: fallback_id as u16,
@@ -1026,10 +1077,20 @@ pub fn cacheBlockStates(mut env: JNIEnv, _class: JClass) {
             );
 
             let key = match model {
-                Some((_, augment)) => BlockstateKey {
-                    block: id_key as u16,
-                    augment,
-                },
+                Some((mesh, augment)) => {
+                    // A mesh with no faces in it is a block that is drawn as nothing: the state has a
+                    // key, so it culls its neighbours and the block behind it loses the face between
+                    // them, and there is no other line anywhere that says so. See `MISSING_SPRITES`
+                    // for the other half of this, and `blockBakeDiagnostics` for where it is reported.
+                    if mesh.is_empty() {
+                        note_empty_mesh(&block_name);
+                    }
+
+                    BlockstateKey {
+                        block: id_key as u16,
+                        augment,
+                    }
+                }
                 None => {
                     unmodelled += 1;
                     BlockstateKey {
@@ -1065,6 +1126,27 @@ pub fn cacheBlockStates(mut env: JNIEnv, _class: JClass) {
         .unwrap();
     });
 
+    // The block models are baked in two passes and this is the seam between them: `bake_blocks` baked
+    // every `variants` model and uploaded the atlas, and asking for a mesh per state above is what
+    // baked the `multipart` ones - each of which can name a sprite no earlier model named, allocated
+    // into the atlas *image* at that moment. Without this upload those sprites are not on the GPU, and
+    // the faces that sample them are discarded by the shader's alpha test: a block that is baked,
+    // keyed, culls its neighbours, and is invisible. See `Atlas::upload_if_dirty`.
+    {
+        let atlases = wm.mc.texture_manager.atlases.read();
+
+        if let Some(atlas) = atlases.get(BLOCK_ATLAS) {
+            if atlas.upload_if_dirty(wm) {
+                writeln!(
+                    std::io::stdout().lock(),
+                    "wgpu-mc: the block atlas was uploaded again: the multipart models added sprites \
+                     after the first upload"
+                )
+                .unwrap();
+            }
+        }
+    }
+
     // Every state's key has now been handed over - and that is also where the JVM reads what each
     // state says about the faces around it, because it is the first moment those shapes exist (see
     // `registerBlockStateFaceFlags`, and the crash that taught us).
@@ -1096,6 +1178,34 @@ pub fn cacheBlockStates(mut env: JNIEnv, _class: JClass) {
 
     block_manager.face_flags = face_flags;
 
+    // The blocks whose faces the baker counts by name. Resolved here because this is the one place the
+    // registry and the watch list are both in hand, and stored as indices because that is all a baked
+    // section carries. See `wgpu_mc::mc::chunk::WATCHED_BLOCKS`.
+    block_manager.watched = wgpu_mc::mc::chunk::WATCHED_BLOCKS
+        .iter()
+        .enumerate()
+        .filter_map(|(slot, (name, _))| {
+            block_manager
+                .blocks
+                .get_index_of(*name)
+                .map(|index| (index as u16, slot as u8))
+        })
+        .collect();
+
+    writeln!(
+        // Spelled out rather than through the `stdout` name: the lock above was dropped when the keys
+        // were handed over, and this is the same shape the face-flag line below uses.
+        std::io::stdout().lock(),
+        "wgpu-mc: watching {} block(s) by name for the face counts ({})",
+        block_manager.watched.len(),
+        wgpu_mc::mc::chunk::WATCHED_BLOCKS
+            .iter()
+            .map(|(name, _)| *name)
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+    .unwrap();
+
     let instant = Instant::now();
 
     let state_count = states.len();
@@ -1123,6 +1233,106 @@ pub fn cacheBlockStates(mut env: JNIEnv, _class: JClass) {
         })],
     )
     .unwrap();
+}
+
+/// What the model baker could not draw, for the JVM's log - empty when there is nothing to say.
+///
+/// The two ways a block ends up invisible while looking perfectly registered, and neither of them
+/// says anything on its own:
+///
+///  - **a face whose sprite the atlas does not have** is dropped, which leaves a hole in the block -
+///    or the whole block gone, when that face was the only one its model had (see
+///    [`wgpu_mc::mc::block::MISSING_SPRITES`]);
+///  - **a state whose mesh has no faces at all**, which is the same thing one step further along: the
+///    state has a key, it occludes its neighbours, and the block behind it loses the face between
+///    them - so what the player sees is a hole in the world with no visible cause.
+///
+/// Both are reported here rather than in the Rust log because the Rust log does not reach the game's
+/// log file, and a run that is being read afterwards is the run this has to explain. Called by the
+/// JVM right after [`cacheBlockStates`], which is where both are decided.
+#[jni_fn("dev.birb.wgpu.rust.WgpuNative")]
+pub fn blockBakeDiagnostics(mut env: JNIEnv, _class: JClass) -> jstring {
+    let mut report = String::new();
+
+    let unreadable = wgpu_mc::mc::block::UNREADABLE_TEXTURES.faces();
+
+    if unreadable != 0 {
+        report.push_str(&format!(
+            "{} texture(s) a model names could not be read (so their faces are untextured): {}",
+            unreadable,
+            wgpu_mc::mc::block::UNREADABLE_TEXTURES.names().join(", ")
+        ));
+    }
+
+    let sprites = wgpu_mc::mc::block::MISSING_SPRITES.faces();
+
+    if sprites != 0 {
+        if !report.is_empty() {
+            report.push_str("; ");
+        }
+
+        report.push_str(&format!(
+            "{} face(s) were dropped for a sprite the atlas does not have: {}",
+            sprites,
+            wgpu_mc::mc::block::MISSING_SPRITES.names().join(", ")
+        ));
+    }
+
+    let empty = EMPTY_MESH_BLOCKS.lock().clone();
+
+    if !empty.is_empty() {
+        if !report.is_empty() {
+            report.push_str("; ");
+        }
+
+        let states: u64 = empty.iter().map(|(_, states)| states).sum();
+
+        report.push_str(&format!(
+            "{} block state(s) baked to a mesh with no faces (drawn as nothing, and still occluding \
+             their neighbours): {}",
+            states,
+            empty
+                .iter()
+                .map(|(block, states)| format!("{block} x{states}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+
+    let unmodelled = UNMODELLED_BLOCKS.lock().clone();
+
+    if !unmodelled.is_empty() {
+        if !report.is_empty() {
+            report.push_str("; ");
+        }
+
+        let states: u64 = unmodelled.iter().map(|(_, states)| states).sum();
+
+        report.push_str(&format!(
+            "{} block state(s) have no model at all and are drawn as bedrock: {}",
+            states,
+            unmodelled
+                .iter()
+                .map(|(block, states)| format!("{block} x{states}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+
+    env.new_string(report).unwrap().into_raw()
+}
+
+/// What the watched blocks have been seen, drawn and culled for - empty until one of them is baked.
+///
+/// The one line that says why a block is invisible: `seen 0` is a state that never reached a bake,
+/// `drawn 0 culled N` is a model whose every face a neighbour test removed, and `drawn N` is faces that
+/// are in the section - which puts the fault after the bake rather than in it. See
+/// `wgpu_mc::mc::chunk::WATCHED_BLOCKS` for the list and for the four answers.
+#[jni_fn("dev.birb.wgpu.rust.WgpuNative")]
+pub fn watchedBlockFaces(mut env: JNIEnv, _class: JClass) -> jstring {
+    env.new_string(wgpu_mc::mc::chunk::watched_faces())
+        .unwrap()
+        .into_raw()
 }
 
 #[allow(unused_must_use)]

@@ -239,6 +239,14 @@ object RustChunkBake {
 	 * again, so it gets another chance at the pool; and a section that is refused again is handed over
 	 * again, so the two sides keep converging rather than giving up after one try.
 	 *
+	 * Dropping the entry is not enough on its own, and that is the half this used to be missing: it
+	 * makes the *next* rebuild carry the blocks, and the next rebuild is the thing that does not
+	 * happen. A section whose mesh is missing is a section Minecraft believes it has meshed, so nothing
+	 * dirties it - the arena stays full, the section stays a hole, and the player breaking a block in
+	 * it changes nothing they can see. So the section is marked dirty here as well, which is what asks
+	 * the game for that rebuild. The cost is one rebuild per refusal, and the native side grows the
+	 * arena on the same refusal (see `WmRenderer::grow_arena`), so the second attempt has room.
+	 *
 	 * Called once a client tick - often enough that a refusal is undone before the player can see it,
 	 * and it is one native call that returns an empty array in the normal case. The keys are
 	 * `SectionPos.asLong`, which is the key [sent] already uses, so nothing is unpacked.
@@ -262,13 +270,73 @@ object RustChunkBake {
 
 		refusedDrained += refused.size
 
+		val redirtied = redirty(refused)
+
 		WgpuMcMod.LOGGER.warn(
 			"wgpu: the section arena refused {} section(s); forgetting them, so the next rebuild " +
-				"of each carries its blocks again ({} drained so far)",
+				"of each carries its blocks again, and asking the game for {} of those rebuild(s) " +
+				"({} drained so far)",
 			refused.size,
+			redirtied,
 			refusedDrained,
 		)
 	}
+
+	/**
+	 * Marks the refused sections dirty, which is what makes Minecraft rebuild them.
+	 *
+	 * Only while the arena can still grow: the native side doubles the pool on a refusal, so the
+	 * rebuild asked for here has somewhere to land - and once the pool is at the device's own buffer
+	 * limit it never will, which is exactly the case where a rebuild per refusal, once a tick, is a
+	 * spin rather than a convergence.
+	 *
+	 * Bounded per tick as well, for the same reason: sixty-four rebuilds of a section whose blocks have
+	 * not changed is a burst of work the player pays for in frame time, and what is skipped is not lost
+	 * - the next refusal of the same section arrives with the next drain.
+	 */
+	private fun redirty(refused: LongArray): Int {
+		val client = Minecraft.getInstance()
+
+		// Only with a world loaded: `setSectionDirty` walks the view area, which is not there on the
+		// title screen - and after leaving a world the drain can still find refusals from the one before.
+		if (client.level == null) {
+			return 0
+		}
+
+		val canGrow = try {
+			WmNative.terrainArenaCanGrow.invokeExact() as Boolean
+		} catch (error: Throwable) {
+			// No renderer to ask: nothing was baked, so nothing can be waiting on a rebuild.
+			return 0
+		}
+
+		if (!canGrow) {
+			return 0
+		}
+
+		val renderer = client.levelRenderer
+		var count = 0
+
+		for (key in refused) {
+			if (count >= REDIRTY_PER_TICK) {
+				break
+			}
+
+			try {
+				renderer.setSectionDirty(SectionPos.x(key), SectionPos.y(key), SectionPos.z(key))
+				count++
+			} catch (error: Throwable) {
+				// A nudge that does not land is not worth taking the game down for: the section keeps
+				// the geometry it had, which is where this path started.
+				return count
+			}
+		}
+
+		return count
+	}
+
+	/** How many refused sections one tick may ask the game to rebuild. See [redirty]. */
+	private const val REDIRTY_PER_TICK = 32
 
 	/**
 	 * Checks the arena's return channel against this side's own count.

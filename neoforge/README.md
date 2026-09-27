@@ -2234,6 +2234,167 @@ under the world's horizon height, which this does not touch.
 each transition, so a run says which body is being skipped rather than leaving it to a screenshot. It
 alternates sun, moon, sun over a day, which is the whole of the test.
 
+### The arena filled up, and the world stopped changing
+
+This is the one that looked like a modelling bug and was not. The report was a huge mushroom that was
+not drawn at all, and - the half that gave it away - breaking a block did not change the terrain, with
+`F3+T` no better. Nothing about that says "rotation": it says the geometry on screen stopped being
+replaced. The terrain line from that run says why, in two numbers side by side:
+
+```
+… 231 section(s) refused by the arena, … ; 231 refused section(s) drained
+```
+
+`231` sections the section feed had baked, handed to Rust, and been told there was no room for. The
+arena is a fixed pool of `u32` slots inside one buffer, and it was sized from a guess about what a
+section costs - `SLOTS_PER_SECTION = 8_000`, 32 KB, "a few hundred quads". One quad is **twenty-two**
+slots (four vertices of four words, then six indices), so 8 000 is 364 quads, and the shell of a single
+full cube is 1 536 quads: 33 792 slots, four times the estimate, before the cutout layer draws one
+plant. At 16 chunks - what that run was set to - the pool came out at 32.9M slots, 131 MB, and a world
+of ordinary surface geometry fills that in seconds. Hence the other number: the first refusals arrived
+about four seconds after joining, and the count kept climbing to the end of the session.
+
+What a refusal *does* is what made it look like something else entirely. `SectionStorage::allocate`
+leaves a section it cannot replace exactly as it was, deliberately - stale geometry is a wrong picture,
+no geometry is a hole - so a refused section keeps drawing its old mesh and the next rebuild of it is
+refused as well. The world stops updating, section by section, and the only visible symptom is that
+blocks do not change when you break them. The mushroom was a section that never got a mesh at all.
+
+Three things were wrong behind that, and one of them made it permanent:
+
+- **The refusal leaked the pool.** A section is several layers, each of which allocates a vertex range
+  and an index range. When a later layer did not fit, the layers that *had* fit were dropped along with
+  the section - and their ranges were never given back, because the allocator still counted them as
+  handed out. Every refusal cost the pool the geometry that did fit, so a session that refused a section
+  here and there ended up refusing everything. `SectionStorage::refuse` gives them back now.
+- **The estimate was four times too small.** See above; `SLOTS_PER_SECTION` is 16 000 with the
+  arithmetic written next to it, and the placeholder the arena is created with (`ARENA_SLOTS`) is now
+  the *small* one on purpose - the game reports its render distance before anything is baked, and that
+  report is what sizes the pool.
+- **Nothing grew the arena, and nothing retried the section.** A fixed pool and a render distance that
+  is a slider do not have to agree, and the two ends of that disagreement were both missing. The arena
+  now grows: `RangeAllocator::grow_to` extends the pool at the *end*, so every range already handed out
+  keeps its offset and growing is one `copy_buffer_to_buffer` into a bigger buffer plus a swap of the
+  bind group the terrain pass reads - no re-mesh, and the frame already recorded keeps the old buffer
+  until it is done with it. `COPY_SRC` on the arena's usage flags is what makes that copy legal. And the
+  JVM side, which was already dropping its "I have sent this" record so the *next* rebuild would carry
+  the blocks again, now also marks the section dirty: the next rebuild was the thing that never
+  happened, because Minecraft believes it has meshed the section and has no reason to look at it again.
+  That is bounded to 32 sections a tick and only while the arena can still grow - at the device's own
+  `max_buffer_size` a rebuild would be refused exactly as the last one was, once a tick, forever.
+
+The diagnostic that would have caught all of this in one line is on the terrain line now: `arena N of
+M slot(s) handed out (X%, Y MB), the largest section L slot(s)`. `L` is the measurement the constant is
+a guess at, and the pair is what says whether a refusal is a nearly-full arena, a fragmented one, or one
+enormous section. The first session against the corrected numbers, same world and 16 chunks:
+
+```
+arena 51,753,658 of 65,712,000 slot(s) handed out (79%, 197 MB), the largest section 168,014 slot(s)
+```
+
+Zero refusals, and three things worth keeping. The pool is the size the world needs with a fifth of it
+spare, which is the first time those two constants have been checked against anything - and they are
+only right *together*, as a product: 1 369 columns × 48 000 slots came out at 79% of the pool. The
+largest single section is 168 014 slots, 672 KB, **ten times** the per-section constant: a section is
+not "about 16 000 slots", it is whatever its geometry is. And the line itself is now a diagnostic
+rather than a flood - see below.
+
+### The terrain line was half a megabyte of log every thirty seconds
+
+The line above was written once per frame, and a world frame takes about 6 ms: 805 lines and 567 KB in
+the thirty seconds of the run it was measured on, which buried everything else the game said. It is
+now written when there is something to *say*:
+
+- **the first frame of a session, and any frame where something changed** - the pass drew nothing, the
+  arena started refusing sections, or it grew - writes the whole line: fluids, arena, largest section,
+  bob, camera, and the JVM side's own counters;
+- **any other frame** writes the arena and the two counters and nothing else, once a second:
+  `; 11,661,278 section draw(s), arena 51,753,658 of 65,712,000 slot(s) handed out (79%, 197 MB), the
+  largest section 168,014 slot(s), 0 refused`.
+
+The state that gets the full line is the state that has to be reported *now*: a refusal is geometry
+that was baked and never reached the screen, and a growth is the answer to it - a second late is a
+second of the world not changing. The rest is a heartbeat, and a heartbeat that costs 200 bytes a
+second is one that can be left on.
+
+### A block that is baked into nothing, and the line that now says so
+
+Three ways the baker can turn a block into nothing, and until this line existed **none of them said
+anything in the game's log**. They are worth separating because they have one symptom between them - a
+registered block that is not drawn, that still occludes its neighbours, so the block behind it loses
+the face between them and what the player sees is a hole in the world with no visible cause:
+
+| What happened | What it leaves | Where it was reported |
+| --- | --- | --- |
+| a texture a model names cannot be read | the sprite is never packed, and every face that samples it is dropped | a `log::warn!` on the native side, which does not reach the game's log file |
+| a face's sprite is not in the atlas | the face is dropped; the block has a hole - or *is* the hole, if it was the model's only face | nowhere |
+| a state's mesh comes out with no faces at all | the block is drawn as nothing, and still culls its neighbours | nowhere |
+
+The middle one is the quietest thing in this renderer: `get_atlas_uv` returning `None` drops a face by
+`?`, on purpose - a block with one bad texture reference must not take the block registry down - and
+the result is indistinguishable, from the outside, from a model that never existed. A mushroom cap was
+that for a whole session of looking at the wrong thing (see the rotation section): the state had a key,
+the key had a mesh, the mesh had no faces, and the terrain line was full of numbers about the arena.
+
+So all three are counted where they happen and reported where the log is. The native side keeps the
+counts and the first few names (`MISSING_SPRITES`, `UNREADABLE_TEXTURES`, and the states whose mesh
+`is_empty`), and `blockBakeDiagnostics` hands them to the JVM, which logs them right after the block
+cache:
+
+```
+wgpu: the block models did not all bake: 2 texture(s) a model names could not be read (so their faces
+are untextured): minecraft:textures/block/brown_mushroom_block.png; 64 block state(s) baked to a mesh
+with no faces (drawn as nothing, and still occluding their neighbours): minecraft:brown_mushroom_block x64
+```
+
+Nothing is printed when everything baked, which is the normal case - and the point of the line is that
+the abnormal one is one grep away from the run that showed it.
+
+### A sprite allocated after the atlas was uploaded is a block that is invisible
+
+The mushroom blocks, and the four days of looking at the wrong thing that they cost. Every number the
+renderer had said they were fine: the state was registered, the model resolved, the mesh was built, the
+faces were **drawn** - `brown_mushroom_block seen 663 drawn 1,712 culled 2,266`, from the counters the
+section above describes - and the blocks were not on screen. The one visible symptom beyond that was
+reported as "the block touching the mushroom disappears when you look through it", which is the
+mushroom's own occlusion flags doing their job on a block that is not drawn: its neighbour loses the
+face between them, exactly as vanilla would have it, and what is missing is the skin.
+
+The baker was innocent, and the reason is a seam between two passes that bake block models:
+
+1. `bake_blocks` bakes every `variants` model, allocates the sprites they name, allocates the fluid
+   sprites, and calls `Atlas::upload` - which is what copies the atlas *image* to the texture the pass
+   samples.
+2. `cacheBlockStates` then asks for a mesh per block **state**, and that is what bakes the `multipart`
+   models - one state at a time, lazily, because a multipart's mesh depends on the properties.
+
+`Atlas::allocate` writes the CPU image and the maps. It does not touch the GPU. So a sprite that only a
+multipart model names is allocated into the image *after* the upload and copied to the GPU **never**:
+its rectangle is in `uv_map` (so the face is baked and the block is not reported as untextured), and the
+texels behind that rectangle are wgpu's zero-initialization, `(0, 0, 0, 0)`. The terrain shader alpha-
+tests, so every face that samples it is discarded.
+
+`brown_mushroom_block`, `red_mushroom_block`, `mushroom_block_inside` and `mushroom_stem` are exactly
+that: two `template_single_face` models whose sprites nothing else in the game names. Every other
+multipart block in vanilla - fences, panes, walls, buttons, redstone - names textures that its own
+`variants` counterpart already put in the atlas, which is why the bug looked like "the mushrooms are
+invisible" rather than "multiparts are invisible". It would have hit vines, sculk veins and glow lichen
+the same way, and it hit whoever else had a texture only a multipart names.
+
+The fix is the flag `Atlas::allocate` should always have set: `sprites_since_upload`, and
+`upload_if_dirty`, which copies the image when the count is not zero. It is called at the seam
+(`cacheBlockStates`, right after the per-state bakes) and once per frame as a net (`tick_scene`), which
+logs a warning when it fires - a sprite that arrives outside the seam is a block that was invisible
+until that frame, and the warning is what says so rather than another afternoon of watching a block
+that is not there.
+
+Two things about the search are worth keeping. The **counter that answered it** was three numbers per
+watched block - seen, drawn, culled - and it answered in one run what four rounds of reading the baker
+had not: `drawn` alone means the fault is after the bake, and everything before that point can be
+dropped from the enquiry. And the **console was the only place the Rust log went**: the line that would
+have shown the empty meshes and the unreadable textures existed for the whole of this hunt, in a stream
+nobody was reading. That is why the same facts are now on a `WARN` line in the game's own log.
+
 ### A face is hidden by the neighbour's state, not by the neighbour's model
 
 The Rust baker leaves a face out of a section's mesh when the block next to it makes it invisible, and
@@ -2308,6 +2469,111 @@ game's own test is `computeTransparency(u0, v0, u1, v1)` over the rectangle a fa
 that only samples the opaque part of a partly-cutout sprite is put in the cutout layer too, which is
 the same pass either way. What it costs is this renderer drawing less of the world into the layer it
 owns, which is the trade to make towards a picture that is right.
+
+### The rotation belongs to the variant, and so does the face it culls against
+
+A blockstate variant may name a model *and* turn it (`"x"`, `"y"`, `"uvlock"`), and the baker used to
+read the model name and nothing else. Five things came out of that, four of which were in the picture:
+
+- The geometry was turned, but by the wrong composition. The element's own `rotation` was applied
+  *between* the variant's `x` and its `y` (`x`, then the element matrix about its origin, then `y`),
+  so an element-rotated model under a rotated variant - a plant on its side, a wall-mounted block -
+  came out somewhere neither rotation puts it. Minecraft's order is the element's rotation first and
+  the variant's on the result, which is what `vertex_transform` now does.
+- **`x` was the other quarter turn.** This is the one that cost a picture. `x: 90` is
+  `OctahedralGroup.BLOCK_ROT_X_90 = ROT_90_X_NEG` - a *negative* quarter turn about X, which takes a
+  model's up direction to **north** - and the baker had it as the positive one, so `x: 90` and `x: 270`
+  were swapped. `x: 180` is its own inverse and every `y` turn was already right, which is why it
+  survived: only the quarter turns about X were wrong, and that is **112** of the 1170 blockstate files
+  (`amethyst_cluster` and every wall cluster, `basalt`/`bone_block`/every log's `axis=x` and `axis=z`,
+  levers and buttons on a wall, and both mushroom blocks). `amethyst_cluster` states the convention in
+  one line - its model points up and its `facing=north` variant is `{"x": 90}` - and the mushroom cap
+  is what the swap did to the world: the `up` piece was baked onto the *bottom* of the cube facing
+  down, where the mushroom block below it, being a full block that occludes, then culled it. A huge
+  mushroom had no top.
+- The `cullface` was not read at all. Culling used the plane a face's geometry sits on and nothing
+  else, so a face declaring **nothing** was left out whenever the neighbour happened to be a full
+  block, where vanilla draws it. 16 vanilla block models are in that position (39 faces, `*_inventory`
+  aside) - `beacon`, all six of its faces, plus `heavy_core`, `bell_floor`, `coral_fan`,
+  `brewing_stand`, `lectern` - and `BlockModelFace::cull` now carries the declaration, with a face
+  that declares none never culled.
+
+  This half is overdraw rather than picture, and the numbers say why: a face between two blocks is
+  hidden from outside either way, and vanilla is tidy about the field - of the 2392 block models in
+  the client jar, the 16 faces that name a direction whose boundary they are not exactly on are all
+  geometry a hair inside or outside the cube (`cube_all_inner_faces` at 15.998, the hopper's inside
+  top at y = 10, the lever's underside at -0.02), each naming the direction it is nearest to. A model
+  from a resource pack need not be that tidy, and reading the field is what makes it mean what it says.
+- `uvlock` was ignored, so every `"uvlock": true` variant had its texture turn with the model where
+  the game leaves it still.
+- The normals were the six axis-aligned literals, never turned. They are not decoration: the vertex
+  packs one into a three-bit field (`render::pipeline`) and the shader shades with it, and a face
+  whose normal still points where the model file wrote it is lit from the wrong side. The turned
+  direction is built from the rotation's matrix rather than from its position form, because a normal
+  has no position to be folded about - the `1.0 -` in the position form is where the middle of the
+  block is - which also keeps it axis-aligned for the packing.
+
+How much of the world that was: of the 1170 blockstate files in the 26.1 client jar, **131** set
+`"uvlock": true`, **407** turn a model about Y, **182** about X, and every one of the 182 turns about
+Y as well - 182 of them put both in a **single** variant (`acacia_log`'s `axis=x` is
+`{"x": 90, "y": 90}`), which is what makes the order of the two turns observable at all. Stairs and
+walls are in both lists, and they are among the most common blocks in a world.
+
+`brown_mushroom_block.json` is the case that ties all of it together, and the one this was noticed
+on - a multipart whose six cap pieces are the **same** model under six different rotations, all of
+them `"uvlock": true`, beside inside faces that are another model with no `uvlock`:
+
+```json
+{ "apply": { "model": "minecraft:block/brown_mushroom_block", "uvlock": true, "y": 90 },
+  "when": { "east": "true" } },
+{ "apply": { "model": "minecraft:block/brown_mushroom_block", "uvlock": true, "x": 270 },
+  "when": { "up": "true" } },
+```
+
+Six pieces of one model, six rotations, one texture that must not turn - and, next to them, a piece
+whose texture must turn. Nothing but a per-`ModelProperties` rotation can express that. It is also
+where the `x` sign showed up, and why the report was "the mushroom block is gone" rather than "the
+mushroom block is facing the wrong way": the `up` piece was drawn on the bottom of the cube facing
+down, the block below a cap is another mushroom block, that block occludes, and culling is what
+happens to a face whose neighbour occludes - so nothing was drawn on top of a cap at all.
+
+The direction a `cullface` names has to be turned too, because it names a neighbour of the *block*:
+`Direction.rotate(modelState.transformation().getMatrix(), face.cullForDirection())` is what the game
+does, and the rotated direction is what the culling test compares against the world as baked. So
+`face_data` returns the declaration already turned, and `BlockModelFace::cull` is the neighbour this
+face now touches rather than the one the model file was written against.
+
+`uvlock` is the interesting one, and the whole of it is one matrix. Minecraft's
+`BlockMath#getFaceTransformation`:
+
+```java
+Transformation faceAction = VANILLA_UV_TRANSFORM_LOCAL_TO_GLOBAL.get(originalSide);
+faceAction = transformation.compose(faceAction);
+Vector3f transformedNormal = faceAction.getMatrix().transformDirection(new Vector3f(0, 0, 1));
+Direction newSide = Direction.getApproximateNearest(...);
+return VANILLA_UV_TRANSFORM_GLOBAL_TO_LOCAL.get(newSide).compose(faceAction);
+```
+
+so the transform is `GLOBAL_TO_LOCAL[newSide] * R * LOCAL_TO_GLOBAL[declared]`, applied to the UV as
+the point `(u - 0.5, v - 0.5, 0)` in sprite-normalized coordinates. Two things in there are easy to
+get wrong and were:
+
+- `newSide` is the face the **declared** face's normal ends up pointing at, not the south face's.
+  `faceAction` is `R ∘ LOCAL_TO_GLOBAL[declared]`, whose local `(0, 0, 1)` is the declared face's own
+  normal; taking the south face's instead gives the right answer for a south face and the wrong one
+  for the other five. A test hand-derives a north face turned 90° about X - which becomes the up face,
+  and whose transform comes out as `rotX(180) ∘ rotY(180)`, the sprite turned half way round.
+- `uvlock` is *not* "no transform". A north face turned 90° about Y becomes the east face, and those
+  two frames compose with the rotation to the identity - the sprite keeps every corner it had. It is
+  still locked: the face it is on turned, and the numbers on it did not. With `uvlock` off the UVs stay
+  attached to the corners the rotation moves, which is the texture turning with the block.
+
+There is one more thing about *where* this happens. A `ModelMesh` is cached per variant - `Block`'s
+variants each keep an `Arc<ModelMesh>`, and a multipart model keeps one per key - and the rotation is
+part of the variant rather than of the model file, so it has to be applied inside `bake`, per
+`ModelProperties`, before the faces of several properties are merged into the one mesh. Rotating a
+finished mesh could not express a multipart block whose two variants are turned differently, and doing
+it per state would rebuild meshes that are shared.
 
 ### Known gaps
 
