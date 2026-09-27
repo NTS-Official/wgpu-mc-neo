@@ -1,4 +1,5 @@
 use crate::mc::chunk::RenderLayer;
+use crate::mc::direction::java_mask_has;
 use glam::{Mat3, Vec3, vec3};
 use itertools::Itertools;
 use minecraft_assets::api::ModelResolver;
@@ -69,6 +70,63 @@ pub struct BlockModelFace {
     pub normal: Vec3,
     pub tint_index: i32,
     pub animation_uv_offset: u32,
+    /// The layer this face is baked into, from two answers the game also asks separately: what the
+    /// model says (`force_translucent`, `render_type` - `declared_layer`) and what the *sprite* it
+    /// samples says (`Atlas::sprite_layer`, which is where ice, leaves and every plant are decided -
+    /// none of them declares anything in its model).
+    ///
+    /// Per face rather than per model because that is what the game does, and because a model is not
+    /// one thing: a grass block is an opaque cube with a cutout overlay on its sides, and classifying
+    /// it as a whole would hand the whole block to Minecraft's cutout pass. Per face keeps the cube in
+    /// this renderer's solid pass and leaves the overlay to the pass that owns cutout.
+    pub layer: RenderLayer,
+}
+
+/// What a block *state* says about the faces around it, as Minecraft itself answers it.
+///
+/// Two masks, one bit per direction, both computed on the JVM side when the block is registered
+/// (`RegistryMixin`) and keyed by the state the section palette carries:
+///
+/// - `occlusion`: `state.getFaceOcclusionShape(dir) == Shapes.block()`. The state's own shape covers
+///   that whole face, so a neighbour's face against it is not drawn. Note that this is *not* the
+///   model: glass, ice, leaves and every plant have a full-cube model and none of them occlude
+///   anything, which is exactly the difference this type exists for.
+/// - `self_hide`: `state.skipRendering(state, dir)`. The block leaves out the face between itself
+///   and a neighbour of its own kind - glass against glass, ice against ice, the bars of a pane, a
+///   fluid against itself.
+///
+/// The bits are in Java's `Direction.ordinal()` order, because that is the side that computes them;
+/// read them with [`crate::mc::direction::java_mask_has`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FaceFlags {
+    pub occlusion: u8,
+    pub self_hide: u8,
+}
+
+impl FaceFlags {
+    /// The flags two states that wear the same model agree on.
+    ///
+    /// A packed key can be worn by more than one state - a property the blockstate file does not
+    /// vary its model on, `waterlogged` for one - and what these bits decide is whether a *face* is
+    /// left out of the mesh, where being wrong means a hole in the world. So a bit survives only
+    /// where every state with this model has it, and a disagreement costs an invisible face between
+    /// two blocks rather than a missing one.
+    pub fn and(self, other: FaceFlags) -> FaceFlags {
+        FaceFlags {
+            occlusion: self.occlusion & other.occlusion,
+            self_hide: self.self_hide & other.self_hide,
+        }
+    }
+
+    /// Whether the state's shape covers the whole face in this direction.
+    pub fn occludes(self, dir: Direction) -> bool {
+        java_mask_has(self.occlusion, dir)
+    }
+
+    /// Whether the state hides its own face toward a neighbour of the same kind in this direction.
+    pub fn hides_same_state(self, dir: Direction) -> bool {
+        java_mask_has(self.self_hide, dir)
+    }
 }
 
 /// Parses a model file, allowing for the object form of a texture that 26.1 introduced.
@@ -130,6 +188,53 @@ fn flatten_textures(value: &mut serde_json::Value) -> bool {
     changed
 }
 
+/// The render layer a model json asks for, if it asks for one.
+///
+/// Two spellings, because the game has used both. 26.1 spells "this model draws with blending" as
+/// `force_translucent` on a texture entry - `glass.json` is the object form
+/// `{"sprite": …, "force_translucent": true}`, which is also the form [`flatten_textures`] has to
+/// rewrite before the model schema can read it, so this reads the field out of the raw json rather
+/// than out of the parsed model. 1.21 spelled it as `render_type` on the model
+/// (`minecraft:translucent`, `minecraft:cutout`, `minecraft:solid`), and a pack or a mod written
+/// for that spelling still lands in the layer it asked for.
+///
+/// This is the model's half of the answer and it is the *floor* under a face's layer: the sprite a
+/// face samples can put it in a stronger one, and does for everything a model says nothing about -
+/// ice, leaves, every plant. See [`BlockModelFace::layer`].
+fn declared_layer(json: &str) -> Option<RenderLayer> {
+    let value: serde_json::Value = serde_json::from_str(json).ok()?;
+
+    let mut layer = match value.get("render_type").and_then(|kind| kind.as_str()) {
+        Some("minecraft:translucent" | "translucent") => Some(RenderLayer::Transparent),
+        Some("minecraft:cutout" | "cutout" | "minecraft:cutout_mipped" | "cutout_mipped") => {
+            Some(RenderLayer::Cutout)
+        }
+        Some("minecraft:solid" | "solid") => Some(RenderLayer::Solid),
+        _ => None,
+    };
+
+    // A model that asks for translucency in either spelling gets it, whichever its parent said.
+    let forced = value
+        .get("textures")
+        .and_then(|textures| textures.as_object())
+        .is_some_and(|textures| {
+            textures.values().any(|texture| {
+                texture
+                    .get("force_translucent")
+                    .and_then(|forced| forced.as_bool())
+                    .unwrap_or(false)
+            })
+        });
+
+    if forced {
+        layer = Some(layer.map_or(RenderLayer::Transparent, |layer| {
+            layer.stronger(RenderLayer::Transparent)
+        }));
+    }
+
+    layer
+}
+
 fn recurse_model_parents(
     model: &schemas::Model,
     resource_provider: &dyn ResourceProvider,
@@ -164,14 +269,20 @@ fn recurse_model_parents(
 
 fn resolve_model(
     model: schemas::Model,
+    declared: Option<RenderLayer>,
     resource_provider: &dyn ResourceProvider,
-) -> Result<schemas::Model, MeshBakeError> {
+) -> Result<(schemas::Model, Option<RenderLayer>), MeshBakeError> {
     if model.parent.is_none() {
-        return Ok(model);
+        return Ok((model, declared));
     }
 
     let mut parent_paths = Vec::new();
     recurse_model_parents(&model, resource_provider, &mut parent_paths)?;
+
+    // The layer the model chain asks for. The strongest spelling wins rather than the child's:
+    // `force_translucent` sits on the *textures*, which a child that does not override them inherits
+    // from its parent, so a chain that asks for blending anywhere in it is a chain that blends.
+    let mut layer = declared;
 
     let parents: Vec<schemas::Model> = parent_paths
         .iter()
@@ -179,6 +290,10 @@ fn resolve_model(
             let json = resource_provider
                 .get_string(parent_path)
                 .ok_or_else(|| MeshBakeError::UnresolvedResourcePath(parent_path.clone()))?;
+
+            if let Some(declared) = declared_layer(&json) {
+                layer = Some(layer.map_or(declared, |layer| layer.stronger(declared)));
+            }
 
             parse_model(&json).map_err(MeshBakeError::JsonError)
         })
@@ -211,7 +326,7 @@ fn resolve_model(
         }
     }
 
-    Ok(schema)
+    Ok((schema, layer))
 }
 
 fn get_atlas_uv(face: &schemas::models::ElementFace, block_atlas: &Atlas) -> Option<UV> {
@@ -259,7 +374,6 @@ pub struct ModelMesh {
     pub down: Vec<BlockModelFace>,
     pub any: Vec<BlockModelFace>,
     pub cull: u8,
-    pub layer: RenderLayer,
 }
 
 impl ModelMesh {
@@ -275,25 +389,29 @@ impl ModelMesh {
                     .prepend("models/")
                     .append(".json");
 
+                let model_json = resource_provider
+                    .get_string(&model_resource_path)
+                    .ok_or_else(|| MeshBakeError::UnresolvedResourcePath(model_resource_path.clone()))?;
+
                 //Recursively resolve the model using it's parents if it has any
-                let model: schemas::Model = resolve_model(
+                let (model, layer): (schemas::Model, Option<RenderLayer>) = resolve_model(
                     //Parse the JSON into the model schema
-                    parse_model(
-                        //Get the model JSON
-                        &resource_provider
-                            .get_string(&model_resource_path)
-                            .ok_or_else(|| {
-                                MeshBakeError::UnresolvedResourcePath(model_resource_path.clone())
-                            })?,
-                    )
-                    .map_err(|err| {
+                    parse_model(&model_json).map_err(|err| {
                         log::warn!(
                             "wgpu-mc: the model {model_resource_path} could not be read: {err}"
                         );
                         MeshBakeError::JsonError(err)
                     })?,
+                    declared_layer(&model_json),
                     resource_provider,
                 )?;
+
+                // What the model chain says every one of its faces is at least: `force_translucent`
+                // on a 26.1 texture entry, or the older `render_type`. The sprite a face samples can
+                // put it in a stronger layer than this, and does for everything the model says
+                // nothing about.
+                let model_layer = layer.unwrap_or(RenderLayer::Solid);
+
                 if let Some(textures) = model.textures {
                     //Make sure the textures in the model are fully resolved with no references
                     if let Some(reference) = textures
@@ -381,6 +499,12 @@ impl ModelMesh {
                                             .get(&(&tex.texture.0).into())
                                             .unwrap_or(&0),
                                         tex.tint_index,
+                                        //What the sprite's own pixels say about the face that samples
+                                        //them: this is where ice, leaves and every plant are decided,
+                                        //because none of them declares anything in its model.
+                                        block_atlas
+                                            .sprite_layer(&(&tex.texture.0).into())
+                                            .unwrap_or(RenderLayer::Solid),
                                     )
                                 })
                             });
@@ -401,6 +525,12 @@ impl ModelMesh {
                                             .get(&(&tex.texture.0).into())
                                             .unwrap_or(&0),
                                         tex.tint_index,
+                                        //What the sprite's own pixels say about the face that samples
+                                        //them: this is where ice, leaves and every plant are decided,
+                                        //because none of them declares anything in its model.
+                                        block_atlas
+                                            .sprite_layer(&(&tex.texture.0).into())
+                                            .unwrap_or(RenderLayer::Solid),
                                     )
                                 })
                             });
@@ -421,6 +551,12 @@ impl ModelMesh {
                                             .get(&(&tex.texture.0).into())
                                             .unwrap_or(&0),
                                         tex.tint_index,
+                                        //What the sprite's own pixels say about the face that samples
+                                        //them: this is where ice, leaves and every plant are decided,
+                                        //because none of them declares anything in its model.
+                                        block_atlas
+                                            .sprite_layer(&(&tex.texture.0).into())
+                                            .unwrap_or(RenderLayer::Solid),
                                     )
                                 })
                             });
@@ -441,6 +577,12 @@ impl ModelMesh {
                                             .get(&(&tex.texture.0).into())
                                             .unwrap_or(&0),
                                         tex.tint_index,
+                                        //What the sprite's own pixels say about the face that samples
+                                        //them: this is where ice, leaves and every plant are decided,
+                                        //because none of them declares anything in its model.
+                                        block_atlas
+                                            .sprite_layer(&(&tex.texture.0).into())
+                                            .unwrap_or(RenderLayer::Solid),
                                     )
                                 })
                             });
@@ -461,6 +603,12 @@ impl ModelMesh {
                                             .get(&(&tex.texture.0).into())
                                             .unwrap_or(&0),
                                         tex.tint_index,
+                                        //What the sprite's own pixels say about the face that samples
+                                        //them: this is where ice, leaves and every plant are decided,
+                                        //because none of them declares anything in its model.
+                                        block_atlas
+                                            .sprite_layer(&(&tex.texture.0).into())
+                                            .unwrap_or(RenderLayer::Solid),
                                     )
                                 })
                             });
@@ -481,6 +629,12 @@ impl ModelMesh {
                                             .get(&(&tex.texture.0).into())
                                             .unwrap_or(&0),
                                         tex.tint_index,
+                                        //What the sprite's own pixels say about the face that samples
+                                        //them: this is where ice, leaves and every plant are decided,
+                                        //because none of them declares anything in its model.
+                                        block_atlas
+                                            .sprite_layer(&(&tex.texture.0).into())
+                                            .unwrap_or(RenderLayer::Solid),
                                     )
                                 })
                             });
@@ -581,6 +735,7 @@ impl ModelMesh {
                             normal: vec3(0.0, 0.0, 1.0),
                             tint_index: south_face.2,
                             animation_uv_offset: south_face.1,
+                            layer: model_layer.stronger(south_face.3),
                         }));
                         faces.extend(west.map(|west_face| BlockModelFace {
                             vertices: [
@@ -604,6 +759,7 @@ impl ModelMesh {
                             normal: vec3(-1.0, 0.0, 0.0),
                             tint_index: west_face.2,
                             animation_uv_offset: west_face.1,
+                            layer: model_layer.stronger(west_face.3),
                         }));
                         faces.extend(north.map(|north_face| BlockModelFace {
                             vertices: [
@@ -627,6 +783,7 @@ impl ModelMesh {
                             normal: vec3(0.0, 0.0, -1.0),
                             tint_index: north_face.2,
                             animation_uv_offset: north_face.1,
+                            layer: model_layer.stronger(north_face.3),
                         }));
                         faces.extend(east.map(|east_face| BlockModelFace {
                             vertices: [
@@ -650,6 +807,7 @@ impl ModelMesh {
                             normal: vec3(1.0, 0.0, 0.0),
                             tint_index: east_face.2,
                             animation_uv_offset: east_face.1,
+                            layer: model_layer.stronger(east_face.3),
                         }));
                         faces.extend(up.map(|up_face| BlockModelFace {
                             vertices: [
@@ -673,6 +831,7 @@ impl ModelMesh {
                             normal: vec3(0.0, 1.0, 0.0),
                             tint_index: up_face.2,
                             animation_uv_offset: up_face.1,
+                            layer: model_layer.stronger(up_face.3),
                         }));
 
                         faces.extend(down.map(|down_face| BlockModelFace {
@@ -697,6 +856,7 @@ impl ModelMesh {
                             normal: vec3(0.0, -1.0, 0.0),
                             tint_index: down_face.2,
                             animation_uv_offset: down_face.1,
+                            layer: model_layer.stronger(down_face.3),
                         }));
                         faces
                     })
@@ -704,8 +864,8 @@ impl ModelMesh {
             })
             .flatten_ok()
             .collect::<Result<Vec<BlockModelFace>, MeshBakeError>>()?;
+
         let mut result = Self {
-            layer: RenderLayer::Solid,
             north: vec![],
             south: vec![],
             west: vec![],

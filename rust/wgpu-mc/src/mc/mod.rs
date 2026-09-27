@@ -34,6 +34,30 @@ pub struct BlockManager {
     /// This maps block state keys to either a [VariantMesh] or a [Multipart] struct. How the keys are formatted
     /// is defined by the user of wgpu-mc. For example `Block{minecraft:anvil}[facing=west]` or `minecraft:anvil#facing=west`
     pub blocks: IndexMap<String, Block>,
+    /// What every block *state* the JVM described says about the faces around it, keyed by the packed
+    /// [`BlockstateKey`](block::BlockstateKey) - which is the only thing a baked section carries about
+    /// a block, so it is the only key this table can use.
+    ///
+    /// It is filled when the block registry is built (`cacheBlockStates`, on the JNI side) from the
+    /// masks `RegistryMixin` computes for each state, and it is what the terrain baker's face test
+    /// reads: a neighbour's *state* decides whether a face is drawn, not its model - see
+    /// `chunk::face_is_hidden`.
+    pub face_flags: HashMap<u32, block::FaceFlags>,
+}
+
+impl BlockManager {
+    pub fn new() -> Self {
+        Self {
+            blocks: IndexMap::new(),
+            face_flags: HashMap::new(),
+        }
+    }
+}
+
+impl Default for BlockManager {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[derive(Debug)]
@@ -304,9 +328,7 @@ impl MinecraftState {
 
             texture_manager: TextureManager::new(wgpu_state),
 
-            block_manager: RwLock::new(BlockManager {
-                blocks: IndexMap::new(),
-            }),
+            block_manager: RwLock::new(BlockManager::new()),
             resource_provider,
 
             animated_block_buffer: ArcSwap::new(Arc::new(None)),

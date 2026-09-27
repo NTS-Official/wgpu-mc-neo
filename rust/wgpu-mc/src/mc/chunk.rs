@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use crate::WmRenderer;
 use crate::mc::BlockManager;
-use crate::mc::block::{BlockModelFace, ChunkBlockState, ModelMesh};
+use crate::mc::block::{BlockModelFace, ChunkBlockState, FaceFlags, ModelMesh};
 use crate::mc::direction::Direction;
 use crate::mc::resource::ResourcePath;
 use crate::render::atlas::Atlas;
@@ -105,6 +105,20 @@ pub enum RenderLayer {
     Solid = 0,
     Cutout = 1,
     Transparent = 2,
+}
+
+impl RenderLayer {
+    /// The layer of the two that has to be drawn later, if they differ.
+    ///
+    /// Which one that is is the variant order: a face that blends cannot be drawn in the pass that
+    /// writes opaque depth, so the strongest thing a model asks for is what its faces get.
+    pub fn stronger(self, other: RenderLayer) -> RenderLayer {
+        if (self as u8) >= (other as u8) {
+            self
+        } else {
+            other
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -436,6 +450,77 @@ fn get_block(block_manager: &BlockManager, state: ChunkBlockState) -> Option<Arc
         .get_model(key.augment, 0)
 }
 
+/// The face flags of a state, or none when the state was never described.
+///
+/// "None" is the two masks at zero, which reads as "this state occludes nothing and hides nothing" -
+/// the conservative reading, where the face is drawn. That is the one to fail towards: a missing bit
+/// costs a face between two blocks that nothing can see, and a bit that should not have been set
+/// costs a hole in the world.
+#[inline]
+fn face_flags(block_manager: &BlockManager, state: ChunkBlockState) -> FaceFlags {
+    match state {
+        ChunkBlockState::Air => FaceFlags::default(),
+        ChunkBlockState::State(key) => block_manager
+            .face_flags
+            .get(&key.pack())
+            .copied()
+            .unwrap_or_default(),
+    }
+}
+
+/// Whether Minecraft would leave this face out of the mesh: `Block.shouldRenderFace`, as far as two
+/// per-state masks and the model can carry it.
+///
+/// The neighbour's *state* is what decides, and that is the difference this replaced. Reading the
+/// neighbour's model instead - a full-size quad on the side facing us - culls the face of every block
+/// next to a full-cube model that does not occlude anything: glass, ice, leaves, stained glass, every
+/// plant. Those are exactly the blocks a player looks *through*, so the face that should have been
+/// behind them was missing and the world showed its insides.
+///
+/// Vanilla's rule has three parts; these are the two a mask can hold:
+///
+/// - `neighbour.occlusion[dir.opposite()]`: the neighbour's shape covers that whole face
+///   (`getFaceOcclusionShape(opposite) == Shapes.block()`), so nothing of ours can be seen behind it;
+/// - `self.self_hide[dir]` with the neighbour the *same state*: `state.skipRendering(neighborState,
+///   direction)`, which is how glass, ice, a pane's bars and a fluid leave out the faces between two
+///   blocks of their own kind. The mask is a per-state answer, so it can only speak for the same-state
+///   neighbour - two states of one block that wear different models (a pane's connections, say) are
+///   not recognised, which costs an invisible face between two blocks rather than a hole.
+///
+/// The third part - vanilla intersects the two occlusion *shapes* when the neighbour's is partial -
+/// is what the old geometry test approximates and is kept as an additional condition: a face is only
+/// left out where the neighbour's model also has a full-size quad on that side. Vanilla hides a few
+/// of those that this draws; every one of them is a face between two blocks, at a boundary no camera
+/// can be on both sides of, so what is drawn there cannot be seen.
+fn face_is_hidden(
+    block_manager: &BlockManager,
+    state: ChunkBlockState,
+    neighbour: ChunkBlockState,
+    dir: Direction,
+) -> bool {
+    if neighbour.is_air() {
+        return false;
+    }
+
+    // No model is a neighbour drawn as something else - the fallback block - so the geometry test
+    // has nothing to say about it and the face is kept.
+    let Some(mesh) = get_block(block_manager, neighbour) else {
+        return false;
+    };
+
+    if (mesh.cull >> dir.opposite() as u8) & 1 != 1 {
+        return false;
+    }
+
+    let flags = face_flags(block_manager, neighbour);
+
+    if flags.occludes(dir.opposite()) {
+        return true;
+    }
+
+    state == neighbour && face_flags(block_manager, state).hides_same_state(dir)
+}
+
 pub fn bake_section<Provider: BlockStateProvider>(pos: IVec3, wm: &WmRenderer, bsp: &Provider) {
     let bm = wm.mc.block_manager.read();
 
@@ -691,7 +776,7 @@ fn bake_layers<Provider: BlockStateProvider>(
             const INDICES: [u32; 6] = [0, 3, 1, 1, 3, 2];
             let mut add_quad =
                 |face: &BlockModelFace, _light_level: LightLevel, dir: Direction, color: u32| {
-                    let baked_layer = &mut layers[RenderLayer::Solid as usize];
+                    let baked_layer = &mut layers[face.layer as usize];
                     let vec_index = baked_layer.vertices.len() / Vertex::VERTEX_LENGTH;
 
                     let dir_vec = dir.to_vec();
@@ -802,19 +887,17 @@ fn bake_layers<Provider: BlockStateProvider>(
                     0xffffffff
                 };
 
-                let cull = if let Some(mesh) =
-                    get_block(block_manager, state_provider.get_state(pos + dir.to_vec()))
-                {
-                    (mesh.cull >> dir.opposite() as u8) & 1 == 1
-                } else {
-                    false
-                };
-
-                if !cull {
-                    let light_level: LightLevel =
-                        state_provider.get_light_level(pos + dir.to_vec());
-                    add_quad(face, light_level, dir, color);
+                if face_is_hidden(
+                    block_manager,
+                    block_state,
+                    state_provider.get_state(pos + dir.to_vec()),
+                    dir,
+                ) {
+                    return;
                 }
+
+                let light_level: LightLevel = state_provider.get_light_level(pos + dir.to_vec());
+                add_quad(face, light_level, dir, color);
             };
 
             model_mesh.west.iter().for_each(|face| {
@@ -1379,5 +1462,178 @@ mod winding_tests {
                 );
             }
         }
+    }
+}
+
+/// The face test, state by state. See [`face_is_hidden`].
+#[cfg(test)]
+mod face_culling_tests {
+    use super::*;
+    use crate::mc::Block;
+    use crate::mc::block::BlockstateKey;
+    use indexmap::map::IndexMap;
+
+    /// A full cube's worth of bits, which is what a model whose every face sits on the block boundary
+    /// gets - glass, ice and leaves all have one.
+    const FULL_CUBE: u8 = 0b0011_1111;
+
+    /// A block id and the mask its model culls with.
+    ///
+    /// The ids are indices into the manager's `blocks`, and `face_flags` is keyed by the packed state
+    /// key - `(block << 16) | augment`, the same packing the section palette carries.
+    fn registry(blocks: &[(u16, u8)], flags: &[(u16, FaceFlags)]) -> BlockManager {
+        let mut manager = BlockManager::new();
+
+        for (id, cull) in blocks {
+            let mut variants = IndexMap::new();
+            variants.insert(
+                Vec::new(),
+                vec![Arc::new(ModelMesh {
+                    north: vec![],
+                    south: vec![],
+                    west: vec![],
+                    east: vec![],
+                    up: vec![],
+                    down: vec![],
+                    any: vec![],
+                    cull: *cull,
+                })],
+            );
+
+            manager.blocks.insert(format!("block{id}"), Block::Variants(variants));
+        }
+
+        for (id, flags) in flags {
+            manager.face_flags.insert((*id as u32) << 16, *flags);
+        }
+
+        manager
+    }
+
+    fn state(id: u16) -> ChunkBlockState {
+        ChunkBlockState::State(BlockstateKey {
+            block: id,
+            augment: 0,
+        })
+    }
+
+    /// What a stone-like state says: its shape is the full block, so every face is occluded, and it
+    /// hides nothing against its own kind (`skipRendering` is false by default).
+    fn stone() -> FaceFlags {
+        FaceFlags {
+            occlusion: FULL_CUBE,
+            self_hide: 0,
+        }
+    }
+
+    /// What glass, ice or a leaf block says: a full-cube *model* that occludes nothing at all, and
+    /// `skipRendering` true against its own kind.
+    fn glass() -> FaceFlags {
+        FaceFlags {
+            occlusion: 0,
+            self_hide: FULL_CUBE,
+        }
+    }
+
+    /// Two full cubes of the same kind: the face between them is not drawn, which is most of what the
+    /// test does and what every block in the world relies on.
+    #[test]
+    fn a_face_against_an_occluding_neighbour_is_left_out() {
+        let manager = registry(&[(0, FULL_CUBE), (1, FULL_CUBE)], &[(0, stone()), (1, stone())]);
+
+        for dir in [
+            Direction::Up,
+            Direction::Down,
+            Direction::North,
+            Direction::South,
+            Direction::West,
+            Direction::East,
+        ] {
+            assert!(
+                face_is_hidden(&manager, state(0), state(1), dir),
+                "{dir:?}: two full blocks share a hidden face"
+            );
+        }
+    }
+
+    /// The bug this rule replaced: a full-cube model that does not occlude - glass, ice, leaves,
+    /// every plant - used to have its neighbour's face culled, because the model *looks* like a
+    /// solid cube. The world showed its insides wherever one of them touched anything.
+    #[test]
+    fn a_face_against_glass_is_drawn() {
+        let manager = registry(&[(0, FULL_CUBE), (1, FULL_CUBE)], &[(0, stone()), (1, glass())]);
+
+        for dir in [
+            Direction::Up,
+            Direction::Down,
+            Direction::North,
+            Direction::South,
+            Direction::West,
+            Direction::East,
+        ] {
+            assert!(
+                !face_is_hidden(&manager, state(0), state(1), dir),
+                "{dir:?}: stone's face against glass is drawn, however full glass's model is"
+            );
+        }
+    }
+
+    /// `skipRendering` against the same kind: the faces between two glass blocks are left out, which
+    /// is what keeps a wall of glass from being drawn twice over.
+    #[test]
+    fn glass_against_glass_hides_its_own_face() {
+        let manager = registry(&[(0, FULL_CUBE)], &[(0, glass())]);
+
+        assert!(
+            face_is_hidden(&manager, state(0), state(0), Direction::North),
+            "two glass blocks share one face"
+        );
+
+        // The same state against a *different* kind that hides its own faces just as much - two
+        // colours of stained glass, say - is a face that is drawn: `skipRendering` speaks for one
+        // block against its own kind, and the mask is a per-state answer, so the most it can say is
+        // "the same state".
+        let mixed = registry(&[(0, FULL_CUBE), (1, FULL_CUBE)], &[(0, glass()), (1, glass())]);
+        assert!(
+            !face_is_hidden(&mixed, state(0), state(1), Direction::North),
+            "two different glass blocks are not the same state"
+        );
+    }
+
+    /// A neighbour whose occluding shape covers only part of the face - a slab, a stair - is not an
+    /// occluder here, and the face is drawn. Vanilla hides a few of those by intersecting the two
+    /// shapes; every one of them is a face between two blocks, where nothing can see it.
+    #[test]
+    fn a_partial_occluder_draws_the_face() {
+        let partial = FaceFlags {
+            occlusion: 0,
+            self_hide: 0,
+        };
+
+        let manager = registry(&[(0, FULL_CUBE), (1, FULL_CUBE)], &[(1, partial)]);
+
+        assert!(!face_is_hidden(&manager, state(0), state(1), Direction::Up));
+    }
+
+    /// A state the JVM never described has no bits at all, and the conservative reading of that is
+    /// "occludes nothing": a registry without the flags is a world with every face drawn rather than
+    /// a world with holes in it.
+    #[test]
+    fn a_state_with_no_flags_occludes_nothing() {
+        let manager = registry(&[(0, FULL_CUBE), (1, FULL_CUBE)], &[]);
+
+        assert!(!face_is_hidden(&manager, state(0), state(1), Direction::Up));
+    }
+
+    /// Air, and a neighbour whose model is missing, leave the face alone.
+    #[test]
+    fn a_neighbour_with_no_model_draws_the_face() {
+        let manager = registry(&[(0, FULL_CUBE)], &[(0, stone())]);
+
+        assert!(!face_is_hidden(&manager, state(0), ChunkBlockState::Air, Direction::Up));
+        assert!(
+            !face_is_hidden(&manager, state(0), state(7), Direction::Up),
+            "block 7 has no model, so there is no geometry to cull against"
+        );
     }
 }

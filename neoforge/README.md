@@ -572,6 +572,8 @@ first, then **Debug** - separated from the backend and vsync by a blank row:
 | Binding resolution log | Debug | off | next frame |
 | GPU timestamps | Debug | off | next frame |
 | PIX capture | Debug | off | next frame - see "The GPU's own clock, and a PIX capture" |
+| Terrain without back-face culling | Debug | off | next frame, and it rebuilds the graph's pipelines |
+| Terrain with the depth test reversed | Debug | off | the same - it is the other half of that pair |
 
 **Logging and Diagnostics are two switches, not one.** They were one, which meant a run that wanted a
 frame written to disk also got a line per pipeline, a line per pass and a line a second of counters -
@@ -634,12 +636,21 @@ makes a wgpu error name the call that caused it.
 
 Each of them is also still a marker file (`wgpu-dump-frames`, `wgpu-logging`,
 `wgpu-no-bind-group-cache`, `wgpu-no-dynamic-offsets`, `wgpu-trace-dynamic-offsets`,
-`wgpu-dump-shaders`, `wgpu-binding-log`), and a marker wins where the two disagree - including the
-two that are spelled as the *off* switch, where the file turns the feature off regardless of the
-setting. The schema says which settings belong to which heading (`"section": "Optimization"` or
-`"Debug"`), so the options screen draws both headings without knowing what any of them do, and the
-Rust side resolves them into atomics when the settings are loaded or applied: the draw path reads a
-flag, never a config file or a lock.
+`wgpu-dump-shaders`, `wgpu-binding-log`, `wgpu-terrain-no-cull`, `wgpu-terrain-greater-depth`), and a
+marker wins where the two disagree - including the two that are spelled as the *off* switch, where the
+file turns the feature off regardless of the setting. The schema says which settings belong to which
+heading (`"section": "Optimization"` or `"Debug"`), so the options screen draws both headings without
+knowing what any of them do, and the Rust side resolves them into atomics when the settings are loaded
+or applied: the draw path reads a flag, never a config file or a lock.
+
+The last two are the exception that proves the rule, because a draw path is not where they are read.
+A cull mode and a depth compare are built *into* a pipeline, so `apply` hands them to the crate that
+creates the pipelines (`set_pipeline_diagnostics`, in `wgpu-mc`'s graph) and that call reports whether
+either of them moved - and if it did, the graph is built again at the end of the frame that follows,
+from `present_surface`. That is the one point a frame is known to be finished with the graph: rebuilt
+between two of a frame's passes, half of that frame would be drawn one way and half the other. Both
+apply to every pipeline the graph builds rather than to the terrain one alone, because that is where
+the markers were read when they were files - the names are the bug they were written for.
 
 That is what made the gating worth doing at all. Three of these were *unconditional* work on the hot
 path before:
@@ -2223,7 +2234,90 @@ under the world's horizon height, which this does not touch.
 each transition, so a run says which body is being skipped rather than leaving it to a screenshot. It
 alternates sun, moon, sun over a day, which is the whole of the test.
 
+### A face is hidden by the neighbour's state, not by the neighbour's model
+
+The Rust baker leaves a face out of a section's mesh when the block next to it makes it invisible, and
+for a long time it asked the wrong thing: the neighbour's *model*, "does it have a full-size quad on
+the side facing us". Full cubes pass that test whether or not they occlude anything, and glass, ice,
+leaves, stained glass and every plant are full cubes that occlude **nothing** (`noOcclusion()`, or
+`noCollision()` for a plant, both of which set `canOcclude = false`). So the stone placed against a
+glass block lost the face it shared with it, and the world showed its insides wherever one of them
+touched anything - visible through the block itself, which is exactly where a player looks.
+
+The test is now the one vanilla makes, as far as two per-state bytes can carry it
+(`Block.shouldRenderFace`):
+
+| Bit | Where it comes from | Read as |
+| --- | --- | --- |
+| occlusion | `state.getFaceOcclusionShape(dir) == Shapes.block()` | the neighbour covers that whole face |
+| self-hide | `state.skipRendering(state, dir)` | the neighbour is the *same state* and hides the face between them |
+
+The masks are read from the *state*, and **when** they are read matters. `getFaceOcclusionShape`
+reads a field that `BlockStateBase#initCache` fills in - and the game calls that at the end of
+`Blocks`' class initializer, after every block has been registered. Asking for it from the
+registration mixin, where the state is first seen, is a null dereference in the middle of bootstrap:
+
+```
+java.lang.NullPointerException: Cannot load from object array because "this.occlusionShapesByFace" is null
+    at BlockBehaviour$BlockStateBase.getFaceOcclusionShape(BlockBehaviour.java:554)
+    at Registry.occludes(Registry.java:582)
+    at Blocks.<clinit>(Blocks.java:53)
+```
+
+So `RegistryMixin` hands over the state and its name and nothing else, and the masks are read on the
+block cache thread - seconds later, as `Wgpu#helperSetBlockStateIndex` sets each state's key, which is
+the one moment both the key and the shapes exist. `BlockFaceFlags.describe` sends them under that key;
+the Rust side ANDs them per key (two states can wear one model) and `chunk::face_is_hidden` reads them.
+The old geometry test stays as an added condition, so a face is only left out where the state *and*
+the model agree: vanilla hides a few partial-occluder faces this draws, and every one of them is a
+face between two blocks, where nothing can see it.
+
+Two details are worth the words. The two `Direction` enums are in **different orders** - Java's is
+`DOWN, UP, NORTH, SOUTH, WEST, EAST`, this crate's is `West, East, Down, Up, North, South` - so a mask
+that arrives from Java is read back through `direction::JAVA_ORDINAL`, and a test pins each face to
+the ordinal Java gave it. Reading it directly is invisible on a full cube (all six bits agree) and
+wrong on exactly the blocks this exists for. And the self-hide mask is a *per-state* answer, so the
+Rust side can only consult it when the neighbour is the same state: a pane's two connection states, or
+two colours of stained glass, get their face drawn where vanilla might hide it - an invisible face
+between two blocks, not a hole.
+
+`BlockModelFace::layer` is filled from the same kind of signal, and it is what decides which pass draws
+a face. Two answers go into it, and the game asks both: what the *model* says (`force_translucent` on a
+26.1 texture entry - 110 vanilla models, `glass.json` among them - and the older `render_type`), and
+what the *sprite* says, which is where ice, leaves and every plant are decided because none of their
+models declares anything at all. The sprite answer is the one the game computes from pixels
+(`SpriteContents#computeTransparency`): a texel that is half there makes the face translucent, a texel
+that is not there makes it cutout, and the whole sprite is read once as it is allocated
+(`Atlas::sprite_layer`).
+
+Which of those layers this renderer draws is decided by the pass it stands in for, and that pass is
+bigger than its name suggests. 26.1 opens **one** render pass per section-layer *group*, and the
+`OPAQUE` group is `[SOLID, CUTOUT]`: `ChunkSectionsToRender#renderGroup` calls `setPipeline` for the
+solid layer, draws every section's solid geometry, and then calls `setPipeline` again for the cutout
+layer and draws that - all inside the same pass. The takeover fires on the first of those pipelines and
+takes the whole pass with it, so the graph draws **both** layers out of the arena; drawing only solid
+was a frame with no leaves, plants or grass overlay in it at all, because Minecraft's cutout draws were
+further down the pass that no longer existed. The `TRANSLUCENT` layer is a group of its own, in a pass
+of its own, into a render target of its own, so it stays Minecraft's: ice, glass and water are drawn
+there, against the depth the graph's pass filled.
+
+It is **per face** rather than per model because a model is not one thing: a grass block is an opaque
+cube with a cutout overlay on its sides, and a model-wide answer could not put the cube in one layer
+and the overlay in the other. The sprite table is per sprite rather than per face's UV rectangle - the
+game's own test is `computeTransparency(u0, v0, u1, v1)` over the rectangle a face samples - so a face
+that only samples the opaque part of a partly-cutout sprite is put in the cutout layer too, which is
+the same pass either way. What it costs is this renderer drawing less of the world into the layer it
+owns, which is the trade to make towards a picture that is right.
+
 ### Known gaps
+
+- **A sprite is classified as a whole, not per face.** The layer table `Atlas::sprite_layer` fills in
+  is one answer per sprite, while the game asks `SpriteContents#computeTransparency(u0, v0, u1, v1)`
+  over the rectangle each face samples. For the blocks this was written for - ice, leaves, glass, a
+  plant - the whole sprite is one kind of thing throughout and the two agree; for a sprite that is
+  part opaque and part cutout, a face that only samples the opaque part is put in the cutout layer as
+  well. That is the safe direction (Minecraft's own pass draws it, correctly), and closing it needs
+  the face's UV rectangle handed down to the atlas rather than the sprite's name.
 
 - **The Fabric module's C header is a snapshot from before the 26.1 work.** `fabric/src/main/wgpu-mc.h`
   is what the Fabric backend's `jextract` bindings are generated from, and it is not

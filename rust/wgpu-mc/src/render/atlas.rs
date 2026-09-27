@@ -11,6 +11,7 @@ use minecraft_assets::schemas;
 use parking_lot::RwLock;
 use wgpu::Extent3d;
 
+use crate::mc::chunk::RenderLayer;
 use crate::mc::resource::{ResourcePath, ResourceProvider};
 use crate::texture::{TextureAndView, UV};
 use crate::{Gpu, WmRenderer};
@@ -75,6 +76,12 @@ pub struct Atlas {
     /// Not every [Atlas] is used for block textures, but the ones that are store the information for each animated texture here
     pub animated_textures: RwLock<Vec<schemas::texture::TextureAnimation>>,
     pub animated_texture_offsets: RwLock<HashMap<ResourcePath, u32>>,
+    /// The layer each sprite's own pixels put it in, filled as it is allocated.
+    ///
+    /// Minecraft decides a face's render layer from the sprite it samples - `force_translucent` on the
+    /// model is the other half, and the only one that can be read from JSON - so this is the table the
+    /// block model baker asks when it fills in a face's layer. See [`Atlas::sprite_layer`].
+    pub sprite_layers: RwLock<HashMap<ResourcePath, RenderLayer>>,
     size: u32,
 }
 
@@ -110,8 +117,23 @@ impl Atlas {
             texture: Arc::new(tv),
             animated_textures: RwLock::new(Vec::new()),
             animated_texture_offsets: Default::default(),
+            sprite_layers: Default::default(),
             size: ATLAS_DIMENSIONS,
         }
+    }
+
+    /// The layer a sprite's own pixels put it in, or `None` for a sprite this atlas does not hold.
+    ///
+    /// The game asks the sprite the same question, one face at a time - `Material.Baked#sprite`
+    /// through `SpriteContents#computeTransparency(u0, v0, u1, v1)` over the face's own UV rectangle,
+    /// and `force_translucent` on the model overrules it. What is stored here is the answer for the
+    /// *whole* sprite, which is the same answer for every face of a sprite that is one kind of thing
+    /// throughout - ice, leaves, glass, a plant - and the conservative one for a sprite that is not:
+    /// a face that only samples the opaque part of a partly-cutout sprite is put in the cutout layer
+    /// too, where Minecraft's own pass draws it correctly. What that costs is this renderer drawing
+    /// less of the world, which is the trade to make towards a picture that is right.
+    pub fn sprite_layer(&self, path: &ResourcePath) -> Option<RenderLayer> {
+        self.sprite_layers.read().get(path).copied()
     }
 
     /// Add multiple textures to the atlas. This automatically handles .mcmeta files when dealing with block textures
@@ -127,6 +149,7 @@ impl Atlas {
         let mut map = self.uv_map.write();
 
         let mut animated_textures = self.animated_textures.write();
+        let mut sprite_layers = self.sprite_layers.write();
         // let mut animated_texture_offsets = self.animated_texture_offsets.write();
 
         images.into_iter().for_each(|(name, slice)| {
@@ -135,6 +158,7 @@ impl Atlas {
                 &mut map,
                 &mut allocator,
                 &mut animated_textures,
+                &mut sprite_layers,
                 name,
                 slice.as_ref(),
                 resource_provider,
@@ -149,6 +173,7 @@ impl Atlas {
         map: &mut HashMap<ResourcePath, UV>,
         allocator: &mut AtlasAllocator,
         animated_textures: &mut Vec<schemas::texture::TextureAnimation>,
+        sprite_layers: &mut HashMap<ResourcePath, RenderLayer>,
         path: &ResourcePath,
         image_bytes: &[u8],
         resource_provider: &dyn ResourceProvider,
@@ -210,6 +235,10 @@ impl Atlas {
                 ),
             ),
         );
+
+        // What this sprite's own pixels say about the faces that sample it, read here because this is
+        // where the decoded image is: the atlas keeps the composed one, not the sprites.
+        sprite_layers.insert(path.clone(), layer_of_pixels(&image));
     }
 
     /// Upload the atlas texture to the GPU. If the Atlas has to resize the texture on the GPU, then the bindable_texture that this struct provides may
@@ -262,7 +291,72 @@ impl Atlas {
         self.allocator.write().clear();
         self.animated_texture_offsets.write().clear();
         self.animated_textures.write().clear();
+        self.sprite_layers.write().clear();
         *self.image.write() = ImageBuffer::new(self.size, self.size);
+    }
+}
+
+/// The layer a sprite's pixels put it in: opaque, cutout or translucent.
+///
+/// Read the same way round as the game's own answer: a texel that is *half* there makes the sprite
+/// translucent (it blends, so it has to be drawn after everything opaque), a texel that is not there
+/// at all makes it cutout (it is drawn with the alpha test), and a sprite of fully opaque texels is
+/// solid. Partial alpha wins over a hole because the hole can be tested and the blend cannot be
+/// avoided: a sprite with both is a sprite that blends, and the transparent parts of a blended sprite
+/// are transparent for free.
+fn layer_of_pixels(image: &image::DynamicImage) -> RenderLayer {
+    use image::GenericImageView;
+
+    let mut layer = RenderLayer::Solid;
+
+    for (_x, _y, pixel) in image.pixels() {
+        match pixel.0[3] {
+            0 => layer = layer.stronger(RenderLayer::Cutout),
+            alpha if alpha < 255 => return RenderLayer::Transparent,
+            _ => {}
+        }
+    }
+
+    layer
+}
+
+#[cfg(test)]
+mod sprite_layer_tests {
+    use super::*;
+    use image::{DynamicImage, ImageBuffer};
+
+    /// A sprite of the given texels, in row order.
+    fn sprite(width: u32, height: u32, texels: &[[u8; 4]]) -> DynamicImage {
+        DynamicImage::ImageRgba8(ImageBuffer::from_fn(width, height, |x, y| {
+            Rgba(texels[(y * width + x) as usize])
+        }))
+    }
+
+    /// Every texel opaque is the solid layer, which is what most of a world is made of.
+    #[test]
+    fn an_opaque_sprite_is_solid() {
+        let opaque = sprite(2, 1, &[[10, 20, 30, 255], [40, 50, 60, 255]]);
+
+        assert_eq!(layer_of_pixels(&opaque), RenderLayer::Solid);
+    }
+
+    /// A hole makes it cutout - what the terrain pass already draws with its `discard`, and what
+    /// Minecraft's own cutout pass owns once the layer is read from the sprite.
+    #[test]
+    fn a_sprite_with_a_hole_is_cutout() {
+        let leaves = sprite(2, 1, &[[10, 20, 30, 255], [0, 0, 0, 0]]);
+
+        assert_eq!(layer_of_pixels(&leaves), RenderLayer::Cutout);
+    }
+
+    /// A texel that is half there makes it translucent, whatever else is in the sprite: a blended
+    /// sprite cannot be drawn with the alpha test alone, so the layer has to be the one that blends -
+    /// and this is what ice is, which is why it was being drawn twice.
+    #[test]
+    fn a_sprite_that_blends_is_translucent() {
+        let blended = sprite(2, 1, &[[10, 20, 30, 255], [40, 50, 60, 128]]);
+
+        assert_eq!(layer_of_pixels(&blended), RenderLayer::Transparent);
     }
 }
 

@@ -4050,6 +4050,11 @@ pub extern "C" fn present_surface(wm: &WmRenderer, surface_texture: Box<SurfaceT
     surface_texture.present();
     PRESENTS.fetch_add(1, Ordering::Relaxed);
 
+    // The frame that just presented is the frame this side is finished with, which is the one moment
+    // a graph holding pipelines built for a cull mode or a depth test can be replaced without one
+    // frame being drawn half with the old ones. Nothing happens unless a pipeline-state switch moved.
+    crate::debug::rebuild_pipelines_if_stale(wm);
+
     // The `frames in flight` setting, read per present rather than cached: one relaxed lock read a
     // frame, and lowering it has to take effect now - a player would be lowering it because the
     // latency is what they are looking at.
@@ -4506,7 +4511,8 @@ pub extern "C" fn terrain_fluid_quads() -> u32 {
     wgpu_mc::mc::chunk::fluid_totals().1.min(u32::MAX as u64) as u32
 }
 
-/// Whether the graph can draw the terrain pass yet, building it if it cannot.///
+/// Whether the graph can draw the terrain pass yet, building it if it cannot.
+///
 /// The JVM side asks this before it takes a pass away from Minecraft. The graph's terrain pipeline is
 /// built from the block atlas, which a resource reload stitches on a background thread, so for the
 /// first seconds of a session there is nothing to draw with - and a pass taken away then is a frame

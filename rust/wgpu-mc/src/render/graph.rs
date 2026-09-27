@@ -106,8 +106,8 @@ fn report_terrain_pass() {
     }
 
     log::info!(
-        "wgpu-mc: terrain pass: {drawn} section(s) drawn, {culled} culled by the frustum, {empty} \
-         with no solid layer"
+        "wgpu-mc: terrain pass: {drawn} section draw(s) - the solid and cutout layers of one pass - \
+         {culled} culled by the frustum, {empty} with neither layer"
     );
 }
 
@@ -799,57 +799,75 @@ impl RenderGraph {
                         model_translation[2],
                     );
 
-                    for (pos, section) in sections.iter() {
-                        // The section's *own* position: the view matrix carries the camera's translation,
-                        // so a draw is placed by naming where it is, not by naming where it is relative to
-                        // something the draw was told about separately. One transform, one truth - a second
-                        // camera is a second thing that can be out of step with the first.
-                        let rel_pos = *pos;
+                    // The layers this pass draws, in the order the pass it stands in for draws them.
+                    //
+                    // That pass is the game's OPAQUE group, and it is *one* render pass with two
+                    // pipelines inside it - `ChunkSectionsToRender#renderGroup` walks the group's
+                    // layers, calling `setPipeline` for each, and opens nothing in between. A group
+                    // whose first pipeline is the solid layer is therefore taken over whole: drawing
+                    // only the solid layer here dropped every cutout face in the world from the frame,
+                    // and there is no other pass for them - every leaf, plant and grass overlay simply
+                    // disappeared, because Minecraft's own cutout draws would have happened further
+                    // down the pass this one replaced.
+                    //
+                    // The two need no different pipeline state - neither blends, both write depth, and
+                    // the shader discards the texels a cutout texture leaves empty - so what separates
+                    // them here is only which range of the arena is drawn.
+                    for layer_index in [RenderLayer::Solid as usize, RenderLayer::Cutout as usize] {
+                        for (pos, section) in sections.iter() {
+                            // The section's *own* position: the view matrix carries the camera's
+                            // translation, so a draw is placed by naming where it is, not by naming
+                            // where it is relative to something the draw was told about separately.
+                            // One transform, one truth - a second camera is a second thing that can be
+                            // out of step with the first.
+                            let rel_pos = *pos;
 
-                        // The box the section occupies *where the shader draws it*: the section's name
-                        // is absolute in y and section-relative in x and z, and the model matrix then
-                        // translates all three - so a box built from the name alone would be compared
-                        // against a frustum that is measured from the camera, and every section below
-                        // the player would test as if it were above them. That is the ground culled out
-                        // from under the camera, and the sky left in its place.
-                        let a: Vec3<f32> = [
-                            rel_pos.x as f32 * 16.0,
-                            rel_pos.y as f32 * 16.0,
-                            rel_pos.z as f32 * 16.0,
-                        ]
-                        .into();
-                        let a = a + translation;
-                        let b: Vec3<f32> = a + Vec3::new(16.0, 16.0, 16.0);
+                            // The box the section occupies *where the shader draws it*: the section's
+                            // name is absolute in y and section-relative in x and z, and the model
+                            // matrix then translates all three - so a box built from the name alone
+                            // would be compared against a frustum that is measured from the camera,
+                            // and every section below the player would test as if it were above them.
+                            // That is the ground culled out from under the camera, and the sky left in
+                            // its place.
+                            let a: Vec3<f32> = [
+                                rel_pos.x as f32 * 16.0,
+                                rel_pos.y as f32 * 16.0,
+                                rel_pos.z as f32 * 16.0,
+                            ]
+                            .into();
+                            let a = a + translation;
+                            let b: Vec3<f32> = a + Vec3::new(16.0, 16.0, 16.0);
 
-                        let bounds: AABB<f32> = AABB::new(a.into_array(), b.into_array());
+                            let bounds: AABB<f32> = AABB::new(a.into_array(), b.into_array());
 
-                        if !bounds.coherent_test_against_frustum(frustum, 0).0 {
-                            TERRAIN_CULLED.fetch_add(1, Ordering::Relaxed);
-                            continue;
+                            if !bounds.coherent_test_against_frustum(frustum, 0).0 {
+                                TERRAIN_CULLED.fetch_add(1, Ordering::Relaxed);
+                                continue;
+                            }
+
+                            let Some(layer) = &section.layers[layer_index] else {
+                                TERRAIN_EMPTY.fetch_add(1, Ordering::Relaxed);
+                                continue;
+                            };
+
+                            let mut pc: HashMap<String, (Vec<u8>, ShaderStages)> = HashMap::new();
+                            pc.insert(
+                                "@pc_section_position".to_string(),
+                                (
+                                    bytemuck::cast_slice(&rel_pos.to_array()).to_vec(),
+                                    ShaderStages::VERTEX,
+                                ),
+                            );
+                            set_push_constants(pipeline_config, &mut render_pass, Some(pc));
+                            render_pass.draw_indexed(
+                                layer.index_range.clone(),
+                                0,
+                                layer.vertex_range.start..layer.vertex_range.start + 1,
+                            );
+
+                            TERRAIN_DRAWN.fetch_add(1, Ordering::Relaxed);
+                            TERRAIN_DRAWN_TOTAL.fetch_add(1, Ordering::Relaxed);
                         }
-
-                        let Some(layer) = &section.layers[RenderLayer::Solid as usize] else {
-                            TERRAIN_EMPTY.fetch_add(1, Ordering::Relaxed);
-                            continue;
-                        };
-
-                        let mut pc: HashMap<String, (Vec<u8>, ShaderStages)> = HashMap::new();
-                        pc.insert(
-                            "@pc_section_position".to_string(),
-                            (
-                                bytemuck::cast_slice(&rel_pos.to_array()).to_vec(),
-                                ShaderStages::VERTEX,
-                            ),
-                        );
-                        set_push_constants(pipeline_config, &mut render_pass, Some(pc));
-                        render_pass.draw_indexed(
-                            layer.index_range.clone(),
-                            0,
-                            layer.vertex_range.start..layer.vertex_range.start + 1,
-                        );
-
-                        TERRAIN_DRAWN.fetch_add(1, Ordering::Relaxed);
-                        TERRAIN_DRAWN_TOTAL.fetch_add(1, Ordering::Relaxed);
                     }
 
                     report_terrain_pass();

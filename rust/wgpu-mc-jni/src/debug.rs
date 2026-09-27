@@ -14,7 +14,7 @@
 //!
 //! Two of them are not read on the draw path at all. `terrain_no_cull` and `terrain_greater_depth`
 //! are state built into a pipeline when it is created, so they are handed to the crate that creates
-//! them and the graph is built again when either moves - see [`rebuild_pipelines`].
+//! them and the graph is built again when either moves - see [`rebuild_pipelines_if_stale`].
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -69,14 +69,18 @@ static SECTION_TIMING: AtomicBool = AtomicBool::new(false);
 
 /// Whether the graph's pipelines are built with their back faces kept.
 ///
-/// The one debug switch whose effect is not a flag read on the draw path: a cull mode is part of the
-/// pipeline, so the switch is resolved into `wgpu_mc`'s own static and the graph's pipelines are
-/// rebuilt when it moves - see [`rebuild_pipelines_if_stale`].
+/// One of the two debug switches whose effect is not a flag read on the draw path: a cull mode is
+/// part of the pipeline, so the switch is resolved into `wgpu_mc`'s own static and the graph's
+/// pipelines are rebuilt when it moves - see [`rebuild_pipelines_if_stale`].
 static TERRAIN_NO_CULL: AtomicBool = AtomicBool::new(false);
 
 /// Whether the graph's pipelines are built with the depth test the other way round. The other half
 /// of the pair above.
 static TERRAIN_GREATER_DEPTH: AtomicBool = AtomicBool::new(false);
+
+/// Whether a pipeline-state switch has moved since the graph was last built. See
+/// [`rebuild_pipelines_if_stale`], which is what spends it.
+static PIPELINES_STALE: AtomicBool = AtomicBool::new(false);
 
 #[inline]
 pub fn diagnostics() -> bool {
@@ -140,9 +144,8 @@ pub fn gpu_based_validation() -> bool {
 
 /// Whether the graph's pipelines are built without back-face culling.
 ///
-/// Read by the caller that builds them - the pipelines themselves ask `wgpu_mc`, which is where the
-/// answer lives - so this getter exists for the log line and for a future reader who wants to know
-/// what a run was drawn with.
+/// The switch is read where the pipelines are built, in `wgpu_mc`; this is the same answer kept on
+/// this side so that the line about rebuilding them can say what they are being rebuilt *with*.
 #[inline]
 pub fn terrain_no_cull() -> bool {
     TERRAIN_NO_CULL.load(Ordering::Relaxed)
@@ -212,7 +215,9 @@ pub fn apply(settings: &Settings) {
     set(&TERRAIN_GREATER_DEPTH, greater_depth);
 
     if wgpu_mc::render::graph::set_pipeline_diagnostics(no_cull, greater_depth) {
-        rebuild_pipelines();
+        // Not rebuilt here: this runs when the settings are handed over, which is not a point a frame
+        // is known to be between. The frame's own end is - see [`rebuild_pipelines_if_stale`].
+        PIPELINES_STALE.store(true, Ordering::Relaxed);
     }
 
     // The `wgpu-mc` crate writes lines of its own - the per-bake report, for one - and the switch
@@ -223,25 +228,30 @@ pub fn apply(settings: &Settings) {
     crate::pix::set_capturing(pix_capture);
 }
 
-/// Rebuilds the render graph, which is what makes a pipeline-state switch take effect.
+/// Rebuilds the render graph if a pipeline-state switch has moved since it was last built.
 ///
 /// Every other switch here is read *as* the frame is drawn, so setting the flag is the whole of
 /// applying it. These two are built into a pipeline when it is created, so the ones already in the
 /// graph keep the answer they were built with until the graph is built again - and a resource reload
 /// is not something a player should have to go and trigger.
 ///
-/// Nothing happens before the renderer exists, and nothing needs to: those pipelines are built from
-/// the flags as they were just set. `apply` runs on the thread that drives the frame - the options
-/// screen hands its settings over from there - so replacing the graph between frames is what a
-/// resource reload already does to it.
-fn rebuild_pipelines() {
-    let Some(renderer) = crate::RENDERER.get() else {
+/// Called once a frame, with the frame behind it - see `present_surface` - because that is the one
+/// point a frame is known to be finished with the graph: a graph replaced between two of a frame's
+/// passes would draw half of that frame one way and half the other. Nothing happens on the frames
+/// where the switches have not moved, which is all of them but the one after an Apply.
+pub fn rebuild_pipelines_if_stale(wm: &wgpu_mc::WmRenderer) {
+    if !PIPELINES_STALE.swap(false, Ordering::Relaxed) {
         return;
-    };
+    }
 
-    log::info!("wgpu-mc: rebuilding the render graph for a pipeline-state switch");
+    log::info!(
+        "wgpu-mc: rebuilding the render graph for a pipeline-state switch (no-cull {}, greater depth \
+         {})",
+        terrain_no_cull(),
+        terrain_greater_depth()
+    );
 
-    crate::application::load_shaders(renderer);
+    crate::application::load_shaders(wm);
 }
 
 fn set(flag: &AtomicBool, value: bool) {

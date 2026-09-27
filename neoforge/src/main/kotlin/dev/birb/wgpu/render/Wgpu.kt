@@ -1,11 +1,13 @@
 package dev.birb.wgpu.render
 
 import dev.birb.wgpu.WgpuMcMod
+import dev.birb.wgpu.chunk.BlockFaceFlags
 import dev.birb.wgpu.entity.EntityState
 import dev.birb.wgpu.palette.RustBlockStateAccessor
 import dev.birb.wgpu.rust.WgpuNative
 import net.minecraft.client.Minecraft
 import net.minecraft.core.BlockPos
+import net.minecraft.world.level.block.state.BlockState
 import org.lwjgl.glfw.GLFW
 import org.lwjgl.glfw.GLFWNativeCocoa
 import org.lwjgl.glfw.GLFWNativeWayland
@@ -141,6 +143,15 @@ object Wgpu {
 	fun helperSetBlockStateIndex(state: Any?, blockstateKey: Int) {
 		if (state is RustBlockStateAccessor) {
 			state.`wgpu_mc$setRustBlockStateIndex`(blockstateKey)
+		}
+
+		// What the state says about the faces around it goes over with its key, and this is the only
+		// moment it can be read: the native side computes the key here, seconds after the game is up,
+		// while the masks need the occlusion shapes that `BlockStateBase#initCache` fills in - and the
+		// game calls that at the end of `Blocks`' class initializer, long after every block was
+		// registered. Reading them at registration is a null dereference during bootstrap.
+		if (state is BlockState) {
+			BlockFaceFlags.describe(blockstateKey, state)
 		}
 	}
 

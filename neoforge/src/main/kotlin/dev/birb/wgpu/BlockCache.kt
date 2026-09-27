@@ -1,5 +1,6 @@
 package dev.birb.wgpu
 
+import dev.birb.wgpu.chunk.BlockFaceFlags
 import dev.birb.wgpu.render.Wgpu
 import dev.birb.wgpu.rust.WgpuNative
 import net.minecraft.client.Minecraft
@@ -89,6 +90,12 @@ object BlockCache {
 	 */
 	private fun cacheAndRebuild() {
 		WgpuNative.cacheBlockStates()
+
+		// What every state says about the faces around it went over during that call - the native side
+		// asks for it as it hands out each state's key, because that is the first moment the shapes can
+		// be read at all (see `BlockFaceFlags`). This is the line that says the masks arrived: without
+		// them the baker draws every face of every block.
+		BlockFaceFlags.report()
 
 		val client = Minecraft.getInstance()
 		WgpuMcMod.LOGGER.info("wgpu: block states cached; asking Minecraft to mesh its sections again so the feed sees them")

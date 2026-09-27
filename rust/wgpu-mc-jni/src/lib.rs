@@ -34,7 +34,7 @@ use wgpu::Extent3d;
 use wgpu_mc::render::graph::{Geometry, RenderGraph, ResourceBacking};
 use wgpu_mc::wgpu::util::DeviceExt;
 
-use wgpu_mc::mc::block::{BlockstateKey, ChunkBlockState};
+use wgpu_mc::mc::block::{BlockstateKey, ChunkBlockState, FaceFlags};
 use wgpu_mc::mc::chunk::{BlockStateProvider, LightLevel, bake_section};
 use wgpu_mc::mc::resource::{ResourcePath, ResourceProvider};
 use wgpu_mc::mc::SkyState;
@@ -132,7 +132,22 @@ static AIR: Lazy<Option<BlockstateKey>> = Lazy::new(|| {
 });
 
 static BLOCKS: Mutex<Vec<String>> = Mutex::new(Vec::new());
-static BLOCK_STATES: Mutex<Vec<(String, String, GlobalRef)>> = Mutex::new(Vec::new());
+
+/// One block state as `RegistryMixin` offers it, before the block registry is built.
+struct BlockStateRegistration {
+    block_name: String,
+    state_key: String,
+    global_ref: GlobalRef,
+}
+
+static BLOCK_STATES: Mutex<Vec<BlockStateRegistration>> = Mutex::new(Vec::new());
+
+/// What each block state says about the faces around it, keyed by the packed state key.
+///
+/// Filled by [`registerBlockStateFaceFlags`] while [`cacheBlockStates`] hands the keys out, and drained
+/// into the block manager at the end of that same call. See `wgpu_mc::mc::block::FaceFlags` for what
+/// the two masks mean and why they come from the JVM rather than from the block's model.
+static BLOCK_STATE_FACE_FLAGS: Mutex<Vec<(u32, FaceFlags)>> = Mutex::new(Vec::new());
 
 /// Set once [`cacheBlockStates`] has built the block manager from the game's resources.
 ///
@@ -433,9 +448,41 @@ pub fn registerBlockState(
     let block_name: String = env.get_string(&block_name).unwrap().into();
     let state_key: String = env.get_string(&state_key).unwrap().into();
 
-    BLOCK_STATES
-        .lock()
-        .push((block_name, state_key, global_ref));
+    BLOCK_STATES.lock().push(BlockStateRegistration {
+        block_name,
+        state_key,
+        global_ref,
+    });
+}
+
+/// What one block state says about the faces around it, keyed by the packed state key it wears.
+///
+/// Sent from `Wgpu#helperSetBlockStateIndex` rather than from the registration mixin, and that is not
+/// an accident of plumbing: the masks are read from the state's occlusion *shapes*, which
+/// `BlockStateBase#initCache` fills in - and the game runs that at the end of `Blocks`' class
+/// initializer, so during block registration every one of them is still null. Asking there is a null
+/// dereference during bootstrap, which is exactly how this crashed the game once.
+///
+/// The keys are the ones [`cacheBlockStates`] is handing out at the same moment, so the two arrive in
+/// step: this is called from inside the Java callback that sets a state's key, and the map is built
+/// after that loop returns.
+#[jni_fn("dev.birb.wgpu.rust.WgpuNative")]
+pub fn registerBlockStateFaceFlags(
+    _env: JNIEnv,
+    _class: JClass,
+    key: jint,
+    occlusion: jint,
+    self_hide: jint,
+) {
+    BLOCK_STATE_FACE_FLAGS.lock().push((
+        key as u32,
+        FaceFlags {
+            // Six bits of six directions, from `Direction.ordinal()`; the high bits are not
+            // directions and are dropped rather than carried into a mask the baker shifts.
+            occlusion: occlusion as u8 & 0b0011_1111,
+            self_hide: self_hide as u8 & 0b0011_1111,
+        },
+    ));
 }
 
 
@@ -804,7 +851,7 @@ pub fn cacheBlockStates(mut env: JNIEnv, _class: JClass) {
 
     let mut states = BLOCK_STATES.lock();
 
-    let block_manager = wm.mc.block_manager.write();
+    let mut block_manager = wm.mc.block_manager.write();
 
     // Nothing was baked, so there is nothing to map and `AIR` would not be in the registry either.
     // Leave `BLOCKS_CACHED` false: the section baker checks it, and a bake against an empty registry
@@ -835,7 +882,13 @@ pub fn cacheBlockStates(mut env: JNIEnv, _class: JClass) {
 
     states
         .iter()
-        .for_each(|(block_name, state_key, global_ref)| {
+        .for_each(|registration| {
+            let BlockStateRegistration {
+                block_name,
+                state_key,
+                global_ref,
+            } = registration;
+
             // A block whose blockstate file is missing or malformed is not in the registry at all,
             // and `get_full(..).unwrap()` here used to take the block cache thread down with it -
             // meaning nothing downstream, including the Rust terrain baker, ever saw a registry.
@@ -925,6 +978,37 @@ pub fn cacheBlockStates(mut env: JNIEnv, _class: JClass) {
         )
         .unwrap();
     });
+
+    // Every state's key has now been handed over - and that is also where the JVM reads what each
+    // state says about the faces around it, because it is the first moment those shapes exist (see
+    // `registerBlockStateFaceFlags`, and the crash that taught us).
+    //
+    // They arrive keyed by the key just handed out. A key can be worn by more than one state (a
+    // property the blockstate file does not vary its model on, `waterlogged` for one), and the masks
+    // are ANDed in that case: a bit survives only where every state wearing this key agrees, because
+    // what it decides is whether a face is left out of the mesh - and a disagreement that way costs
+    // an invisible face between two blocks rather than a hole in the world.
+    let mut face_flags: HashMap<u32, FaceFlags> = HashMap::new();
+
+    for (key, flags) in BLOCK_STATE_FACE_FLAGS.lock().drain(..) {
+        face_flags
+            .entry(key)
+            .and_modify(|known: &mut FaceFlags| *known = known.and(flags))
+            .or_insert(flags);
+    }
+
+    // How many keys came back with masks. A registry with none of them draws every face of every
+    // block, which is more geometry than the game meshes and no hole in it - the failure a missing
+    // mask would otherwise hide.
+    writeln!(
+        // Spelled out rather than through the `stdout` name, which the lock above still holds.
+        std::io::stdout().lock(),
+        "wgpu-mc: {} block state key(s) carry face flags (occlusion and self-hiding)",
+        face_flags.len()
+    )
+    .unwrap();
+
+    block_manager.face_flags = face_flags;
 
     let instant = Instant::now();
 

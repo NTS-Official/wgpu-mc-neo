@@ -17,19 +17,22 @@ import java.lang.foreign.MemorySegment
  * it is drawn with.
  *
  * The graph pass draws the sections the Rust baker meshed (see [RustChunkBake]), and it draws them
- * *instead of* Minecraft's own solid layer rather than beside it: two sets of the same terrain are two
+ * *instead of* Minecraft's own terrain rather than beside it: two sets of the same terrain are two
  * sets of the same triangles, and the pass that draws it has to be the one the rest of the frame shares
  * its depth buffer with - which is why the takeover happens where Minecraft's own pass would have
- * been opened. So the two things this side has to get right are which pass (see [replaces]) and with
- * what camera (see [sendCameraMatrices]).
+ * been opened. So the two things this side has to get right are which pass (see [replaces], and what
+ * that pass turns out to contain) and with what camera (see [sendCameraMatrices]).
  */
 object TerrainPass {
 	/**
 	 * The pipeline whose pass the graph draws instead.
 	 *
-	 * The solid layer only: the baker meshes that layer, and the cutout and translucent layers stay
-	 * Minecraft's - drawn into the depth buffer this pass fills, which is the whole point of drawing it
-	 * in the same pass Minecraft would have.
+	 * This is where the takeover fires, and it takes the *whole* pass with it - which in 26.1 is the
+	 * game's `OPAQUE` section-layer group: `ChunkSectionsToRender#renderGroup` opens one render pass
+	 * and walks the group's layers inside it, calling `setPipeline` first for the solid layer and then
+	 * for the cutout one. So the graph pass draws both of those layers out of the arena, and the
+	 * translucent layer is the one that stays Minecraft's - it is a group of its own, drawn in a pass
+	 * of its own, into a target of its own.
 	 */
 	private const val SOLID_TERRAIN = "minecraft:pipeline/solid_terrain"
 
@@ -40,10 +43,10 @@ object TerrainPass {
 	/**
 	 * Whether the arena has anything to draw.
 	 *
-	 * The solid layer's pass stays Minecraft's until it does: the graph draws the arena's contents, so a
-	 * pass taken over while the arena is empty is a frame with no ground in it - the same trade [ready]
-	 * makes about the pipeline, for the same reason. Asked per frame, because the answer changes as the
-	 * world is meshed; the call is one lock and a length.
+	 * That pass stays Minecraft's until it does: the graph draws the arena's contents, so a pass taken
+	 * over while the arena is empty is a frame with no ground in it - the same trade [ready] makes
+	 * about the pipeline, for the same reason. Asked per frame, because the answer changes as the world
+	 * is meshed; the call is one lock and a length.
 	 */
 	fun hasGeometry(renderer: MemorySegment): Boolean =
 		(WmNative.terrainArenaSections.invokeExact(renderer) as Int) > 0
@@ -67,7 +70,8 @@ object TerrainPass {
 		canDraw = WmNative.terrainPassReady.invokeExact(renderer) as Boolean
 		if (canDraw) {
 			WgpuMcMod.LOGGER.info(
-				"wgpu: the render graph is drawing the solid terrain; Minecraft's own meshes for that layer are skipped"
+				"wgpu: the render graph is drawing the solid and cutout terrain; Minecraft's own " +
+					"meshes for those two layers are skipped"
 			)
 		}
 		return canDraw
@@ -309,7 +313,8 @@ object TerrainPass {
 		val fluidQuads = WmNative.terrainFluidQuads.invokeExact() as Int
 		val refused = WmNative.terrainSectionsRefused.invokeExact() as Int
 
-		"; $sections section(s) drawn, $fluidBlocks fluid block(s) in the bakes, " +
+		"; $sections section draw(s) - the solid and cutout layers of one pass -, " +
+			"$fluidBlocks fluid block(s) in the bakes, " +
 			"$fluidQuads fluid face(s), $refused section(s) refused by the arena, " +
 			"bob (%.2f, %.2f)".format(lastBobX, lastBobY) +
 			", bobView=$lastBobView player=$lastIsPlayer walk=%.2f".format(lastWalk) +

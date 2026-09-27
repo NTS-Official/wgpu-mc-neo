@@ -27,6 +27,13 @@ import java.util.stream.Collectors;
  * `vanillaBlockId(name)` and hands it to that overload, and NeoForge's `DeferredRegister` goes
  * through the same one. The mixin was written against `register(Registry, Identifier, T)`, the
  * overload the 1.21.1 port used - and the descriptor still existed, so it applied, and never ran.
+ *
+ * <p>What it hands over is the state and its name, and that is all it can hand over: the masks the
+ * native baker's face test reads (`BlockFaceFlags`) need the state's occlusion shapes, and those are
+ * built by {@code BlockStateBase#initCache} - which the game calls at the *end* of `Blocks`' class
+ * initializer, after every block is registered. Asking for one here is a null dereference during
+ * bootstrap, which is how this crashed the game once. The masks are read on the block cache thread
+ * instead, as each state's key is set - see {@code Wgpu#helperSetBlockStateIndex}.
  */
 @Mixin(Registry.class)
 public interface RegistryMixin {

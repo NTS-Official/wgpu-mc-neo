@@ -238,6 +238,22 @@ object WgpuNative {
 	@JvmStatic
 	external fun registerBlockState(state: Any, blockId: String, stateKey: String)
 
+	/**
+	 * Offers what one block state says about the faces around it, under the key the registry gave it.
+	 *
+	 * [occlusion] and [selfHide] are six bits each, one per `Direction.ordinal()`:
+	 * `state.getFaceOcclusionShape(dir) == Shapes.block()` and `state.skipRendering(state, dir)`.
+	 * They are what the baker's face test reads - a neighbour's *state*, not its model - so a
+	 * full-cube model that occludes nothing (glass, ice, leaves, every plant) no longer culls the
+	 * faces of the block next to it. See `wgpu_mc::mc::block::FaceFlags`.
+	 *
+	 * Called once per state from `Wgpu#helperSetBlockStateIndex`, *not* from the registration mixin:
+	 * the shapes these are read from are null until `BlockStateBase#initCache`, which the game runs at
+	 * the end of `Blocks`' class initializer. See `BlockFaceFlags`.
+	 */
+	@JvmStatic
+	external fun registerBlockStateFaceFlags(key: Int, occlusion: Int, selfHide: Int)
+
 	@JvmStatic
 	external fun getBackend(): String
 
