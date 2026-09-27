@@ -2925,6 +2925,36 @@ drew before**, which is the correct fallback and also indistinguishable from a f
 off. The line that says the sprites arrived is `wgpu: registered N sprite(s) of the block atlas`, and it is
 the one to look for.
 
+### One texture, one filter: the two atlases have to be sampled the same way
+
+The first session with the registrations working came back with "these are all blurry, there is none of the
+game's crisp pixels left" - about the fire, the lava, the water and every other sprite the game animates,
+which are exactly the faces that had just started drawing from the game's atlas.
+
+They were the only faces in the frame sampled with a **bilinear** filter. A face the game animates is baked
+with the game's coordinates and samples `@sampler_mc_block_atlas`, and every face beside it - the stone
+under the lava, the leaves above the fire - samples this side's own copy through the sampler
+`TextureManager::new` builds, which is `NEAREST` both ways. The game-atlas sampler had been written as "the
+sampler the game itself samples its atlas with" (`LevelRenderer` builds `CLAMP_TO_EDGE, LINEAR, LINEAR` and
+the video settings' anisotropy for the chunk layers), which is a defensible thing to write down and the
+wrong thing to do here:
+
+- **a block texture is sixteen texels across, and the filter that magnifies it decides whether it has pixels
+  at all.** Filling two hundred screen pixels with sixteen texels is either sixteen squares or a smear, and
+  a smear is what "blurry, no crisp pixels" is;
+- a face from one atlas lands next to a face from the other *in the same quad of the same block* - an
+  animated lava surface beside its own still sides - so the two atlases being filtered differently is a
+  seam the eye reads as one of them being out of focus;
+- and the game's choice is not a fact about the *texture*: it is a fact about the game's pipeline, which
+  applies the player's `Texture Filtering` and `Mipmap Levels` settings. This side's terrain does not, and
+  matching one of the two samplers to the game while leaving the other alone is the worst of the three
+  options.
+
+So the game-atlas sampler is now the same sampler as this side's own, field for field, apart from the
+address mode (`ClampToEdge` rather than `Repeat`: a mip level of the game's atlas is written per sprite and
+must not wrap). Both are `NEAREST` within a level, a blend between the two levels a face lands between, and
+the whole chain.
+
 ### The fire animated and nothing else did: 1074 blockstates are baked before the atlas is read
 
 The animated-texture path asks two questions per face - does the game animate this sprite, and where is it

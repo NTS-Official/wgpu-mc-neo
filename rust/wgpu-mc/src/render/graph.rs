@@ -836,11 +836,27 @@ impl RenderGraph {
             ResourceBacking::Sampler(wm.mc.texture_manager.default_sampler.clone()),
         );
 
-        // The game's own block atlas, for the faces whose sprite the game animates, and the sampler
-        // the game itself samples it with: `LevelRenderer` builds `CLAMP_TO_EDGE`, `LINEAR`, `LINEAR`
-        // for the chunk layers, and every sampler this backend makes for the game pins the sample to
-        // mip 0 (see `create_sampler` in the JNI crate) - the game fills its atlas's mip levels by
-        // rendering into them, and an unfilled level samples the neighbouring sprite.
+        // The game's own block atlas, for the faces whose sprite the game animates - fire, lava, the
+        // campfire, a lantern - and the sampler those faces are drawn with.
+        //
+        // **It is deliberately the same sampler as this side's own atlas**: nearest within a mip level,
+        // a blend between the two it lands between, both ways, no anisotropy, level 0 to the top of the
+        // chain. Which is *not* what the game samples its own terrain with - `LevelRenderer` builds
+        // `CLAMP_TO_EDGE, LINEAR, LINEAR` plus the video settings' anisotropy - and that difference is
+        // the whole point of writing it down here.
+        //
+        // Two atlases are in play in one frame: a face whose sprite the game animates is baked with the
+        // game's coordinates and samples this one, and every face beside it - grass, stone, the leaves
+        // above the fire - samples this side's copy through `TextureManager`'s `NEAREST`. A bilinear
+        // sampler on one of the two is not a subtle difference at the magnification a block texture is
+        // seen at: a sixteen-texel texture filling two hundred pixels is either sixteen squares or a
+        // smear, and a player who had just been handed this path said exactly that - "these are all
+        // blurry, there is none of the game's crisp pixels left" - about the fire, the lava and every
+        // other sprite the game animates, while the blocks around them were clean.
+        //
+        // The filter that decides that is `mag_filter`, and it is the one thing here that is not the
+        // game's own choice: the renderer's two atlases are the same textures at the same size, so the
+        // picture has to be filtered the same way whichever of them a face was baked for.
         //
         // Always registered, even before the JVM has handed the atlas over: a named resource that is
         // missing is a pipeline the graph *skips* (`create_pipelines`), and losing the whole terrain
@@ -853,17 +869,17 @@ impl RenderGraph {
             ResourceBacking::Sampler(Arc::new(wm.gpu.device.create_sampler(
                 &wgpu::SamplerDescriptor {
                     label: Some("wgpu-mc: the game's block atlas"),
+                    // `ClampToEdge` rather than `Repeat`, and everything else - the two filters, the
+                    // mipmap filter, the level range, the anisotropy - left at its default, which is
+                    // what `TextureManager::new` builds for this side's own atlas. One texture, one
+                    // filter, whichever atlas a face was baked for.
                     address_mode_u: wgpu::AddressMode::ClampToEdge,
                     address_mode_v: wgpu::AddressMode::ClampToEdge,
                     address_mode_w: wgpu::AddressMode::ClampToEdge,
-                    mag_filter: wgpu::FilterMode::Linear,
-                    min_filter: wgpu::FilterMode::Linear,
-                    mipmap_filter: wgpu::MipmapFilterMode::Nearest,
-                    lod_min_clamp: 0.0,
-                    lod_max_clamp: 0.0,
-                    compare: None,
-                    anisotropy_clamp: 1,
-                    border_color: None,
+                    mag_filter: wgpu::FilterMode::Nearest,
+                    min_filter: wgpu::FilterMode::Nearest,
+                    mipmap_filter: wgpu::MipmapFilterMode::Linear,
+                    ..Default::default()
                 },
             ))),
         );
