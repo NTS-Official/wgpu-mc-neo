@@ -491,6 +491,47 @@ object WmNative {
         handle("terrain_pass_ready", FunctionDescriptor.of(ValueLayout.JAVA_BOOLEAN, PTR))
 
     /**
+     * How many sections the section arena holds.
+     *
+     * Asked before the solid layer's pass is taken away from Minecraft, beside [terrainPassReady]: until
+     * the arena has something in it, taking that pass over is a frame with no ground in it rather than a
+     * frame drawn another way. Asked per frame, because the answer changes as the world is meshed.
+     */
+    @JvmField val terrainArenaSections: MethodHandle =
+        handle("terrain_arena_sections", FunctionDescriptor.of(INT, PTR))
+
+    /**
+     * How many sections the render graph's terrain pass has drawn since the renderer started.
+     *
+     * Asked before the terrain layer is dumped: the pass runs from the first frame, when the section
+     * arena is still empty, and a dump taken then is a picture of nothing.
+     */
+    @JvmField val terrainSectionsDrawn: MethodHandle =
+        handle("terrain_sections_drawn", FunctionDescriptor.of(INT))
+
+    /**
+     * How many blocks the fluid mesher has found holding a fluid, over every bake so far.
+     *
+     * Logged beside the terrain pass: zero is a fluid that never reached the baker, and blocks with no
+     * faces is a fluid whose sprite is not in the atlas - the two ways "there is no lava" happens.
+     */
+    @JvmField val terrainFluidBlocks: MethodHandle =
+        handle("terrain_fluid_blocks", FunctionDescriptor.of(INT))
+
+    /** How many fluid faces the mesher has drawn, over every bake so far. See [terrainFluidBlocks]. */
+    @JvmField val terrainFluidQuads: MethodHandle =
+        handle("terrain_fluid_quads", FunctionDescriptor.of(INT))
+
+    /**
+     * How many sections the section arena has refused to hold, over the whole run.
+     *
+     * Anything but zero is ground that was dropped for want of arena space, which is what sections
+     * that come and go look like from the outside.
+     */
+    @JvmField val terrainSectionsRefused: MethodHandle =
+        handle("terrain_sections_refused", FunctionDescriptor.of(INT))
+
+    /**
      * Restricts drawing in [createRenderPass]'s pass to a rectangle of its colour target.
      *
      * Coordinates are OpenGL's - measured from the target's origin row - which is the convention

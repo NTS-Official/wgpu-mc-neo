@@ -4058,6 +4058,13 @@ pub extern "C" fn present_surface(wm: &WmRenderer, surface_texture: Box<SurfaceT
         .as_ref()
         .map_or(2, |settings| settings.frames_in_flight());
 
+    // The arena's range recycling follows the same number: a section's old ranges are parked for that
+    // many frames, because that is the first frame whose submission this present has waited for, and a
+    // range handed out before then can be written while the frame that still draws it is on the GPU.
+    if let Some(scene) = wm.scene() {
+        scene.section_storage.write().set_deferred_depth(limit);
+    }
+
     // What is left once this frame is counted among those in flight - `None` until there are `limit`
     // of them, which is the warm-up of a run and the case where nothing was submitted at all.
     //
@@ -4334,6 +4341,29 @@ pub extern "C" fn render_terrain_pass(
         multiply(&matrices.projection, &matrices.view)
     };
 
+    // The camera's section, read back out of the matrix this frame is drawn with rather than taken from
+    // a value sent beside it: the view matrix is `R * translate(-p)`, so `p = -R^T * t` and the section
+    // follows. It is used for one thing - the arena's trim - and the JVM's own `setCameraSection` is the
+    // same kind of hint, sent when this path is off so that the arena is still trimmed against a camera.
+    // Nothing in the transform reads either of them.
+    if let Some(scene) = wm.scene() {
+        let matrices = crate::renderer::MATRICES.lock();
+        let view = matrices.view;
+
+        *scene.camera_section_pos.write() = derive_camera_section(&view);
+    }
+
+    // The model matrix's translation, which is where the camera is in the space a section's name is
+    // relative to. The culler needs it for the same reason the shader does: without it, a section is
+    // tested where its *name* points rather than where it is drawn.
+    let model_translation = {
+        let matrices = crate::renderer::MATRICES.lock();
+        let model = matrices.terrain_transformation;
+        [model[3][0], model[3][1], model[3][2]]
+    };
+
+    report_terrain_transform(scene, &view_projection, model_translation);
+
     with_shared_encoder(|encoder| {
         graph.render_with_mvp(
             wm,
@@ -4343,10 +4373,93 @@ pub extern "C" fn render_terrain_pass(
             Some(depth),
             [0.0, 0.0, 0.0],
             view_projection,
+            model_translation,
         );
     });
 
     true
+}
+
+/// The section the camera is in, read out of the level's view matrix.
+///
+/// The matrix is `R * translate(-p)` (see the terrain pass's own side): its three-by-three part is the
+/// camera's rotation and its translation column is `R * (-p)`, so the position is `-R^T * t` - one dot
+/// product per axis. Only the arena's trim wants it: what a draw is placed by is the matrix itself, and
+/// a trim hint that is a frame old trims a frame late, which costs nothing at all.
+fn derive_camera_section(view: &[[f32; 4]; 4]) -> glam::IVec2 {
+    let translation = glam::Vec3::new(view[3][0], view[3][1], view[3][2]);
+
+    let axis = |column: usize| {
+        glam::Vec3::new(view[column][0], view[column][1], view[column][2]).dot(translation)
+    };
+
+    let position = glam::Vec3::new(-axis(0), -axis(1), -axis(2));
+
+    glam::ivec2(
+        (position.x / 16.0).floor() as i32,
+        (position.z / 16.0).floor() as i32,
+    )
+}
+
+/// Diagnostics: what the shader is handed, and where it lands.
+///
+/// The terrain pass is a transform in three parts - the section the pass names, the model matrix the
+/// JVM sends, and the view-projection - and a picture that is mirrored, shifted or flat says which of
+/// them is wrong only if their numbers are in the log. So the line names the camera's section, the
+/// first section the arena holds with its model translation, the y scale of the matrix the shader
+/// multiplies by, and the clip position the section's centre comes out at. Once a second, and only
+/// with the section diagnostics on.
+fn report_terrain_transform(
+    scene: &wgpu_mc::mc::Scene,
+    view_projection: &[[f32; 4]; 4],
+    model_translation: [f32; 3],
+) {
+    if !wgpu_mc::mc::chunk::DIAGNOSTIC_LOGGING.load(Ordering::Relaxed) {
+        return;
+    }
+
+    static REPORTED: AtomicU64 = AtomicU64::new(0);
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_secs())
+        .unwrap_or(0);
+
+    if REPORTED.swap(now, Ordering::Relaxed) == now {
+        return;
+    }
+
+    let camera = *scene.camera_section_pos.read();
+    let sections = scene.section_storage.read();
+    let Some((pos, _)) = sections.iter().next() else {
+        return;
+    };
+
+    let rel = glam::ivec3(pos.x - camera.x, pos.y, pos.z - camera.y);
+    let centre = glam::vec3(
+        (rel.x as f32 + 0.5) * 16.0,
+        (rel.y as f32 + 0.5) * 16.0,
+        (rel.z as f32 + 0.5) * 16.0,
+    );
+
+    // The shader's own arithmetic, in the order it does it: the section's centre, the model matrix,
+    // the view (which is the identity here) and the view-projection. The culler is handed the same
+    // translation and builds the same box, which is what keeps "where it is drawn" and "what is
+    // culled" one place.
+    let moved = [
+        centre.x + model_translation[0],
+        centre.y + model_translation[1],
+        centre.z + model_translation[2],
+    ];
+    let clip: [f32; 4] = std::array::from_fn(|row| {
+        (0..4).map(|k| view_projection[k][row] * if k == 3 { 1.0 } else { moved[k] }).sum()
+    });
+
+    log::info!(
+        "wgpu-mc: terrain transform: camera section {camera:?}, first section {pos:?} (relative {rel:?}), \
+         model translation {model_translation:?}, y scale {:+.4}, section centre at {moved:?}, clip {clip:?}",
+        view_projection[1][1],
+    );
 }
 
 /// `a * b` for two column-major 4x4 matrices, which is the order the shader multiplies in.
@@ -4362,8 +4475,38 @@ fn multiply(a: &[[f32; 4]; 4], b: &[[f32; 4]; 4]) -> [[f32; 4]; 4] {
     out
 }
 
-/// Whether the graph can draw the terrain pass yet, building it if it cannot.
+/// How many sections the terrain pass has drawn since the renderer started.
 ///
+/// The JVM side asks before it dumps the terrain layer: the pass runs from the first frame, when the
+/// section arena is still empty, and a dump of the first one is a picture of nothing. This is the
+/// number that says the pass has had a world to draw.
+#[unsafe(no_mangle)]
+pub extern "C" fn terrain_sections_drawn() -> u32 {
+    wgpu_mc::render::graph::terrain_sections_drawn().min(u32::MAX as u64) as u32
+}
+
+/// How many blocks the fluid mesher has seen holding a fluid, over every bake so far.
+///
+/// The JVM side logs this beside the terrain pass. Zero is a fluid that never reached the baker;
+/// blocks with no faces is a fluid whose sprite is not in the atlas. See `chunk::FLUID_BLOCKS`.
+#[unsafe(no_mangle)]
+pub extern "C" fn terrain_fluid_blocks() -> u32 {
+    wgpu_mc::mc::chunk::fluid_totals().0.min(u32::MAX as u64) as u32
+}
+
+/// How many sections the arena has refused to hold, over the whole run. See [terrain_fluid_blocks].
+#[unsafe(no_mangle)]
+pub extern "C" fn terrain_sections_refused() -> u32 {
+    wgpu_mc::mc::chunk::sections_refused().min(u32::MAX as u64) as u32
+}
+
+/// How many fluid faces the mesher has drawn, over every bake so far. See [terrain_fluid_blocks].
+#[unsafe(no_mangle)]
+pub extern "C" fn terrain_fluid_quads() -> u32 {
+    wgpu_mc::mc::chunk::fluid_totals().1.min(u32::MAX as u64) as u32
+}
+
+/// Whether the graph can draw the terrain pass yet, building it if it cannot.///
 /// The JVM side asks this before it takes a pass away from Minecraft. The graph's terrain pipeline is
 /// built from the block atlas, which a resource reload stitches on a background thread, so for the
 /// first seconds of a session there is nothing to draw with - and a pass taken away then is a frame
@@ -4371,6 +4514,18 @@ fn multiply(a: &[[f32; 4]; 4], b: &[[f32; 4]; 4]) -> [[f32; 4]; 4] {
 #[unsafe(no_mangle)]
 pub extern "C" fn terrain_pass_ready(wm: &WmRenderer) -> bool {
     wm.scene().is_some() && ensure_terrain_pipeline(wm)
+}
+
+/// How many sections the arena holds, which is what says whether there is terrain to draw at all.
+///
+/// The JVM side asks this before it takes the solid layer's pass away from Minecraft: the graph draws
+/// the arena's contents, so a pass taken over while the arena is still empty is a frame with no ground
+/// in it - the same trade, and the same answer, as the pipeline check above. It is one lock and a length,
+/// and it is asked per frame because it changes as the world is meshed.
+#[unsafe(no_mangle)]
+pub extern "C" fn terrain_arena_sections(wm: &WmRenderer) -> u32 {
+    wm.scene()
+        .map_or(0, |scene| scene.section_storage.read().len() as u32)
 }
 
 /// Whether the graph has a terrain pipeline, building it if it does not.
@@ -4448,10 +4603,37 @@ pub fn setRenderDistance(_env: JNIEnv, _class: JClass, chunks: jint) {
 
     let chunks = chunks.max(0);
     let previous = scene.section_storage.read().width();
+    let wanted = wgpu_mc::mc::chunk::arena_slots(chunks as u32);
+    let wanted = wanted.min(wgpu_mc::mc::chunk::ARENA_SLOTS);
+
+    // The pool, not just the trim radius: a render distance is what says how many sections there are to
+    // hold, and the arena is one range allocator that cannot be resized under live sections. The first
+    // report is a frame or two after the window opens, long before the world has anything to bake, so
+    // the pool is set then - and a later change is refused by `set_pool` rather than corrupting what is
+    // already drawn, with a line saying so.
+    let sized = {
+        let mut storage = scene.section_storage.write();
+        let sized = storage.set_pool(wanted);
+
+        if sized {
+            info!(
+                "wgpu-mc: the section arena holds {} slot(s) for {chunks} chunk(s) of view",
+                wanted
+            );
+        }
+
+        sized
+    };
 
     scene.section_storage.write().set_width(chunks);
 
-    if previous != chunks {
+    if previous != chunks && !sized {
+        warn!(
+            "wgpu-mc: the render distance is now {chunks} chunk(s), which the arena cannot be resized \
+             for while it holds sections; it keeps the {} slot(s) it was built with",
+            scene.section_storage.read().pool_slots()
+        );
+    } else if previous != chunks {
         info!("wgpu-mc: the section arena now reaches {chunks} chunk(s) from the camera");
     }
 }

@@ -22,6 +22,7 @@ import java.util.OptionalInt
 import java.util.OptionalLong
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.function.Supplier
+import dev.birb.wgpu.render.TerrainPass
 
 /** wgpu requires mapped and staged ranges to be 16-byte aligned. */
 private const val MAPPING_ALIGNMENT = 16
@@ -969,6 +970,17 @@ class WgpuCommandEncoder(@get:JvmName("device") val device: WgpuDevice) : Comman
             WgpuNative.setRenderDistance(renderDistance)
         }
 
+        // While the Rust terrain is drawn, the section belongs to the terrain pass and is sent from
+        // there, immediately before the pass is recorded: sent from here - which is not ordered against
+        // the pass - the pass would offset its draws by the previous frame's section whenever the two
+        // straddle a boundary, and the terrain would jump by sixteen blocks. With that path off, this
+        // frame's bookkeeping is the only thing that keeps the arena trimmed against the camera.
+        if (TerrainPass.isOn()) {
+            return
+        }
+
+        // The live camera, deliberately: this call is the arena's trim, not a transform, and the
+        // transform's own copy of the section is the one `TerrainPass` sends.
         val camera = client.gameRenderer.mainCamera
         val position = camera?.position() ?: client.player?.position() ?: return
 

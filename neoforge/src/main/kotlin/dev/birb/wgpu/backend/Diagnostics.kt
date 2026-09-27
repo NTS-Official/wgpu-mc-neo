@@ -18,13 +18,14 @@ import java.nio.file.Path
  *  - **logging** ([loggingEnabled]) writes the *lines*: each pipeline once, each pass once, the draw
  *    and submission counters once a second, the sprite-animation counter, and the uploads and
  *    uniforms the renderer verifies as it goes. The renderer's `logging` setting, which is the
- *    `Debug` switch on the options screen, or a file named [LOGGING_MARKER] in the run directory.
+ *    `Debug` switch on the options screen. The `wgpu-logging` marker file it also accepted is gone.
  *  - **dumps** ([dumpsEnabled]) writes the *files*: the frames listed in [WgpuSurface.DUMP_FRAMES]
  *    as raw images, every uploaded texture whose label contains [DUMP_TEXTURE_LABEL], and the sprite
- *    atlases as they are composed. The renderer's `diagnostics` setting, or [DUMP_MARKER].
+ *    atlases as they are composed. The renderer's `diagnostics` setting, which is the `Debug` switch
+ *    for the files - the `wgpu-dump-frames` marker file it also accepted is gone.
  *
  * They are separate because they are asked for at different moments and cost different things: a
- * dump is about one specific frame and is usually asked for with [DUMP_NOW] while the game runs,
+ * dump is about one specific frame, and the `dump_frames` setting asks for the next N of them while
  * while the log is read over a whole session - so a session that wants the second should not be
  * flooded by the first. Both answer to `-Dwgpu_mc.diagnostics=true` and to `WGPU_MC_DIAGNOSTICS=1`,
  * which is the "make this run diagnosable" override a launcher can pass.
@@ -34,25 +35,30 @@ import java.nio.file.Path
  */
 object Diagnostics {
 
-    /**
-     * Presence of this file next to the run directory turns the *dumps* on.
-     *
-     * The name is the one this switch has had since it was the only one, so a run started with
-     * `touch wgpu-dump-frames` still behaves as it did.
-     */
-    const val DUMP_MARKER = "wgpu-dump-frames"
 
     /** The renderer setting behind the dumps. */
     const val DUMP_SETTING = "diagnostics"
 
-    /** Presence of this file next to the run directory turns the *log lines* on. */
-    const val LOGGING_MARKER = "wgpu-logging"
 
     /** The renderer setting behind the log lines. */
     const val LOGGING_SETTING = "logging"
 
-    /** Creating this file dumps the next presented frame, then deletes it. */
-    const val DUMP_NOW = "wgpu-dump-now"
+    /**
+     * The renderer setting that asks for frames to be written out: how many, starting with the next.
+     *
+     * It was a `wgpu-dump-now` file - a file name a player had to know, and one frame per ask. The
+     * count is what makes it useful for a flicker: one frame says what the frame looks like, and a
+     * handful in a row says whether what is on screen is there on every frame or on every other one.
+     */
+    const val DUMP_FRAMES_SETTING = "dump_frames"
+
+    /** The count the frames in flight were asked for with, so one ask dumps one handful. */
+    @Volatile
+    private var requestedFrames = -1
+
+    /** How many of the frames asked for are still to be written out. */
+    @Volatile
+    private var remainingFrames = 0
 
     /** Where frame and texture dumps land. */
     const val DIRECTORY = "wgpu-frames"
@@ -82,6 +88,17 @@ object Diagnostics {
      * per-frame: the label is what is keyed on, so one dump per label per run.
      */
     const val DUMP_PASS_PREFIX_2 = "Clouds"
+
+    /**
+     * Passes whose label starts with this are dumped too: the world's opaque layer.
+     *
+     * This is the pass the `@geo_terrain` path takes over - either Minecraft's meshes or the render
+     * graph's, depending on the switch - so one dump per run is what says whether the Rust terrain is
+     * drawn where the rest of the world thinks it is. "Terrain mirrored, missing or see-through" is
+     * three different bugs, and a picture of the layer on its own is what tells them apart without a
+     * screenshot of a window nobody is watching.
+     */
+    const val DUMP_PASS_PREFIX_3 = "Section layers for opaque"
 
     /**
      * Whether the renderer's diagnostic *log lines* are written.
@@ -120,7 +137,6 @@ object Diagnostics {
      * too: the question it answers - which name was a shader looking for - is asked while looking at
      * a log, not while clicking through an options screen.
      */
-    const val BINDING_MARKER = "wgpu-binding-log"
 
     /** The renderer setting behind the binding-resolution log. */
     const val BINDING_SETTING = "binding_verbosity"
@@ -148,13 +164,12 @@ object Diagnostics {
      * "what does one section rebuild cost, and which part of it" is worth being able to ask of a run
      * started without touching the config, and the answer is three averages on the F3 screen.
      */
-    const val SECTION_TIMING_MARKER = "wgpu-section-timing"
 
     /** The renderer setting behind the section-feed timing. */
     const val SECTION_TIMING_SETTING = "section_timing"
 
     /**
-     * Whether the section feed is timed, phase by phase. See [SECTION_TIMING_MARKER].
+     * Whether the section feed is timed, phase by phase: the renderer's `section_timing` setting.
      *
      * Read once per section rebuild, so what it guards is a handful of clock reads; off means the
      * feed does not read the clock at all.
@@ -175,7 +190,6 @@ object Diagnostics {
      * looking at an upload that misbehaved, and the run that misbehaves is rarely one started from
      * the options screen.
      */
-    const val UPLOAD_MARKER = "wgpu-upload-report"
 
     /** The renderer setting behind the upload reports. */
     const val UPLOAD_SETTING = "upload_report"
@@ -251,15 +265,15 @@ object Diagnostics {
 
     /** The upload-report switch: the renderer's setting, or its marker file. */
     private fun resolveUploads(): Boolean =
-        RendererSettings.bool(UPLOAD_SETTING) == true || Files.exists(Path.of(UPLOAD_MARKER))
+        RendererSettings.bool(UPLOAD_SETTING) == true
 
     /** The section-timing switch: the renderer's setting, or its marker file. */
     private fun resolveSectionTiming(): Boolean =
-        RendererSettings.bool(SECTION_TIMING_SETTING) == true || Files.exists(Path.of(SECTION_TIMING_MARKER))
+        RendererSettings.bool(SECTION_TIMING_SETTING) == true
 
     /** The binding-resolution switch: the renderer's setting, or its marker file. */
     private fun resolveBindings(): Boolean =
-        RendererSettings.bool(BINDING_SETTING) == true || Files.exists(Path.of(BINDING_MARKER))
+        RendererSettings.bool(BINDING_SETTING) == true
 
     /** The renderer's own switch, whatever it is called on that side. */
     private fun setting(name: String): Boolean = RendererSettings.bool(name) == true
@@ -279,7 +293,7 @@ object Diagnostics {
             return it != "0" && !it.equals("false", ignoreCase = true)
         }
 
-        return setting(LOGGING_SETTING) || Files.exists(Path.of(LOGGING_MARKER))
+        return setting(LOGGING_SETTING)
     }
 
     /**
@@ -294,16 +308,18 @@ object Diagnostics {
             return it != "0" && !it.equals("false", ignoreCase = true)
         }
 
-        return setting(DUMP_SETTING) || Files.exists(Path.of(DUMP_MARKER))
+        return setting(DUMP_SETTING)
     }
 
     /**
-     * Takes the frame-dump request a marker file represents, if there is one.
+     * Takes the frame-dump request the settings hold, if there is one.
      *
-     * [WgpuSurface] dumps a handful of fixed frame numbers, which is no use for "look at the frame
-     * I am looking at now" - a world is reached after a different number of frames every run, and a
-     * screenshot of the window cannot see a GPU debugger's worth of detail. Creating this file
-     * dumps the next presented frame instead, and deletes the file, so a request is answered once.
+     * [WgpuSurface] dumps a handful of fixed frame numbers, which is no use for "look at the frame I am
+     * looking at now" - a world is reached after a different number of frames every run, and a
+     * screenshot of the window cannot see a GPU debugger's worth of detail. The `dump_frames` setting
+     * asks for the next N frames instead: each call spends one of them, and the setting has to *change*
+     * to ask again - a count that stayed up would otherwise be spent and immediately asked for again,
+     * every frame, for as long as it stayed up.
      */
     @JvmStatic
     fun consumeDumpRequest(): Boolean {
@@ -311,17 +327,19 @@ object Diagnostics {
             return false
         }
 
-        val request = Path.of(DUMP_NOW)
-        if (!Files.exists(request)) {
+        val asked = RendererSettings.int(DUMP_FRAMES_SETTING) ?: 0
+
+        if (asked != requestedFrames) {
+            requestedFrames = asked
+            remainingFrames = asked
+        }
+
+        if (remainingFrames <= 0) {
             return false
         }
 
-        return try {
-            Files.delete(request)
-            true
-        } catch (error: java.io.IOException) {
-            false
-        }
+        remainingFrames--
+        return true
     }
 
     /** Returns a path inside [DIRECTORY] for [name], creating the directory. */
@@ -424,6 +442,7 @@ object Diagnostics {
     private fun dumpPrefixFor(label: String): String? = when {
         label.startsWith(DUMP_PASS_PREFIX) -> DUMP_PASS_PREFIX
         label.startsWith(DUMP_PASS_PREFIX_2) -> DUMP_PASS_PREFIX_2
+        label.startsWith(DUMP_PASS_PREFIX_3) -> DUMP_PASS_PREFIX_3
         else -> null
     }
 
@@ -436,8 +455,40 @@ object Diagnostics {
      */
     @JvmStatic
     fun dumpsPass(label: String): Boolean {
+        // The terrain pass is not like the others: it runs from the first frame, when the section arena
+        // is still empty, so a dump of the first one is a picture of nothing. The dump is taken once the
+        // world has been up for a while instead - which is when the arena holds one, and what the
+        // picture is for.
+        if (label.startsWith(DUMP_PASS_PREFIX_3)) {
+            return dumps && terrainPasses.incrementAndGet() >= TERRAIN_DUMP_AFTER && terrainDrewAWorld() && drawnTerrainLayer.compareAndSet(false, true)
+        }
+
         val prefix = dumpPrefixFor(label) ?: return false
         return !dumpedPasses.contains("$prefix/$label")
+    }
+
+    /** Whether the terrain layer has been dumped this run. See [dumpsPass]. */
+    private val drawnTerrainLayer = java.util.concurrent.atomic.AtomicBoolean()
+
+    /** How many times the terrain pass has closed this run. See [dumpsPass]. */
+    private val terrainPasses = java.util.concurrent.atomic.AtomicInteger()
+
+    /** The soonest pass number the terrain layer may be dumped at: about five seconds in. */
+    private const val TERRAIN_DUMP_AFTER = 600
+
+    /**
+     * Whether the terrain pass has drawn a world yet.
+     *
+     * The pass runs from the first frame and the section arena fills later - five seconds in, once the
+     * native registry exists and the game has meshed its sections again - so the first frames of a run
+     * are a terrain layer with nothing in it.
+     */
+    private fun terrainDrewAWorld(): Boolean {
+        return try {
+            (WmNative.terrainSectionsDrawn.invokeExact() as Int) > 100
+        } catch (error: Throwable) {
+            false
+        }
     }
     /**
      * Whether a texture dump under [name] is still due, so a caller can decide whether it is worth

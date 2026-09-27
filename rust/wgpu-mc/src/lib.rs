@@ -258,11 +258,28 @@ impl WmRenderer {
 
         let mut moved = 0usize;
 
+        // Once per frame, before the frame's own updates: this is the rotation that gives back the
+        // ranges parked a whole `frames in flight` ago, i.e. those whose submission the present has
+        // waited for. Doing it per update would free a range parked earlier in the *same* frame.
+        scene.section_storage.write().free_deferred();
+
         updates.for_each(|(pos, layers)| {
             moved += 1;
 
             let mut storage = scene.section_storage.write();
-            let section = storage.replace(pos, &layers);
+
+            // Allocate, write, publish - in that order. The section is only in the storage once its
+            // bytes are queued, so the frame that draws it draws what was written rather than whatever
+            // the range held before; and the ranges it replaced are only reused a frame from now.
+            //
+            // A full pool leaves the section exactly as it was: its ranges are not given back to the
+            // allocator and it is not replaced, so the world keeps drawing the geometry it has. A
+            // section that cannot be baked is stale ground, which is a wrong picture; replacing it
+            // with nothing is a hole, which is not a picture at all.
+            let Some((section, freed)) = storage.allocate(pos, &layers) else {
+                return;
+            };
+
             for (i, ranges) in section.layers.iter().enumerate() {
                 if let Some(ranges) = ranges {
                     self.gpu.queue.write_buffer(
@@ -277,6 +294,9 @@ impl WmRenderer {
                     );
                 }
             }
+
+            storage.insert(pos, section);
+            storage.defer_free(freed);
         });
 
         // The count of sections that became the arena's contents in this frame: the one number that

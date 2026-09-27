@@ -453,6 +453,16 @@ impl<'a> BlockStateProvider for MinecraftBlockStateProviderWrapper<'a> {
         self.internal.get_light_level(pos)
     }
 
+    /// The fluid a block holds, which is the only thing that says a section has lava or water in it.
+    ///
+    /// Forwarded like the rest, and for a reason worth writing down: the trait's own default answers
+    /// "no fluid" for every block, and this wrapper is the provider the bake actually runs with - so
+    /// without this method the fluid mesher asked a provider that always said no, and lava went
+    /// missing without a single line in any log. It was the counters on the bridge that found it.
+    fn get_fluid(&self, pos: IVec3) -> u8 {
+        self.internal.get_fluid(pos)
+    }
+
     fn is_section_empty(&self, rel_pos: IVec3) -> bool {
         self.internal.is_section_empty(rel_pos)
     }

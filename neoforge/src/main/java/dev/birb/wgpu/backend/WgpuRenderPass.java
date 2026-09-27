@@ -385,11 +385,17 @@ public class WgpuRenderPass implements RenderPassBackend {
         // The Rust terrain path: the pass Minecraft has opened for the solid layer is the one the
         // render graph draws, so this is where it is handed over - the pipeline is what says which pass
         // this is, and it is bound before anything is drawn into it.
+        //
+        // The last two conditions are the same trade twice: a pass taken away from Minecraft before the
+        // graph can draw it, or before the arena holds anything to draw, is a frame with no ground in it
+        // rather than a frame drawn another way. The second one is asked per frame, because the arena
+        // fills as the world is meshed - and it empties again if the camera leaves everything it held.
         if (!graphTerrain
                 && TerrainPass.INSTANCE.isOn()
                 && TerrainPass.INSTANCE.replaces(activePipelineName)
                 && !depthView.equals(MemorySegment.NULL)
-                && TerrainPass.INSTANCE.ready(device.renderer())) {
+                && TerrainPass.INSTANCE.ready(device.renderer())
+                && TerrainPass.INSTANCE.hasGeometry(device.renderer())) {
             takeOverTerrainPass();
         }
     }
@@ -416,9 +422,10 @@ public class WgpuRenderPass implements RenderPassBackend {
         boolean drawn = (boolean) invoke(WmNative.renderTerrainPass, device.renderer(), colorView, depthView);
 
         dev.birb.wgpu.WgpuMcMod.LOGGER.info(
-                "wgpu: {} is drawn by the render graph now{}",
+                "wgpu: {} is drawn by the render graph now{}{}",
                 label,
-                drawn ? "" : "; nothing was drawn, so this frame has no ground in it");
+                drawn ? "" : "; nothing was drawn, so this frame has no ground in it",
+                TerrainPass.INSTANCE.describeFrame());
     }
 
     /** Plans already described by [reportPlanOnce]. */

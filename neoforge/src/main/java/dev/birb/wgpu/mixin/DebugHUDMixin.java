@@ -71,10 +71,10 @@ public class DebugHUDMixin {
         long offers = WgpuMcMod.SECTION_OFFERS.sum();
         if (offers > 0) {
             lines.add("[Neolectrum] section feed per offer: light "
-                    + (WgpuMcMod.TIME_SPENT_SECTION_LIGHT.sum() / offers) + "ns, blocks "
-                    + (WgpuMcMod.TIME_SPENT_SECTION_BLOCKS.sum() / offers) + "ns, call "
-                    + (WgpuMcMod.TIME_SPENT_SECTION_CALL.sum() / offers) + "ns, "
-                    + (WgpuMcMod.SECTION_PAYLOAD_BYTES.sum() / offers) + " B");
+                    + (WgpuMcMod.TIME_SPENT_SECTION_LIGHT.sum() / offers / 1E6) + "ms, blocks "
+                    + (WgpuMcMod.TIME_SPENT_SECTION_BLOCKS.sum() / offers / 1E6) + "ms, call "
+                    + (WgpuMcMod.TIME_SPENT_SECTION_CALL.sum() / offers / 1E6) + "ms, "
+                    + (WgpuMcMod.SECTION_PAYLOAD_BYTES.sum() / offers / 1E3) + " KB");
         }
 
         wgpu_mc$report("left", lines);

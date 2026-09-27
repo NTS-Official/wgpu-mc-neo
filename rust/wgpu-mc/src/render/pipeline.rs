@@ -308,3 +308,72 @@ pub fn create_bind_group_layouts(device: &wgpu::Device) -> HashMap<String, BindG
     .into_iter()
     .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The shader's own decode of one vertex, transliterated from `shaders/terrain.wgsl`.
+    ///
+    /// This is the half of the terrain path that is not checked by either compiler: the baker writes
+    /// sixteen bytes and the shader reads four words out of them, and the two only agree by hand. A
+    /// y that lands in another byte, or a "this coordinate is 16" flag on the wrong axis, is terrain
+    /// that is drawn somewhere it is not - mirrored, stretched, or off the ground entirely - with
+    /// nothing in the log to say which.
+    fn shader_decode(bytes: &[u8; 16]) -> [f32; 3] {
+        let word = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+
+        let v1 = word(0);
+        let v3 = word(8);
+
+        let mut x = (v1 & 0xff) as f32 * 0.0625;
+        let mut y = ((v1 >> 8) & 0xff) as f32 * 0.0625;
+        let mut z = ((v1 >> 16) & 0xff) as f32 * 0.0625;
+
+        // The "one past the section edge" flags, which is how a coordinate of exactly 16 is stored.
+        if (v3 >> 29) & 1 == 1 {
+            x = 16.0;
+        }
+        if (v3 >> 30) & 1 == 1 {
+            y = 16.0;
+        }
+        if (v3 >> 31) == 1 {
+            z = 16.0;
+        }
+
+        [x, y, z]
+    }
+
+    fn vertex_at(position: [f32; 3]) -> Vertex {
+        Vertex {
+            position,
+            uv: [0, 0],
+            normal: [0.0, 1.0, 0.0],
+            color: 0,
+            uv_offset: 0,
+            lightmap_coords: 0,
+            ao: 0,
+        }
+    }
+
+    /// A baked vertex decodes to the position it was baked at, on every axis and at both edges.
+    #[test]
+    fn a_baked_vertex_decodes_to_the_position_it_was_baked_at() {
+        let positions = [
+            [0.0, 0.0, 0.0],
+            [3.0, 7.0, 11.0],
+            [15.0, 15.0, 15.0],
+            [16.0, 16.0, 16.0],
+            [15.0, 1.0, 16.0],
+            [16.0, 0.0, 8.0],
+        ];
+
+        for position in positions {
+            assert_eq!(
+                shader_decode(&vertex_at(position).compressed()),
+                position,
+                "a vertex baked at {position:?} did not come back at that position"
+            );
+        }
+    }
+}

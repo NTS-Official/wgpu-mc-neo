@@ -21,4 +21,14 @@ object RendererSettings {
             ?.getAsJsonPrimitive("value")
             ?.asBoolean
     }.getOrNull()
+
+    /** The value of an int setting, or null when the renderer has no such setting (yet). */
+    @JvmStatic
+    fun int(name: String): Int? = runCatching {
+        JsonParser.parseString(WgpuNative.getSettings())
+            .asJsonObject
+            .getAsJsonObject(name)
+            ?.getAsJsonPrimitive("value")
+            ?.asInt
+    }.getOrNull()
 }

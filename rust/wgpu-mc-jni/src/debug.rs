@@ -11,6 +11,10 @@
 //! draw path - once per draw for `diagnostics`, once per pipeline bind for the rest - and the
 //! settings are behind a lock. [`apply`] is what moves a setting into the atomics: it runs whenever
 //! the settings are loaded or sent, which is startup and every Apply on the options screen.
+//!
+//! Two of them are not read on the draw path at all. `terrain_no_cull` and `terrain_greater_depth`
+//! are state built into a pipeline when it is created, so they are handed to the crate that creates
+//! them and the graph is built again when either moves - see [`rebuild_pipelines`].
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -62,6 +66,17 @@ static GPU_BASED_VALIDATION: AtomicBool = AtomicBool::new(false);
 
 /// Whether the section feed is timed. See [`section_timing`].
 static SECTION_TIMING: AtomicBool = AtomicBool::new(false);
+
+/// Whether the graph's pipelines are built with their back faces kept.
+///
+/// The one debug switch whose effect is not a flag read on the draw path: a cull mode is part of the
+/// pipeline, so the switch is resolved into `wgpu_mc`'s own static and the graph's pipelines are
+/// rebuilt when it moves - see [`rebuild_pipelines_if_stale`].
+static TERRAIN_NO_CULL: AtomicBool = AtomicBool::new(false);
+
+/// Whether the graph's pipelines are built with the depth test the other way round. The other half
+/// of the pair above.
+static TERRAIN_GREATER_DEPTH: AtomicBool = AtomicBool::new(false);
 
 #[inline]
 pub fn diagnostics() -> bool {
@@ -123,6 +138,22 @@ pub fn gpu_based_validation() -> bool {
     GPU_BASED_VALIDATION.load(Ordering::Relaxed)
 }
 
+/// Whether the graph's pipelines are built without back-face culling.
+///
+/// Read by the caller that builds them - the pipelines themselves ask `wgpu_mc`, which is where the
+/// answer lives - so this getter exists for the log line and for a future reader who wants to know
+/// what a run was drawn with.
+#[inline]
+pub fn terrain_no_cull() -> bool {
+    TERRAIN_NO_CULL.load(Ordering::Relaxed)
+}
+
+/// Whether the graph's pipelines are built with the depth test the other way round.
+#[inline]
+pub fn terrain_greater_depth() -> bool {
+    TERRAIN_GREATER_DEPTH.load(Ordering::Relaxed)
+}
+
 /// Resolves every flag from the settings and the marker files.
 pub fn apply(settings: &Settings) {
     let DebugSettings {
@@ -137,6 +168,8 @@ pub fn apply(settings: &Settings) {
         pix_capture,
         section_timing,
         logging,
+        terrain_no_cull,
+        terrain_greater_depth,
     } = settings.debug();
 
     set(&LOGGING, logging || marker("wgpu-logging"));
@@ -168,12 +201,47 @@ pub fn apply(settings: &Settings) {
     set(&PIX_CAPTURE, pix_capture);
     set(&SECTION_TIMING, section_timing || marker("wgpu-section-timing"));
 
+    // The two pipeline-state switches are the odd ones out: they are not flags the draw path reads
+    // but state built into every pipeline, which is why they are handed to the crate that builds
+    // them instead of being kept here. It answers whether either of them moved, and that is the one
+    // thing a change to them invalidates - the pipelines already in the graph carry the old answer.
+    let no_cull = terrain_no_cull || marker("wgpu-terrain-no-cull");
+    let greater_depth = terrain_greater_depth || marker("wgpu-terrain-greater-depth");
+
+    set(&TERRAIN_NO_CULL, no_cull);
+    set(&TERRAIN_GREATER_DEPTH, greater_depth);
+
+    if wgpu_mc::render::graph::set_pipeline_diagnostics(no_cull, greater_depth) {
+        rebuild_pipelines();
+    }
+
     // The `wgpu-mc` crate writes lines of its own - the per-bake report, for one - and the switch
     // that decides whether they are sampled or written is the same one this file just resolved.
     wgpu_mc::mc::chunk::DIAGNOSTIC_LOGGING.store(LOGGING.load(Ordering::Relaxed), Ordering::Relaxed);
 
     crate::timing::set_enabled(gpu_timestamps);
     crate::pix::set_capturing(pix_capture);
+}
+
+/// Rebuilds the render graph, which is what makes a pipeline-state switch take effect.
+///
+/// Every other switch here is read *as* the frame is drawn, so setting the flag is the whole of
+/// applying it. These two are built into a pipeline when it is created, so the ones already in the
+/// graph keep the answer they were built with until the graph is built again - and a resource reload
+/// is not something a player should have to go and trigger.
+///
+/// Nothing happens before the renderer exists, and nothing needs to: those pipelines are built from
+/// the flags as they were just set. `apply` runs on the thread that drives the frame - the options
+/// screen hands its settings over from there - so replacing the graph between frames is what a
+/// resource reload already does to it.
+fn rebuild_pipelines() {
+    let Some(renderer) = crate::RENDERER.get() else {
+        return;
+    };
+
+    log::info!("wgpu-mc: rebuilding the render graph for a pipeline-state switch");
+
+    crate::application::load_shaders(renderer);
 }
 
 fn set(flag: &AtomicBool, value: bool) {
@@ -198,6 +266,8 @@ fn name(flag: &AtomicBool) -> &'static str {
         f if std::ptr::eq(f, &GPU_TIMESTAMPS) => "gpu timestamps",
         f if std::ptr::eq(f, &PIX_CAPTURE) => "pix capture",
         f if std::ptr::eq(f, &SECTION_TIMING) => "section timing",
+        f if std::ptr::eq(f, &TERRAIN_NO_CULL) => "terrain no-cull",
+        f if std::ptr::eq(f, &TERRAIN_GREATER_DEPTH) => "terrain greater depth",
         _ => "gpu based validation",
     }
 }
@@ -213,7 +283,7 @@ fn marker(file_name: &'static str) -> bool {
 
     MARKERS
         .get_or_init(|| {
-            const NAMES: [&str; 8] = [
+            const NAMES: [&str; 10] = [
                 "wgpu-dump-frames",
                 "wgpu-no-bind-group-cache",
                 "wgpu-no-dynamic-offsets",
@@ -222,6 +292,8 @@ fn marker(file_name: &'static str) -> bool {
                 "wgpu-binding-log",
                 "wgpu-logging",
                 "wgpu-section-timing",
+                "wgpu-terrain-no-cull",
+                "wgpu-terrain-greater-depth",
             ];
 
             let mut present = std::collections::HashSet::new();

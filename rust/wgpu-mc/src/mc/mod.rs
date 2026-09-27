@@ -225,9 +225,12 @@ impl Scene {
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::INDIRECT,
             mapped_at_creation: false,
         });
-        let buffer_size = 100000000u64;
+        // Sized for a large render distance up front, and narrowed to the one the game reports before
+        // anything is baked - see `arena_slots`. A buffer that is too large is video memory; one that is
+        // too small is sections that cannot be baked.
+        let buffer_size = crate::mc::chunk::ARENA_SLOTS as u64 * 4;
         Self {
-            section_storage: RwLock::new(SectionStorage::new((buffer_size / 4) as u32)),
+            section_storage: RwLock::new(SectionStorage::new(crate::mc::chunk::ARENA_SLOTS)),
             camera_section_pos: RwLock::new(ivec2(0, 0)),
             trimmed_section_pos: RwLock::new(ivec2(i32::MAX, i32::MAX)),
             chunk_buffer: Arc::new(BindableBuffer::new_deferred(
@@ -436,6 +439,25 @@ impl MinecraftState {
                     .blocks
                     .insert(String::from(block_name.as_ref()), block);
             });
+
+        // The fluids' own textures. Lava and water have no block model to name them, so this is the
+        // only place they can enter the atlas - and the fluid mesher draws them, so without this the
+        // fluids would be baked untextured. Allocated before the upload, which is what puts them in
+        // the texture the pass samples.
+        for name in chunk::FLUID_TEXTURES {
+            let path = ResourcePath(format!("minecraft:block/{name}"));
+
+            if block_atlas.uv_map.read().contains_key(&path) {
+                continue;
+            }
+
+            let Some(bytes) = self.resource_provider.get_bytes(&path) else {
+                log::warn!("wgpu-mc: {path} cannot be read, so that fluid is not drawn");
+                continue;
+            };
+
+            block_atlas.allocate([(&path, &bytes)], &*self.resource_provider);
+        }
 
         block_atlas.upload(wm);
     }

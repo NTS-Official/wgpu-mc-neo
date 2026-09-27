@@ -146,6 +146,19 @@ fn vert(
     var world_pos = pos + section_origin;
 
     vr.pos = mat4_persp * mat4_view * mat4_model * vec4(world_pos, 1.0);
+
+    // The two patches every Minecraft GLSL shader gets appended to its `main` by this backend's
+    // preprocessing (see `preprocessing.rs`), written out here because this shader is not one of them:
+    // `OPENGL_TO_WGPU_MATRIX_AST` and `EMULATE_GL_CLIP_SPACE_AST`.
+    //
+    // Minecraft's projections are OpenGL's, so they expect a clip space whose `y = +1` is the top of
+    // the render target and whose depth runs -1..1, and this backend gives every *its* shaders the
+    // same two fixes rather than converting the matrices. Without them the terrain lands mirrored
+    // about the horizontal plane - the ground in the sky - which is a picture that says what happened
+    // only if you know the patch exists.
+    vr.pos.z = 0.5 * vr.pos.z + 0.5 * vr.pos.w;
+    vr.pos.y = -vr.pos.y;
+
     vr.tex_coords = vec2<f32>(u, v);
     vr.tex_coords2 = vec2(0.0, 0.0);
     vr.world_pos = world_pos;

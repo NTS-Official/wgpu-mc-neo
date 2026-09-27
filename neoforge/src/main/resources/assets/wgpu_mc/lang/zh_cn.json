@@ -19,6 +19,10 @@
   "wgpu_mc.option.frames_in_flight": "等待帧数",
   "wgpu_mc.option.frames_in_flight.tooltip": "CPU 最多可以领先 GPU 处理多少帧。",
   "wgpu_mc.option.vsync": "垂直同步",
+  "wgpu_mc.option.terrain": "Rust 地形",
+  "wgpu_mc.option.dump_frames": "转储帧数",
+  "wgpu_mc.option.dump_frames.tooltip": "把渲染器接下来呈现的 N 帧写成原始文件，放在 wgpu-frames 目录下，0 表示关闭。\n转储针对的是“当前屏幕上那一帧”；而一帧往往说明不了闪烁——连续好几帧才能看出你看到的东西是每帧都有，还是隔帧才有。\n先调到 0 再调回来，就会重新要一批。",
+  "wgpu_mc.option.terrain.tooltip": "用 Rust 烘焙出的网格绘制地形，占用的正是 Minecraft 自己实心层本会使用的那个 pass。\n挖空层、半透明层、实体以及之后绘制的一切仍然由 Minecraft 负责，它们与这个 pass 写入的深度做测试。\n关闭时使用 Minecraft 自己的地形。\n打开时会请求 Minecraft 重建区块网格，所以大约一秒后才看得出变化。",
   "wgpu_mc.option.vsync.tooltip": "把帧率与显示器的刷新率相同步。\n可能可以改善画面撕裂，但会增加输入延迟。\n此选项应用后立即生效，交换链会用另一种呈现模式重新配置。",
   "wgpu_mc.option.gpu_based_validation": "GPU 侧校验",
   "wgpu_mc.option.gpu_based_validation.tooltip": "让驱动自带的校验层检查 GPU 实际被要求做什么，而不只是 WebGPU 被要求记录什么。\n它能发现主机侧校验看不到的错误，例如：资源释放后仍被读取、着色器越过绑定读取、屏障放错位置等等。并通过驱动的调试输出报告。\n它会拖慢性能，属于开发阶段的调试工具，因此默认关闭。WebGPU 实例需要在创建时就带上这个标志，因此切换要等到下次启动才生效。",
@@ -43,5 +47,9 @@
   "wgpu_mc.option.section_timing": "区块喂送计时",
   "wgpu_mc.option.section_timing.tooltip": "分相计时区块喂送路径并给出平均值。\n这条路径跑在 Minecraft 的区块构建线程上：查一次重建周围 27 节的光照、把方块数据从 PalettedContainer 里读出来、再把整份数据一次调用交给 Rust 侧。\n所以这个开关用三个数字回答\"一次区块重建要花多少、花在哪一段\"，而不是靠猜。\n开启期间平均值显示在 F3 界面上，计数按 offer 计，因此没活干的帧不会有数字。\n默认关闭：它是每节每相一次读时钟，关掉时完全没有开销。这是 wgpu-section-timing 标记文件的开关形式。",
   "wgpu_mc.option.upload_report": "上传上报",
+  "wgpu_mc.option.terrain_no_cull": "地形不剔除背面",
+  "wgpu_mc.option.terrain_no_cull.tooltip": "渲染图构建的每条管线都不再剔除背面，于是画面与顶点的绕序完全无关。\n这是给「画面里外翻」准备的诊断开关：两个面都画出来之后，「绕序反了」和「深度测试取错了端点」看起来就不再一样，两者才能被区分开。\n它不是能拿来玩的模式：每个四边形都会有第二份副本，并且用背面的光照着色；半透明四边形上两份副本落在同一个深度，谁留下是不确定的。\n它作用于渲染图构建的每一条管线，而不是只有地形那条——标记文件 wgpu-terrain-no-cull 就是在这里被读的，名字说的是它当初为哪个 bug 而写。\n应用它会重建渲染图的管线，因为剔除模式是管线的一部分，不是某次绘制能改的东西。",
+  "wgpu_mc.option.terrain_greater_depth": "地形反向深度",
+  "wgpu_mc.option.terrain_greater_depth.tooltip": "渲染图构建的每条管线都用相反的深度比较，于是被留下的是*背面*那些面。\n它是上面那个开关的另一半：如果深度值的正反真的反了，画面看起来就是这样，而这正是「正面全部消失」的另一种读法。\n深度写入本身不变，变的是测试——所以看到的是相机能看穿的一切的远侧，天空与 HUD 照常画在它上面。\n这是标记文件 wgpu-terrain-greater-depth 的开关形式，同样作用于渲染图构建的每一条管线。\n应用它会重建渲染图的管线。",
   "wgpu_mc.option.upload_report.tooltip": "报告渲染器缓冲上传做了什么：每次写入常量缓冲的映射写及其携带的头几个整数、这些字节是否真的到达了缓冲（做法是从 GPU 读回来比对，所以这条上报本身要花一次拷贝和一次映射），以及这类写每秒一次的暂存统计。\n怀疑某次上传没落地时开这个开关：\"mapped write to … first 12 ints\" 和 \"the bytes written to … did not arrive\" 这两行能把\"收到了错误的字节\"和\"一个字节都没收到\"区分开。\n默认关闭，并且与上面的\"日志\"开关相互独立，因为它是每次上传一行，而回读是每次上传一次拷贝。这是 wgpu-upload-report 标记文件的开关形式。"
 }

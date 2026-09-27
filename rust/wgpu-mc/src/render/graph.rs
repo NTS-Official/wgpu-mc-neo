@@ -2,7 +2,7 @@ use glam::ivec3;
 use linked_hash_map::LinkedHashMap;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use treeculler::{AABB, BVol, Frustum, Vec3};
 use wgpu::util::{BufferInitDescriptor, DeviceExt};
 
@@ -37,6 +37,50 @@ static TERRAIN_DRAWN: AtomicU64 = AtomicU64::new(0);
 static TERRAIN_CULLED: AtomicU64 = AtomicU64::new(0);
 static TERRAIN_EMPTY: AtomicU64 = AtomicU64::new(0);
 static TERRAIN_REPORTED: AtomicU64 = AtomicU64::new(0);
+
+/// Sections drawn by the terrain pass, in total rather than since the last report.
+///
+/// The counter above is drained by the report; this one is not, because it is what a caller outside
+/// this module asks to decide whether the pass is drawing a world yet - a dump of the terrain layer
+/// taken before the arena holds one is a picture of nothing.
+static TERRAIN_DRAWN_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// How many sections the terrain pass has drawn since the renderer started.
+pub fn terrain_sections_drawn() -> u64 {
+    TERRAIN_DRAWN_TOTAL.load(Ordering::Relaxed)
+}
+
+/// The two pipeline-state diagnostics, which are read when a pipeline is *built*.
+///
+/// They exist to answer one question about a picture that is inside out: whether the faces are wound
+/// the wrong way or the depth test keeps the wrong end of the range. Drawn two-sided, the picture
+/// stops depending on the winding at all, which is what tells the two apart; drawn with the depth
+/// test the other way round, the faces behind are the ones kept, which is what "the depth values are
+/// the wrong way round" would look like. Both are switches on the options screen now, and both were
+/// marker files (`wgpu-terrain-no-cull`, `wgpu-terrain-greater-depth`) first.
+///
+/// They are read by every pipeline the graph builds, not only by the terrain one - which is where
+/// the marker was read. The names are the bug they were written for rather than the scope of the
+/// switch.
+///
+/// Unlike the switches that are consulted per draw, these two are *built into* a pipeline, so a
+/// change leaves the pipelines already in the graph stale: [`set_pipeline_diagnostics`] reports
+/// that, and the caller rebuilds them.
+static TERRAIN_NO_CULL: AtomicBool = AtomicBool::new(false);
+static TERRAIN_GREATER_DEPTH: AtomicBool = AtomicBool::new(false);
+
+/// Sets both pipeline-state diagnostics, and says whether either of them changed.
+///
+/// The answer is what the pipelines are rebuilt on - the ones built with the old answer keep it.
+/// Nothing here rebuilds anything itself: this crate has no renderer to rebuild against, and the
+/// caller that has one is the caller that owns the graph.
+pub fn set_pipeline_diagnostics(no_cull: bool, greater_depth: bool) -> bool {
+    let no_cull_changed = TERRAIN_NO_CULL.swap(no_cull, Ordering::Relaxed) != no_cull;
+    let depth_changed =
+        TERRAIN_GREATER_DEPTH.swap(greater_depth, Ordering::Relaxed) != greater_depth;
+
+    no_cull_changed || depth_changed
+}
 
 /// Reports what the terrain pass drew, once a second and only while the section diagnostics are on.
 ///
@@ -380,7 +424,13 @@ impl RenderGraph {
                             topology: wgpu::PrimitiveTopology::TriangleList,
                             strip_index_format: None,
                             front_face: wgpu::FrontFace::Ccw,
-                            cull_mode: Some(wgpu::Face::Back),
+                            // The two pipeline-state diagnostics, read here because a pipeline's cull
+                            // mode is part of the pipeline - see `TERRAIN_NO_CULL`.
+                            cull_mode: if TERRAIN_NO_CULL.load(Ordering::Relaxed) {
+                                None
+                            } else {
+                                Some(wgpu::Face::Back)
+                            },
                             unclipped_depth: false,
                             polygon_mode: Default::default(),
                             conservative: false,
@@ -389,7 +439,15 @@ impl RenderGraph {
                             wgpu::DepthStencilState {
                                 format: wgpu::TextureFormat::Depth32Float,
                                 depth_write_enabled: Some(true),
-                                depth_compare: Some(wgpu::CompareFunction::Less),
+                                // The other half of that diagnostic - see `TERRAIN_GREATER_DEPTH`. It
+                                // asks the depth test the opposite question, which is what "the faces
+                                // behind are the ones drawn" would mean if the depth values were the
+                                // wrong way round.
+                                depth_compare: Some(if TERRAIN_GREATER_DEPTH.load(Ordering::Relaxed) {
+                                    wgpu::CompareFunction::Greater
+                                } else {
+                                    wgpu::CompareFunction::Less
+                                }),
                                 stencil: wgpu::StencilState::default(),
                                 bias: Default::default(),
                             }
@@ -570,6 +628,12 @@ impl RenderGraph {
     /// handed one from Minecraft's camera once a frame - and the frustum's planes are derived from
     /// that same matrix, so building it here keeps the matrix convention in one place. The matrix is
     /// column-major, which is the order `glam`, `joml` and the uniform buffer all agree on.
+    ///
+    /// `model_translation` is the translation of the model matrix the pass draws with, and it is what
+    /// makes the *culling* agree with the drawing: the frustum's planes are relative to the camera,
+    /// while a section is named by absolute block coordinates, so a box built from the name alone sits
+    /// `camera.y` blocks away from where the shader draws it - above the camera rather than below it,
+    /// which culls the ground under the player and keeps the sky. See [`Self::render`].
     #[allow(clippy::too_many_arguments)]
     pub fn render_with_mvp(
         &self,
@@ -580,8 +644,9 @@ impl RenderGraph {
         depth_override: Option<&wgpu::TextureView>,
         clear_color: [f32; 3],
         view_projection: [[f32; 4]; 4],
+        model_translation: [f32; 3],
     ) {
-        let frustum = Frustum::from_modelview_projection(view_projection);
+        let frustum = Frustum::from_modelview_projection(with_gl_depth_range(view_projection));
         let mut geometry = HashMap::new();
 
         self.render(
@@ -593,9 +658,11 @@ impl RenderGraph {
             clear_color,
             &mut geometry,
             &frustum,
+            model_translation,
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn render(
         &self,
         wm: &WmRenderer,
@@ -606,6 +673,7 @@ impl RenderGraph {
         clear_color: [f32; 3],
         geometry: &mut HashMap<String, Box<dyn Geometry>>,
         frustum: &Frustum<f32>,
+        model_translation: [f32; 3],
     ) {
         let arena = WmArena::new(4096);
 
@@ -725,15 +793,35 @@ impl RenderGraph {
                     );
 
                     let sections = scene.section_storage.write();
-                    let camera_pos = *scene.camera_section_pos.read();
-                    for (pos, section) in sections.iter() {
-                        let rel_pos = ivec3(pos.x - camera_pos.x, pos.y, pos.z - camera_pos.y);
-                        let a: Vec3<f32> =
-                            [rel_pos.x as f32, rel_pos.y as f32, rel_pos.z as f32].into();
-                        let b: Vec3<f32> = a + Vec3::new(1.0, 1.0, 1.0);
+                    let translation = Vec3::new(
+                        model_translation[0],
+                        model_translation[1],
+                        model_translation[2],
+                    );
 
-                        let bounds: AABB<f32> =
-                            AABB::new((a * 16.0).into_array(), (b * 16.0).into_array());
+                    for (pos, section) in sections.iter() {
+                        // The section's *own* position: the view matrix carries the camera's translation,
+                        // so a draw is placed by naming where it is, not by naming where it is relative to
+                        // something the draw was told about separately. One transform, one truth - a second
+                        // camera is a second thing that can be out of step with the first.
+                        let rel_pos = *pos;
+
+                        // The box the section occupies *where the shader draws it*: the section's name
+                        // is absolute in y and section-relative in x and z, and the model matrix then
+                        // translates all three - so a box built from the name alone would be compared
+                        // against a frustum that is measured from the camera, and every section below
+                        // the player would test as if it were above them. That is the ground culled out
+                        // from under the camera, and the sky left in its place.
+                        let a: Vec3<f32> = [
+                            rel_pos.x as f32 * 16.0,
+                            rel_pos.y as f32 * 16.0,
+                            rel_pos.z as f32 * 16.0,
+                        ]
+                        .into();
+                        let a = a + translation;
+                        let b: Vec3<f32> = a + Vec3::new(16.0, 16.0, 16.0);
+
+                        let bounds: AABB<f32> = AABB::new(a.into_array(), b.into_array());
 
                         if !bounds.coherent_test_against_frustum(frustum, 0).0 {
                             TERRAIN_CULLED.fetch_add(1, Ordering::Relaxed);
@@ -761,6 +849,7 @@ impl RenderGraph {
                         );
 
                         TERRAIN_DRAWN.fetch_add(1, Ordering::Relaxed);
+                        TERRAIN_DRAWN_TOTAL.fetch_add(1, Ordering::Relaxed);
                     }
 
                     report_terrain_pass();
@@ -1007,4 +1096,135 @@ pub fn set_push_constants(
             Some((data, stages)) => render_pass.set_immediates(*offset as u32, data),
         }
     });
+}
+
+/// Rewrites a clip-space matrix from wgpu's depth range into the one the culler extracts from.
+///
+/// wgpu's clip space is `0..1` in z, always - that is the WebGPU convention rather than a backend's -
+/// while the Gribb-Hartmann extraction in `treeculler` takes the near plane to be the third row *plus*
+/// the fourth, which is the `-1..1` convention. The planes that come out of the mismatch are not this
+/// frustum's: a world drawn through that answer is a world with ground missing from it, and nothing
+/// about the picture says which of the two ranges went in. Converting the matrix rather than the planes
+/// is one row operation, `z' = 2z - 1`, and keeps the extraction in one place.
+fn with_gl_depth_range(mvp: [[f32; 4]; 4]) -> [[f32; 4]; 4] {
+    let mut converted = mvp;
+
+    // `[column][row]`, so the z *row* of a column-major matrix is the third entry of every column -
+    // which is the one index that is not the first here. Written as `[2][row]` this rewrites a column
+    // instead, and the planes come out of a frustum that has nothing to do with the camera.
+    for column in 0..4 {
+        converted[column][2] = 2.0 * mvp[column][2] - mvp[column][3];
+    }
+
+    converted
+}
+
+#[cfg(test)]
+mod culling_tests {
+    use super::*;
+    use glam::Mat4;
+
+    /// A section in front of the camera is tested where it is drawn, not where its name points.
+    ///
+    /// A section's name is absolute in y and section-relative in x and z, and the model matrix then
+    /// translates all three; the frustum, on the other hand, is measured from the camera. A box built
+    /// from the name alone is therefore `camera.y` blocks away from the geometry it stands for - the
+    /// ground under the player becomes a box in the sky, outside the frustum, and is culled. That is
+    /// terrain missing exactly where the player is looking, with the water and the sky behind it left
+    /// in its place, which reads as "the terrain is not drawn at all".
+    #[test]
+    fn a_section_below_the_camera_is_tested_where_it_is_drawn() {
+        let camera = glam::Vec3::new(0.0, 100.0, 0.0);
+        let _ = camera;
+        let projection = Mat4::perspective_rh(70f32.to_radians(), 16.0 / 9.0, 0.05, 256.0);
+        let frustum =
+            Frustum::from_modelview_projection(with_gl_depth_range(projection.to_cols_array_2d()));
+
+        // The camera is at y 100, so the pass's model matrix translates by -100 in y.
+        let translation = Vec3::new(0.0, -100.0, 0.0);
+        let size = Vec3::new(16.0, 16.0, 16.0);
+
+        // A section at absolute y 80 - one section under the camera - forty blocks in front of it.
+        let drawn_at = Vec3::new(0.0, 80.0, -40.0) + translation;
+        let bounds = AABB::new(drawn_at.into_array(), (drawn_at + size).into_array());
+        assert!(
+            bounds.coherent_test_against_frustum(&frustum, 0).0,
+            "the section in front of the camera was culled where it is drawn"
+        );
+
+        // And the same section built from its name alone, which is where that bug put it: eighty
+        // blocks above the camera, out of the frustum, gone.
+        let named_at = Vec3::new(0.0, 80.0, -40.0);
+        let named = AABB::new(named_at.into_array(), (named_at + size).into_array());
+        assert!(
+            !named.coherent_test_against_frustum(&frustum, 0).0,
+            "a box built from the name alone is in front of the camera, so the translation is not needed"
+        );
+    }
+
+    /// The conversion puts a `0..1` projection into the convention the culler reads, and the culler
+    /// keeps what is in front of the camera and drops what is behind it.
+    ///
+    /// This is the whole of the culler's contract with the terrain pass: Minecraft's camera hands over a
+    /// `joml` `perspective` built with the device's depth range, and every section the arena holds is
+    /// asked about with it. The test is worth its lines because the failure mode is quiet from the
+    /// outside - "0 section(s) drawn, N culled by the frustum" is one line in the log, and the picture
+    /// is a world with holes in it.
+    #[test]
+    fn a_zero_to_one_projection_culls_like_the_gl_one() {
+        // The pass works in camera-section-relative blocks, so these are 16-block boxes with the camera
+        // at the origin looking down -z, which is the space a right-handed projection describes.
+        let around_the_camera = AABB::new([-8.0f32, -8.0, -8.0], [8.0f32, 8.0, 8.0]);
+        let in_front = AABB::new([-8.0f32, -8.0, -40.0], [8.0f32, 8.0, -24.0]);
+        let behind = AABB::new([-8.0f32, -8.0, 24.0], [8.0f32, 8.0, 40.0]);
+
+        // `glam`'s `perspective_rh` is the `0..1` range and `perspective_rh_gl` the `-1..1` one, which
+        // is the pair of conventions Minecraft's `Projection` can produce.
+        let zero_to_one = Mat4::perspective_rh(70f32.to_radians(), 16.0 / 9.0, 0.05, 256.0);
+        let minus_one_to_one = Mat4::perspective_rh_gl(70f32.to_radians(), 16.0 / 9.0, 0.05, 256.0);
+
+        let converted =
+            Frustum::from_modelview_projection(with_gl_depth_range(zero_to_one.to_cols_array_2d()));
+        let already_gl = Frustum::from_modelview_projection(minus_one_to_one.to_cols_array_2d());
+
+        // The two matrices describe the same volume, so the converted frustum is the other one's
+        // planes: this is what says the conversion is the depth range and nothing else.
+        for (index, (from_zero_to_one, gl)) in converted
+            .planes
+            .iter()
+            .zip(already_gl.planes.iter())
+            .enumerate()
+        {
+            let difference = (from_zero_to_one.x - gl.x).abs()
+                + (from_zero_to_one.y - gl.y).abs()
+                + (from_zero_to_one.z - gl.z).abs()
+                + (from_zero_to_one.w - gl.w).abs();
+            // Relative rather than absolute: the far plane's `w` is the far distance itself (256 here),
+            // and the two `glam` constructors reach it through different divisions, so their last bits
+            // differ. A wrong depth range moves a plane by its whole length, which this still catches.
+            let scale = 1.0
+                + gl.x.abs().max(gl.y.abs()).max(gl.z.abs()).max(gl.w.abs());
+            assert!(
+                difference < 1e-3 * scale,
+                "plane {index} differs by {difference}: converted {from_zero_to_one:?}, native {gl:?}"
+            );
+        }
+
+        for (name, frustum) in [("converted 0..1", &converted), ("native -1..1", &already_gl)] {
+            for (label, bounds) in [
+                ("the camera's own section", &around_the_camera),
+                ("a section in front of it", &in_front),
+            ] {
+                assert!(
+                    bounds.coherent_test_against_frustum(frustum, 0).0,
+                    "{label} was culled with a {name} projection"
+                );
+            }
+
+            assert!(
+                !behind.coherent_test_against_frustum(frustum, 0).0,
+                "a section behind the camera was kept with a {name} projection"
+            );
+        }
+    }
 }

@@ -34,7 +34,7 @@ use crate::pia::PackedIntegerArray;
 
 /// The first four bytes of a payload, so a buffer written by a different build is refused rather
 /// than read as if it were this one.
-pub const PAYLOAD_MAGIC: u32 = 0x574D_5331; // "WMS1"
+pub const PAYLOAD_MAGIC: u32 = 0x574D_5332; // "WMS2": the payload carries a fluid byte per palette entry
 
 /// How many sections one call describes: the 3x3x3 around the one being rebuilt.
 pub const SECTIONS: usize = 27;
@@ -53,6 +53,22 @@ pub struct SectionBlocks {
     pub storage: PackedIntegerArray,
     /// `palette[minecraft index]` is the Rust block key.
     pub palette: Box<[u32]>,
+    /// `fluids[minecraft index]`, in the encoding [`fluid_of`] reads. A block state's *fluid* is not
+    /// in its model - lava and water have no model elements at all - so this is the only thing that
+    /// says a section holds a fluid, and it comes over with the palette because it is a property of
+    /// the state rather than of the position.
+    pub fluids: Box<[u8]>,
+}
+
+/// The fluid a palette entry's byte describes: kind, `amount`, falling.
+///
+/// The kind is 0 for "no fluid", 1 water, 2 lava, 3 anything else - a mod's fluid is a fluid this
+/// mesher has no textures for, and it is better left to Minecraft than drawn as a guess. The amount is
+/// MC's `FluidState#getAmount`: 8 for a source, lower for a flowing block, and the height a fluid
+/// surface sits at is `amount / 9` - which is MC's own `getOwnHeight`, so the arithmetic is the same
+/// on both sides.
+pub fn fluid_of(byte: u8) -> (u8, u8, bool) {
+    (byte & 0b11, (byte >> 2) & 0b1111, byte & 0b0100_0000 != 0)
 }
 
 impl SectionBlocks {
@@ -64,6 +80,16 @@ impl SectionBlocks {
             .get(index as usize)
             .copied()
             .map(BlockstateKey::from)
+    }
+
+    /// The fluid at a position **inside this section**, in the encoding [`fluid_of`] reads.
+    ///
+    /// A palette entry the JVM did not describe is "no fluid": an older payload, or a state whose
+    /// fluid could not be asked for, is a section that draws its blocks and no fluid rather than one
+    /// that draws a fluid it made up.
+    pub fn fluid(&self, x: i32, y: i32, z: i32) -> u8 {
+        let index = self.storage.get(x, y, z);
+        self.fluids.get(index as usize).copied().unwrap_or(0)
     }
 }
 
@@ -290,11 +316,18 @@ impl Payload {
             let palette_offset = read_word(record, 11) as usize;
             let longs_len = read_word(record, 12) as usize;
             let longs_offset = read_word(record, 13) as usize;
+            let fluids_offset = read_word(record, 14) as usize;
 
             let palette_bytes = bytes.get(palette_offset..palette_offset.checked_add(palette_len * 4)?)?;
             let palette: Box<[u32]> = (0..palette_len)
                 .map(|i| read_word(palette_bytes, i))
                 .collect();
+
+            // One byte per palette entry, beside the keys rather than inside them: the key is Rust's
+            // (block, variant) pair and has no room for anything else.
+            let fluids: Box<[u8]> = bytes
+                .get(fluids_offset..fluids_offset.checked_add(palette_len)?)?
+                .into();
 
             let long_bytes = bytes.get(longs_offset..longs_offset.checked_add(longs_len * 8)?)?;
             let longs: Box<[i64]> = (0..longs_len).map(|i| read_long(long_bytes, i)).collect();
@@ -311,6 +344,7 @@ impl Payload {
                     size as i32,
                 ),
                 palette,
+                fluids,
             });
 
             payload.present |= 1 << index;
@@ -443,6 +477,13 @@ impl BlockStateProvider for CachedBlockstateProvider {
         LightLevel::from_sky_and_block(sky, block)
     }
 
+    fn get_fluid(&self, pos: IVec3) -> u8 {
+        let Some(blocks) = &self.blocks[Self::slot(pos)] else {
+            return 0;
+        };
+
+        blocks.fluid(pos.x & 15, pos.y & 15, pos.z & 15)
+    }
     fn is_section_empty(&self, rel_pos: IVec3) -> bool {
         if rel_pos.abs().cmpgt(IVec3::ONE).any() {
             return true;
@@ -469,6 +510,7 @@ mod tests {
         mask: i64,
         longs: &'a [i64],
         palette: &'a [u32],
+        fluids: &'a [u8],
     }
 
     fn payload(blocks: &[BlockFixture<'_>], light: &[(usize, Vec<u8>, Vec<u8>)]) -> Vec<u8> {
@@ -511,12 +553,22 @@ mod tests {
             put(&mut bytes, at + 4, block.values_per_long);
             put(&mut bytes, at + 5, block.mask as u32);
             put(&mut bytes, at + 6, (block.mask as u64 >> 32) as u32);
+            // One fluid byte per palette entry, in its own blob beside the keys - the same shape the
+            // JVM writes.
+            let fluids_offset = longs_offset + block.longs.len() * 8;
+            bytes.resize(fluids_offset + block.palette.len(), 0);
+
+            for (j, value) in block.fluids.iter().enumerate() {
+                bytes[fluids_offset + j] = *value;
+            }
+
             put(&mut bytes, at + 10, block.palette.len() as u32);
             put(&mut bytes, at + 11, palette_offset as u32);
             put(&mut bytes, at + 12, block.longs.len() as u32);
             put(&mut bytes, at + 13, longs_offset as u32);
+            put(&mut bytes, at + 14, fluids_offset as u32);
 
-            blob = longs_offset + block.longs.len() * 8;
+            blob = fluids_offset + block.palette.len();
         }
 
         for (i, (index, block, sky)) in light.iter().enumerate() {
@@ -539,7 +591,7 @@ mod tests {
     /// Sixteen four-bit values in one long, with the divide constants zeroed - which is the identity
     /// for the first sixteen positions and so is enough to exercise the decode, the palette
     /// translation and the reader together.
-    fn nibbles<'a>(longs: &'a [i64], palette: &'a [u32]) -> BlockFixture<'a> {
+    fn nibbles<'a>(longs: &'a [i64], palette: &'a [u32], fluids: &'a [u8]) -> BlockFixture<'a> {
         BlockFixture {
             index: 13,
             bits: 4,
@@ -547,6 +599,7 @@ mod tests {
             mask: 0xf,
             longs,
             palette,
+            fluids,
         }
     }
 
@@ -556,7 +609,10 @@ mod tests {
         let longs = [0x10i64]; // the second nibble is 1, so the position (1, 0, 0)
         let palette = [0u32, key];
 
-        let bytes = payload(&[nibbles(&longs, &palette)], &[]);
+        let bytes = payload(
+            &[nibbles(&longs, &palette, &[0, 0b0000_1010])],
+            &[],
+        );
         let parsed = Payload::parse(&bytes).expect("a payload this build writes");
 
         assert_eq!(parsed.present, 1 << 13);
@@ -564,6 +620,11 @@ mod tests {
         let section = parsed.blocks[13].as_ref().expect("the section it carried");
         assert_eq!(section.key(0, 0, 0), Some(BlockstateKey::from(0u32)));
         assert_eq!(section.key(1, 0, 0), Some(BlockstateKey::from(key)));
+
+        // The fluid channel rides on the same palette index as the block key: kind 2 (lava) with
+        // amount 2, which is a flowing block rather than a source.
+        assert_eq!(section.fluid(1, 0, 0), 0b0000_1010);
+        assert_eq!(section.fluid(0, 0, 0), 0, "the entry with no fluid byte carries none");
         assert_eq!(
             section.key(2, 0, 0),
             Some(BlockstateKey::from(0u32)),
@@ -576,7 +637,10 @@ mod tests {
         let longs = [0x50i64]; // the second nibble is 5, past the end of the table
         let palette = [0u32, 1];
 
-        let bytes = payload(&[nibbles(&longs, &palette)], &[]);
+        let bytes = payload(
+            &[nibbles(&longs, &palette, &[0, 0b0000_1010])],
+            &[],
+        );
         let parsed = Payload::parse(&bytes).expect("a payload this build writes");
         let section = parsed.blocks[13].as_ref().expect("the section it carried");
 
@@ -615,7 +679,7 @@ mod tests {
         let mut sky = vec![0u8; LIGHT_BYTES];
         block[0] = 0x3f;
 
-        let bytes = payload(&[nibbles(&longs, &palette)], &[(0, block, sky)]);
+        let bytes = payload(&[nibbles(&longs, &palette, &[])], &[(0, block, sky)]);
         let parsed = Payload::parse(&bytes).expect("a payload this build writes");
 
         assert_eq!(parsed.present, 1 << 13, "the fixture's block record is index 13");
@@ -637,7 +701,7 @@ mod tests {
         let longs = [0i64];
         let palette = [0u32, 1];
 
-        let mut bytes = payload(&[nibbles(&longs, &palette)], &[]);
+        let mut bytes = payload(&[nibbles(&longs, &palette, &[])], &[]);
         bytes.truncate(bytes.len() - 4);
 
         assert!(

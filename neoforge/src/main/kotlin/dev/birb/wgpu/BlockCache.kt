@@ -2,6 +2,7 @@ package dev.birb.wgpu
 
 import dev.birb.wgpu.render.Wgpu
 import dev.birb.wgpu.rust.WgpuNative
+import net.minecraft.client.Minecraft
 import net.neoforged.bus.api.SubscribeEvent
 import net.neoforged.fml.common.EventBusSubscriber
 import net.neoforged.neoforge.client.event.ClientTickEvent
@@ -62,12 +63,39 @@ object BlockCache {
 		if (sinceReload < TICKS_AFTER_RELOAD) return
 		if (!started.compareAndSet(false, true)) return
 
-		val thread = Thread(Runnable(WgpuNative::cacheBlockStates), "wgpu-mc block cache")
+		val thread = Thread(Runnable(::cacheAndRebuild), "wgpu-mc block cache")
 		thread.isDaemon = true
 		thread.contextClassLoader = BlockCache::class.java.classLoader
 		thread.start()
 
 		WgpuMcMod.LOGGER.info("wgpu: caching block states for the native side")
+	}
+
+	/**
+	 * Builds the registry, and then has Minecraft build its meshes again.
+	 *
+	 * The second half is not an optimisation, it is what makes the section feed work at all on a
+	 * launch that goes straight into a world: the cache lands five seconds after the resource reload,
+	 * which is *after* the chunks around the player have been meshed - and the feed drops an offer it
+	 * cannot bake (`RustChunkBake.bake` returns early when the registry is not there yet, because a
+	 * bake with no registry and no "air" would be a copy of nothing). Minecraft only offers a section
+	 * again when something makes it stale, so those first sections were never offered a second time:
+	 * the arena stayed at a handful of sections and the terrain pass drew an empty world, for a whole
+	 * session, with nothing in the log about it.
+	 *
+	 * `allChanged` is what the game itself calls when the whole world has to be meshed again, and this
+	 * is a launch-time cost of a second or two for the chunks that are loaded. It has to run on the
+	 * render thread, which is where the meshes are built.
+	 */
+	private fun cacheAndRebuild() {
+		WgpuNative.cacheBlockStates()
+
+		val client = Minecraft.getInstance()
+		WgpuMcMod.LOGGER.info("wgpu: block states cached; asking Minecraft to mesh its sections again so the feed sees them")
+
+		client.execute {
+			client.levelRenderer.allChanged()
+		}
 	}
 
 	@SubscribeEvent

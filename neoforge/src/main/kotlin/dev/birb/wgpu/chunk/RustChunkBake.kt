@@ -6,6 +6,9 @@ import dev.birb.wgpu.mixin.chunk.RenderSectionRegionAccessor
 import dev.birb.wgpu.mixin.world.PackedIntegerArrayMixin
 import dev.birb.wgpu.mixin.chunk.SectionCopyAccessor
 import dev.birb.wgpu.palette.RustBlockStateAccessor
+import net.minecraft.world.level.material.Fluids
+
+import dev.birb.wgpu.rust.RendererSettings
 import dev.birb.wgpu.rust.WgpuNative
 import net.minecraft.client.Minecraft
 import net.minecraft.client.renderer.chunk.RenderSectionRegion
@@ -59,21 +62,29 @@ import kotlin.math.min
  *    building in the same task and safe off-thread (the live chunk is guarded by a threading
  *    detector). A position the snapshot does not cover is "not loaded", which is air to both sides.
  *
- * Nothing here runs unless the path is switched on - see [MARKER] - because until the render graph
- * draws these sections, a baked section is work nobody reads.
+ * Nothing here runs unless the path is switched on - see [SETTING] - and it is one switch for both
+ * halves: the sections baked here are the ones the render graph's terrain pass draws in place of
+ * Minecraft's own opaque layer, so turning it off is what puts that layer back.
  */
 object RustChunkBake {
 	/**
-	 * The switch: a file named this in the run directory, or `-Dwgpu_mc.geo_terrain=true`.
+	 * The setting the path is switched on by: `terrain`, under the renderer's own settings.
 	 *
-	 * A marker rather than a setting on purpose, for now: the Rust baker is the first half of the
-	 * `@geo_terrain` path, and turning it on currently buys nothing but CPU - the terrain is still
-	 * drawn from Minecraft's own meshes. It becomes a real setting when the graph pass that draws
-	 * these sections exists, because that is when anyone would want it on.
+	 * One switch for the whole `@geo_terrain` path, which is two halves that only make sense together:
+	 * this side meshes the sections, and the render graph's terrain pass draws them *instead of*
+	 * Minecraft's own opaque layer (see `TerrainPass`). Off, both halves are off and the layer is
+	 * Minecraft's again.
+	 *
+	 * It was a marker file (`wgpu-geo-terrain`) while the path was being brought up, which is a file
+	 * name a player has to know and a restart to change. A setting is the right shape for it: the
+	 * options screen reaches it, and flipping it *on* rebuilds the sections, because the graph can only
+	 * draw what the baker has baked.
 	 */
-	const val MARKER = "wgpu-geo-terrain"
+	private const val SETTING = "terrain"
 
-	private const val PROPERTY = "wgpu_mc.geo_terrain"
+	/** How often [isOn] may go and ask the settings for the switch. */
+	private const val SETTING_POLL_NANOS = 1_000_000_000L
+
 	private const val SECTIONS = 27
 	private const val AXIS = 3
 	private const val LIGHT_BYTES = 2048
@@ -94,7 +105,7 @@ object RustChunkBake {
 	private const val BLOBS_AT = HEADER_BYTES + SECTIONS * BLOCK_RECORD_BYTES + SECTIONS * LIGHT_RECORD_BYTES
 
 	/** Must match `PAYLOAD_MAGIC` in `rust/wgpu-mc-jni/src/section.rs`. */
-	private const val MAGIC = 0x574D5331
+	private const val MAGIC = 0x574D5332
 
 	/**
 	 * One buffer per build thread, big enough for the worst case: 27 sections of a 32-bit-per-entry
@@ -105,8 +116,61 @@ object RustChunkBake {
 
 	private val EMPTY_LIGHT = ByteArray(LIGHT_BYTES)
 
+	/** Whether the path is on, as last read from the settings. Read per rebuild and per frame. */
 	@Volatile
-	private var switchedOn: Boolean? = null
+	private var enabled = true
+
+	/** When the switch was last read from the settings, so the read is not per rebuild. */
+	@Volatile
+	private var enabledAt = 0L
+
+	/** Whether the state has been said in the log yet, so the first read always reports it. */
+	@Volatile
+	private var reportedState = false
+
+	/** Whether the Rust terrain baker runs at all. */
+	@JvmStatic
+	fun isOn(): Boolean {
+		val now = System.nanoTime()
+
+		// Once a second, and on the first ask. `isOn` is called for every section Minecraft meshes and
+		// for every frame the terrain pass is taken over for, and reading the setting is a JNI call and
+		// a JSON parse - see `RendererSettings` - so the value is kept and this is what moves it.
+		if (enabledAt == 0L || now - enabledAt >= SETTING_POLL_NANOS) {
+			enabledAt = now
+			refresh()
+		}
+
+		return enabled
+	}
+
+	/**
+	 * Reads the switch back out of the renderer's settings and applies it.
+	 *
+	 * Switching it *on* has to reach the sections that are already meshed: the graph draws the arena's
+	 * contents, and nothing rebuilds a section whose blocks have not changed. Asking the level renderer
+	 * for all of them is the same call the feed makes when the block registry arrives.
+	 */
+	private fun refresh() {
+		val previous = enabled
+		enabled = RendererSettings.bool(SETTING) ?: true
+
+		if (enabled == previous && reportedState) {
+			return
+		}
+
+		reportedState = true
+
+		WgpuMcMod.LOGGER.info(
+			"wgpu: the Rust terrain path is {} (the renderer's `{}` setting)",
+			if (enabled) "on" else "off",
+			SETTING,
+		)
+
+		if (enabled && enabled != previous) {
+			Minecraft.getInstance().execute { Minecraft.getInstance().levelRenderer.allChanged() }
+		}
+	}
 
 	private var bakes = 0L
 	private var reported = 0L
@@ -121,25 +185,6 @@ object RustChunkBake {
 
 	/** What Rust has been told about each section, so the next rebuild can send only what changed. */
 	private val sent = ConcurrentHashMap<Long, Sent>()
-
-	/** Whether the Rust terrain baker runs at all. Resolved once, because this is read per rebuild. */
-	@JvmStatic
-	fun isOn(): Boolean {
-		switchedOn?.let { return it }
-
-		val property = System.getProperty(PROPERTY)?.toBoolean() ?: false
-		val marker = Files.exists(Path.of(MARKER))
-		val on = property || marker
-
-		switchedOn = on
-		if (on) {
-			WgpuMcMod.LOGGER.info(
-				"wgpu: the Rust terrain baker is on ({}); terrain is still drawn from Minecraft's own meshes",
-				if (marker) MARKER else "-D$PROPERTY=true",
-			)
-		}
-		return on
-	}
 
 	/**
 	 * Offers the middle section of [region] to the Rust baker. Called from the head of the compile
@@ -445,21 +490,41 @@ object RustChunkBake {
 			return null
 		}
 
+		// One fluid byte per palette entry, beside the keys: a state's fluid is not in its model,
+		// so this is the only thing that says a section holds lava - and how deep it is there.
+		val fluids = ByteArray(palette.size) { index -> fluidByte(palette.valueFor(index)) }
+
+		sectionsDescribed.incrementAndGet()
+		for (fluid in fluids) {
+			when (fluid.toInt() and 0b11) {
+				1, 2 -> paletteFluids.incrementAndGet()
+				else -> continue
+			}
+
+			if (fluid.toInt() and 0b11 == 2) {
+				paletteLava.incrementAndGet()
+			}
+		}
+
 		val table = IntArray(palette.size) { index ->
-			(palette.valueFor(index) as? RustBlockStateAccessor)?.`wgpu_mc$getRustBlockStateIndex`() ?: 0
+			val state = palette.valueFor(index)
+			val key = (state as? RustBlockStateAccessor)?.`wgpu_mc$getRustBlockStateIndex`() ?: 0
+
+			key
 		}
 
 		// A section of one state has no storage of its own (`ZeroBitStorage`): every position is index
 		// 0, which is the single entry the palette holds. One zero long and a zero mask is what makes
 		// the Rust decode agree with that.
 		if (storage !is SimpleBitStorage) {
-			return Blocks(Table(table), 0, longArrayOf(0L), 0, 0L, 0, 0, 0, 4096)
+			return Blocks(Table(table), fluids, 0, longArrayOf(0L), 0, 0L, 0, 0, 0, 4096)
 		}
 
 		val geometry = storage as PackedIntegerArrayMixin
 
 		return Blocks(
 			Table(table),
+			fluids,
 			storage.bits,
 			storage.raw,
 			geometry.`wgpu_mc$valuesPerLong`(),
@@ -471,6 +536,49 @@ object RustChunkBake {
 		)
 	}
 
+	/**
+	 * The fluid a state carries, packed into one byte: kind in the low two bits, MC's
+	 * `FluidState#getAmount` in the next four.
+	 *
+	 * A fluid is not in its block model - lava and water have no model elements at all - so this is
+	 * the only thing that tells the Rust mesher that a section holds lava, and how deep the fluid is
+	 * at that position: MC's own `getOwnHeight` is `amount / 9`, so the surface height is the same
+	 * arithmetic on both sides. Kinds are 1 water, 2 lava, 3 anything else, which the mesher leaves to
+	 * Minecraft rather than drawing with a texture it does not have.
+	 */
+	private fun fluidByte(state: BlockState?): Byte {
+		if (state == null) return 0
+
+		val fluid = state.fluidState
+		if (fluid.isEmpty) return 0
+
+		val kind = when {
+			fluid.type.`isSame`(Fluids.WATER) -> 1
+			fluid.type.`isSame`(Fluids.LAVA) -> 2
+			else -> 3
+		}
+
+		return (kind or (fluid.amount shl 2)).toByte()
+	}
+
+	/** Sections described for the Rust baker this run, and the fluid bytes that went with them. */
+	private val sectionsDescribed = java.util.concurrent.atomic.AtomicLong()
+
+	private val paletteFluids = java.util.concurrent.atomic.AtomicLong()
+
+	private val paletteLava = java.util.concurrent.atomic.AtomicLong()
+
+	/**
+	 * Diagnostics: what the fluid bytes have said so far, for the line the terrain pass logs.
+	 *
+	 * The Rust mesher counts the fluid blocks it is *handed*, and this counts the fluid the payload
+	 * *carried* - the two numbers together say which side of the bridge a fluid that never appears went
+	 * missing on. Neither is visible from the other side of the bridge, which is why both are printed.
+	 */
+	@JvmStatic
+	val fluidDiagnostics: String
+		get() = "$sectionsDescribed section(s) described carrying $paletteFluids fluid palette " +
+			"entr(ies), $paletteLava of them lava"
 	/**
 	 * The palette translation table: `keys[minecraft index]` is the Rust block key.
 	 *
@@ -491,6 +599,7 @@ object RustChunkBake {
 	/** One section's block storage, exactly as Minecraft holds it. */
 	private class Blocks(
 		val palette: Table,
+		val fluids: ByteArray,
 		val bits: Int,
 		val longs: LongArray,
 		val valuesPerLong: Int,
@@ -609,6 +718,10 @@ object RustChunkBake {
 			put(longsOffset, section.longs)
 			cursor += section.longs.size * 8L
 
+			val fluidsOffset = cursor
+			put(fluidsOffset, section.fluids)
+			cursor += section.fluids.size
+
 			word(at, index)
 			word(at + 4, 1)
 			word(at + 8, section.bits)
@@ -623,6 +736,7 @@ object RustChunkBake {
 			word(at + 44, paletteOffset.toInt())
 			word(at + 48, section.longs.size)
 			word(at + 52, longsOffset.toInt())
+			word(at + 56, fluidsOffset.toInt())
 
 			blocks++
 		}

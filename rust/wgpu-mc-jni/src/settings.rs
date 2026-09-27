@@ -32,6 +32,13 @@ pub struct Settings {
     pub backend: EnumSetting,
     #[serde(default)]
     pub vsync: BoolSetting,
+    /// Whether the terrain is drawn from the Rust baker's meshes rather than from Minecraft's own.
+    ///
+    /// On by default, because the path is what the renderer is being built towards; the switch is here
+    /// so that it can be turned off from inside the game - which is what the `wgpu-geo-terrain` marker
+    /// file used to be, a file name a player had to know and a restart to change.
+    #[serde(default)]
+    pub terrain: BoolSetting,
     /// How many frames the CPU may record ahead of the GPU.
     ///
     /// One is a full stall on every frame; two hides the recording behind the GPU's own work, which
@@ -95,6 +102,29 @@ pub struct Settings {
     /// the logging switch, for the same reason.
     #[serde(default = "off")]
     pub upload_report: BoolSetting,
+    /// How many frames to write out, starting with the next one presented.
+    ///
+    /// Zero is off. A dump is asked for while looking at the frame that misbehaves - the world is
+    /// reached after a different number of frames every run, so "frame 300" is no use - and *one* frame
+    /// rarely settles a flicker: a handful in a row is what says whether the terrain is there on every
+    /// frame or on every other one. This is the `wgpu-dump-now` marker as a setting, with a count
+    /// instead of a file, and turning it down to zero and up again asks for another handful.
+    #[serde(default)]
+    pub dump_frames: IntSetting,
+    /// The two that change the *picture* rather than what is said about it: every pipeline the render
+    /// graph builds is drawn with back faces kept, or with the depth test asking the opposite
+    /// question.
+    ///
+    /// They were written to tell "the winding is wrong" apart from "the depth test keeps the wrong
+    /// end", on a picture that is inside out either way, and they are the `wgpu-terrain-no-cull` and
+    /// `wgpu-terrain-greater-depth` marker files as switches. Both are read when a pipeline is built
+    /// rather than as it draws - see `wgpu_mc::render::graph::set_pipeline_diagnostics` - so applying
+    /// one rebuilds the graph's pipelines, which is the one debug switch here that costs a moment
+    /// rather than nothing.
+    #[serde(default = "off")]
+    pub terrain_no_cull: BoolSetting,
+    #[serde(default = "off")]
+    pub terrain_greater_depth: BoolSetting,
 }
 
 /// The default of a setting that is off unless a player asks for it.
@@ -117,6 +147,7 @@ fn two_frames_in_flight() -> IntSetting {
 pub struct SettingsInfo {
     backend: EnumSettingInfo<GraphicsBackend>,
     vsync: SettingInfo,
+    terrain: SettingInfo,
     frames_in_flight: SettingInfo,
     /// The two switches that change *how* the frame is rendered rather than what is reported about
     /// it. **This order has to match [`Settings`]'s**, because the two halves of a row come from the
@@ -134,6 +165,9 @@ pub struct SettingsInfo {
     pix_capture: SettingInfo,
     section_timing: SettingInfo,
     upload_report: SettingInfo,
+    dump_frames: SettingInfo,
+    terrain_no_cull: SettingInfo,
+    terrain_greater_depth: SettingInfo,
 }
 
 /// The section the options screen puts a setting under, when it is not one of the plain ones.
@@ -166,6 +200,17 @@ lazy_static! {
             // Unlike `backend`, this is not a property of the wgpu instance: it only picks the
             // swapchain's present mode, and a surface can be reconfigured at any time. `sendSettings`
             // does exactly that, which is why this one is applied without a restart.
+            needs_restart: false,
+            section: None,
+        },
+        terrain: SettingInfo {
+            desc: "Draw the terrain from the Rust baker's meshes instead of from Minecraft's own. \
+            The sections are baked natively and drawn by the render graph in the pass Minecraft's own \
+            solid layer would have used, so the depth buffer, the cutout and translucent layers and \
+            everything drawn after them stay Minecraft's. Switching it on asks the level renderer to \
+            rebuild its sections, because the graph can only draw what the baker has baked; switching \
+            it off hands the terrain back on the next frame. This is what the `wgpu-geo-terrain` marker \
+            file used to be.",
             needs_restart: false,
             section: None,
         },
@@ -298,15 +343,20 @@ lazy_static! {
             true,
         ),
         upload_report: SettingInfo::debug(
-            "Report what the renderer's buffer uploads did: every mapped write into a constant \
-            buffer, with the first integers it carried, whether the bytes actually arrived in the \
-            buffer - which is checked by reading them back from the GPU, so that report is a copy \
-            and a map of its own - and the staging totals for those writes once a second. It is the \
-            switch to turn on when an upload is suspected of not landing: `mapped write to Cloud UBO \
-            ... first 12 ints` and `the bytes written to ... did not arrive` are the two lines that \
-            tell a buffer that received the wrong bytes apart from one that received none. Off by \
-            default, and independent of the logging switch above, because it is a line per upload and \
-            the readback costs a copy per upload. This is the `wgpu-upload-report` marker as a switch.",
+            "Report what the renderer's buffer uploads did: what a mapped write put in the buffer, \
+            whether those bytes are in it afterwards, and how much staging the writes went through. \
+            Off by default, because one of the three reads the buffer back from the GPU, and this is \
+            a line per upload rather than a line per second. This is the `wgpu-upload-report` marker \
+            as a switch.",
+            false,
+        ),
+        dump_frames: SettingInfo::debug(
+            "Write out the next N frames the renderer presents, as raw files under `wgpu-frames`, and \
+            zero for none. A dump is about the frame that is on screen - the world is reached after a \
+            different number of frames every run, so a fixed frame number is no use - and one frame \
+            rarely settles a flicker: a handful in a row is what says whether the terrain is there on \
+            every frame or on every other one. Turning it to zero and up again asks for another \
+            handful. This is the `wgpu-dump-now` marker as a setting, with a count instead of a file.",
             false,
         ),
         section_timing: SettingInfo::debug(
@@ -317,6 +367,30 @@ lazy_static! {
             on the F3 screen while it is on, and the counts are per offer, so a quiet frame is one \
             with nothing to show. Off by default: it is a clock read per phase per section, and \
             closing it costs nothing at all. This is the `wgpu-section-timing` marker as a switch.",
+            false,
+        ),
+        terrain_no_cull: SettingInfo::debug(
+            "Draw every pipeline the render graph builds without back-face culling, so nothing \
+            depends on the winding at all. This is a diagnostic for a picture that is inside out - \
+            with both faces rasterized, \"the winding is wrong\" and \"the depth test keeps the wrong \
+            end\" stop looking the same - and it is not a mode to play with: the second copy of every \
+            quad is shaded with the far side's lighting, and on a translucent quad the two copies land \
+            at the same depth, where which of them survives is not defined. It is read by every \
+            pipeline the graph builds and not only by the terrain one, because that is where the \
+            `wgpu-terrain-no-cull` marker it replaces was read; the name is the bug it was written \
+            for. Applying it rebuilds the graph's pipelines, because a cull mode is part of the \
+            pipeline rather than something a draw can change.",
+            false,
+        ),
+        terrain_greater_depth: SettingInfo::debug(
+            "Draw every pipeline the render graph builds with the depth test the opposite way round, \
+            so the faces *behind* are the ones kept. The other half of the pair above: it is what \
+            \"the depth values are the wrong way round\" would look like, which is the other reading \
+            of a picture whose front faces are missing. Depth writes are unchanged - the test is what \
+            moved - so the picture is the far side of everything the camera can see through, and the \
+            sky and the HUD are drawn over it as usual. This is the `wgpu-terrain-greater-depth` \
+            marker as a switch, and it too applies to every pipeline the graph builds. Applying it \
+            rebuilds the graph's pipelines.",
             false,
         ),
     };
@@ -451,6 +525,9 @@ impl Default for Settings {
         Settings {
             backend: EnumSetting::from_variant(GraphicsBackend::default()),
             vsync: BoolSetting::default(),
+            // `BoolSetting::default()` is `true`, which is the right default for the terrain path: it is
+            // what the renderer is being built towards, and the switch is here to turn it *off*.
+            terrain: BoolSetting::default(),
             frames_in_flight: two_frames_in_flight(),
             // The debug switches default to the behaviour the renderer had before they existed:
             // logging and tracing off, the bind group cache and dynamic offsets on, and GPU-based
@@ -468,6 +545,11 @@ impl Default for Settings {
             pix_capture: BoolSetting::of(false),
             section_timing: BoolSetting::of(false),
             upload_report: BoolSetting::of(false),
+            dump_frames: IntSetting::of(0, 120, 1, 0),
+            // The renderer culled back faces and used the ordinary depth test before these existed,
+            // and both of them are diagnostics: the switch is here to turn one *on*.
+            terrain_no_cull: BoolSetting::of(false),
+            terrain_greater_depth: BoolSetting::of(false),
         }
     }
 }
@@ -493,6 +575,13 @@ pub struct DebugSettings {
     pub pix_capture: bool,
     /// Whether the section feed is timed - see [`Settings::section_timing`].
     pub section_timing: bool,
+    /// Whether every pipeline the graph builds keeps its back faces. See
+    /// [`Settings::terrain_no_cull`], which is the switch - and
+    /// `wgpu_mc::render::graph::set_pipeline_diagnostics`, which is what applies it to a pipeline.
+    pub terrain_no_cull: bool,
+    /// Whether every pipeline the graph builds draws with the depth test the other way round. The
+    /// other half of the pair above.
+    pub terrain_greater_depth: bool,
 }
 
 impl Settings {
@@ -509,6 +598,8 @@ impl Settings {
             gpu_timestamps: self.gpu_timestamps.value,
             pix_capture: self.pix_capture.value,
             section_timing: self.section_timing.value,
+            terrain_no_cull: self.terrain_no_cull.value,
+            terrain_greater_depth: self.terrain_greater_depth.value,
         }
     }
 }
@@ -755,6 +846,11 @@ mod tests {
         assert!(debug.dynamic_offsets, "an absent switch keeps its default");
         assert!(!debug.diagnostics);
         assert!(!debug.gpu_based_validation);
+        assert!(!debug.terrain_no_cull, "the renderer culled back faces");
+        assert!(
+            !debug.terrain_greater_depth,
+            "and the depth test kept the near faces"
+        );
     }
 
     #[test]
@@ -787,7 +883,8 @@ mod tests {
     }
 
     #[test]
-    fn the_debug_switches_are_offered_under_a_heading() {        let info: serde_json::Value = serde_json::from_str(&SETTINGS_INFO_JSON).expect("schema");
+    fn the_debug_switches_are_offered_under_a_heading() {
+        let info: serde_json::Value = serde_json::from_str(&SETTINGS_INFO_JSON).expect("schema");
 
         for name in [
             "gpu_based_validation",
@@ -800,6 +897,8 @@ mod tests {
             "pix_capture",
             "section_timing",
             "upload_report",
+            "terrain_no_cull",
+            "terrain_greater_depth",
         ] {
             assert_eq!(
                 info[name]["section"],
@@ -851,6 +950,8 @@ mod tests {
             "dump_shaders",
             "gpu_timestamps",
             "pix_capture",
+            "terrain_no_cull",
+            "terrain_greater_depth",
         ];
 
         for earlier in plain {
@@ -914,9 +1015,10 @@ mod tests {
 
     /// Every setting's name, which is the same in both documents. Kept as a list because the two
     /// documents' own key order is not readable through `serde_json::Value` - see the test above.
-    const NAME_LIST: [&str; 15] = [
+    const NAME_LIST: [&str; 19] = [
         "backend",
         "vsync",
+        "terrain",
         "frames_in_flight",
         "bind_group_cache",
         "dynamic_offsets",
@@ -930,6 +1032,9 @@ mod tests {
         "pix_capture",
         "section_timing",
         "upload_report",
+        "dump_frames",
+        "terrain_no_cull",
+        "terrain_greater_depth",
     ];
 
     /// The options screen, pulled in for the one part of it that is a contract with this side: how
@@ -1068,7 +1173,8 @@ mod tests {
     }
 
     #[test]
-    fn only_gpu_based_validation_needs_a_restart() {        let info: serde_json::Value = serde_json::from_str(&SETTINGS_INFO_JSON).expect("schema");
+    fn only_gpu_based_validation_needs_a_restart() {
+        let info: serde_json::Value = serde_json::from_str(&SETTINGS_INFO_JSON).expect("schema");
 
         // Two of them are decided while the device is being created and cannot be revisited: the
         // instance flag, and PIX's capturers, which have to be in the process before the first
@@ -1091,6 +1197,11 @@ mod tests {
             "binding_verbosity",
             "dump_shaders",
             "gpu_timestamps",
+            // These two are built into a pipeline rather than consulted as it draws, but a rebuild
+            // of the graph's pipelines is still not a restart: applying one takes effect on the
+            // frame after it is applied.
+            "terrain_no_cull",
+            "terrain_greater_depth",
         ] {
             assert_eq!(
                 info[name]["needs_restart"],
@@ -1116,6 +1227,11 @@ mod tests {
         assert!(
             !debug.gpu_based_validation,
             "GPU-based validation is a development tool, not a default"
+        );
+        assert!(
+            !debug.terrain_no_cull && !debug.terrain_greater_depth,
+            "both pipeline-state diagnostics are off: the renderer culled back faces and tested the \
+             usual way round"
         );
     }
 

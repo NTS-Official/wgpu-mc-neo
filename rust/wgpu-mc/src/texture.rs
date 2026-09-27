@@ -47,6 +47,7 @@ impl TextureAndView {
             },
             label,
             wgpu::TextureFormat::Rgba8Unorm,
+            1,
         )
     }
 
@@ -56,11 +57,12 @@ impl TextureAndView {
         size: Extent3d,
         label: Option<&str>,
         format: wgpu::TextureFormat,
+        mip_level_count: u32,
     ) -> Result<Self, anyhow::Error> {
         let texture = wgpu_state.device.create_texture(&wgpu::TextureDescriptor {
             label,
             size,
-            mip_level_count: 1,
+            mip_level_count,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format,

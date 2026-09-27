@@ -18,7 +18,10 @@ use crate::WmRenderer;
 use crate::mc::BlockManager;
 use crate::mc::block::{BlockModelFace, ChunkBlockState, ModelMesh};
 use crate::mc::direction::Direction;
-use crate::render::pipeline::Vertex;
+use crate::mc::resource::ResourcePath;
+use crate::render::atlas::Atlas;
+use crate::render::pipeline::{BLOCK_ATLAS, Vertex};
+use crate::texture::UV;
 
 pub const CHUNK_WIDTH: usize = 16;
 pub const CHUNK_AREA: usize = CHUNK_WIDTH * CHUNK_WIDTH;
@@ -51,12 +54,51 @@ impl LightLevel {
 pub trait BlockStateProvider {
     fn get_state(&self, pos: IVec3) -> ChunkBlockState;
 
+    /// The fluid at a position, in the encoding `section::fluid_of` reads: kind, amount, falling.
+    ///
+    /// Zero - no fluid - is what a provider that knows nothing about fluids answers, and then the
+    /// mesher draws the block and no fluid rather than a fluid it made up.
+    fn get_fluid(&self, _pos: IVec3) -> u8 {
+        0
+    }
+
     fn get_light_level(&self, pos: IVec3) -> LightLevel;
 
     fn is_section_empty(&self, rel_pos: IVec3) -> bool;
 
     fn get_block_color(&self, pos: IVec3, tint_index: i32) -> u32;
 }
+
+/// How many u32 slots of arena a render distance is worth, in chunks.
+///
+/// The pool is sized from the render distance rather than fixed because the two are the same question:
+/// a view at N chunks holds (2N+1)^2 columns, a column of an ordinary world is a few sections deep, and
+/// a section costs a few tens of kilobytes between its vertices and its indices. The numbers are round
+/// and deliberately generous: the cost of being too high is video memory, and the cost of being too low
+/// is sections that cannot be baked at all - which, since a section that cannot be allocated keeps the
+/// geometry it already had, is stale ground rather than a hole in it.
+///
+/// The margin is the ring [`SectionStorage::trim`] keeps beyond the view, so that a section the game
+/// has just meshed is not refused before the camera even sees it.
+pub const fn arena_slots(render_distance: u32) -> u32 {
+    /// The ring beyond the view the trim keeps.
+    const RING: u32 = 2;
+    /// How many sections deep a column of an ordinary world is meshed.
+    const SECTIONS_PER_COLUMN: u32 = 3;
+    /// One section's vertices and indices, in u32 slots: about 32 KB.
+    const SLOTS_PER_SECTION: u32 = 8_000;
+
+    let capped = if render_distance > 64 { 64 } else { render_distance };
+    let width = capped * 2 + 1 + RING * 2;
+
+    width * width * SECTIONS_PER_COLUMN * SLOTS_PER_SECTION
+}
+
+/// The arena's pool in u32 slots, as the pool [`Scene`](crate::mc::Scene) starts with.
+///
+/// Sized for a large render distance so that a session which never reports one still works; the pool is
+/// narrowed to the reported distance by [`SectionStorage::set_pool`] before anything is baked.
+pub const ARENA_SLOTS: u32 = arena_slots(32);
 
 #[derive(Debug, Copy, Clone, Hash, Eq, PartialEq)]
 pub enum RenderLayer {
@@ -75,6 +117,22 @@ pub struct SectionRanges {
 pub struct SectionStorage {
     storage: HashMap<IVec3, Section>,
     allocator: RangeAllocator<u32>,
+    /// Ranges waiting to be given back, one bucket per frame that may still be in flight.
+    ///
+    /// A range stops being *stored* one frame and is reused the next, and the frame that still draws it
+    /// may still be on the GPU: a `queue.write_buffer` is only ordered against submissions made after
+    /// it. So a range is parked for as many frames as the renderer is allowed to have in flight - the
+    /// same number the present paces itself by, because that is the first frame whose submission is
+    /// known to have been waited for. See [`SectionStorage::free_deferred`].
+    deferred: Vec<Vec<Range<u32>>>,
+    /// The bucket this frame's ranges are parked in.
+    deferred_head: usize,
+    /// How many buckets there are. See [`SectionStorage::set_deferred_depth`].
+    deferred_depth: usize,
+    /// How many slots the pool holds, which is what an allocation is refused against.
+    pool: u32,
+    /// Whether the last [`SectionStorage::allocate_ranges`] ran out of pool.
+    refused: bool,
     width: i32,
 }
 impl SectionStorage {
@@ -83,11 +141,43 @@ impl SectionStorage {
             storage: HashMap::new(),
             width: 0,
             allocator: RangeAllocator::new(0..range),
+            deferred: vec![Vec::new()],
+            deferred_head: 0,
+            deferred_depth: 1,
+            pool: range,
+            refused: false,
         }
     }
+    /// Narrows or widens the pool to a render distance, which is only possible while it is empty.
+    ///
+    /// The pool comes from one range allocator, and a range allocator cannot be resized under live
+    /// allocations: every stored section's ranges would have to be handed out again, and the data they
+    /// point at is in the buffer. The render distance is therefore taken from the *first* report, which
+    /// is a frame or two after the window opens and long before the world has anything to bake - and a
+    /// later change is refused here rather than corrupting what is already drawn.
+    pub fn set_pool(&mut self, slots: u32) -> bool {
+        if !self.storage.is_empty() {
+            return false;
+        }
+
+        self.allocator = RangeAllocator::new(0..slots);
+        self.pool = slots;
+        self.refused = false;
+        self.deferred.clear();
+        self.deferred_head = 0;
+
+        true
+    }
+
+    /// How many slots the pool has.
+    pub fn pool_slots(&self) -> u32 {
+        self.pool
+    }
+
     pub fn clear(&mut self) {
         self.allocator.reset();
         self.storage.clear();
+        self.deferred.clear();
     }
     /// How far the arena reaches from the camera, in chunks.
     pub fn width(&self) -> i32 {
@@ -99,6 +189,7 @@ impl SectionStorage {
     }
     pub fn trim(&mut self, pos: IVec2) {
         let mut to_remove = vec![];
+        let mut deferred = Vec::new();
         for (k, section) in &self.storage {
             let dist = (k.xz() - pos).abs();
             let radius = self.width + 2; //temp fix until proper sync
@@ -106,8 +197,11 @@ impl SectionStorage {
                 to_remove.push(*k);
                 for layer in &section.layers {
                     if let Some(l) = layer.as_ref() {
-                        self.allocator.free_range(l.vertex_range.clone());
-                        self.allocator.free_range(l.index_range.clone());
+                        // Deferred like every other free: walking away from a section removes it from
+                        // the storage, but the frame already on the GPU may still be reading its
+                        // ranges. See `allocate`.
+                        deferred.push(l.vertex_range.clone());
+                        deferred.push(l.index_range.clone());
                     }
                 }
             }
@@ -115,23 +209,113 @@ impl SectionStorage {
         to_remove.iter().for_each(|pos| {
             self.storage.remove(pos);
         });
+        self.defer_free(deferred);
     }
-    pub fn replace(&mut self, pos: IVec3, baked_layers: &[BakedLayer]) -> Section {
+    /// Allocates a section's ranges, and hands back the ones the section it replaces was using.
+    ///
+    /// Split from [`Self::insert`] because the two halves have to happen on either side of the GPU
+    /// write: a range that is in the storage is a range the frame will draw, so publishing one whose
+    /// bytes are not in the buffer yet is a section drawn from whatever was there before - which, while
+    /// the player walks and Minecraft keeps rebuilding sections behind them, is a flicker per rebuild.
+    ///
+    /// The ranges handed back are *not* freed here either: the previous frame's commands may still be
+    /// reading them on the GPU, and `queue.write_buffer` is only ordered against submissions made after
+    /// it. [`Self::defer_free`] is where they go, and the frame after that is where they come back.
+    ///
+    /// `None` when the pool is full. The section is then left exactly as it was - its ranges are not
+    /// given back, and it is not replaced - because the alternative is a section that vanishes from the
+    /// world and stays gone until something else asks for it: stale geometry is a wrong picture, and no
+    /// geometry is a hole.
+    pub fn allocate(
+        &mut self,
+        pos: IVec3,
+        baked_layers: &[BakedLayer],
+    ) -> Option<(Section, Vec<Range<u32>>)> {
+        let mut freed = Vec::new();
+
         if let Some(previous_section) = self.storage.get(&pos) {
             for layer in &previous_section.layers {
                 if let Some(l) = layer.as_ref() {
-                    self.allocator.free_range(l.vertex_range.clone());
-                    self.allocator.free_range(l.index_range.clone());
+                    freed.push(l.vertex_range.clone());
+                    freed.push(l.index_range.clone());
                 }
             }
         }
+
+        let section = self.allocate_ranges(baked_layers);
+
+        if self.refused {
+            return None;
+        }
+
+        Some((section, freed))
+    }
+
+    /// Queues ranges to be freed once the frames that may still draw them are done. See [`Self::allocate`].
+    pub fn defer_free(&mut self, ranges: Vec<Range<u32>>) {
+        if self.deferred.is_empty() {
+            self.deferred.push(Vec::new());
+            self.deferred_head = 0;
+        }
+
+        let head = self.deferred_head;
+
+        self.deferred[head].extend(ranges);
+    }
+
+    /// Sets how many frames of submissions the renderer may have in flight, which is how long a range
+    /// waits before it can be handed out again.
+    ///
+    /// Called from the present, which is where the same number is read to pace itself: a frame is only
+    /// presented once the one `frames_in_flight` behind it has finished, so a range parked for that many
+    /// frames is parked until its submission is known to be done. Resizing frees what the old buckets
+    /// held rather than dropping it - a range that is never freed is a leak the fixed pool cannot afford.
+    pub fn set_deferred_depth(&mut self, depth: usize) {
+        let depth = depth.clamp(1, 8);
+
+        if depth == self.deferred_depth && !self.deferred.is_empty() {
+            return;
+        }
+
+        for bucket in std::mem::take(&mut self.deferred) {
+            for range in bucket {
+                self.allocator.free_range(range);
+            }
+        }
+
+        self.deferred = (0..depth).map(|_| Vec::new()).collect();
+        self.deferred_head = 0;
+        self.deferred_depth = depth;
+    }
+
+    /// Frees the bucket whose submission has been waited for. Called once per frame, before the frame's
+    /// updates, so a range parked this frame is freed once the present has run `depth` more times.
+    pub fn free_deferred(&mut self) {
+        if self.deferred.is_empty() {
+            return;
+        }
+
+        self.deferred_head = (self.deferred_head + 1) % self.deferred.len();
+
+        let bucket = std::mem::take(&mut self.deferred[self.deferred_head]);
+
+        for range in bucket {
+            self.allocator.free_range(range);
+        }
+    }
+
+    /// Publishes an allocated section, which is what makes the next frame draw it.
+    pub fn insert(&mut self, pos: IVec3, section: Section) {
+        self.storage.insert(pos, section);
+    }
+
+    fn allocate_ranges(&mut self, baked_layers: &[BakedLayer]) -> Section {
         // A full arena is a state this has to survive rather than panic on: the ranges come out of one
         // fixed pool, and a render distance whose sections do not fit in it is a *policy* problem -
-        // the pool is 25 million u32 slots, and a fully baked view at 16 chunks is several times that.
-        // Panicking here ended the game (the panic hook throws, and the JVM aborts on a panic through
-        // a native frame), which is not a trade a renderer gets to make: the section is left without
-        // geometry instead, and Minecraft offers it again the next time it is rebuilt.
-        let mut full = false;
+        // see `arena_slots` for how the pool is sized, and `allocate` for what happens when it is not
+        // enough. Panicking here ended the game (the panic hook throws, and the JVM aborts on a panic
+        // through a native frame), which is not a trade a renderer gets to make.
+        self.refused = false;
 
         let section = Section {
             layers: baked_layers
@@ -147,7 +331,7 @@ impl SectionStorage {
                     {
                         Ok(range) => range,
                         Err(_) => {
-                            full = true;
+                            self.refused = true;
                             return None;
                         }
                     };
@@ -161,7 +345,7 @@ impl SectionStorage {
                             // Give the vertices back: a layer with no indices draws nothing, and
                             // holding them would leak the range for as long as the section is stored.
                             self.allocator.free_range(vertices);
-                            full = true;
+                            self.refused = true;
                             return None;
                         }
                     };
@@ -174,11 +358,10 @@ impl SectionStorage {
                 .collect(),
         };
 
-        if full {
+        if self.refused {
             report_full_arena();
         }
 
-        self.storage.insert(pos, section.clone());
         section
     }
     pub fn iter(&self) -> std::collections::hash_map::Iter<IVec3, Section> {
@@ -200,12 +383,19 @@ impl SectionStorage {
 /// The number that matters is how much of the view does not fit: a handful of sections is a world edge
 /// nobody notices, and thousands of them is a rendering-policy problem - the pool is fixed and the
 /// render distance is not.
+/// How many sections the arena has refused to hold, over the whole run.
+///
+/// Read by the JVM side and printed on the terrain line: a run where this is not zero is a run whose
+/// sections were being dropped for want of arena space, which looks like ground that comes and goes.
+static REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// sections refused for the JVM side. See [REFUSED].
+pub fn sections_refused() -> u64 {
+    REFUSED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 fn report_full_arena() {
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    static REFUSED: AtomicU64 = AtomicU64::new(0);
-
-    let refused = REFUSED.fetch_add(1, Ordering::Relaxed);
+    let refused = REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if refused < 4 || refused.is_multiple_of(512) {
         log::warn!(
             "wgpu-mc: the section arena is full, so this section was left without geometry \
@@ -249,11 +439,178 @@ fn get_block(block_manager: &BlockManager, state: ChunkBlockState) -> Option<Arc
 pub fn bake_section<Provider: BlockStateProvider>(pos: IVec3, wm: &WmRenderer, bsp: &Provider) {
     let bm = wm.mc.block_manager.read();
 
-    let baked_section = bake_layers(pos, &bm, bsp);
+    // The fluid mesher has to know where the fluids' sprites ended up in the atlas, so the atlas is
+    // handed down with the block manager. Without one the fluids are simply not baked, which is
+    // where this started: lava and water are not block models and nothing else draws them.
+    let atlases = wm.mc.texture_manager.atlases.read();
+    let atlas = atlases.get(BLOCK_ATLAS);
+
+    let baked_section = bake_layers(pos, &bm, bsp, atlas);
 
     report_bake(pos, &baked_section);
+    report_winding(pos, &baked_section);
 
     wm.chunk_update_queue.0.send((pos, baked_section)).unwrap();
+}
+
+/// How a baked layer's quads are wound, counted. See [`report_winding`].
+pub struct WindingCounts {
+    pub checked: u64,
+    pub outward: u64,
+    /// The quads that came out the other way, by the direction their own normal names.
+    pub inward_by_direction: [u64; 6],
+}
+
+/// Walks one baked layer's quads and asks each whether it is wound the way its own normal points.
+///
+/// Kept apart from the logging so it can be tested on a quad whose answer is known: the check is the
+/// whole point of the diagnostic, and a diagnostic nobody has seen produce a number is a diagnostic
+/// that reports zero for a reason nobody knows - which is exactly what happened the first time it ran.
+pub fn count_winding(layers: &[BakedLayer]) -> WindingCounts {
+    let mut counts = WindingCounts {
+        checked: 0,
+        outward: 0,
+        inward_by_direction: [0; 6],
+    };
+
+    let Some(layer) = layers.get(RenderLayer::Solid as usize) else {
+        return counts;
+    };
+
+    // A quad is four vertices of sixteen bytes. The index stream is not needed to walk them, because
+    // the baker emits them four at a time in that order.
+    for quad in layer.vertices.chunks_exact(Vertex::VERTEX_LENGTH * 4) {
+        let Some((first, normal)) = read_vertex(&quad[0..16]) else {
+            continue;
+        };
+        let Some((second, _)) = read_vertex(&quad[16..32]) else {
+            continue;
+        };
+        let Some((third, _)) = read_vertex(&quad[32..48]) else {
+            continue;
+        };
+
+        counts.checked += 1;
+
+        let cross = (second - first).cross(third - first);
+
+        if cross.dot(normal) > 0.0 {
+            counts.outward += 1;
+        } else if let Some(direction) = direction_of(normal) {
+            counts.inward_by_direction[direction as usize] += 1;
+        }
+    }
+
+    counts
+}
+
+/// Diagnostics: which way the quads of a baked section face.
+///
+/// A quad carries its own normal - three bits in the twelfth byte - and that normal is the direction
+/// the face is *supposed* to be seen from. The mesher takes the winding from the model file instead,
+/// which has no reason to agree with it: MC's own mesher re-orders every face, and a quad whose
+/// triangle comes out wound the other way is a face the pass's back-face culling drops exactly where
+/// it should be visible. "Some sections are inside out and others are not" is that, per section.
+///
+/// So each quad is asked here: does the cross product of its first triangle point the way its own
+/// normal does? Counted per bake and logged, because this is the question a picture of the world
+/// answers only if you already know what you are looking at.
+fn report_winding(pos: IVec3, layers: &[BakedLayer]) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Quads checked across all bakes, and how they came out.
+    static CHECKED: AtomicU64 = AtomicU64::new(0);
+    static OUTWARD: AtomicU64 = AtomicU64::new(0);
+    static REPORTED: AtomicU64 = AtomicU64::new(0);
+
+    let counts = count_winding(layers);
+    if counts.checked == 0 {
+        return;
+    }
+
+    let total_checked = CHECKED.fetch_add(counts.checked, Ordering::Relaxed) + counts.checked;
+    let total_outward = OUTWARD.fetch_add(counts.outward, Ordering::Relaxed) + counts.outward;
+
+    // Once a second, and *not* behind the logging switch: the first version of this was, and it
+    // produced no line at all for reasons that took a run to notice. A line a second is nothing next
+    // to a bake's worth of work, and this is the one number that says whether the terrain is wound
+    // the way it is drawn.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_secs())
+        .unwrap_or(0);
+
+    if REPORTED.swap(now, Ordering::Relaxed) == now {
+        return;
+    }
+
+    log::info!(
+        "wgpu-mc: winding: {total_checked} quad(s) checked over all bakes, {total_outward} wound the \
+         way their own normal points ({} inward, {}% outward); this section {pos:?}: {} of {} outward, \
+         inward by direction [west, east, down, up, north, south] {:?}",
+        total_checked - total_outward,
+        total_outward * 100 / total_checked.max(1),
+        counts.outward,
+        counts.checked,
+        counts.inward_by_direction,
+    );
+}
+
+
+/// One baked vertex's position and normal, decoded the way `terrain.wgsl` decodes them.
+///
+/// The format is `Vertex::compressed`'s, and the two have to agree: the position is one byte per axis
+/// in sixteenths, with a coordinate of exactly sixteen stored as a flag instead (it does not fit in a
+/// byte), and the normal is three bits. `None` for anything that does not decode, which is a vertex
+/// this diagnostic has nothing to say about rather than a reason to stop.
+fn read_vertex(bytes: &[u8]) -> Option<(glam::Vec3, glam::Vec3)> {
+    use glam::Vec3;
+
+    if bytes.len() < 16 {
+        return None;
+    }
+
+    let flags = bytes[11] >> 5;
+
+    let axis = |byte: u8, flag: u8| -> f32 {
+        if flags & flag != 0 {
+            16.0
+        } else {
+            byte as f32 / 16.0
+        }
+    };
+
+    let position = Vec3::new(
+        axis(bytes[0], 1),
+        axis(bytes[1], 2),
+        axis(bytes[2], 4),
+    );
+
+    let normal = match (bytes[11] >> 2) & 0b111 {
+        0b000 => Vec3::X,
+        0b100 => Vec3::NEG_X,
+        0b001 => Vec3::Y,
+        0b101 => Vec3::NEG_Y,
+        0b010 => Vec3::Z,
+        0b110 => Vec3::NEG_Z,
+        _ => return None,
+    };
+
+    Some((position, normal))
+}
+
+/// The `Direction` a normal is, for the per-direction counts above.
+fn direction_of(normal: glam::Vec3) -> Option<Direction> {
+    [
+        Direction::West,
+        Direction::East,
+        Direction::Down,
+        Direction::Up,
+        Direction::North,
+        Direction::South,
+    ]
+    .into_iter()
+    .find(|direction| direction.to_vec().as_vec3() == normal)
 }
 
 /// Says what one bake produced, without flooding the log with a world's worth of sections.
@@ -305,6 +662,7 @@ fn bake_layers<Provider: BlockStateProvider>(
     section_pos: IVec3,
     block_manager: &BlockManager,
     state_provider: &Provider,
+    atlas: Option<&Atlas>,
 ) -> Vec<BakedLayer> {
     let mut layers = vec![BakedLayer::default(); 3];
 
@@ -322,7 +680,15 @@ fn bake_layers<Provider: BlockStateProvider>(
         let block_state: ChunkBlockState = state_provider.get_state(pos);
 
         if let Some(model_mesh) = get_block(block_manager, block_state) {
-            const INDICES: [u32; 6] = [1, 3, 0, 2, 3, 1];
+            // The winding, and the one thing about a baked quad that nothing else can tell you is
+            // wrong: the pass culls back faces with a front face of counter-clockwise, and this backend
+            // gives Minecraft's shaders OpenGL's clip space (`preprocessing.rs`) - which *mirrors* the
+            // clip space, and a mirror turns every triangle over. The model's own vertex order, drawn
+            // through that flip, comes out inside out: the faces that point away from the camera are the
+            // ones kept, so the terrain shows its insides and loses its outsides. Reversing the two
+            // triangles puts the outside back; the same triangles in the other order are
+            // `[1, 3, 0, 2, 3, 1]`.
+            const INDICES: [u32; 6] = [0, 3, 1, 1, 3, 2];
             let mut add_quad =
                 |face: &BlockModelFace, _light_level: LightLevel, dir: Direction, color: u32| {
                     let baked_layer = &mut layers[RenderLayer::Solid as usize];
@@ -482,5 +848,536 @@ fn bake_layers<Provider: BlockStateProvider>(
             });
         }
     }
+
+    if let Some(atlas) = atlas {
+        bake_fluid_faces(state_provider, atlas, &mut layers);
+    }
+
     layers
+}
+
+/// The fluid textures. A fluid has no block model - no elements, no blockstate variant - so nothing
+/// else puts its sprites in the block atlas, and the fluid mesher has no texture to sample until
+/// they are there: [`crate::mc::MinecraftState::bake_blocks`] allocates them before it uploads the
+/// atlas.
+pub const FLUID_TEXTURES: [&str; 4] = ["lava_still", "lava_flow", "water_still", "water_flow"];
+
+/// The fluid byte a block carries: which fluid (1 water, 2 lava, 3 some other, 0 none), how much of
+/// it there is out of nine, and whether it is falling. The mod writes it and
+/// `wgpu_mc_jni::section` reads the same three fields back out of the same byte, so the three
+/// shifts and masks here are an ABI: the writer is `describe` in the mod's `Payload`.
+pub fn fluid_of(byte: u8) -> (u8, u8, bool) {
+    (byte & 0b11, (byte >> 2) & 0b1111, byte & 0b0100_0000 != 0)
+}
+
+/// How many blocks the fluid mesher has seen holding a fluid, and how many faces it has drawn for
+/// them, over every bake so far.
+///
+/// Two numbers because they are the two halves of "there is no lava on screen": a block count of zero
+/// is a fluid that never reached the baker - the payload's fluid blob, or the states themselves - and
+/// blocks counted with no faces drawn is a fluid the mesher saw and could not draw, which is a sprite
+/// that is not in the atlas. The JVM side logs both next to the terrain pass, because the Rust side's
+/// own log does not reach the game's log file.
+static FLUID_BLOCKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static FLUID_QUADS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `(blocks holding a fluid, faces drawn for them)`. See [FLUID_BLOCKS].
+pub fn fluid_totals() -> (u64, u64) {
+    (
+        FLUID_BLOCKS.load(std::sync::atomic::Ordering::Relaxed),
+        FLUID_QUADS.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// How high a fluid stands in its own block, in blocks.
+///
+/// Its amount out of nine, which is Minecraft's rule, except that lava and a falling fluid are drawn
+/// to the top of the block: lava is thick enough to fill the block it is in, and a falling fluid is
+/// a column rather than a surface. Both come out of the game's own `getOwnHeight`.
+fn fluid_height(kind: u8, amount: u8, falling: bool) -> f32 {
+    if kind == 2 || falling || amount == 0 {
+        1.0
+    } else {
+        amount.min(9) as f32 / 9.0
+    }
+}
+
+/// The height of a fluid's surface at one corner of a block, in blocks.
+///
+/// Minecraft averages the fluid in the four blocks that touch that corner - which is what turns a
+/// surface that steps from block to block into one that slopes - and gives the corner the full
+/// block when one of those four holds a *different* fluid, because the two do not join. A corner
+/// with none of this fluid at all is the full block too.
+fn fluid_corner_height<Provider: BlockStateProvider>(
+    state_provider: &Provider,
+    pos: IVec3,
+    kind: u8,
+    corner: IVec2,
+) -> f32 {
+    let base = pos + ivec3(corner.x - 1, 0, corner.y - 1);
+
+    let mut total = 0.0;
+    let mut counted = 0;
+
+    for step in [IVec3::ZERO, IVec3::X, IVec3::Z, ivec3(1, 0, 1)] {
+        let (other_kind, amount, falling) = fluid_of(state_provider.get_fluid(base + step));
+
+        if other_kind == kind {
+            total += fluid_height(kind, amount, falling);
+            counted += 1;
+        } else if other_kind != 0 {
+            return 1.0;
+        }
+    }
+
+    if counted == 0 {
+        1.0
+    } else {
+        total / counted as f32
+    }
+}
+
+/// Puts the four corners of a face in the order that turns counter-clockwise around its normal,
+/// which is the order the baker's index list and the winding diagnostic both read them in.
+///
+/// Written as a correction rather than as a table of corner orders per direction: the tables are
+/// easy to get backwards - the face comes out drawn inside out and is culled exactly where it
+/// should be visible - and the cross product cannot be.
+fn wind_quad(
+    mut corners: [(glam::Vec3, [u16; 2]); 4],
+    normal: glam::Vec3,
+) -> [(glam::Vec3, [u16; 2]); 4] {
+    let cross = (corners[1].0 - corners[0].0).cross(corners[2].0 - corners[0].0);
+
+    if cross.dot(normal) < 0.0 {
+        corners.swap(1, 3);
+    }
+
+    corners
+}
+
+/// Where one texel of a sprite is in the block atlas, in the sixteenths of a pixel a baked vertex
+/// stores: `u` and `v` run 0 to 16 across the sprite with v downwards, as in a block model's face.
+fn sprite_uv(sprite: UV, u: u16, v: u16) -> [u16; 2] {
+    [sprite.0.0 + u, sprite.0.1 + v]
+}
+
+/// The sprites of one fluid and the layer it is drawn in: water is translucent and lava is not.
+struct FluidSprites {
+    still: UV,
+    flow: UV,
+}
+
+fn fluid_sprites(atlas: &Atlas, kind: u8, name: &str) -> Option<(RenderLayer, FluidSprites)> {
+    let layer = match kind {
+        1 => RenderLayer::Transparent,
+        2 => RenderLayer::Solid,
+        _ => return None,
+    };
+
+    let uv_map = atlas.uv_map.read();
+
+    let sprite = |suffix: &str, bit: u64| {
+        let path = ResourcePath(format!("minecraft:block/{name}_{suffix}"));
+        let sprite = uv_map.get(&path).copied();
+
+        // Reported once per sprite rather than once per bake: a pack without the fluid textures
+        // would otherwise write one line per section while the world loads.
+        static WARNED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if sprite.is_none()
+            && WARNED.fetch_or(bit, std::sync::atomic::Ordering::Relaxed) & bit == 0
+        {
+            log::warn!("wgpu-mc: {path} is not in the block atlas, so {name} is not drawn");
+        }
+
+        sprite
+    };
+
+    let still = sprite("still", 1 << kind)?;
+    // The flowing sprite is what a fluid's sides are drawn with, but 26.1 does not hand one out under
+    // this name - `minecraft:block/lava_flow` is not a resource the game has - and a fluid drawn with
+    // its still sprite on the sides is a whole fluid rather than none at all. The still sprite is the
+    // one that has to be there: without it there is no texture to sample and nothing is baked.
+    let flow = sprite("flow", 1 << (kind + 2)).unwrap_or(still);
+
+    Some((layer, FluidSprites { still, flow }))
+}
+
+/// Bakes the fluids of a section: the lava and the water in it, shaped the way Minecraft's own
+/// `LiquidBlockRenderer` shapes them.
+///
+/// Nothing else does it. A fluid is not a block model - no elements to bake, no variant to look up -
+/// so the pass above walks straight past it, and the Rust terrain came out with the lava and the
+/// water simply missing, which in a superflat world is the lava lakes and the water.
+///
+/// The shape: a top face at the height the fluid settled at and only where the block above holds a
+/// different fluid, side faces only towards blocks that do not hold the same fluid, clipped to the
+/// corners' heights so a sloping surface comes out sloping, a bottom face where the fluid does not
+/// continue downwards, and no face at all between two blocks of the same fluid.
+fn bake_fluid_faces<Provider: BlockStateProvider>(
+    state_provider: &Provider,
+    atlas: &Atlas,
+    layers: &mut [BakedLayer],
+) {
+    // Lava is the only fluid with a layer to draw into yet (see the `match` below). The water sprites
+    // are still looked up, so that a pack missing them says so once now rather than on the day water is
+    // drawn.
+    let _water = fluid_sprites(atlas, 1, "water");
+    let lava = fluid_sprites(atlas, 2, "lava");
+
+    // The same index list the block baker emits, for the same reason: a mirror in the clip space
+    // (see `preprocessing.rs`) turns every triangle over, so the two triangles of a quad are emitted
+    // in the order that comes back out wound counter-clockwise.
+    const INDICES: [u32; 6] = [0, 3, 1, 1, 3, 2];
+
+    // Water is tinted by the biome it is in, which nothing on this path knows. This is the colour
+    // the game uses where no biome says otherwise, packed the way the terrain shader reads the
+    // vertex colour back: red in the low byte.
+    const WATER_TINT: u32 = 0x00e4_763f;
+
+    let mut add_quad =
+        |layer: RenderLayer,
+         dir: Direction,
+         light: u8,
+         color: u32,
+         corners: [(glam::Vec3, [u16; 2]); 4]| {
+            FLUID_QUADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+            let baked_layer = &mut layers[layer as usize];
+            let first = baked_layer.vertices.len() / Vertex::VERTEX_LENGTH;
+            let normal = dir.to_vec().as_vec3().to_array();
+
+            baked_layer.vertices.extend(
+                wind_quad(corners, glam::Vec3::from_array(normal))
+                    .iter()
+                    .flat_map(|(position, uv)| {
+                        Vertex {
+                            position: position.to_array(),
+                            uv: *uv,
+                            normal,
+                            color,
+                            uv_offset: 0,
+                            lightmap_coords: light,
+                            // Fluids are not shaded per corner in the game either: a fluid face is
+                            // one flat surface, lit by the block it is seen from.
+                            ao: 3,
+                        }
+                        .compressed()
+                    }),
+            );
+            baked_layer.indices.extend(
+                INDICES
+                    .iter()
+                    .flat_map(|index| (index + (first as u32)).to_ne_bytes()),
+            );
+        };
+
+    for block_index in 0..16 * 16 * 16 {
+        let pos = ivec3(block_index & 15, block_index >> 8, (block_index & 255) >> 4);
+        let (kind, _, _) = fluid_of(state_provider.get_fluid(pos));
+
+        // Counted before the sprites are looked at: a fluid whose sprite never made it into the atlas
+        // is exactly the case the counters exist to tell apart from a fluid that never arrived.
+        if kind == 1 || kind == 2 {
+            FLUID_BLOCKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        let sprites = match kind {
+            // Lava only, for now: water belongs in the translucent layer and no pass of ours draws that
+            // layer yet - Minecraft still draws its own water - so baking it would be a second copy of
+            // every ocean in the arena, in space the sections that *are* drawn have to share. It comes
+            // back the day the translucent pass is taken over.
+            1 => continue,
+            2 => &lava,
+            // 3 is "a fluid this mesher does not know": a modded one, or the empty fluid of a block
+            // that has none, which is 0.
+            _ => continue,
+        };
+
+        let Some((layer, sprites)) = sprites else {
+            continue;
+        };
+
+        let (fx, fy, fz) = (pos.x as f32, pos.y as f32, pos.z as f32);
+        let color = if kind == 1 { WATER_TINT } else { 0x00ff_ffff };
+
+        // The four corners of the block, in the order (0,0), (1,0), (0,1), (1,1) in x and z, each
+        // with the height the fluid stands at there. Both the top face and the sides are cut to
+        // them, and each one walks four blocks to work out, so they are worked out once.
+        let heights = [
+            fluid_corner_height(state_provider, pos, kind, IVec2::new(0, 0)),
+            fluid_corner_height(state_provider, pos, kind, IVec2::new(1, 0)),
+            fluid_corner_height(state_provider, pos, kind, IVec2::new(0, 1)),
+            fluid_corner_height(state_provider, pos, kind, IVec2::new(1, 1)),
+        ];
+        let corner = [
+            (fx, fz),
+            (fx + 1.0, fz),
+            (fx, fz + 1.0),
+            (fx + 1.0, fz + 1.0),
+        ];
+
+        // The surface, where the fluid ends: no face between two blocks of the same fluid, which is
+        // also what keeps a lake from being drawn a block at a time.
+        if fluid_of(state_provider.get_fluid(pos + IVec3::Y)).0 != kind {
+            let light = state_provider.get_light_level(pos + IVec3::Y).byte;
+
+            add_quad(
+                *layer,
+                Direction::Up,
+                light,
+                color,
+                [
+                    (vec3(fx, fy + heights[0], fz), sprite_uv(sprites.still, 0, 0)),
+                    (
+                        vec3(fx, fy + heights[2], fz + 1.0),
+                        sprite_uv(sprites.still, 0, 16),
+                    ),
+                    (
+                        vec3(fx + 1.0, fy + heights[3], fz + 1.0),
+                        sprite_uv(sprites.still, 16, 16),
+                    ),
+                    (
+                        vec3(fx + 1.0, fy + heights[1], fz),
+                        sprite_uv(sprites.still, 16, 0),
+                    ),
+                ],
+            );
+        }
+
+        // The sides, towards each block that does not hold the same fluid: lava against stone is a
+        // wall of lava, lava against lava is nothing at all.
+        for (dir, first, second) in [
+            (Direction::North, 0, 1),
+            (Direction::South, 2, 3),
+            (Direction::West, 0, 2),
+            (Direction::East, 1, 3),
+        ] {
+            let neighbour = pos + dir.to_vec();
+
+            if fluid_of(state_provider.get_fluid(neighbour)).0 == kind {
+                continue;
+            }
+
+            let (low, high) = (heights[first], heights[second]);
+
+            if low <= 0.0 && high <= 0.0 {
+                continue;
+            }
+
+            let light = state_provider.get_light_level(neighbour).byte;
+            let bottom = |v: f32| (16.0 - 16.0 * v.clamp(0.0, 1.0)) as u16;
+
+            add_quad(
+                *layer,
+                dir,
+                light,
+                color,
+                [
+                    (
+                        vec3(corner[first].0, fy, corner[first].1),
+                        sprite_uv(sprites.flow, 0, 16),
+                    ),
+                    (
+                        vec3(corner[second].0, fy, corner[second].1),
+                        sprite_uv(sprites.flow, 16, 16),
+                    ),
+                    (
+                        vec3(corner[second].0, fy + high, corner[second].1),
+                        sprite_uv(sprites.flow, 16, bottom(high)),
+                    ),
+                    (
+                        vec3(corner[first].0, fy + low, corner[first].1),
+                        sprite_uv(sprites.flow, 0, bottom(low)),
+                    ),
+                ],
+            );
+        }
+
+        // The underside, where the fluid does not carry on into the block below - lava pouring over
+        // an edge rather than a lake.
+        if fluid_of(state_provider.get_fluid(pos - IVec3::Y)).0 != kind {
+            let light = state_provider.get_light_level(pos - IVec3::Y).byte;
+
+            add_quad(
+                *layer,
+                Direction::Down,
+                light,
+                color,
+                [
+                    (vec3(fx, fy, fz), sprite_uv(sprites.still, 0, 0)),
+                    (vec3(fx, fy, fz + 1.0), sprite_uv(sprites.still, 0, 16)),
+                    (
+                        vec3(fx + 1.0, fy, fz + 1.0),
+                        sprite_uv(sprites.still, 16, 16),
+                    ),
+                    (vec3(fx + 1.0, fy, fz), sprite_uv(sprites.still, 16, 0)),
+                ],
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod winding_tests {
+    use super::*;
+    use crate::render::pipeline::Vertex;
+    use glam::vec3;
+
+    /// The winding check answers for a quad whose answer is known.
+    ///
+    /// This is the diagnostic that had to exist before anything could be said about "some sections are
+    /// inside out": the check itself was the part that could be wrong, and it reported nothing at all
+    /// the first time it ran - which looked exactly like a mesh that was fine. A quad in the plane
+    /// `y = 0`, wound so that its triangle's cross product points the way its own normal does, has to
+    /// come out outward; the same four vertices in the other order, inward.
+    #[test]
+    fn a_quad_is_counted_by_which_way_its_triangle_turns() {
+        let up = vec3(0.0, 1.0, 0.0);
+
+        let vertex = |position: [f32; 3]| Vertex {
+            position,
+            uv: [0, 0],
+            normal: up.to_array(),
+            color: 0xffff_ffff,
+            uv_offset: 0,
+            lightmap_coords: 0,
+            ao: 0,
+        };
+
+        let layer_of = |positions: [[f32; 3]; 4]| {
+            let mut layer = BakedLayer::default();
+            for position in positions {
+                layer.vertices.extend_from_slice(&vertex(position).compressed());
+            }
+
+            vec![layer, BakedLayer::default(), BakedLayer::default()]
+        };
+
+        // (0,0,0) -> (0,0,1) -> (1,0,1): the cross product of the first two edges is +y, which is the
+        // normal these vertices carry.
+        let outward = layer_of([[0.0, 0.0, 0.0], [0.0, 0.0, 1.0], [1.0, 0.0, 1.0], [1.0, 0.0, 0.0]]);
+        let counts = count_winding(&outward);
+        assert_eq!(counts.checked, 1, "one quad was checked");
+        assert_eq!(counts.outward, 1, "the quad wound the way its normal points");
+
+        // The same quad the other way round.
+        let inward = layer_of([[0.0, 0.0, 0.0], [1.0, 0.0, 1.0], [0.0, 0.0, 1.0], [1.0, 0.0, 0.0]]);
+        let counts = count_winding(&inward);
+        assert_eq!(counts.checked, 1, "one quad was checked");
+        assert_eq!(counts.outward, 0, "the quad wound against its own normal");
+        assert_eq!(
+            counts.inward_by_direction[Direction::Up as usize], 1,
+            "and it is counted against the direction its normal names"
+        );
+    }
+
+    /// A fluid face is put in its drawing order by its corners rather than by a table, and this is
+    /// the property that has to hold: whichever way round the four corners arrive, the quad has to
+    /// come out one the diagnostic counts as outward.
+    ///
+    /// It is worth a test of its own because it cost a day of "the terrain is inside out": a quad
+    /// whose triangles turn against its own normal is a face the pass culls exactly where it should
+    /// be seen, and the same mistake is one swap away in every one of the six directions.
+    #[test]
+    fn a_fluid_face_is_wound_the_way_it_is_seen_from() {
+        let layer_of = |direction: Direction, corners: [[f32; 3]; 4]| {
+            let normal = direction.to_vec().as_vec3().to_array();
+            let wound = wind_quad(
+                corners.map(|corner| (glam::Vec3::from_array(corner), [0u16, 0u16])),
+                glam::Vec3::from_array(normal),
+            );
+
+            let mut layer = BakedLayer::default();
+
+            for (position, _) in wound {
+                layer.vertices.extend_from_slice(
+                    &Vertex {
+                        position: position.to_array(),
+                        uv: [0, 0],
+                        normal,
+                        color: 0xffff_ffff,
+                        uv_offset: 0,
+                        lightmap_coords: 0,
+                        ao: 0,
+                    }
+                    .compressed(),
+                );
+            }
+
+            vec![layer, BakedLayer::default(), BakedLayer::default()]
+        };
+
+        let faces: [(Direction, [[f32; 3]; 4]); 6] = [
+            (
+                Direction::Up,
+                [
+                    [0.0, 1.0, 0.0],
+                    [1.0, 1.0, 0.0],
+                    [1.0, 1.0, 1.0],
+                    [0.0, 1.0, 1.0],
+                ],
+            ),
+            (
+                Direction::Down,
+                [
+                    [0.0, 0.0, 0.0],
+                    [1.0, 0.0, 0.0],
+                    [1.0, 0.0, 1.0],
+                    [0.0, 0.0, 1.0],
+                ],
+            ),
+            (
+                Direction::North,
+                [
+                    [0.0, 0.0, 0.0],
+                    [1.0, 0.0, 0.0],
+                    [1.0, 1.0, 0.0],
+                    [0.0, 1.0, 0.0],
+                ],
+            ),
+            (
+                Direction::South,
+                [
+                    [0.0, 0.0, 1.0],
+                    [1.0, 0.0, 1.0],
+                    [1.0, 1.0, 1.0],
+                    [0.0, 1.0, 1.0],
+                ],
+            ),
+            (
+                Direction::West,
+                [
+                    [0.0, 0.0, 0.0],
+                    [0.0, 0.0, 1.0],
+                    [0.0, 1.0, 1.0],
+                    [0.0, 1.0, 0.0],
+                ],
+            ),
+            (
+                Direction::East,
+                [
+                    [1.0, 0.0, 0.0],
+                    [1.0, 0.0, 1.0],
+                    [1.0, 1.0, 1.0],
+                    [1.0, 1.0, 0.0],
+                ],
+            ),
+        ];
+
+        for (direction, corners) in faces {
+            // The corners as they come, and the same four the other way round - which is the order a
+            // face picked off a neighbour the other way round would arrive in.
+            let reversed = [corners[0], corners[3], corners[2], corners[1]];
+
+            for corners in [corners, reversed] {
+                let counts = count_winding(&layer_of(direction, corners));
+                assert_eq!(counts.checked, 1, "{direction:?}: one quad was checked");
+                assert_eq!(
+                    counts.outward, 1,
+                    "{direction:?} came out wound against its own normal"
+                );
+            }
+        }
+    }
 }
