@@ -56,6 +56,9 @@ impl JavaPalette {
         self.store.len()
     }
 
+    /// Kept for the JVM side's lookup path: an index past the end of the store is the "no state" a
+    /// pre-registry palette holds, and the first entry is what it falls back to.
+    #[allow(dead_code)]
     pub fn get(&self, index: usize) -> Option<&BlockstateKey> {
         self.store.get(index).or_else(|| self.store.first())
     }

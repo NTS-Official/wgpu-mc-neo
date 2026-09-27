@@ -19,6 +19,30 @@ pub struct Vertex {
 impl Vertex {
     pub const VERTEX_LENGTH: usize = 16;
 
+    /// One axis of a baked position, in the 1/16-block units this vertex format holds.
+    ///
+    /// Eight bits to an axis, plus one for "it is exactly 256", is a grid of sixteenths of a block and
+    /// nothing between the lines - and a model is free to put a face between them. That face used to be
+    /// **truncated**, which lands it on the line *below* it, and for anything smaller than a block that
+    /// line is usually the block boundary. The block boundary is where the neighbouring block's own
+    /// face is, so the two are exactly coplanar, and which of them is seen is then decided per pixel by
+    /// the last bits of two projected z values that are only equal to within rounding: the ground
+    /// showing through a leaf litter in patches that change as the camera turns, and not at all as it
+    /// moves, because moving both surfaces together leaves their difference where it was.
+    ///
+    /// Rounding *up* instead keeps the face off the line: a quad at 1/64 of a block is drawn at 1/16,
+    /// which is a third of a pixel at any distance and no longer shares a plane with the block below
+    /// it. Geometry on the grid - which is nearly all of it - is not moved at all, and geometry thinner
+    /// than 1/16 collapses onto the next line, which is what truncation did to it as well: this format
+    /// cannot tell those apart, and the honest fix for that is more bits rather than a cleverer
+    /// rounding. See [`Vertex::VERTEX_LENGTH`] and the shader's decode in `shaders/terrain.wgsl`.
+    #[inline]
+    fn axis_to_sixteenths(v: f32) -> u16 {
+        // Clamped rather than wrapped: a byte and one flag bit cannot name a coordinate past 256, and
+        // a model that reaches outside its block is one this format was never able to hold.
+        (v * 16.0).clamp(0.0, 256.0).ceil() as u16
+    }
+
     pub fn compressed(self) -> [u8; Self::VERTEX_LENGTH] {
         // XYZ: 4 bytes (1 for each axis)
         // Normal: 3 bits
@@ -31,13 +55,9 @@ impl Vertex {
         // Total: 101 bits (13 bytes)
         let mut array = [0; Self::VERTEX_LENGTH];
 
-        let x = self.position[0] * 16.0;
-        let y = self.position[1] * 16.0;
-        let z = self.position[2] * 16.0;
-
-        let x = x as u16;
-        let y = y as u16;
-        let z = z as u16;
+        let x = Self::axis_to_sixteenths(self.position[0]);
+        let y = Self::axis_to_sixteenths(self.position[1]);
+        let z = Self::axis_to_sixteenths(self.position[2]);
 
         let x_byte = x as u8;
         let y_byte = y as u8;
@@ -373,6 +393,44 @@ mod tests {
                 shader_decode(&vertex_at(position).compressed()),
                 position,
                 "a vertex baked at {position:?} did not come back at that position"
+            );
+        }
+    }
+
+    /// A face that is not on the 1/16 grid is drawn *off* the line it is near, not on it.
+    ///
+    /// This is the leaf litter: `template_leaf_litter_*` is one quad at 0.25/16 of a block, with an
+    /// `up` and a `down` face, and the block below it draws its own top face at the boundary. Truncated,
+    /// both are at y = 0 and the depth buffer picks between them per pixel - litter that flickers
+    /// against the ground as the camera turns. Rounded up, the quad is at 1/16 and there is nothing to
+    /// pick between.
+    #[test]
+    fn a_face_between_the_lines_is_drawn_off_them() {
+        let decoded = shader_decode(&vertex_at([8.0, 0.25 / 16.0, 8.0]).compressed());
+
+        assert_eq!(
+            decoded[1],
+            1.0 / 16.0,
+            "the quad landed on the block boundary - the plane the ground's own top face is on"
+        );
+
+        // And it is monotone: a coordinate never moves *down* past one it was above, and on-grid
+        // geometry does not move at all.
+        for (baked, drawn) in [
+            (0.0, 0.0),
+            (0.25 / 16.0, 1.0 / 16.0),
+            (0.999 / 16.0, 1.0 / 16.0),
+            (1.0 / 16.0, 1.0 / 16.0),
+            (15.5 / 16.0, 1.0),
+            (15.0, 15.0),
+            (16.0, 16.0),
+        ] {
+            let decoded = shader_decode(&vertex_at([baked, 0.0, 0.0]).compressed());
+
+            assert_eq!(
+                decoded[0], drawn,
+                "{baked} (blocks) was drawn at {}",
+                decoded[0]
             );
         }
     }

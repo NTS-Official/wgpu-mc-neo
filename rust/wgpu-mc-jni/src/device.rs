@@ -1,22 +1,19 @@
-use crate::blaze::{BindGroupPlan, BlazeDepthStencilState, BlazeRenderPass, BlazeRenderPassDescriptor, DrawCall, FfiStr, GpuFormat, PrimitiveTopology, RawArray, RenderPipeline, UniformType};
-use crate::preprocessing::{RemovePointSize, process_shaders, shim_samplers, ProcessedShaderResult};
-use crate::settings::{GraphicsBackend, Settings};
-use crate::{MinecraftResourceManagerAdapter, RENDERER, preprocessing};
-use cyntax::MacroD;
-use futures::executor::block_on;
-use glsl::parser::Parse;
-use glsl::syntax::{
-    ExternalDeclaration, Preprocessor, PreprocessorVersion, ShaderStage, TypeSpecifierNonArray,
+use crate::blaze::{
+    BindGroupPlan, BlazeDepthStencilState, BlazeRenderPass, BlazeRenderPassDescriptor, DrawCall,
+    FfiStr, GpuFormat, PrimitiveTopology, RenderPipeline,
 };
-use glsl::transpiler::glsl::show_translation_unit;
-use glsl::visitor::HostMut;
+use crate::preprocessing::{ProcessedShaderResult, process_shaders};
+use crate::settings::{GraphicsBackend, Settings};
+use crate::{MinecraftResourceManagerAdapter, RENDERER};
+use futures::executor::block_on;
+use glsl::syntax::TypeSpecifierNonArray;
+use jni::JNIEnv;
 use jni::objects::JClass;
 use jni::sys::{jint, jlong};
-use jni::{JNIEnv, JavaVM};
 use jni_fn::jni_fn;
 use log::{error, info, warn};
 use once_cell::sync::OnceCell;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::Mutex;
 use raw_window_handle::{
     RawDisplayHandle, RawWindowHandle, Win32WindowHandle, WindowsDisplayHandle,
 };
@@ -24,19 +21,17 @@ use std::borrow::Cow;
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::ffi::{CStr, c_char};
-use std::hash::{DefaultHasher, Hasher};
-use std::io::pipe;
-use std::iter;
 use std::num::{NonZero, NonZeroIsize};
-use std::ops::{Deref, Rem};
 use std::path::PathBuf;
 use std::ptr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use futures::sink::unfold;
-use wgpu_mc::util::WmArena;
-use wgpu_mc::wgpu::util::{BufferInitDescriptor, DeviceExt, StagingBelt};
-use wgpu_mc::wgpu::{BlendState, BufferAddress, CurrentSurfaceTexture, Extent3d, IndexFormat, Limits, Origin3d, PresentMode, ShaderSource, SurfaceTexture, TexelCopyBufferInfo, TexelCopyBufferLayout, TexelCopyTextureInfo, TextureFormat, naga, Color, Operations};
+use wgpu_mc::wgpu::util::{BufferInitDescriptor, DeviceExt};
+use wgpu_mc::wgpu::{
+    Color, CurrentSurfaceTexture, Extent3d, Limits, Operations, Origin3d, PresentMode,
+    ShaderSource, SurfaceTexture, TexelCopyBufferInfo, TexelCopyBufferLayout, TexelCopyTextureInfo,
+    TextureFormat, naga,
+};
 use wgpu_mc::{Gpu, WmRenderer, wgpu};
 
 /// Present mode asked for through the C ABI by the JVM side.
@@ -300,10 +295,14 @@ fn resolve_present_mode(request: PresentModeRequest, supported: &[PresentMode]) 
     } else {
         // Mailbox is the tear-free immediate mode; Immediate is the tearing one. Fall back to
         // Fifo rather than asking for a mode the surface will reject.
-        [PresentMode::Mailbox, PresentMode::Immediate, PresentMode::Fifo]
-            .into_iter()
-            .find(|mode| supported.contains(mode))
-            .unwrap_or(PresentMode::Fifo)
+        [
+            PresentMode::Mailbox,
+            PresentMode::Immediate,
+            PresentMode::Fifo,
+        ]
+        .into_iter()
+        .find(|mode| supported.contains(mode))
+        .unwrap_or(PresentMode::Fifo)
     }
 }
 
@@ -579,8 +578,8 @@ fn try_create_renderer(
     };
 
     let adapter = match block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-        power_preference: wgpu::PowerPreference::from_env()
-            .unwrap_or(wgpu::PowerPreference::HighPerformance),
+        power_preference:
+            wgpu::PowerPreference::from_env().unwrap_or(wgpu::PowerPreference::HighPerformance),
         force_fallback_adapter: false,
         compatible_surface: surface.as_ref(),
     })) {
@@ -614,7 +613,8 @@ fn try_create_renderer(
         .features()
         .contains(wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS)
     {
-        required_features |= wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
+        required_features |=
+            wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
     }
 
     // Immediates - push constants, spelled the way WebGPU spells them: the render graph's terrain pass
@@ -704,7 +704,13 @@ fn register_renderer(wm: WmRenderer, framebuffer: (u32, u32)) -> jlong {
 ///
 /// Kept separate from the JNI wrappers below so the renderer can also be created from Rust code
 /// and so every JVM-side declaration shares one implementation.
-pub fn create_renderer(env: &mut JNIEnv, display: u64, window: u64, width: u32, height: u32) -> jlong {
+pub fn create_renderer(
+    env: &mut JNIEnv,
+    display: u64,
+    window: u64,
+    width: u32,
+    height: u32,
+) -> jlong {
     let requested = selected_backend();
 
     // The configured backend is tried first, then the other one. A backend that is valid in the
@@ -760,7 +766,13 @@ pub fn createWmRendererOnWindow(
     width: jint,
     height: jint,
 ) -> jlong {
-    create_renderer(&mut env, display as u64, window as u64, width as u32, height as u32)
+    create_renderer(
+        &mut env,
+        display as u64,
+        window as u64,
+        width as u32,
+        height as u32,
+    )
 }
 
 #[unsafe(no_mangle)]
@@ -823,8 +835,6 @@ static SUBMISSIONS: AtomicU64 = AtomicU64::new(0);
 /// frame cost" - and neither is answerable without the other: a submission count alone cannot tell
 /// one-per-frame apart from two, and the frame rate is not the same number as the present count.
 static PRESENTS: AtomicU64 = AtomicU64::new(0);
-
-
 
 /// The submission the frame being recorded ended with, if it has submitted yet.
 static LAST_SUBMISSION: Mutex<Option<wgpu::SubmissionIndex>> = Mutex::new(None);
@@ -1137,8 +1147,8 @@ pub extern "C" fn create_texture_view(
     // for the pointers that reach the ABI some other way.
     if !texture_is_alive(texture) {
         // Every field comes from the tombstone: the texture itself must not be read.
-        let (width, height, format) = dead_texture_description(texture)
-            .unwrap_or((1, 1, wgpu::TextureFormat::Rgba8Unorm));
+        let (width, height, format) =
+            dead_texture_description(texture).unwrap_or((1, 1, wgpu::TextureFormat::Rgba8Unorm));
         let view = Box::new(placeholder_view(wm, format, width, height));
         // Counted like any other view: `drop_texture_view` decrements for every view the JVM
         // closes, and a view that was never counted makes the live count drift downwards.
@@ -1239,12 +1249,13 @@ pub extern "C" fn create_render_pass(
     let encoder = unsafe { &mut *shared_encoder() };
 
     let render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-        label: None,        color_attachments: &render_pass_descriptor
+        label: None,
+        color_attachments: &render_pass_descriptor
             .attachments
             .iter()
             .map(|attachment| {
                 Some(wgpu::RenderPassColorAttachment {
-                    view: &attachment.texture_view,
+                    view: attachment.texture_view,
                     depth_slice: None,
                     resolve_target: None,
                     // `None` is `OptionalInt.empty()` on the Java side: "no clear value", which is
@@ -1272,7 +1283,7 @@ pub extern "C" fn create_render_pass(
             .collect::<Vec<_>>(),
         depth_stencil_attachment: render_pass_descriptor.depth_attachment.map(|tex| {
             wgpu::RenderPassDepthStencilAttachment {
-                view: &tex.texture_view,
+                view: tex.texture_view,
                 depth_ops: Some(wgpu::Operations {
                     // A pass that asks for a depth clear has to get one. This used to load the
                     // depth buffer unconditionally, which silently dropped every `clearDepth` a
@@ -1422,7 +1433,9 @@ static WRITE_HIGH_WATER: std::sync::Mutex<Option<std::collections::HashMap<usize
 /// have to - and Minecraft's uploads share one offset space with their readers, so the conservative
 /// answer is the safe one.
 fn write_needs_a_submission(address: usize, start: u64, length: u64) -> bool {
-    let mut marks = WRITE_HIGH_WATER.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut marks = WRITE_HIGH_WATER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let marks = marks.get_or_insert_with(Default::default);
 
     let previous = marks.insert(address, start + length);
@@ -1440,7 +1453,6 @@ fn forget_write_marks(address: usize) {
         marks.remove(&address);
     }
 }
-
 
 /// Copies `length` bytes from `data` into `buffer` at `start`.
 ///
@@ -1477,7 +1489,9 @@ pub unsafe extern "C" fn write_to_buffer(
     // the process. The JVM side rounds its uploads to 16 bytes for exactly this reason, so this is
     // the backstop for the paths that do not - and the write that is dropped is the last three bytes
     // of an upload the caller was told is aligned.
-    if start % wgpu::COPY_BUFFER_ALIGNMENT != 0 || length % wgpu::COPY_BUFFER_ALIGNMENT != 0 {
+    if !start.is_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT)
+        || !length.is_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT)
+    {
         log::error!(
             "wgpu-mc: refusing to write {length} bytes at {start}, which is not a multiple of the \
              {} byte copy alignment",
@@ -1586,7 +1600,8 @@ static LIVE_PASS_COUNT: AtomicU64 = AtomicU64::new(0);
 pub static LIVE_BIND_GROUP_COUNT: AtomicU64 = AtomicU64::new(0);
 static LIVE_PIPELINE_COUNT: AtomicU64 = AtomicU64::new(0);
 
-static DEAD_TEXTURES: Mutex<Option<std::collections::HashMap<usize, DeadTexture>>> = Mutex::new(None);
+static DEAD_TEXTURES: Mutex<Option<std::collections::HashMap<usize, DeadTexture>>> =
+    Mutex::new(None);
 
 /// The order tombstones were added in, so the oldest can be forgotten once there are too many.
 ///
@@ -1631,7 +1646,11 @@ fn note_texture_dead(texture: &wgpu::Texture) {
         width: texture.width(),
         height: texture.height(),
         format: texture.format(),
-        bytes: texture_bytes(texture.width(), texture.height(), texture.depth_or_array_layers()),
+        bytes: texture_bytes(
+            texture.width(),
+            texture.height(),
+            texture.depth_or_array_layers(),
+        ),
     };
 
     LIVE_TEXTURE_COUNT.fetch_sub(1, Ordering::Relaxed);
@@ -1712,7 +1731,9 @@ fn note_view_dead(view: &wgpu::TextureView) {
 /// Whether a view address names a live view, a dropped one, or one this side never made.
 ///
 /// A report is what this is for: a draw that binds a dropped view is the bug that mixes textures
-/// between models, and it has to be found without dereferencing the address to ask.
+/// between models, and it has to be found without dereferencing the address to ask - so a caller
+/// added when a mix is being chased would be the first. Nothing calls it today.
+#[allow(dead_code)]
 pub fn view_is_alive(address: usize) -> bool {
     LIVE_VIEWS
         .lock()
@@ -1730,7 +1751,11 @@ pub fn view_is_dead(address: usize) -> bool {
 
 /// How many dropped view addresses are still remembered, for the report that names one.
 pub fn dead_view_count() -> usize {
-    DEAD_VIEWS.lock().as_ref().map(|dead| dead.len()).unwrap_or(0)
+    DEAD_VIEWS
+        .lock()
+        .as_ref()
+        .map(|dead| dead.len())
+        .unwrap_or(0)
 }
 
 /// The label a view address was registered under, if any.
@@ -1743,8 +1768,13 @@ pub fn view_label(address: usize) -> Option<String> {
 
 /// How many views are live, for the render-stats line.
 pub fn live_view_labels() -> usize {
-    LIVE_VIEWS.lock().as_ref().map(|live| live.len()).unwrap_or(0)
-}/// An estimate of what a texture costs, good enough to watch for growth: four bytes a texel.
+    LIVE_VIEWS
+        .lock()
+        .as_ref()
+        .map(|live| live.len())
+        .unwrap_or(0)
+}
+/// An estimate of what a texture costs, good enough to watch for growth: four bytes a texel.
 fn texture_bytes(width: u32, height: u32, depth_or_layers: u32) -> u64 {
     (width as u64) * (height as u64) * (depth_or_layers.max(1) as u64) * 4
 }
@@ -1854,8 +1884,12 @@ fn clear_attachments(
     depth_texture: Option<&wgpu::Texture>,
     clear_depth: f64,
 ) {
-    let color_view = color_texture.filter(|texture| texture_is_alive(texture)).map(clear_view);
-    let depth_view = depth_texture.filter(|texture| texture_is_alive(texture)).map(clear_view);
+    let color_view = color_texture
+        .filter(|texture| texture_is_alive(texture))
+        .map(clear_view);
+    let depth_view = depth_texture
+        .filter(|texture| texture_is_alive(texture))
+        .map(clear_view);
 
     // A pass with no attachments at all is a validation error - "at least one attachment of any
     // kind must be provided" - and a validation error ends the process here. Both textures being
@@ -1908,7 +1942,9 @@ pub extern "C" fn clear_color_texture(
     texture: &wgpu::Texture,
     clear_color: u32,
 ) {
-    with_shared_encoder(|encoder| clear_attachments(encoder, Some(texture), clear_color, None, 0.0));
+    with_shared_encoder(|encoder| {
+        clear_attachments(encoder, Some(texture), clear_color, None, 0.0)
+    });
 }
 
 #[unsafe(no_mangle)]
@@ -1994,18 +2030,14 @@ pub extern "C" fn clear_color_and_depth_textures_region(
             });
 
             with_shared_encoder(|encoder| {
-                clear_attachments(
-                    encoder,
-                    Some(color_texture),
-                    clear_color,
-                    None,
-                    1.0,
-                );
+                clear_attachments(encoder, Some(color_texture), clear_color, None, 1.0);
             });
         }
     }
 
-    with_shared_encoder(|encoder| clear_attachments(encoder, None, 0, Some(depth_texture), clear_depth));
+    with_shared_encoder(|encoder| {
+        clear_attachments(encoder, None, 0, Some(depth_texture), clear_depth)
+    });
 }
 
 /// The clear colour as the bytes a texture of [format] holds, or `None` for a format this does not
@@ -2120,7 +2152,8 @@ pub extern "C" fn dump_texture_rgba(
     let width = texture.width();
     let height = texture.height();
     let unpadded = width * 4;
-    let padded = unpadded.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+    let padded =
+        unpadded.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
 
     if width == 0 || height == 0 || width > DUMP_SANITY_LIMIT || height > DUMP_SANITY_LIMIT {
         error!("wgpu-mc: refusing to dump a {width}x{height} texture to {path}");
@@ -2244,7 +2277,7 @@ pub unsafe extern "C" fn flush_encoder(wm: &WmRenderer, _encoder: &mut CommandEn
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn copy_buffer_to_buffer(
-    wm: &WmRenderer,
+    _wm: &WmRenderer,
     _encoder: &mut CommandEncoderHandle,
     src: &wgpu::Buffer,
     dest: &wgpu::Buffer,
@@ -2275,20 +2308,20 @@ pub unsafe extern "C" fn copy_texture_to_buffer(
     x: u32,
     y: u32,
     width: u32,
-    height: u32
+    height: u32,
 ) {
     // The token stands in for the one encoder this side owns; see `CommandEncoderHandle`.
     let encoder = unsafe { &mut *shared_encoder() };
 
     let texel_size = source.format().block_copy_size(None).unwrap();
     let unpadded = width * texel_size;
-    let padded = unpadded.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
-        * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+    let padded =
+        unpadded.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
 
     if unpadded == padded {
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
-                texture: &source,
+                texture: source,
                 mip_level: mip,
                 origin: Origin3d { x, y, z: 0 },
                 aspect: wgpu::TextureAspect::All,
@@ -2301,7 +2334,11 @@ pub unsafe extern "C" fn copy_texture_to_buffer(
                     rows_per_image: Some(height),
                 },
             },
-            Extent3d { width, height, depth_or_array_layers: 1 },
+            Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
         );
         return;
     }
@@ -2315,7 +2352,7 @@ pub unsafe extern "C" fn copy_texture_to_buffer(
 
     encoder.copy_texture_to_buffer(
         wgpu::TexelCopyTextureInfo {
-            texture: &source,
+            texture: source,
             mip_level: mip,
             origin: Origin3d { x, y, z: 0 },
             aspect: wgpu::TextureAspect::All,
@@ -2328,7 +2365,11 @@ pub unsafe extern "C" fn copy_texture_to_buffer(
                 rows_per_image: Some(height),
             },
         },
-        Extent3d { width, height, depth_or_array_layers: 1 },
+        Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
     );
 
     for row in 0..height as u64 {
@@ -2342,12 +2383,23 @@ pub unsafe extern "C" fn copy_texture_to_buffer(
     }
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn copy_texture_to_texture(_encoder: &mut CommandEncoderHandle, source: &wgpu::Texture, destination: &wgpu::Texture, mip: u32, dest_x: u32, dest_y: u32, src_x: u32, src_y: u32, width: u32, height: u32)  {
+pub unsafe extern "C" fn copy_texture_to_texture(
+    _encoder: &mut CommandEncoderHandle,
+    source: &wgpu::Texture,
+    destination: &wgpu::Texture,
+    mip: u32,
+    dest_x: u32,
+    dest_y: u32,
+    src_x: u32,
+    src_y: u32,
+    width: u32,
+    height: u32,
+) {
     // The token stands in for the encoder this side owns; see `CommandEncoderHandle`.
     let encoder = unsafe { &mut *shared_encoder() };
 
     let src_info = wgpu::TexelCopyTextureInfo {
-        texture: &source,
+        texture: source,
         mip_level: mip,
         origin: Origin3d {
             x: src_x,
@@ -2357,13 +2409,17 @@ pub unsafe extern "C" fn copy_texture_to_texture(_encoder: &mut CommandEncoderHa
         aspect: wgpu::TextureAspect::All,
     };
     let dest_info = wgpu::TexelCopyTextureInfo {
-        texture: &destination,
+        texture: destination,
         mip_level: mip,
-        origin: Origin3d { x: dest_x, y: dest_y, z: 0 },
+        origin: Origin3d {
+            x: dest_x,
+            y: dest_y,
+            z: 0,
+        },
         aspect: wgpu::TextureAspect::All,
     };
 
-    let extent = Extent3d{
+    let extent = Extent3d {
         width,
         height,
         depth_or_array_layers: 1,
@@ -2394,7 +2450,10 @@ fn shader_dump_directory() -> Option<PathBuf> {
             let directory = run_directory.join("wgpu-shaders");
 
             std::fs::create_dir_all(&directory).ok()?;
-            info!("wgpu-mc: writing processed shaders to {}", directory.display());
+            info!(
+                "wgpu-mc: writing processed shaders to {}",
+                directory.display()
+            );
             Some(directory)
         })
         .clone()
@@ -2441,7 +2500,9 @@ fn reflected_block_sizes(vert: &str, frag: &str) -> HashMap<String, u64> {
             // The shader goes to wgpu as it is; if naga will not parse it here, its error there
             // says more about why than a second copy of the message would.
             if crate::debug::trace_dynamic_offsets() {
-                warn!("wgpu-mc: naga would not parse the preprocessed {stage:?} shader for reflection");
+                warn!(
+                    "wgpu-mc: naga would not parse the preprocessed {stage:?} shader for reflection"
+                );
             }
             continue;
         };
@@ -2554,7 +2615,10 @@ pub(crate) fn fan_indices(device: &wgpu::Device, index_count: u32) -> Option<wgp
 }
 
 /// The index buffer that turns [vertex_count] quads into triangles, and how many indices it holds.
-pub(crate) fn quad_indices(device: &wgpu::Device, vertex_count: u32) -> Option<(wgpu::Buffer, u32)> {
+pub(crate) fn quad_indices(
+    device: &wgpu::Device,
+    vertex_count: u32,
+) -> Option<(wgpu::Buffer, u32)> {
     let quads = vertex_count / 4;
     if quads == 0 {
         return None;
@@ -2598,7 +2662,9 @@ pub(crate) fn quad_indices(device: &wgpu::Device, vertex_count: u32) -> Option<(
 /// Reinterprets a slice of `u32` as bytes, which is what `create_buffer_init` wants.
 fn bytemuck_cast_slice(values: &[u32]) -> &[u8] {
     // Safety: `u32` has no padding and no invalid bit patterns, so any byte view of it is defined.
-    unsafe { std::slice::from_raw_parts(values.as_ptr() as *const u8, std::mem::size_of_val(values)) }
+    unsafe {
+        std::slice::from_raw_parts(values.as_ptr() as *const u8, std::mem::size_of_val(values))
+    }
 }
 
 /// Logs a pipeline the first time it is bound, and never touches its name again.
@@ -2770,7 +2836,10 @@ pub(crate) fn count_vertices(vertices: u64) {
 }
 
 pub(crate) fn count_bind_groups(bind_groups: u64) {
-    with_counters(|c| c.bind_groups_created.set(c.bind_groups_created.get() + bind_groups));
+    with_counters(|c| {
+        c.bind_groups_created
+            .set(c.bind_groups_created.get() + bind_groups)
+    });
 }
 
 pub(crate) fn count_cache_hit() {
@@ -2832,10 +2901,11 @@ pub(crate) fn trace_pipeline(name: &str) {
         return;
     }
 
-    if let Some(trace) = CURRENT_TRACE.lock().as_mut() {
-        if trace.pipelines.len() < 6 && !trace.pipelines.iter().any(|seen| seen == name) {
-            trace.pipelines.push(name.to_owned());
-        }
+    if let Some(trace) = CURRENT_TRACE.lock().as_mut()
+        && trace.pipelines.len() < 6
+        && !trace.pipelines.iter().any(|seen| seen == name)
+    {
+        trace.pipelines.push(name.to_owned());
     }
 }
 
@@ -2957,8 +3027,16 @@ pub extern "C" fn log_render_stats() {
             .as_ref()
             .map(|dead| dead.len())
             .unwrap_or(0),
-        FAN_INDICES.lock().as_ref().map(|cache| cache.len()).unwrap_or(0),
-        QUAD_INDICES.lock().as_ref().map(|cache| cache.len()).unwrap_or(0),
+        FAN_INDICES
+            .lock()
+            .as_ref()
+            .map(|cache| cache.len())
+            .unwrap_or(0),
+        QUAD_INDICES
+            .lock()
+            .as_ref()
+            .map(|cache| cache.len())
+            .unwrap_or(0),
     );
 
     let traces = std::mem::take(&mut *TRACES.lock());
@@ -3064,73 +3142,83 @@ impl PipelineRecipe {
             })
             .collect::<Vec<_>>();
 
-        wm.gpu.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some(&self.label),
-            layout: Some(&self.layout),
-            vertex: wgpu::VertexState {
-                module: &self.vertex_module,
-                entry_point: Some("main"),
-                compilation_options: Default::default(),
-                buffers: &vertex_buffers,
-            },
-            primitive: wgpu::PrimitiveState {
-                topology: self.topology,
-                strip_index_format: None,
-                // `Cw`, *because* the vertex shaders flip `gl_Position.y` to emulate GL's clip
-                // space: that flip mirrors the winding, so a triangle OpenGL calls
-                // counter-clockwise - and therefore front-facing - comes out clockwise here.
-                // `Ccw` culled exactly the faces that should have been kept, which showed as the
-                // ground disappearing and the sky's dark lower half showing through it. Without
-                // the flip this would have to be `Ccw`. Culling was not forwarded at all before, so
-                // every quad was rasterized - and for a single-sided mesh, culling the wrong side
-                // removes the surface rather than revealing a back face.
-                front_face: wgpu::FrontFace::Cw,
-                cull_mode: if self.cull {
-                    Some(wgpu::Face::Back)
-                } else {
-                    None
+        wm.gpu
+            .device
+            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(&self.label),
+                layout: Some(&self.layout),
+                vertex: wgpu::VertexState {
+                    module: &self.vertex_module,
+                    entry_point: Some("main"),
+                    compilation_options: Default::default(),
+                    buffers: &vertex_buffers,
                 },
-                unclipped_depth: false,
-                // `RenderPipeline#getPolygonMode` is not forwarded: the one pipeline that asks for
-                // `WIREFRAME` (`pipeline/wireframe`, the chunk-section debug view) draws filled
-                // here. wgpu would need `Features::POLYGON_MODE_LINE` for it.
-                polygon_mode: Default::default(),
-                conservative: false,
-            },
-            depth_stencil: depth_stencil.map(|state| wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth32Float,
-                // Both of these used to be constants - `Always` with writes forced on - which
-                // is not a depth test at all. Minecraft asks for `LESS_THAN_OR_EQUAL` on
-                // almost everything, `EQUAL` without writes for glint, and biased variants for
-                // the overlays that sit on top of the block they belong to.
-                depth_write_enabled: Some(state.active != 0),
-                depth_compare: Some(state.compare_function.into()),
-                stencil: Default::default(),
-                bias: wgpu::DepthBiasState {
-                    // wgpu rejects a depth bias on a non-triangle topology - "Depth bias is not
-                    // compatible with non-triangle topology LineList" - and it is right to:
-                    // polygon offset applies to polygons. OpenGL ignores it for lines and
-                    // points in the same way, so zeroing it here is what Minecraft gets there
-                    // too, and `lines_depth_bias` asks for it only because the pipeline is
-                    // shared with the quad-based outlines.
-                    constant: if self.is_polygon { state.bias_constant } else { 0 },
-                    slope_scale: if self.is_polygon { state.bias_slope_scale } else { 0.0 },
-                    clamp: 0.0,
+                primitive: wgpu::PrimitiveState {
+                    topology: self.topology,
+                    strip_index_format: None,
+                    // `Cw`, *because* the vertex shaders flip `gl_Position.y` to emulate GL's clip
+                    // space: that flip mirrors the winding, so a triangle OpenGL calls
+                    // counter-clockwise - and therefore front-facing - comes out clockwise here.
+                    // `Ccw` culled exactly the faces that should have been kept, which showed as the
+                    // ground disappearing and the sky's dark lower half showing through it. Without
+                    // the flip this would have to be `Ccw`. Culling was not forwarded at all before, so
+                    // every quad was rasterized - and for a single-sided mesh, culling the wrong side
+                    // removes the surface rather than revealing a back face.
+                    front_face: wgpu::FrontFace::Cw,
+                    cull_mode: if self.cull {
+                        Some(wgpu::Face::Back)
+                    } else {
+                        None
+                    },
+                    unclipped_depth: false,
+                    // `RenderPipeline#getPolygonMode` is not forwarded: the one pipeline that asks for
+                    // `WIREFRAME` (`pipeline/wireframe`, the chunk-section debug view) draws filled
+                    // here. wgpu would need `Features::POLYGON_MODE_LINE` for it.
+                    polygon_mode: Default::default(),
+                    conservative: false,
                 },
-            }),
-            multisample: Default::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &self.fragment_module,
-                entry_point: Some("main"),
-                compilation_options: Default::default(),
-                targets: &self.color_targets,
-            }),
-            multiview_mask: None,
-            // The driver's own cache, when the backend has one: the second launch of the same
-            // build hands back pipelines that were already compiled instead of compiling them
-            // again. `None` on the backends that do not implement it.
-            cache: wm.gpu.pipeline_cache.as_ref(),
-        })
+                depth_stencil: depth_stencil.map(|state| wgpu::DepthStencilState {
+                    format: wgpu::TextureFormat::Depth32Float,
+                    // Both of these used to be constants - `Always` with writes forced on - which
+                    // is not a depth test at all. Minecraft asks for `LESS_THAN_OR_EQUAL` on
+                    // almost everything, `EQUAL` without writes for glint, and biased variants for
+                    // the overlays that sit on top of the block they belong to.
+                    depth_write_enabled: Some(state.active != 0),
+                    depth_compare: Some(state.compare_function.into()),
+                    stencil: Default::default(),
+                    bias: wgpu::DepthBiasState {
+                        // wgpu rejects a depth bias on a non-triangle topology - "Depth bias is not
+                        // compatible with non-triangle topology LineList" - and it is right to:
+                        // polygon offset applies to polygons. OpenGL ignores it for lines and
+                        // points in the same way, so zeroing it here is what Minecraft gets there
+                        // too, and `lines_depth_bias` asks for it only because the pipeline is
+                        // shared with the quad-based outlines.
+                        constant: if self.is_polygon {
+                            state.bias_constant
+                        } else {
+                            0
+                        },
+                        slope_scale: if self.is_polygon {
+                            state.bias_slope_scale
+                        } else {
+                            0.0
+                        },
+                        clamp: 0.0,
+                    },
+                }),
+                multisample: Default::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &self.fragment_module,
+                    entry_point: Some("main"),
+                    compilation_options: Default::default(),
+                    targets: &self.color_targets,
+                }),
+                multiview_mask: None,
+                // The driver's own cache, when the backend has one: the second launch of the same
+                // build hands back pipelines that were already compiled instead of compiling them
+                // again. `None` on the backends that do not implement it.
+                cache: wm.gpu.pipeline_cache.as_ref(),
+            })
     }
 }
 
@@ -3313,8 +3401,8 @@ pub unsafe extern "C" fn compile_render_pipeline(
                     sampler_types,
                     implicit_uniforms,
                 } = process_shaders(
-                    &*render_pipeline_description.vertex_shader,
-                    &*render_pipeline_description.fragment_shader,
+                    &render_pipeline_description.vertex_shader,
+                    &render_pipeline_description.fragment_shader,
                     &directives,
                     &shader_locations,
                     vertex_stage_input_layout.iter().cloned().collect(),
@@ -3350,7 +3438,11 @@ pub unsafe extern "C" fn compile_render_pipeline(
 
     crate::shader_cache::report_once();
 
-    dump_shaders(&render_pipeline_description.name, &vert_processed, &frag_processed);
+    dump_shaders(
+        &render_pipeline_description.name,
+        &vert_processed,
+        &frag_processed,
+    );
 
     plan.add_implicit_uniforms(&implicit_uniforms);
     plan.apply_sampler_types(&sampler_types);
@@ -3409,8 +3501,7 @@ pub unsafe extern "C" fn compile_render_pipeline(
                             error!(
                                 "wgpu-mc: vertex element {} is {:?}, which has no wgpu vertex \
                                  format; the pipeline will not validate",
-                                element.name.to_string(),
-                                element.format
+                                element.name, element.format
                             );
                             return None;
                         };
@@ -3425,7 +3516,7 @@ pub unsafe extern "C" fn compile_render_pipeline(
                             error!(
                                 "wgpu-mc: vertex element {} ({:?}) needs bytes {}..{} but a \
                                  vertex is only {} bytes; it will read into the next vertex",
-                                element.name.to_string(),
+                                element.name,
                                 element.format,
                                 element.offset,
                                 end,
@@ -3495,7 +3586,10 @@ pub unsafe extern "C" fn compile_render_pipeline(
         is_polygon,
     };
 
-    let pipeline = recipe.create(wm, render_pipeline_description.depth_stencil_state.as_deref());
+    let pipeline = recipe.create(
+        wm,
+        render_pipeline_description.depth_stencil_state.as_deref(),
+    );
 
     // The driver's compilation results are worth carrying into the next launch, and the only
     // moment they change is here.
@@ -3525,7 +3619,8 @@ const PIPELINE_CACHE_SAVE_EVERY: u64 = 16;
 /// The cache is created during mod construction, which is before the logger is up, so which of
 /// these three cases applies is recorded here and printed by the first `log_render_stats` - the
 /// question "why is there no cache file" deserves an answer in the log.
-static PIPELINE_CACHE_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(STATE_UNKNOWN);
+static PIPELINE_CACHE_STATE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(STATE_UNKNOWN);
 
 const STATE_UNKNOWN: u8 = 0;
 /// The device has no `PIPELINE_CACHE` feature, so there is nothing to create.
@@ -3559,7 +3654,8 @@ fn report_pipeline_cache_once() {
         STATE_PERSISTED => info!(
             "wgpu-mc: pipeline cache: started from {:.1} MB, written to {} every {} pipelines",
             loaded,
-            file.map(|file| file.display().to_string()).unwrap_or_default(),
+            file.map(|file| file.display().to_string())
+                .unwrap_or_default(),
             PIPELINE_CACHE_SAVE_EVERY,
         ),
         // No pipeline was compiled before the stats line, which cannot happen in a real frame, but
@@ -3584,7 +3680,10 @@ static LOADED_PIPELINE_CACHE_BYTES: AtomicU64 = AtomicU64::new(0);
 /// Not every backend has one. Vulkan implements it with `vkPipelineCache`; DX12 has no serialisable
 /// form and returns a cache that stores nothing, and `get_data` answers `None` for it, so nothing is
 /// ever written on that path. See [`pipeline_cache_file`] for why the data is kept per adapter.
-fn create_pipeline_cache(device: &wgpu::Device, adapter: &wgpu::Adapter) -> Option<wgpu::PipelineCache> {
+fn create_pipeline_cache(
+    device: &wgpu::Device,
+    adapter: &wgpu::Adapter,
+) -> Option<wgpu::PipelineCache> {
     if !device.features().contains(wgpu::Features::PIPELINE_CACHE) {
         // The logger is not up yet at this point in a launch - the device is created during mod
         // construction - so the case is recorded here and printed by `report_pipeline_cache_once`.
@@ -3606,7 +3705,10 @@ fn create_pipeline_cache(device: &wgpu::Device, adapter: &wgpu::Adapter) -> Opti
             data.len() as f64 / (1024.0 * 1024.0),
             file.display()
         ),
-        None => log::info!("wgpu-mc: pipeline cache: nothing to load from {}", file.display()),
+        None => log::info!(
+            "wgpu-mc: pipeline cache: nothing to load from {}",
+            file.display()
+        ),
     }
 
     // Safety: the data is what a previous `PipelineCache::get_data` wrote to this file for this
@@ -3677,7 +3779,10 @@ fn save_pipeline_cache(wm: &WmRenderer) {
     let temporary = file.with_extension("bin.tmp");
 
     if let Err(err) = std::fs::write(&temporary, &data) {
-        error!("wgpu-mc: could not write the pipeline cache to {}: {err}", temporary.display());
+        error!(
+            "wgpu-mc: could not write the pipeline cache to {}: {err}",
+            temporary.display()
+        );
         return;
     }
 
@@ -3806,7 +3911,10 @@ pub extern "C" fn read_buffer(
 ) -> bool {
     let end = offset + length;
     if end > buffer.size() || length == 0 {
-        error!("wgpu-mc: refusing to read {length} bytes at {offset} of a {} byte buffer", buffer.size());
+        error!(
+            "wgpu-mc: refusing to read {length} bytes at {offset} of a {} byte buffer",
+            buffer.size()
+        );
         return false;
     }
 
@@ -3984,7 +4092,9 @@ pub extern "C" fn acquire_next_texture(wm: &WmRenderer) -> *mut SurfaceTexture {
             static ACQUIRE_FAILURES: AtomicU64 = AtomicU64::new(0);
             let failures = ACQUIRE_FAILURES.fetch_add(1, Ordering::Relaxed);
             if failures.is_multiple_of(120) {
-                info!("wgpu-mc: the swapchain went stale ({failures} frames so far), reconfiguring it");
+                info!(
+                    "wgpu-mc: the swapchain went stale ({failures} frames so far), reconfiguring it"
+                );
             }
 
             let (width, height, request) = {
@@ -4144,16 +4254,11 @@ pub extern "C" fn copy_buffer_to_texture(
     let source_width_u64 = source_width as u64;
     let source_height_u64 = source_height as u64;
 
-    let texel_size = destination
-        .format()
-        .block_copy_size(None)
-        .unwrap() as u64;
+    let texel_size = destination.format().block_copy_size(None).unwrap() as u64;
 
-    let offset_texels =
-        source_x as u64 + source_y as u64 * source_width_u64;
+    let offset_texels = source_x as u64 + source_y as u64 * source_width_u64;
 
-    let source_offset =
-        buffer_start + offset_texels * texel_size;
+    let source_offset = buffer_start + offset_texels * texel_size;
 
     let src_row_bytes = source_width_u64 * texel_size;
 
@@ -4169,18 +4274,16 @@ pub extern "C" fn copy_buffer_to_texture(
     let mut valid_rows = 0u32;
 
     for row in 0..source_height_u64 {
-        let src_row_offset =
-            source_offset + row * src_row_bytes;
+        let src_row_offset = source_offset + row * src_row_bytes;
 
-        let dst_row_offset =
-            row * aligned_row_bytes;
+        let dst_row_offset = row * aligned_row_bytes;
 
         let src_end = src_row_offset + src_row_bytes;
         if src_row_offset >= buffer_size || src_end > buffer_size {
             continue;
         }
 
-        if src_row_offset % 4 != 0 || src_row_bytes % 4 != 0 {
+        if !src_row_offset.is_multiple_of(4) || !src_row_bytes.is_multiple_of(4) {
             continue;
         }
 
@@ -4263,7 +4366,7 @@ pub extern "C" fn write_to_texture(
 
     wm.gpu.queue.write_texture(
         wgpu::TexelCopyTextureInfo {
-            texture: &destination,
+            texture: destination,
             mip_level,
             origin: Origin3d {
                 x: dest_x,
@@ -4457,7 +4560,9 @@ fn report_terrain_transform(
         centre.z + model_translation[2],
     ];
     let clip: [f32; 4] = std::array::from_fn(|row| {
-        (0..4).map(|k| view_projection[k][row] * if k == 3 { 1.0 } else { moved[k] }).sum()
+        (0..4)
+            .map(|k| view_projection[k][row] * if k == 3 { 1.0 } else { moved[k] })
+            .sum()
     });
 
     log::info!(
@@ -4716,7 +4821,9 @@ pub fn setRenderDistance(_env: JNIEnv, _class: JClass, chunks: jint) {
         // a time. Only upwards: a report that asks for less than the pool already has is not a reason to
         // move it.
         let pool = scene.section_storage.read().pool_slots();
-        let target = wanted.max(pool.saturating_mul(2)).min(scene.arena_cap_slots);
+        let target = wanted
+            .max(pool.saturating_mul(2))
+            .min(scene.arena_cap_slots);
 
         if target > pool {
             scene
@@ -4843,7 +4950,11 @@ pub extern "C" fn create_buffer_init(
 
     let diff = data.len().next_multiple_of(16) - data.len();
 
-    let padded_data: Vec<u8> = data.iter().copied().chain(iter::repeat(0).take(diff)).collect();
+    let padded_data: Vec<u8> = data
+        .iter()
+        .copied()
+        .chain(std::iter::repeat_n(0, diff))
+        .collect();
 
     let wgpu_usage_flags = wgpu_buffer_usages(usage);
 
@@ -4874,7 +4985,7 @@ pub extern "C" fn create_texture(
     depth_or_layers: u32,
     usage: u32,
     mip_levels: u32,
-    name: FfiStr
+    name: FfiStr,
 ) -> Box<wgpu::Texture> {
     let mut wgpu_usage_flags = wgpu::TextureUsages::empty();
 
@@ -4911,7 +5022,10 @@ pub extern "C" fn create_texture(
     note_texture_alive(&texture, &name);
 
     LIVE_TEXTURE_COUNT.fetch_add(1, Ordering::Relaxed);
-    LIVE_TEXTURE_BYTES.fetch_add(texture_bytes(width, height, depth_or_layers), Ordering::Relaxed);
+    LIVE_TEXTURE_BYTES.fetch_add(
+        texture_bytes(width, height, depth_or_layers),
+        Ordering::Relaxed,
+    );
 
     texture
 }
@@ -5007,10 +5121,3 @@ pub extern "C" fn max_texture_size(wm: &WmRenderer) -> u32 {
 pub extern "C" fn min_uniform_offset_alignment(wm: &WmRenderer) -> u32 {
     wm.gpu.device.limits().min_uniform_buffer_offset_alignment
 }
-
-
-
-
-
-
-

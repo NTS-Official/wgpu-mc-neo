@@ -17,8 +17,8 @@ use std::mem::{offset_of, size_of};
 
 use crate::blaze::{
     BindGroupEntryDescriptor, BlazeAttachmentDescriptor, BlazeBindGroupLayout, BlazeBlendState,
-    BlazeColorTargetState, BlazeDepthStencilState, BlazeRenderPassDescriptor, DrawBinding, DrawCall,
-    PlanBinding, RawArray, RenderPipeline, VertexFormat, VertexFormatElement,
+    BlazeColorTargetState, BlazeDepthStencilState, BlazeRenderPassDescriptor, DrawBinding,
+    DrawCall, PlanBinding, RawArray, RenderPipeline, VertexFormat, VertexFormatElement,
 };
 
 const WM_NATIVE_KT: &str =
@@ -62,7 +62,10 @@ fn group(source: &str, open: usize) -> (&str, usize) {
         }
     }
 
-    panic!("unbalanced brackets in {:?}", &source[open..(open + 40).min(source.len())]);
+    panic!(
+        "unbalanced brackets in {:?}",
+        &source[open..(open + 40).min(source.len())]
+    );
 }
 
 /// Splits an argument or field list at its top-level commas.
@@ -124,7 +127,11 @@ fn fn_parameters(source: &str, name: &str) -> usize {
             }
         }
 
-        assert_eq!(source.as_bytes()[open], b'(', "{name}: expected a parameter list");
+        assert_eq!(
+            source.as_bytes()[open],
+            b'(',
+            "{name}: expected a parameter list"
+        );
         return split_top_level(group(source, open).0).len();
     }
 }
@@ -226,7 +233,8 @@ fn rust_enum_variants(source: &str, name: &str) -> Vec<(String, u64)> {
     let needle = format!("pub enum {name} {{");
     let start = source
         .find(&needle)
-        .unwrap_or_else(|| panic!("no enum {name}")) + needle.len();
+        .unwrap_or_else(|| panic!("no enum {name}"))
+        + needle.len();
     let end = source[start..].find('}').expect("unterminated enum") + start;
 
     let mut variants = Vec::new();
@@ -294,7 +302,11 @@ fn kotlin_jni_declarations(source: &str) -> Vec<(String, usize)> {
             .take_while(|c| c.is_alphanumeric() || *c == '_')
             .collect();
         let open = start + name.len();
-        assert_eq!(source.as_bytes()[open], b'(', "{name}: expected a parameter list");
+        assert_eq!(
+            source.as_bytes()[open],
+            b'(',
+            "{name}: expected a parameter list"
+        );
 
         out.push((name, split_top_level(group(source, open).0).len()));
         from = open;
@@ -315,7 +327,10 @@ fn rust_jni_implementations(sources: &[&str]) -> Vec<(String, usize)> {
 
         while let Some(found) = source[from..].find("#[jni_fn(\"") {
             let start = found + from + "#[jni_fn(\"".len();
-            let end = start + source[start..].find('"').expect("unterminated jni_fn target");
+            let end = start
+                + source[start..]
+                    .find('"')
+                    .expect("unterminated jni_fn target");
             let target = &source[start..end];
 
             // `jni_fn` names the method after the Rust function unless the target says otherwise.
@@ -325,7 +340,11 @@ fn rust_jni_implementations(sources: &[&str]) -> Vec<(String, usize)> {
             };
 
             let after = end + 2;
-            let fn_at = source[after..].find("fn ").expect("jni_fn without a function") + after + 3;
+            let fn_at = source[after..]
+                .find("fn ")
+                .expect("jni_fn without a function")
+                + after
+                + 3;
             let name: String = source[fn_at..]
                 .chars()
                 .take_while(|c| c.is_alphanumeric() || *c == '_')
@@ -371,14 +390,13 @@ fn kotlin_c_abi_bindings(source: &str) -> Vec<(String, usize)> {
             + end_quote
             + "FunctionDescriptor.".len();
         let returns_nothing = source[descriptor..].starts_with("ofVoid(");
-        let open = source[descriptor..].find('(').expect("descriptor without arguments")
+        let open = source[descriptor..]
+            .find('(')
+            .expect("descriptor without arguments")
             + descriptor;
         let args = split_top_level(group(source, open).0).len();
 
-        out.push((
-            name,
-            if returns_nothing { args } else { args - 1 },
-        ));
+        out.push((name, if returns_nothing { args } else { args - 1 }));
         from = open;
     }
 
@@ -580,56 +598,232 @@ fn every_struct_the_jvm_reads_by_offset_still_has_that_layout() {
     );
 
     // The offsets the JVM writes through, named one by one in WmNative.kt.
-    check_offset(&constants, "FIELD_TEXTURE_VIEW", offset_of!(BlazeAttachmentDescriptor<'static, [f32; 4]>, texture_view));
-    check_offset(&constants, "FIELD_CLEAR_VALUE", offset_of!(BlazeAttachmentDescriptor<'static, [f32; 4]>, clear_value));
-    check_offset(&constants, "BIND_GROUP_ENTRY_TYPE", offset_of!(BindGroupEntryDescriptor, type_));
-    check_offset(&constants, "BIND_GROUP_ENTRY_NAME", offset_of!(BindGroupEntryDescriptor, name));
-    check_offset(&constants, "BIND_GROUP_ENTRY_FORMAT", offset_of!(BindGroupEntryDescriptor, texture_format));
-    check_offset(&constants, "COLOR_TARGET_BLEND", offset_of!(BlazeColorTargetState, blend));
-    check_offset(&constants, "COLOR_TARGET_FORMAT", offset_of!(BlazeColorTargetState, format));
-    check_offset(&constants, "COLOR_TARGET_WRITE_MASK", offset_of!(BlazeColorTargetState, write_mask));
-    check_offset(&constants, "BLEND_STATE_SRC_COLOR", offset_of!(BlazeBlendState, src_color));
-    check_offset(&constants, "BLEND_STATE_DST_COLOR", offset_of!(BlazeBlendState, dst_color));
-    check_offset(&constants, "BLEND_STATE_SRC_ALPHA", offset_of!(BlazeBlendState, src_alpha));
-    check_offset(&constants, "BLEND_STATE_DST_ALPHA", offset_of!(BlazeBlendState, dst_alpha));
-    check_offset(&constants, "DEPTH_STENCIL_COMPARE", offset_of!(BlazeDepthStencilState, compare_function));
-    check_offset(&constants, "DEPTH_STENCIL_ACTIVE", offset_of!(BlazeDepthStencilState, active));
-    check_offset(&constants, "DEPTH_STENCIL_BIAS_CONSTANT", offset_of!(BlazeDepthStencilState, bias_constant));
-    check_offset(&constants, "DEPTH_STENCIL_BIAS_SLOPE_SCALE", offset_of!(BlazeDepthStencilState, bias_slope_scale));
-    check_offset(&constants, "VERTEX_FORMAT_ELEMENT_OFFSET", offset_of!(VertexFormatElement, offset));
-    check_offset(&constants, "VERTEX_FORMAT_ELEMENT_FORMAT", offset_of!(VertexFormatElement, format));
-    check_offset(&constants, "VERTEX_FORMAT_ELEMENT_NAME", offset_of!(VertexFormatElement, name));
-    check_offset(&constants, "VERTEX_FORMAT_ELEMENTS", offset_of!(VertexFormat, elements));
-    check_offset(&constants, "VERTEX_FORMAT_VERTEX_SIZE", offset_of!(VertexFormat, vertex_size));
-    check_offset(&constants, "PIPELINE_NAME", offset_of!(RenderPipeline, name));
-    check_offset(&constants, "PIPELINE_BIND_GROUP_LAYOUTS", offset_of!(RenderPipeline, bind_group_layouts));
-    check_offset(&constants, "PIPELINE_COLOR_TARGETS", offset_of!(RenderPipeline, color_target_states));
-    check_offset(&constants, "PIPELINE_DEPTH_STENCIL", offset_of!(RenderPipeline, depth_stencil_state));
-    check_offset(&constants, "PIPELINE_VERTEX_FORMATS", offset_of!(RenderPipeline, vertex_formats));
-    check_offset(&constants, "PIPELINE_VERTEX_SHADER", offset_of!(RenderPipeline, vertex_shader));
-    check_offset(&constants, "PIPELINE_FRAGMENT_SHADER", offset_of!(RenderPipeline, fragment_shader));
-    check_offset(&constants, "PIPELINE_DIRECTIVES", offset_of!(RenderPipeline, directives));
-    check_offset(&constants, "PIPELINE_FRAG_STATE", offset_of!(RenderPipeline, frag_state));
-    check_offset(&constants, "PIPELINE_TOPOLOGY", offset_of!(RenderPipeline, primitive_topology));
-    check_offset(&constants, "PIPELINE_CULL", offset_of!(RenderPipeline, cull));
+    check_offset(
+        &constants,
+        "FIELD_TEXTURE_VIEW",
+        offset_of!(BlazeAttachmentDescriptor<'static, [f32; 4]>, texture_view),
+    );
+    check_offset(
+        &constants,
+        "FIELD_CLEAR_VALUE",
+        offset_of!(BlazeAttachmentDescriptor<'static, [f32; 4]>, clear_value),
+    );
+    check_offset(
+        &constants,
+        "BIND_GROUP_ENTRY_TYPE",
+        offset_of!(BindGroupEntryDescriptor, type_),
+    );
+    check_offset(
+        &constants,
+        "BIND_GROUP_ENTRY_NAME",
+        offset_of!(BindGroupEntryDescriptor, name),
+    );
+    check_offset(
+        &constants,
+        "BIND_GROUP_ENTRY_FORMAT",
+        offset_of!(BindGroupEntryDescriptor, texture_format),
+    );
+    check_offset(
+        &constants,
+        "COLOR_TARGET_BLEND",
+        offset_of!(BlazeColorTargetState, blend),
+    );
+    check_offset(
+        &constants,
+        "COLOR_TARGET_FORMAT",
+        offset_of!(BlazeColorTargetState, format),
+    );
+    check_offset(
+        &constants,
+        "COLOR_TARGET_WRITE_MASK",
+        offset_of!(BlazeColorTargetState, write_mask),
+    );
+    check_offset(
+        &constants,
+        "BLEND_STATE_SRC_COLOR",
+        offset_of!(BlazeBlendState, src_color),
+    );
+    check_offset(
+        &constants,
+        "BLEND_STATE_DST_COLOR",
+        offset_of!(BlazeBlendState, dst_color),
+    );
+    check_offset(
+        &constants,
+        "BLEND_STATE_SRC_ALPHA",
+        offset_of!(BlazeBlendState, src_alpha),
+    );
+    check_offset(
+        &constants,
+        "BLEND_STATE_DST_ALPHA",
+        offset_of!(BlazeBlendState, dst_alpha),
+    );
+    check_offset(
+        &constants,
+        "DEPTH_STENCIL_COMPARE",
+        offset_of!(BlazeDepthStencilState, compare_function),
+    );
+    check_offset(
+        &constants,
+        "DEPTH_STENCIL_ACTIVE",
+        offset_of!(BlazeDepthStencilState, active),
+    );
+    check_offset(
+        &constants,
+        "DEPTH_STENCIL_BIAS_CONSTANT",
+        offset_of!(BlazeDepthStencilState, bias_constant),
+    );
+    check_offset(
+        &constants,
+        "DEPTH_STENCIL_BIAS_SLOPE_SCALE",
+        offset_of!(BlazeDepthStencilState, bias_slope_scale),
+    );
+    check_offset(
+        &constants,
+        "VERTEX_FORMAT_ELEMENT_OFFSET",
+        offset_of!(VertexFormatElement, offset),
+    );
+    check_offset(
+        &constants,
+        "VERTEX_FORMAT_ELEMENT_FORMAT",
+        offset_of!(VertexFormatElement, format),
+    );
+    check_offset(
+        &constants,
+        "VERTEX_FORMAT_ELEMENT_NAME",
+        offset_of!(VertexFormatElement, name),
+    );
+    check_offset(
+        &constants,
+        "VERTEX_FORMAT_ELEMENTS",
+        offset_of!(VertexFormat, elements),
+    );
+    check_offset(
+        &constants,
+        "VERTEX_FORMAT_VERTEX_SIZE",
+        offset_of!(VertexFormat, vertex_size),
+    );
+    check_offset(
+        &constants,
+        "PIPELINE_NAME",
+        offset_of!(RenderPipeline, name),
+    );
+    check_offset(
+        &constants,
+        "PIPELINE_BIND_GROUP_LAYOUTS",
+        offset_of!(RenderPipeline, bind_group_layouts),
+    );
+    check_offset(
+        &constants,
+        "PIPELINE_COLOR_TARGETS",
+        offset_of!(RenderPipeline, color_target_states),
+    );
+    check_offset(
+        &constants,
+        "PIPELINE_DEPTH_STENCIL",
+        offset_of!(RenderPipeline, depth_stencil_state),
+    );
+    check_offset(
+        &constants,
+        "PIPELINE_VERTEX_FORMATS",
+        offset_of!(RenderPipeline, vertex_formats),
+    );
+    check_offset(
+        &constants,
+        "PIPELINE_VERTEX_SHADER",
+        offset_of!(RenderPipeline, vertex_shader),
+    );
+    check_offset(
+        &constants,
+        "PIPELINE_FRAGMENT_SHADER",
+        offset_of!(RenderPipeline, fragment_shader),
+    );
+    check_offset(
+        &constants,
+        "PIPELINE_DIRECTIVES",
+        offset_of!(RenderPipeline, directives),
+    );
+    check_offset(
+        &constants,
+        "PIPELINE_FRAG_STATE",
+        offset_of!(RenderPipeline, frag_state),
+    );
+    check_offset(
+        &constants,
+        "PIPELINE_TOPOLOGY",
+        offset_of!(RenderPipeline, primitive_topology),
+    );
+    check_offset(
+        &constants,
+        "PIPELINE_CULL",
+        offset_of!(RenderPipeline, cull),
+    );
 
     // The draw call and the two tables inside it. The JVM writes a draw by these offsets, and the
     // fields a draw is numbered by - the combination and whether the table came with it - are the
     // last two, which is exactly the kind of thing a struct edit moves without saying so.
-    check_offset(&constants, "DRAW_CALL_VERTEX_BUFFERS", offset_of!(DrawCall, vertex_buffers));
-    check_offset(&constants, "DRAW_CALL_BINDINGS", offset_of!(DrawCall, bindings));
+    check_offset(
+        &constants,
+        "DRAW_CALL_VERTEX_BUFFERS",
+        offset_of!(DrawCall, vertex_buffers),
+    );
+    check_offset(
+        &constants,
+        "DRAW_CALL_BINDINGS",
+        offset_of!(DrawCall, bindings),
+    );
     check_offset(&constants, "DRAW_CALL_COMBO", offset_of!(DrawCall, combo));
-    check_offset(&constants, "DRAW_CALL_BINDINGS_PRESENT", offset_of!(DrawCall, bindings_present));
-    check_offset(&constants, "DRAW_BINDING_KIND", offset_of!(DrawBinding, kind));
-    check_offset(&constants, "DRAW_BINDING_RESOURCE", offset_of!(DrawBinding, resource));
-    check_offset(&constants, "DRAW_BINDING_OFFSET", offset_of!(DrawBinding, offset));
-    check_offset(&constants, "DRAW_BINDING_LENGTH", offset_of!(DrawBinding, length));
-    check_offset(&constants, "PLAN_BINDING_NAME", offset_of!(PlanBinding, name));
-    check_offset(&constants, "PLAN_BINDING_DECLARED_NAME", offset_of!(PlanBinding, declared_name));
+    check_offset(
+        &constants,
+        "DRAW_CALL_BINDINGS_PRESENT",
+        offset_of!(DrawCall, bindings_present),
+    );
+    check_offset(
+        &constants,
+        "DRAW_BINDING_KIND",
+        offset_of!(DrawBinding, kind),
+    );
+    check_offset(
+        &constants,
+        "DRAW_BINDING_RESOURCE",
+        offset_of!(DrawBinding, resource),
+    );
+    check_offset(
+        &constants,
+        "DRAW_BINDING_OFFSET",
+        offset_of!(DrawBinding, offset),
+    );
+    check_offset(
+        &constants,
+        "DRAW_BINDING_LENGTH",
+        offset_of!(DrawBinding, length),
+    );
+    check_offset(
+        &constants,
+        "PLAN_BINDING_NAME",
+        offset_of!(PlanBinding, name),
+    );
+    check_offset(
+        &constants,
+        "PLAN_BINDING_DECLARED_NAME",
+        offset_of!(PlanBinding, declared_name),
+    );
     check_offset(&constants, "PLAN_BINDING_SET", offset_of!(PlanBinding, set));
-    check_offset(&constants, "PLAN_BINDING_BINDING", offset_of!(PlanBinding, binding));
-    check_offset(&constants, "PLAN_BINDING_KIND", offset_of!(PlanBinding, kind));
-    check_offset(&constants, "PLAN_BINDING_DYNAMIC", offset_of!(PlanBinding, dynamic));
+    check_offset(
+        &constants,
+        "PLAN_BINDING_BINDING",
+        offset_of!(PlanBinding, binding),
+    );
+    check_offset(
+        &constants,
+        "PLAN_BINDING_KIND",
+        offset_of!(PlanBinding, kind),
+    );
+    check_offset(
+        &constants,
+        "PLAN_BINDING_DYNAMIC",
+        offset_of!(PlanBinding, dynamic),
+    );
 
     fn check_layout(layout: &str, rust_size: usize, fields: &[(&str, usize)]) {
         // Trailing padding is a layout entry without a field behind it, which is how the 24-byte
@@ -759,7 +953,7 @@ fn every_c_abi_binding_has_an_export() {
 
     // And the other way round: an export nobody binds is either a leftover or a forgotten binding.
     let bound: Vec<&String> = bindings.iter().map(|(name, _)| name).collect();
-    for (name, _) in &exports {
+    for name in exports.keys() {
         assert!(
             bound.contains(&name),
             "{name} is exported by this crate but nothing in WmNative.kt binds it"

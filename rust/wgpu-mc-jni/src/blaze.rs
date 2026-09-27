@@ -1,23 +1,21 @@
-use std::collections::HashMap;
 use crate::device::{
     BlazePipeline, LIVE_BIND_GROUP_COUNT, count_bind_groups, count_cache_hit, count_cache_miss,
     count_draw, count_numbered, count_pipeline_bind, count_tableless, count_vertices, fan_indices,
     log_pipeline_once, quad_indices, trace_draw, trace_pipeline,
 };
+use glsl::syntax::TypeSpecifierNonArray;
 use log::info;
+use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
+use std::collections::HashMap;
+use std::ffi::{CStr, CString, c_char};
+use std::fmt::{Debug, Display, Formatter};
+use std::ops::{Deref, Index, Range};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use parking_lot::Mutex;
-use std::ffi::{CStr, c_char, CString};
-use std::fmt::{Debug, Display, Formatter};
-use std::iter::{Map, Zip};
-use std::mem;
-use std::ops::{Deref, Index, Range};
 use std::vec::IntoIter;
-use glsl::syntax::TypeSpecifierNonArray;
-use wgpu_mc::{wgpu, WmRenderer};
 use wgpu_mc::wgpu::{BufferAddress, BufferSize, IndexFormat};
+use wgpu_mc::{WmRenderer, wgpu};
 
 #[repr(C)]
 pub struct RawArray<T: Sized> {
@@ -25,14 +23,19 @@ pub struct RawArray<T: Sized> {
     size: u64,
 }
 
-impl<T> Clone for RawArray<T> where T: Clone {
+impl<T> Clone for RawArray<T>
+where
+    T: Clone,
+{
     fn clone(&self) -> Self {
         let cloned_contents: Vec<T> = self.iter().cloned().collect();
 
         assert_eq!(cloned_contents.len() as u64, self.size);
 
         Self {
-            contents: Box::into_raw(cloned_contents.into_boxed_slice()).to_raw_parts().0 as *const _,
+            contents: Box::into_raw(cloned_contents.into_boxed_slice())
+                .to_raw_parts()
+                .0 as *const _,
             size: self.size,
         }
     }
@@ -69,13 +72,13 @@ impl<T> RawArray<T> {
     }
 }
 
-impl<'a, T> IntoIterator for RawArray<T> {
+impl<T> IntoIterator for RawArray<T> {
     type Item = T;
     type IntoIter = IntoIter<T>;
 
     fn into_iter(self) -> Self::IntoIter {
         (0..self.size as usize)
-            .map(|index| unsafe { std::ptr::read(self.contents.offset(index as isize)) })
+            .map(|index| unsafe { std::ptr::read(self.contents.add(index)) })
             .collect::<Vec<T>>()
             .into_iter()
     }
@@ -107,7 +110,7 @@ impl<T> Index<usize> for RawArray<T> {
     fn index(&self, index: usize) -> &Self::Output {
         assert!(index < self.size as usize);
 
-        unsafe { self.contents.offset(index as isize).as_ref_unchecked() }
+        unsafe { self.contents.add(index).as_ref_unchecked() }
     }
 }
 
@@ -337,6 +340,10 @@ pub struct BlazeRenderPass {
     /// The bindings that were emitted for the *current* pipeline, by slot, as the JVM last wrote
     /// them; kept so a pipeline change can re-emit them, since a slot means something different
     /// under a different plan.
+    ///
+    /// Written and never read: the re-emit it was added for reads the plan's slots back out of the
+    /// draw instead. Kept as the place that state belongs when it is needed.
+    #[allow(dead_code)]
     emitted: u32,
 }
 
@@ -863,7 +870,7 @@ pub extern "C" fn pipeline_bindings(
             };
 
             // Safety: `slot < capacity`, and the caller guarantees `capacity` writable entries.
-            unsafe { std::ptr::write(out.contents.offset(slot as isize).cast_mut(), entry) };
+            unsafe { std::ptr::write(out.contents.add(slot).cast_mut(), entry) };
 
             slot += 1;
         }
@@ -927,8 +934,9 @@ fn trace_draw_textures(pipeline: &BlazePipeline, call: &DrawCall) {
             let label = if entry.resource.is_null() {
                 "<nothing bound>".to_string()
             } else {
-                crate::device::view_label(entry.resource as usize)
-                    .unwrap_or_else(|| format!("<unregistered view {:#x}>", entry.resource as usize))
+                crate::device::view_label(entry.resource as usize).unwrap_or_else(|| {
+                    format!("<unregistered view {:#x}>", entry.resource as usize)
+                })
             };
 
             info!(
@@ -1136,7 +1144,11 @@ fn bind_groups_for_call(
 
     // Nothing to walk when the number is the whole table: the loop below reads the call's bindings,
     // and those are the one thing a table-less draw does not carry.
-    let sets = if table_needed { &[][..] } else { &plan.sets[..] };
+    let sets = if table_needed {
+        &[][..]
+    } else {
+        &plan.sets[..]
+    };
 
     for (set, bindings_in_set) in sets.iter().enumerate() {
         let mut count = 0usize;
@@ -1178,7 +1190,7 @@ fn bind_groups_for_call(
                     let size = binding_size(buffer, &range, *min_size);
 
                     key = fold(key, address as u64);
-                    key = fold(key, size as u64);
+                    key = fold(key, size);
 
                     // A dynamic offset is deliberately *not* part of the key: it is the one thing
                     // that may differ between two draws sharing a set, and sharing that set is the
@@ -1203,7 +1215,7 @@ fn bind_groups_for_call(
                     let range = entry.offset..entry.offset + entry.length;
 
                     key = fold(key, address as u64);
-                    key = fold(key, binding_size(buffer, &range, None) as u64);
+                    key = fold(key, binding_size(buffer, &range, None));
                     key = fold(key, range.start);
                 }
                 PlannedResource::Texture { .. } => {
@@ -1295,13 +1307,17 @@ fn bind_groups_for_call(
                             // A dynamic binding is created at offset zero, because the offset arrives
                             // with the draw; anything else keeps its offset here and gets a zero
                             // offset.
-                            let offset =
-                                if dynamic_offset(plan, binding, &range, alignment, min_size.is_some())
-                                {
-                                    0
-                                } else {
-                                    range.start
-                                };
+                            let offset = if dynamic_offset(
+                                plan,
+                                binding,
+                                &range,
+                                alignment,
+                                min_size.is_some(),
+                            ) {
+                                0
+                            } else {
+                                range.start
+                            };
 
                             wgpu::BindGroupEntry {
                                 binding: binding.binding,
@@ -1561,9 +1577,7 @@ fn draw_geometry(
         // A run of quads drawn with no index buffer takes Minecraft's own quad pattern
         // (`i, i+1, i+2, i+2, i+3, i`). With one, the buffer Minecraft supplies already holds it.
         PrimitiveTopology::Quads if call.indexed == 0 => {
-            if let Some((indices, index_count)) =
-                quad_indices(&wm.gpu.device, call.count)
-            {
+            if let Some((indices, index_count)) = quad_indices(&wm.gpu.device, call.count) {
                 pass.set_index_buffer(indices.slice(..), IndexFormat::Uint32);
                 pass.draw_indexed(0..index_count, call.first as i32, instances);
                 return;
@@ -1646,7 +1660,10 @@ fn trace_call(plan: &BindGroupPlan, call: &DrawCall, alignment: u64, key: u64) {
                 }
                 PlannedResource::Texture { .. } => {
                     let (_, address) = call_texture(&plan.name, binding, &entry);
-                    format!("s{set}/b{} {} tex={address:#x}", binding.binding, binding.name)
+                    format!(
+                        "s{set}/b{} {} tex={address:#x}",
+                        binding.binding, binding.name
+                    )
                 }
                 PlannedResource::Sampler => {
                     let (_, address) = call_sampler(&plan.name, binding, &entry);
@@ -1753,7 +1770,7 @@ pub struct FfiStr {
 impl Clone for FfiStr {
     fn clone(&self) -> Self {
         Self {
-            ptr: CString::new(self.to_string()).unwrap().into_raw()
+            ptr: CString::new(self.to_string()).unwrap().into_raw(),
         }
     }
 }
@@ -1777,13 +1794,13 @@ impl Deref for FfiStr {
 
 impl Display for FfiStr {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&*self)
+        f.write_str(self)
     }
 }
 
 impl Debug for FfiStr {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&*self)
+        f.write_str(self)
     }
 }
 
@@ -1792,8 +1809,7 @@ impl Debug for FfiStr {
 pub struct FragState {}
 
 #[repr(C)]
-#[derive(Debug)]
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct BlazeBindGroupLayout {
     pub entries: Box<RawArray<BindGroupEntryDescriptor>>,
 }
@@ -2065,13 +2081,12 @@ pub enum GpuFormat {
 }
 
 impl GpuFormat {
-
     pub fn to_wgpu_texture_format(&self) -> wgpu::TextureFormat {
         match self {
             GpuFormat::RGBA8_UNORM => wgpu::TextureFormat::Rgba8Unorm,
             GpuFormat::R8_UNORM => wgpu::TextureFormat::R8Unorm,
             GpuFormat::D32_FLOAT => wgpu::TextureFormat::Depth32Float,
-            _ => unimplemented!("{self:?}")
+            _ => unimplemented!("{self:?}"),
         }
     }
 
@@ -2203,7 +2218,3 @@ mod tests {
         assert_eq!(PlanBinding::kind_of(&storage), DRAW_BINDING_BUFFER);
     }
 }
-
-
-
-

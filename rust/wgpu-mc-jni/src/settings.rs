@@ -403,17 +403,12 @@ lazy_static! {
 /// knows about Metal and the WebGPU backends too, but neither can present to a GLFW window on
 /// the platforms this mod ships for, so offering them would only produce a launch that fails
 /// after the window is already up.
-#[derive(EnumIter, IntoStaticStr, Eq, PartialEq, Clone, Copy, Debug)]
+#[derive(EnumIter, IntoStaticStr, Eq, PartialEq, Clone, Copy, Debug, Default)]
 pub enum GraphicsBackend {
+    #[default]
     Vulkan,
     #[strum(serialize = "DirectX 12")]
     DirectX12,
-}
-
-impl Default for GraphicsBackend {
-    fn default() -> Self {
-        GraphicsBackend::Vulkan
-    }
 }
 
 impl GraphicsBackend {
@@ -482,11 +477,11 @@ impl Settings {
     pub fn write(&self) -> bool {
         let config_path = Self::config_path_get_or_init();
 
-        if let Some(parent) = config_path.parent() {
-            if let Err(err) = std::fs::create_dir_all(parent) {
-                log::error!("Couldn't create {parent:?} for the renderer config: {err}");
-                return false;
-            }
+        if let Some(parent) = config_path.parent()
+            && let Err(err) = std::fs::create_dir_all(parent)
+        {
+            log::error!("Couldn't create {parent:?} for the renderer config: {err}");
+            return false;
         }
 
         let str = serde_json::to_string_pretty(self).unwrap();
@@ -792,14 +787,9 @@ impl IntSetting {
 
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(tag = "type", rename = "enum")]
+#[derive(Default)]
 pub struct EnumSetting {
     pub selected: usize,
-}
-
-impl Default for EnumSetting {
-    fn default() -> Self {
-        EnumSetting { selected: 0 }
-    }
 }
 
 impl EnumSetting {
@@ -991,14 +981,17 @@ mod tests {
             let mut positions: Vec<(&str, usize)> = NAME_LIST
                 .iter()
                 .map(|name| {
-                    let at = document.find(&format!("\"{name}\"")).unwrap_or_else(|| {
-                        panic!("{name} is in one document and not the other")
-                    });
+                    let at = document
+                        .find(&format!("\"{name}\""))
+                        .unwrap_or_else(|| panic!("{name} is in one document and not the other"));
                     (*name, at)
                 })
                 .collect();
             positions.sort_by_key(|(_, at)| *at);
-            positions.into_iter().map(|(name, _)| name).collect::<Vec<_>>()
+            positions
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect::<Vec<_>>()
         };
 
         assert_eq!(
@@ -1120,7 +1113,10 @@ mod tests {
     #[test]
     fn every_setting_has_a_name_in_every_language() {
         let info: serde_json::Value = serde_json::from_str(&SETTINGS_INFO_JSON).expect("schema");
-        let languages = [("en_us", translations(EN_US)), ("zh_cn", translations(ZH_CN))];
+        let languages = [
+            ("en_us", translations(EN_US)),
+            ("zh_cn", translations(ZH_CN)),
+        ];
 
         for (language, translations) in &languages {
             for setting in setting_names(&info) {
@@ -1137,7 +1133,10 @@ mod tests {
     #[test]
     fn every_value_of_an_enum_setting_has_a_name_in_every_language() {
         let info: serde_json::Value = serde_json::from_str(&SETTINGS_INFO_JSON).expect("schema");
-        let languages = [("en_us", translations(EN_US)), ("zh_cn", translations(ZH_CN))];
+        let languages = [
+            ("en_us", translations(EN_US)),
+            ("zh_cn", translations(ZH_CN)),
+        ];
 
         for (language, translations) in &languages {
             for setting in setting_names(&info) {
@@ -1162,7 +1161,10 @@ mod tests {
         // A key that names nothing is a typo that would show up as a missing translation somewhere
         // else - usually a whole section of the screen left in English - so the namespace is
         // checked from this side, where the settings are.
-        for (language, translations) in [("en_us", translations(EN_US)), ("zh_cn", translations(ZH_CN))] {
+        for (language, translations) in [
+            ("en_us", translations(EN_US)),
+            ("zh_cn", translations(ZH_CN)),
+        ] {
             for key in translations.as_object().expect("an object").keys() {
                 assert!(
                     key.starts_with("wgpu_mc."),
@@ -1237,9 +1239,14 @@ mod tests {
 
     #[test]
     fn the_selected_index_names_the_backend() {
-        let mut settings = Settings::default();
-
-        settings.backend = EnumSetting::from_variant(GraphicsBackend::DirectX12);
+        // Written as the options screen writes it: the field is set on a defaulted `Settings` rather
+        // than built with struct-update syntax, because that is the shape Gson round-trips.
+        #[allow(clippy::field_reassign_with_default)]
+        let settings = {
+            let mut settings = Settings::default();
+            settings.backend = EnumSetting::from_variant(GraphicsBackend::DirectX12);
+            settings
+        };
         assert_eq!(settings.graphics_backend(), GraphicsBackend::DirectX12);
 
         // What Gson writes back after the options screen edited the enum.
@@ -1250,10 +1257,9 @@ mod tests {
 
     #[test]
     fn an_out_of_range_index_falls_back_instead_of_panicking() {
-        let settings: Settings = serde_json::from_str(
-            r#"{ "backend": { "type": "enum", "selected": 7 } }"#,
-        )
-        .expect("config with a bogus index");
+        let settings: Settings =
+            serde_json::from_str(r#"{ "backend": { "type": "enum", "selected": 7 } }"#)
+                .expect("config with a bogus index");
 
         assert_eq!(settings.graphics_backend(), GraphicsBackend::Vulkan);
     }
@@ -1271,4 +1277,3 @@ mod tests {
         );
     }
 }
-

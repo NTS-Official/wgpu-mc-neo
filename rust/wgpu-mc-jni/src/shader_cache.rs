@@ -59,6 +59,10 @@ pub struct Translation {
 }
 
 impl Translation {
+    /// Read by the round-trip test below rather than by the pipelines, which want `blocks` and the
+    /// sampler list separately; the test is what checks a translation survives the trip through JSON
+    /// with its sampler types intact.
+    #[allow(dead_code)]
     pub fn samplers(&self) -> HashMap<String, bool> {
         self.cube_samplers.iter().cloned().collect()
     }
@@ -102,7 +106,10 @@ fn prepare(directory: &Path) {
         return;
     }
 
-    let stamp = format!("{FORMAT_VERSION} wgpu {}\n", wgpu_mc::WmRenderer::wgpu_version());
+    let stamp = format!(
+        "{FORMAT_VERSION} wgpu {}\n",
+        wgpu_mc::WmRenderer::wgpu_version()
+    );
     let version_file = directory.join("version");
 
     match std::fs::read_to_string(&version_file) {
@@ -314,9 +321,24 @@ mod tests {
 
     #[test]
     fn a_key_is_the_same_for_the_same_inputs_and_different_for_others() {
-        let one = key(&["void main() {}", "void main() {}", "#version 440", "sampler0=0"]);
-        let same = key(&["void main() {}", "void main() {}", "#version 440", "sampler0=0"]);
-        let other = key(&["void main() {}", "void main() {}", "#version 440", "sampler0=1"]);
+        let one = key(&[
+            "void main() {}",
+            "void main() {}",
+            "#version 440",
+            "sampler0=0",
+        ]);
+        let same = key(&[
+            "void main() {}",
+            "void main() {}",
+            "#version 440",
+            "sampler0=0",
+        ]);
+        let other = key(&[
+            "void main() {}",
+            "void main() {}",
+            "#version 440",
+            "sampler0=1",
+        ]);
 
         assert_eq!(one, same);
         assert_ne!(one, other);
@@ -360,7 +382,10 @@ mod tests {
 
         assert_eq!(first, second);
         assert_eq!(first, "Globals=4;Sampler0=0;");
-        assert_ne!(first, canonical([("Globals".to_string(), 5), ("Sampler0".to_string(), 0)]));
+        assert_ne!(
+            first,
+            canonical([("Globals".to_string(), 5), ("Sampler0".to_string(), 0)])
+        );
     }
 
     #[test]

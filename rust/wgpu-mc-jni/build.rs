@@ -1,6 +1,5 @@
 use cbindgen::{Config, Language};
 use std::env;
-use std::panic::catch_unwind;
 
 fn main() {
     let crate_dir = env::var("CARGO_MANIFEST_DIR").unwrap();

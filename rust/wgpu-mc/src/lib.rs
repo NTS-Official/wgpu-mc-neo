@@ -38,6 +38,13 @@ so it's up to you to provide them to wgpu-mc.
 See the [render::entity] module for an example of rendering an example entity.
  */
 
+// `impl WmShader for WgslShader` has to prove `Send + Sync`, and proving that has to walk wgpu's
+// auto-trait chain - `ShaderModule` -> `DispatchShaderModule` -> `Arc<CoreShaderModule>` ->
+// `ContextWgpuCore` -> `Global` -> `Hub` -> every registry in it, including the ray-tracing one -
+// which is deeper than the default limit of 128. The default is exceeded rather than any trait
+// genuinely being unsatisfiable, so the limit is what moves; raising it costs nothing at runtime.
+#![recursion_limit = "512"]
+
 use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -47,11 +54,9 @@ use glam::IVec3;
 use mc::Scene;
 use mc::chunk::BakedLayer;
 pub use minecraft_assets;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::Mutex;
 pub use wgpu;
 use wgpu::{BindGroupDescriptor, BindGroupEntry, BindGroupLayout, BufferDescriptor, Surface};
-use winit::dpi::PhysicalSize;
-use winit::window::Window;
 
 use crate::mc::MinecraftState;
 use crate::mc::resource::ResourceProvider;

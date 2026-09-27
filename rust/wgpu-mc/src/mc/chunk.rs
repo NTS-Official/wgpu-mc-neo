@@ -115,7 +115,11 @@ pub const fn arena_slots(render_distance: u32) -> u32 {
     /// One section's vertices and indices, in u32 slots: about 64 KB, or 727 quads.
     const SLOTS_PER_SECTION: u32 = 16_000;
 
-    let capped = if render_distance > 64 { 64 } else { render_distance };
+    let capped = if render_distance > 64 {
+        64
+    } else {
+        render_distance
+    };
     let width = capped * 2 + 1 + RING * 2;
 
     width * width * SECTIONS_PER_COLUMN * SLOTS_PER_SECTION
@@ -288,11 +292,9 @@ impl SectionStorage {
     /// be told about and re-bake (see `refused_positions`) - for a frame that is already gone.
     pub fn forget(&mut self) {
         for section in self.storage.values() {
-            for layer in &section.layers {
-                if let Some(ranges) = layer {
-                    self.allocator.free_range(ranges.vertex_range.clone());
-                    self.allocator.free_range(ranges.index_range.clone());
-                }
+            for ranges in section.layers.iter().flatten() {
+                self.allocator.free_range(ranges.vertex_range.clone());
+                self.allocator.free_range(ranges.index_range.clone());
             }
         }
 
@@ -492,7 +494,10 @@ impl SectionStorage {
                 }
             };
 
-            let indices = match self.allocator.allocate_range(layer.indices.len() as u32 / 4) {
+            let indices = match self
+                .allocator
+                .allocate_range(layer.indices.len() as u32 / 4)
+            {
                 Ok(range) => range,
                 Err(_) => {
                     // Give the vertices back before the section is abandoned: they are part of what
@@ -539,7 +544,7 @@ impl SectionStorage {
     /// The arena filled, refused, and got fuller; a run that had been refusing a section here and there
     /// ended up refusing everything, which is exactly what a world whose terrain has stopped updating
     /// looks like from the player's side.
-    fn refuse(&mut self, layers: &mut Vec<Option<SectionRanges>>) {
+    fn refuse(&mut self, layers: &mut [Option<SectionRanges>]) {
         for layer in layers.iter_mut() {
             if let Some(ranges) = layer.take() {
                 self.allocator.free_range(ranges.vertex_range);
@@ -550,7 +555,7 @@ impl SectionStorage {
         self.refused = true;
         report_full_arena(self.pool, self.used_slots());
     }
-    pub fn iter(&self) -> std::collections::hash_map::Iter<IVec3, Section> {
+    pub fn iter(&self) -> std::collections::hash_map::Iter<'_, IVec3, Section> {
         self.storage.iter()
     }
 
@@ -587,8 +592,8 @@ static REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new
 /// ```
 ///
 /// - and a run where the JVM has drained fewer than [`sections_refused_reported`] says is a channel
-/// that is not working: a call that threw, a list that was cleared in between, a bridge that stopped
-/// being wired to anything.
+///   that is not working: a call that threw, a list that was cleared in between, a bridge that stopped
+///   being wired to anything.
 static REFUSED_REPORTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// How many refusals were never handed over, so that the sum above closes.
@@ -825,6 +830,11 @@ pub fn count_winding(layers: &[BakedLayer]) -> WindingCounts {
 
     // A quad is four vertices of sixteen bytes. The index stream is not needed to walk them, because
     // the baker emits them four at a time in that order.
+    //
+    // `chunks_exact` rather than the `as_chunks` clippy suggests: `as_chunks` is a nightly-only
+    // inherent method on slices, so asking for it here would put the whole crate behind a feature it
+    // does not otherwise need - for a length the two agree on and a remainder neither looks at.
+    #[allow(clippy::chunks_exact_to_as_chunks)]
     for quad in layer.vertices.chunks_exact(Vertex::VERTEX_LENGTH * 4) {
         let Some((first, normal)) = read_vertex(&quad[0..16]) else {
             continue;
@@ -902,7 +912,6 @@ fn report_winding(pos: IVec3, layers: &[BakedLayer]) {
     );
 }
 
-
 /// One baked vertex's position and normal, decoded the way `terrain.wgsl` decodes them.
 ///
 /// The format is `Vertex::compressed`'s, and the two have to agree: the position is one byte per axis
@@ -926,11 +935,7 @@ fn read_vertex(bytes: &[u8]) -> Option<(glam::Vec3, glam::Vec3)> {
         }
     };
 
-    let position = Vec3::new(
-        axis(bytes[0], 1),
-        axis(bytes[1], 2),
-        axis(bytes[2], 4),
-    );
+    let position = Vec3::new(axis(bytes[0], 1), axis(bytes[1], 2), axis(bytes[2], 4));
 
     let normal = match (bytes[11] >> 2) & 0b111 {
         0b000 => Vec3::X,
@@ -1439,8 +1444,7 @@ fn fluid_sprites(atlas: &Atlas, kind: u8, name: &str) -> Option<(RenderLayer, Fl
         // Reported once per sprite rather than once per bake: a pack without the fluid textures
         // would otherwise write one line per section while the world loads.
         static WARNED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        if sprite.is_none()
-            && WARNED.fetch_or(bit, std::sync::atomic::Ordering::Relaxed) & bit == 0
+        if sprite.is_none() && WARNED.fetch_or(bit, std::sync::atomic::Ordering::Relaxed) & bit == 0
         {
             log::warn!("wgpu-mc: {path} is not in the block atlas, so {name} is not drawn");
         }
@@ -1490,42 +1494,41 @@ fn bake_fluid_faces<Provider: BlockStateProvider>(
     // vertex colour back: red in the low byte.
     const WATER_TINT: u32 = 0x00e4_763f;
 
-    let mut add_quad =
-        |layer: RenderLayer,
-         dir: Direction,
-         light: u8,
-         color: u32,
-         corners: [(glam::Vec3, [u16; 2]); 4]| {
-            FLUID_QUADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut add_quad = |layer: RenderLayer,
+                        dir: Direction,
+                        light: u8,
+                        color: u32,
+                        corners: [(glam::Vec3, [u16; 2]); 4]| {
+        FLUID_QUADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-            let baked_layer = &mut layers[layer as usize];
-            let first = baked_layer.vertices.len() / Vertex::VERTEX_LENGTH;
-            let normal = dir.to_vec().as_vec3().to_array();
+        let baked_layer = &mut layers[layer as usize];
+        let first = baked_layer.vertices.len() / Vertex::VERTEX_LENGTH;
+        let normal = dir.to_vec().as_vec3().to_array();
 
-            baked_layer.vertices.extend(
-                wind_quad(corners, glam::Vec3::from_array(normal))
-                    .iter()
-                    .flat_map(|(position, uv)| {
-                        Vertex {
-                            position: position.to_array(),
-                            uv: *uv,
-                            normal,
-                            color,
-                            uv_offset: 0,
-                            lightmap_coords: light,
-                            // Fluids are not shaded per corner in the game either: a fluid face is
-                            // one flat surface, lit by the block it is seen from.
-                            ao: 3,
-                        }
-                        .compressed()
-                    }),
-            );
-            baked_layer.indices.extend(
-                INDICES
-                    .iter()
-                    .flat_map(|index| (index + (first as u32)).to_ne_bytes()),
-            );
-        };
+        baked_layer.vertices.extend(
+            wind_quad(corners, glam::Vec3::from_array(normal))
+                .iter()
+                .flat_map(|(position, uv)| {
+                    Vertex {
+                        position: position.to_array(),
+                        uv: *uv,
+                        normal,
+                        color,
+                        uv_offset: 0,
+                        lightmap_coords: light,
+                        // Fluids are not shaded per corner in the game either: a fluid face is
+                        // one flat surface, lit by the block it is seen from.
+                        ao: 3,
+                    }
+                    .compressed()
+                }),
+        );
+        baked_layer.indices.extend(
+            INDICES
+                .iter()
+                .flat_map(|index| (index + (first as u32)).to_ne_bytes()),
+        );
+    };
 
     for block_index in 0..16 * 16 * 16 {
         let pos = ivec3(block_index & 15, block_index >> 8, (block_index & 255) >> 4);
@@ -1583,7 +1586,10 @@ fn bake_fluid_faces<Provider: BlockStateProvider>(
                 light,
                 color,
                 [
-                    (vec3(fx, fy + heights[0], fz), sprite_uv(sprites.still, 0, 0)),
+                    (
+                        vec3(fx, fy + heights[0], fz),
+                        sprite_uv(sprites.still, 0, 0),
+                    ),
                     (
                         vec3(fx, fy + heights[2], fz + 1.0),
                         sprite_uv(sprites.still, 0, 16),
@@ -1703,7 +1709,9 @@ mod winding_tests {
         let layer_of = |positions: [[f32; 3]; 4]| {
             let mut layer = BakedLayer::default();
             for position in positions {
-                layer.vertices.extend_from_slice(&vertex(position).compressed());
+                layer
+                    .vertices
+                    .extend_from_slice(&vertex(position).compressed());
             }
 
             vec![layer, BakedLayer::default(), BakedLayer::default()]
@@ -1711,18 +1719,32 @@ mod winding_tests {
 
         // (0,0,0) -> (0,0,1) -> (1,0,1): the cross product of the first two edges is +y, which is the
         // normal these vertices carry.
-        let outward = layer_of([[0.0, 0.0, 0.0], [0.0, 0.0, 1.0], [1.0, 0.0, 1.0], [1.0, 0.0, 0.0]]);
+        let outward = layer_of([
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [1.0, 0.0, 1.0],
+            [1.0, 0.0, 0.0],
+        ]);
         let counts = count_winding(&outward);
         assert_eq!(counts.checked, 1, "one quad was checked");
-        assert_eq!(counts.outward, 1, "the quad wound the way its normal points");
+        assert_eq!(
+            counts.outward, 1,
+            "the quad wound the way its normal points"
+        );
 
         // The same quad the other way round.
-        let inward = layer_of([[0.0, 0.0, 0.0], [1.0, 0.0, 1.0], [0.0, 0.0, 1.0], [1.0, 0.0, 0.0]]);
+        let inward = layer_of([
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 1.0],
+            [0.0, 0.0, 1.0],
+            [1.0, 0.0, 0.0],
+        ]);
         let counts = count_winding(&inward);
         assert_eq!(counts.checked, 1, "one quad was checked");
         assert_eq!(counts.outward, 0, "the quad wound against its own normal");
         assert_eq!(
-            counts.inward_by_direction[Direction::Up as usize], 1,
+            counts.inward_by_direction[Direction::Up as usize],
+            1,
             "and it is counted against the direction its normal names"
         );
     }
@@ -1872,7 +1894,9 @@ mod face_culling_tests {
                 })],
             );
 
-            manager.blocks.insert(format!("block{id}"), Block::Variants(variants));
+            manager
+                .blocks
+                .insert(format!("block{id}"), Block::Variants(variants));
         }
 
         for (id, flags) in flags {
@@ -1911,7 +1935,10 @@ mod face_culling_tests {
     /// test does and what every block in the world relies on.
     #[test]
     fn a_face_against_an_occluding_neighbour_is_left_out() {
-        let manager = registry(&[(0, FULL_CUBE), (1, FULL_CUBE)], &[(0, stone()), (1, stone())]);
+        let manager = registry(
+            &[(0, FULL_CUBE), (1, FULL_CUBE)],
+            &[(0, stone()), (1, stone())],
+        );
 
         for dir in [
             Direction::Up,
@@ -1933,7 +1960,10 @@ mod face_culling_tests {
     /// solid cube. The world showed its insides wherever one of them touched anything.
     #[test]
     fn a_face_against_glass_is_drawn() {
-        let manager = registry(&[(0, FULL_CUBE), (1, FULL_CUBE)], &[(0, stone()), (1, glass())]);
+        let manager = registry(
+            &[(0, FULL_CUBE), (1, FULL_CUBE)],
+            &[(0, stone()), (1, glass())],
+        );
 
         for dir in [
             Direction::Up,
@@ -1965,7 +1995,10 @@ mod face_culling_tests {
         // colours of stained glass, say - is a face that is drawn: `skipRendering` speaks for one
         // block against its own kind, and the mask is a per-state answer, so the most it can say is
         // "the same state".
-        let mixed = registry(&[(0, FULL_CUBE), (1, FULL_CUBE)], &[(0, glass()), (1, glass())]);
+        let mixed = registry(
+            &[(0, FULL_CUBE), (1, FULL_CUBE)],
+            &[(0, glass()), (1, glass())],
+        );
         assert!(
             !face_is_hidden(&mixed, state(0), state(1), Direction::North),
             "two different glass blocks are not the same state"
@@ -2002,7 +2035,12 @@ mod face_culling_tests {
     fn a_neighbour_with_no_model_draws_the_face() {
         let manager = registry(&[(0, FULL_CUBE)], &[(0, stone())]);
 
-        assert!(!face_is_hidden(&manager, state(0), ChunkBlockState::Air, Direction::Up));
+        assert!(!face_is_hidden(
+            &manager,
+            state(0),
+            ChunkBlockState::Air,
+            Direction::Up
+        ));
         assert!(
             !face_is_hidden(&manager, state(0), state(7), Direction::Up),
             "block 7 has no model, so there is no geometry to cull against"
@@ -2168,7 +2206,10 @@ mod arena_tests {
     fn the_pool_can_only_be_set_while_the_arena_is_empty() {
         let mut storage = SectionStorage::new(pool_for(4));
 
-        assert!(storage.set_pool(pool_for(2)), "an empty arena takes a new size");
+        assert!(
+            storage.set_pool(pool_for(2)),
+            "an empty arena takes a new size"
+        );
         assert_eq!(storage.pool_slots(), pool_for(2));
 
         assert!(put(&mut storage, IVec3::new(0, 0, 0), 1), "it fits");

@@ -1,52 +1,45 @@
 #![feature(debug_closure_helpers)]
 #![feature(ptr_metadata)]
+// `TERRAIN_MATRICES` is a `Lazy<Mutex<Option<TerrainMatrices>>>` through wgpu's `Buffer`, and proving
+// it `Sync` walks the same auto-trait chain `wgpu-mc` has to walk for `WgslShader` - deeper than the
+// default limit of 128. See the note on the same attribute in `wgpu-mc`'s `lib.rs`.
+#![recursion_limit = "512"]
 pub extern crate wgpu_mc;
 
-use arc_swap::access::Access;
-use arc_swap::{ArcSwap, ArcSwapAny};
-use byteorder::{LittleEndian, ReadBytesExt};
+use arc_swap::ArcSwap;
 use core::slice;
-use crossbeam_channel::{Receiver, Sender, unbounded};
-use glam::{IVec3, Mat4, ivec2, ivec3};
+use glam::{IVec3, ivec3};
 use jni::objects::{
-    AutoElements, GlobalRef, JByteArray, JClass, JIntArray, JLongArray, JObject, JObjectArray,
-    JPrimitiveArray, JString, JValue, JValueOwned, ReleaseMode, WeakRef,
+    AutoElements, GlobalRef, JByteArray, JClass, JObject, JString, JValue, JValueOwned,
+    ReleaseMode, WeakRef,
 };
-use jni::sys::{JNI_FALSE, JNI_TRUE, jboolean, jbyte, jint, jlong, jlongArray, jsize, jstring};
+use jni::sys::{jboolean, jbyte, jint, jlong, jlongArray, jstring};
 use jni::{JNIEnv, JavaVM};
 use jni_fn::jni_fn;
 use once_cell::sync::{Lazy, OnceCell};
-use palette::PALETTE_STORAGE;
 use parking_lot::{Mutex, RwLock};
-use pia::PIA_STORAGE;
 use rayon::{ThreadPool, ThreadPoolBuilder};
-use renderer::MATRICES;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt::Debug;
-use std::io::{Cursor, Write, stdout};
+use std::io::{Write, stdout};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
-use std::{mem, thread};
-use wgpu::Extent3d;
-use wgpu_mc::render::graph::{Geometry, RenderGraph, ResourceBacking};
-use wgpu_mc::wgpu::util::DeviceExt;
+use wgpu_mc::render::graph::{Geometry, RenderGraph};
 
+use wgpu_mc::WmRenderer;
 use wgpu_mc::mc::block::{BlockstateKey, ChunkBlockState, FaceFlags};
 use wgpu_mc::mc::chunk::{BlockStateProvider, LightLevel, bake_section};
 use wgpu_mc::mc::resource::{ResourcePath, ResourceProvider};
-use wgpu_mc::mc::SkyState;
 use wgpu_mc::minecraft_assets::schemas::blockstates::multipart::StateValue;
 use wgpu_mc::render::pipeline::BLOCK_ATLAS;
-use wgpu_mc::texture::{BindableTexture, TextureAndView};
-use wgpu_mc::wgpu::{self, CurrentSurfaceTexture, TextureFormat};
-use wgpu_mc::{Frustum, WmRenderer};
 
 use crate::section::{
     CENTER, CachedBlockstateProvider, Payload, REJECTED_MASK, RESYNC, SECTIONS, SectionBlocks,
-    SectionLight, WORLD, bump_section_generation, neighbour_offset, section_generation, section_key,
+    SectionLight, WORLD, bump_section_generation, neighbour_offset, section_generation,
+    section_key,
 };
 use crate::settings::Settings;
 
@@ -64,8 +57,8 @@ mod pix;
 pub mod preprocessing;
 mod renderer;
 mod section;
-mod shader_cache;
 mod settings;
+mod shader_cache;
 mod timing;
 
 /// Checks that the JVM side of the two bridges still matches this crate: the JNI declarations in
@@ -94,19 +87,12 @@ pub static RENDER_GRAPH: OnceCell<Mutex<RenderGraph>> = OnceCell::new();
 pub static CUSTOM_GEOMETRY: OnceCell<Mutex<HashMap<String, Box<dyn Geometry>>>> = OnceCell::new();
 
 static RUN_DIRECTORY: OnceCell<PathBuf> = OnceCell::new();
-static JVM: OnceCell<RwLock<JavaVM>> = OnceCell::new();
-static YARN_CLASS_LOADER: OnceCell<GlobalRef> = OnceCell::new();
 
-type Task = Box<dyn FnOnce() + Send + Sync>;
-
-static TASK_CHANNELS: Lazy<(Sender<Task>, Receiver<Task>)> = Lazy::new(unbounded);
 static MC_STATE: Lazy<ArcSwap<MinecraftRenderState>> = Lazy::new(|| {
     ArcSwap::new(Arc::new(MinecraftRenderState {
         _render_world: false,
     }))
 });
-
-static CLEAR_COLOR: Lazy<ArcSwap<[f32; 3]>> = Lazy::new(|| ArcSwap::new(Arc::new([0.0; 3])));
 
 /// The block state a section's holes are, or `None` while the block registry is empty.
 ///
@@ -115,20 +101,18 @@ static CLEAR_COLOR: Lazy<ArcSwap<[f32; 3]>> = Lazy::new(|| ArcSwap::new(Arc::new
 /// would have to guess what "air" is, and guessing wrong is geometry built out of nothing, so the
 /// bake refuses instead - see `bakeSection`.
 static AIR: Lazy<Option<BlockstateKey>> = Lazy::new(|| {
-    RENDERER
-        .get()
-        .and_then(|renderer| {
-            renderer
-                .mc
-                .block_manager
-                .read()
-                .blocks
-                .get_full("minecraft:air")
-                .map(|(id, _, _)| BlockstateKey {
-                    block: id as u16,
-                    augment: 0,
-                })
-        })
+    RENDERER.get().and_then(|renderer| {
+        renderer
+            .mc
+            .block_manager
+            .read()
+            .blocks
+            .get_full("minecraft:air")
+            .map(|(id, _, _)| BlockstateKey {
+                block: id as u16,
+                augment: 0,
+            })
+    })
 });
 
 static BLOCKS: Mutex<Vec<String>> = Mutex::new(Vec::new());
@@ -267,7 +251,7 @@ pub fn call_static_from_class_loader<'env>(
 /// the game is running, and holding it strongly here would keep it - and every class it loaded -
 /// alive past shutdown.
 #[jni_fn("dev.birb.wgpu.rust.WgpuNative")]
-pub fn setClassLoader(mut env: JNIEnv, _class: JClass, class_loader: JObject) {
+pub fn setClassLoader(env: JNIEnv, _class: JClass, class_loader: JObject) {
     match env.new_weak_ref(class_loader) {
         Ok(Some(weak)) => {
             if CLASSLOADER.set(weak).is_err() {
@@ -294,7 +278,10 @@ impl ResourceProvider for MinecraftResourceManagerAdapter {
         let mut env = match self.jvm.attach_current_thread() {
             Ok(env) => env,
             Err(err) => {
-                log::error!("wgpu-mc: could not attach to the JVM to read {}: {err}", id.0);
+                log::error!(
+                    "wgpu-mc: could not attach to the JVM to read {}: {err}",
+                    id.0
+                );
                 return None;
             }
         };
@@ -487,7 +474,8 @@ pub fn getAdapterInfo(env: JNIEnv, _class: JClass) -> jstring {
 }
 
 #[jni_fn("dev.birb.wgpu.rust.WgpuNative")]
-pub fn registerBlockState(    mut env: JNIEnv,
+pub fn registerBlockState(
+    mut env: JNIEnv,
     _class: JClass,
     block_state: JObject,
     block_name: JString,
@@ -534,7 +522,6 @@ pub fn registerBlockStateFaceFlags(
         },
     ));
 }
-
 
 struct MinecraftBlockStateProviderWrapper<'a> {
     internal: CachedBlockstateProvider,
@@ -686,9 +673,11 @@ pub fn bakeSections(
     // trimmed, a new world, a section that became empty under us - means a bake against holes. The
     // caller sends everything again instead, and this call queues nothing.
     let known_blocks = payload.known_blocks & !payload.present;
-    let known_light = payload.known_light & !payload.light.iter().fold(0u32, |mask, (index, _)| {
-        mask | (1 << index)
-    });
+    let known_light = payload.known_light
+        & !payload
+            .light
+            .iter()
+            .fold(0u32, |mask, (index, _)| mask | (1 << index));
 
     let (missing_blocks, missing_light) = world.missing(target, known_blocks, known_light);
 
@@ -719,11 +708,7 @@ pub fn bakeSections(
         light[index] = world.light(pos);
     }
 
-    let provider = CachedBlockstateProvider {
-        blocks,
-        light,
-        air,
-    };
+    let provider = CachedBlockstateProvider { blocks, light, air };
 
     world.trim(target);
     drop(world);
@@ -881,7 +866,7 @@ pub fn blocksCached(_env: JNIEnv, _class: JClass) -> jboolean {
 /// handed over by the next call. The keys are packed the way the JVM packs them - see
 /// `section::section_key` - so nothing has to be unpacked on either side.
 #[jni_fn("dev.birb.wgpu.rust.WgpuNative")]
-pub fn refusedSections(mut env: JNIEnv, _class: JClass) -> jlongArray {
+pub fn refusedSections(env: JNIEnv, _class: JClass) -> jlongArray {
     let refused = RENDERER
         .get()
         .and_then(|wm| wm.scene())
@@ -1016,92 +1001,97 @@ pub fn cacheBlockStates(mut env: JNIEnv, _class: JClass) {
     // How many states had to take the fallback, so the log says it once rather than once per state.
     let mut unmodelled = 0usize;
 
-    states
-        .iter()
-        .for_each(|registration| {
-            let BlockStateRegistration {
-                block_name,
-                state_key,
+    states.iter().for_each(|registration| {
+        let BlockStateRegistration {
+            block_name,
+            state_key,
+            global_ref,
+        } = registration;
+
+        // A block whose blockstate file is missing or malformed is not in the registry at all,
+        // and `get_full(..).unwrap()` here used to take the block cache thread down with it -
+        // meaning nothing downstream, including the Rust terrain baker, ever saw a registry.
+        let Some(id_key) = block_manager.blocks.get_index_of(block_name.as_str()) else {
+            unmodelled += 1;
+            note_unmodelled(block_name);
+            mappings.push((
+                BlockstateKey {
+                    block: fallback_id as u16,
+                    augment: 0,
+                },
                 global_ref,
-            } = registration;
+            ));
+            return;
+        };
 
-            // A block whose blockstate file is missing or malformed is not in the registry at all,
-            // and `get_full(..).unwrap()` here used to take the block cache thread down with it -
-            // meaning nothing downstream, including the Rust terrain baker, ever saw a registry.
-            let Some(id_key) = block_manager.blocks.get_index_of(block_name.as_str()) else {
+        let key_iter = if !state_key.is_empty() {
+            state_key
+                .split(',')
+                .filter_map(|kv_pair| {
+                    let mut split = kv_pair.split('=');
+                    if kv_pair.is_empty() {
+                        return None;
+                    }
+
+                    Some((
+                        split.next().unwrap(),
+                        match split.next().unwrap() {
+                            "true" => StateValue::Bool(true),
+                            "false" => StateValue::Bool(false),
+                            other => StateValue::String(other.into()),
+                        },
+                    ))
+                })
+                .collect::<Vec<_>>()
+        } else {
+            vec![]
+        };
+        let atlases = wm.mc.texture_manager.atlases.write();
+        let atlas = &atlases[BLOCK_ATLAS];
+        let wm_block = &block_manager.blocks[id_key];
+        let model = wm_block.get_model_by_key(
+            key_iter
+                .iter()
+                .filter(|(a, _)| *a != "waterlogged")
+                .map(|(a, b)| (*a, b)),
+            &*wm.mc.resource_provider,
+            atlas,
+            0,
+        );
+
+        let key = match model {
+            Some((mesh, augment)) => {
+                // A mesh with no faces in it is a block that is drawn as nothing: the state has a
+                // key, so it culls its neighbours and the block behind it loses the face between
+                // them, and there is no other line anywhere that says so. See `MISSING_SPRITES`
+                // for the other half of this, and `blockBakeDiagnostics` for where it is reported.
+                if mesh.is_empty() {
+                    note_empty_mesh(block_name);
+                }
+
+                BlockstateKey {
+                    block: id_key as u16,
+                    augment,
+                }
+            }
+            None => {
                 unmodelled += 1;
+
+                // The half of "this state is drawn as bedrock" that this did not name: the block *is*
+                // registered, and a mesh for the state could not be baked - every variant of a `variants`
+                // file failed, or a `multipart`'s pieces did. The reason is a `warn!` on the console and
+                // the *block* is what a person can search for. See `blockBakeDiagnostics`.
                 note_unmodelled(block_name);
-                mappings.push((
-                    BlockstateKey {
-                        block: fallback_id as u16,
-                        augment: 0,
-                    },
-                    global_ref,
-                ));
-                return;
-            };
 
-            let key_iter = if !state_key.is_empty() {
-                state_key
-                    .split(',')
-                    .filter_map(|kv_pair| {
-                        let mut split = kv_pair.split('=');
-                        if kv_pair.is_empty() {
-                            return None;
-                        }
-
-                        Some((
-                            split.next().unwrap(),
-                            match split.next().unwrap() {
-                                "true" => StateValue::Bool(true),
-                                "false" => StateValue::Bool(false),
-                                other => StateValue::String(other.into()),
-                            },
-                        ))
-                    })
-                    .collect::<Vec<_>>()
-            } else {
-                vec![]
-            };
-            let atlases = wm.mc.texture_manager.atlases.write();
-            let atlas = &atlases[BLOCK_ATLAS];
-            let wm_block = &block_manager.blocks[id_key];
-            let model = wm_block.get_model_by_key(
-                key_iter
-                    .iter()
-                    .filter(|(a, _)| *a != "waterlogged")
-                    .map(|(a, b)| (*a, b)),
-                &*wm.mc.resource_provider,
-                atlas,
-                0,
-            );
-
-            let key = match model {
-                Some((mesh, augment)) => {
-                    // A mesh with no faces in it is a block that is drawn as nothing: the state has a
-                    // key, so it culls its neighbours and the block behind it loses the face between
-                    // them, and there is no other line anywhere that says so. See `MISSING_SPRITES`
-                    // for the other half of this, and `blockBakeDiagnostics` for where it is reported.
-                    if mesh.is_empty() {
-                        note_empty_mesh(&block_name);
-                    }
-
-                    BlockstateKey {
-                        block: id_key as u16,
-                        augment,
-                    }
+                BlockstateKey {
+                    block: fallback_id as u16,
+                    augment: 0,
                 }
-                None => {
-                    unmodelled += 1;
-                    BlockstateKey {
-                        block: fallback_id as u16,
-                        augment: 0,
-                    }
-                }
-            };
+            }
+        };
 
-            mappings.push((key, global_ref));
-        });
+        mappings.push((key, global_ref));
+    });
 
     if unmodelled != 0 {
         writeln!(
@@ -1135,15 +1125,15 @@ pub fn cacheBlockStates(mut env: JNIEnv, _class: JClass) {
     {
         let atlases = wm.mc.texture_manager.atlases.read();
 
-        if let Some(atlas) = atlases.get(BLOCK_ATLAS) {
-            if atlas.upload_if_dirty(wm) {
-                writeln!(
-                    std::io::stdout().lock(),
-                    "wgpu-mc: the block atlas was uploaded again: the multipart models added sprites \
+        if let Some(atlas) = atlases.get(BLOCK_ATLAS)
+            && atlas.upload_if_dirty(wm)
+        {
+            writeln!(
+                std::io::stdout().lock(),
+                "wgpu-mc: the block atlas was uploaded again: the multipart models added sprites \
                      after the first upload"
-                )
-                .unwrap();
-            }
+            )
+            .unwrap();
         }
     }
 
@@ -1251,7 +1241,7 @@ pub fn cacheBlockStates(mut env: JNIEnv, _class: JClass) {
 /// log file, and a run that is being read afterwards is the run this has to explain. Called by the
 /// JVM right after [`cacheBlockStates`], which is where both are decided.
 #[jni_fn("dev.birb.wgpu.rust.WgpuNative")]
-pub fn blockBakeDiagnostics(mut env: JNIEnv, _class: JClass) -> jstring {
+pub fn blockBakeDiagnostics(env: JNIEnv, _class: JClass) -> jstring {
     let mut report = String::new();
 
     let unreadable = wgpu_mc::mc::block::UNREADABLE_TEXTURES.faces();
@@ -1329,7 +1319,7 @@ pub fn blockBakeDiagnostics(mut env: JNIEnv, _class: JClass) -> jstring {
 /// are in the section - which puts the fault after the bake rather than in it. See
 /// `wgpu_mc::mc::chunk::WATCHED_BLOCKS` for the list and for the four answers.
 #[jni_fn("dev.birb.wgpu.rust.WgpuNative")]
-pub fn watchedBlockFaces(mut env: JNIEnv, _class: JClass) -> jstring {
+pub fn watchedBlockFaces(env: JNIEnv, _class: JClass) -> jstring {
     env.new_string(wgpu_mc::mc::chunk::watched_faces())
         .unwrap()
         .into_raw()
@@ -1360,7 +1350,11 @@ pub fn setPanicHook(env: JNIEnv, _class: JClass) {
         // flushed as it is written.
         if let Some(run_directory) = RUN_DIRECTORY.get() {
             let path = run_directory.join("wgpu-panic.txt");
-            if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+            {
                 use std::io::Write;
                 let _ = writeln!(file, "{panic_info}");
             }
@@ -1385,9 +1379,9 @@ pub fn setPanicHook(env: JNIEnv, _class: JClass) {
             // Java threw.
             describe_and_clear(&mut env, "the panic hook");
 
-            let Ok(jstring) =
-                env.new_string(format!("wgpu-mc has panicked. Minecraft will now exit.\n{panic_info}"))
-            else {
+            let Ok(jstring) = env.new_string(format!(
+                "wgpu-mc has panicked. Minecraft will now exit.\n{panic_info}"
+            )) else {
                 return;
             };
 
@@ -1409,7 +1403,6 @@ pub fn setWorldRenderState(_env: JNIEnv, _class: JClass, boolean: jboolean) {
     }));
 }
 
-
 #[cfg(test)]
 mod bake_queue_tests {
     use super::*;
@@ -1424,7 +1417,10 @@ mod bake_queue_tests {
         }
 
         for taken in 0..MAX_QUEUED_BAKES {
-            assert!(reserve_bake_slot(), "slot {taken} of {MAX_QUEUED_BAKES} was refused");
+            assert!(
+                reserve_bake_slot(),
+                "slot {taken} of {MAX_QUEUED_BAKES} was refused"
+            );
         }
 
         assert!(!reserve_bake_slot(), "the queue took more than its cap");

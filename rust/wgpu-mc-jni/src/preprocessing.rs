@@ -1,42 +1,46 @@
-use crate::preprocessing;
 use glsl::parser::Parse;
-use glsl::syntax::{ArraySpecifier, ArraySpecifierDimension, ArrayedIdentifier, Block, CompoundStatement, Declaration, Expr, ExprStatement, ExternalDeclaration, FullySpecifiedType, FunIdentifier, FunctionDefinition, FunctionParameterDeclaration, FunctionParameterDeclarator, FunctionPrototype, Identifier, InitDeclaratorList, Initializer, LayoutQualifier, LayoutQualifierSpec, NonEmpty, Preprocessor, PreprocessorVersion, ShaderStage, SimpleStatement, SingleDeclaration, Statement, StorageQualifier, TranslationUnit, TypeName, TypeQualifier, TypeQualifierSpec, TypeSpecifier, TypeSpecifierNonArray};
+use glsl::syntax::{
+    ArraySpecifier, ArraySpecifierDimension, ArrayedIdentifier, Block, Declaration, Expr,
+    ExternalDeclaration, FunIdentifier, FunctionDefinition, FunctionParameterDeclaration,
+    FunctionParameterDeclarator, FunctionPrototype, Identifier, InitDeclaratorList, Initializer,
+    NonEmpty, Preprocessor, PreprocessorVersion, ShaderStage, SimpleStatement, SingleDeclaration,
+    Statement, StorageQualifier, TranslationUnit, TypeName, TypeQualifier, TypeQualifierSpec,
+    TypeSpecifier, TypeSpecifierNonArray,
+};
 use glsl::transpiler::glsl::{show_expr, show_translation_unit};
 use glsl::visitor::{Host, HostMut, Visit, Visitor, VisitorMut};
 use log::{debug, error, warn};
-use std::collections::HashMap;
-use std::ffi::{CStr, c_char};
 use once_cell::sync::Lazy;
+use std::collections::HashMap;
 
 static OPENGL_TO_WGPU_MATRIX_AST: Lazy<Statement> = Lazy::new(|| {
-    Statement::Simple(Box::new(SimpleStatement::Expression(
-        Some(
-            Expr::parse(r#"gl_Position = mat4(
+    Statement::Simple(Box::new(SimpleStatement::Expression(Some(
+        Expr::parse(
+            r#"gl_Position = mat4(
     vec4(1.0, 0.0, 0.0, 0.0),
     vec4(0.0, 1.0, 0.0, 0.0),
     vec4(0.0, 0.0, 0.5, 0.0),
     vec4(0.0, 0.0, 0.5, 1.0)
 ) * gl_Position;
-"#).unwrap()
+"#,
         )
-    )))
+        .unwrap(),
+    ))))
 });
 
 static FORCE_WHITE: Lazy<Statement> = Lazy::new(|| {
-    Statement::Simple(Box::new(SimpleStatement::Expression(
-        Some(
-            Expr::parse(r#"fragColor = vec4(1.0, 1.0, 1.0, 1.0);"#).unwrap()
-        )
-    )))
+    Statement::Simple(Box::new(SimpleStatement::Expression(Some(
+        Expr::parse(r#"fragColor = vec4(1.0, 1.0, 1.0, 1.0);"#).unwrap(),
+    ))))
 });
 
 /// Negates the clip-space Y axis, on top of the depth-range patch above.
 ///
 /// Minecraft's shaders, projections and texture coordinates are all written against OpenGL, and
 /// the two APIs disagree about which end of a render target clip-space `y = +1` is. In OpenGL a
-/// framebuffer's first texel row is its window origin row, the bottom-left corner, so `y = +1`
-/// - the top of the projection - lands on the *last* texel row. Everywhere else (Vulkan, D3D,
-/// Metal, and therefore wgpu, which normalises them) `y = +1` lands on the *first* texel row.
+/// framebuffer's first texel row is its window origin row, the bottom-left corner, so `y = +1` -
+/// the top of the projection - lands on the *last* texel row. Everywhere else (Vulkan, D3D, Metal,
+/// and therefore wgpu, which normalises them) `y = +1` lands on the *first* texel row.
 ///
 /// Nothing notices while the target is only ever presented: the image comes out the same either
 /// way up, and the present blit turns it over. It shows the moment a render target is *sampled
@@ -53,11 +57,9 @@ static FORCE_WHITE: Lazy<Statement> = Lazy::new(|| {
 /// is counter-clockwise in *window* coordinates in OpenGL, counter-clockwise in *framebuffer*
 /// coordinates here, and mirroring the clip space is exactly what reconciles the two.
 static EMULATE_GL_CLIP_SPACE_AST: Lazy<Statement> = Lazy::new(|| {
-    Statement::Simple(Box::new(SimpleStatement::Expression(
-        Some(
-            Expr::parse(r#"gl_Position.y = -gl_Position.y;"#).unwrap()
-        )
-    )))
+    Statement::Simple(Box::new(SimpleStatement::Expression(Some(
+        Expr::parse(r#"gl_Position.y = -gl_Position.y;"#).unwrap(),
+    ))))
 });
 
 pub struct MatrixPatcher;
@@ -67,23 +69,26 @@ pub struct EmulateGlClipSpace;
 impl VisitorMut for ForceWhite {
     fn visit_function_definition(&mut self, def: &mut FunctionDefinition) -> Visit {
         if def.prototype.name.0 == "main" {
-            def.statement.statement_list.insert(def.statement.statement_list.len(), FORCE_WHITE.clone());
+            def.statement
+                .statement_list
+                .insert(def.statement.statement_list.len(), FORCE_WHITE.clone());
         }
 
         Visit::Children
     }
-
 }
 
 impl VisitorMut for MatrixPatcher {
     fn visit_function_definition(&mut self, def: &mut FunctionDefinition) -> Visit {
         if def.prototype.name.0 == "main" {
-            def.statement.statement_list.insert(def.statement.statement_list.len(), OPENGL_TO_WGPU_MATRIX_AST.clone());
+            def.statement.statement_list.insert(
+                def.statement.statement_list.len(),
+                OPENGL_TO_WGPU_MATRIX_AST.clone(),
+            );
         }
 
         Visit::Children
     }
-
 }
 
 impl VisitorMut for EmulateGlClipSpace {
@@ -93,12 +98,14 @@ impl VisitorMut for EmulateGlClipSpace {
             // is the one that gets flipped. Both patches land after the shader's own writes, and
             // the depth-range one has to run first so the y flip cannot disturb it - it does not
             // touch y, but keeping the order fixed keeps the two patches readable.
-            def.statement.statement_list.insert(def.statement.statement_list.len(), EMULATE_GL_CLIP_SPACE_AST.clone());
+            def.statement.statement_list.insert(
+                def.statement.statement_list.len(),
+                EMULATE_GL_CLIP_SPACE_AST.clone(),
+            );
         }
 
         Visit::Children
     }
-
 }
 
 struct VersionFixer;
@@ -110,7 +117,6 @@ impl VisitorMut for VersionFixer {
 }
 #[derive(Debug)]
 struct SamplerFinder {
-    layout_qualifiers: Option<[LayoutQualifierSpec; 2]>,
     names: HashMap<String, TypeSpecifierNonArray>,
     uniform: bool,
     sampler: Option<TypeSpecifierNonArray>,
@@ -124,7 +130,7 @@ struct TypeChanger {
 
 impl VisitorMut for TypeChanger {
     fn visit_single_declaration(&mut self, decl: &mut SingleDeclaration) -> Visit {
-        decl.name.as_mut().unwrap().0.extend(self.name_ext.chars());
+        decl.name.as_mut().unwrap().0.push_str(&self.name_ext);
 
         Visit::Children
     }
@@ -177,7 +183,7 @@ impl<'a> VisitorMut for BuiltinFunctionCallMergeSampler<'a> {
 
     fn visit_expr(&mut self, expr: &mut Expr) -> Visit {
         //Function calls can contain other function calls, so we have to deal with that
-        if let Expr::FunCall(FunIdentifier::Identifier(func_name), params) = expr {
+        if let Expr::FunCall(FunIdentifier::Identifier(func_name), _params) = expr {
             //Calling a locally defined function
             if self.local_funcs.contains(&func_name.0) {
                 let mut v = FunctionCallExpandSampler {
@@ -218,7 +224,7 @@ impl<'a> VisitorMut for FunctionCallExpandSampler<'a> {
             } else {
                 *params = params
                     .iter()
-                    .map(|p| {
+                    .flat_map(|p| {
                         if let Expr::Variable(var_name) = p
                             && self.samplers.contains_key(&var_name.0)
                         {
@@ -230,7 +236,6 @@ impl<'a> VisitorMut for FunctionCallExpandSampler<'a> {
                             vec![p.clone()]
                         }
                     })
-                    .flatten()
                     .collect();
             }
         }
@@ -259,7 +264,7 @@ impl VisitorMut for SamplerExpansion {
         proto.parameters = proto
             .parameters
             .iter()
-            .map(|param| match &param {
+            .flat_map(|param| match &param {
                 FunctionParameterDeclaration::Unnamed(_, _) => unimplemented!(),
                 FunctionParameterDeclaration::Named(qual, decl) => {
                     if matches!(
@@ -316,7 +321,6 @@ impl VisitorMut for SamplerExpansion {
                     }
                 }
             })
-            .flatten()
             .collect();
 
         Visit::Parent
@@ -363,14 +367,12 @@ impl VisitorMut for NagaFixConstArrayExplicit {
         if let Some(TypeQualifier {
             qualifiers: NonEmpty(specs),
         }) = &mut idl.head.ty.qualifier
-        {
-            if specs
+            && specs
                 .iter()
                 .any(|x| matches!(x, TypeQualifierSpec::Storage(StorageQualifier::Const)))
-            {
-                idl.head.initializer.visit_mut(self);
-                idl.head.ty.visit_mut(self);
-            }
+        {
+            idl.head.initializer.visit_mut(self);
+            idl.head.ty.visit_mut(self);
         }
 
         Visit::Parent
@@ -389,22 +391,16 @@ impl VisitorMut for NagaFixConstArrayExplicit {
     }
 
     fn visit_initializer(&mut self, i: &mut Initializer) -> Visit {
-        match i {
-            Initializer::Simple(simple) => match &**simple {
-                Expr::FunCall(FunIdentifier::Expr(expr), params) => {
-                    if let Expr::Bracket(
-                        _,
-                        ArraySpecifier {
-                            dimensions: NonEmpty(d),
-                        },
-                    ) = &**expr
-                    {
-                        self.size = Some(params.len() as u32);
-                    }
-                }
-                _ => {}
-            },
-            _ => {}
+        if let Initializer::Simple(simple) = i
+            && let Expr::FunCall(FunIdentifier::Expr(expr), params) = &**simple
+            && let Expr::Bracket(
+                _,
+                ArraySpecifier {
+                    dimensions: NonEmpty(_d),
+                },
+            ) = &**expr
+        {
+            self.size = Some(params.len() as u32);
         }
 
         Visit::Parent
@@ -509,16 +505,16 @@ impl VisitorMut for RemovePointSize {
     }
 
     fn visit_statement(&mut self, statement: &mut Statement) -> Visit {
-        if let Statement::Simple(simple) = statement {
-            if let SimpleStatement::Expression(expr) = &mut **simple {
-                expr.visit_mut(self);
+        if let Statement::Simple(simple) = statement
+            && let SimpleStatement::Expression(expr) = &mut **simple
+        {
+            expr.visit_mut(self);
 
-                if self.is_point_var {
-                    *statement = Statement::parse(";").unwrap();
-                }
-
-                self.is_point_var = false;
+            if self.is_point_var {
+                *statement = Statement::parse(";").unwrap();
             }
+
+            self.is_point_var = false;
         }
 
         Visit::Children
@@ -529,59 +525,54 @@ impl<'a> VisitorMut for RewriteFetches<'a> {
     fn visit_expr(&mut self, expression_base: &mut Expr) -> Visit {
         if let Expr::FunCall(FunIdentifier::Identifier(ident), e) = expression_base
             && ident.0 == "texelFetch"
+            && let Expr::Variable(ident) = e.first().unwrap()
+            && self.buffers.contains(&ident.0)
         {
-            if let Expr::Variable(ident) = e.first().unwrap() {
-                if self.buffers.contains(&ident.0) {
-                    let op = e.get(1).unwrap();
+            let op = e.get(1).unwrap();
 
-                    let mut expr_out = String::new();
+            let mut expr_out = String::new();
 
-                    show_expr(&mut expr_out, op);
+            show_expr(&mut expr_out, op);
 
-                    let name = &ident.0;
-                    let kind = self.kinds.get(name).copied().unwrap_or_default();
+            let name = &ident.0;
+            let kind = self.kinds.get(name).copied().unwrap_or_default();
 
-                    // One texel is one byte, so the word is `index / 4` and the byte inside it is
-                    // selected by `(index % 4) * 8`.
-                    //
-                    // The byte is *signed* for an `isamplerBuffer`: `CloudRenderer#encodeFace`
-                    // writes `cellX >> 1` of a coordinate that is negative for every cell west or
-                    // north of the camera, and the shader shifts the fetched value back up. Reading
-                    // it as an unsigned byte put those cells 2*|x| cells away instead of |x| cells
-                    // away - so the whole western and northern half of the cloud layer was drawn
-                    // outside the fog, and what was left was the two-by-two cells around the player.
-                    // `(byte ^ 0x80) - 0x80` is sign extension without depending on how the backend
-                    // shifts a signed value; a `usamplerBuffer` gets the plain zero-extended byte,
-                    // which is what GL would have handed it.
-                    let byte = match kind {
-                        TexelKind::Int => format!(
-                            "((int(({name}.inner[uint({expr_out}) >> 2u] >> ((uint({expr_out}) & 3u) << 3u)) & 0xFFu) ^ 0x80) - 0x80)"
-                        ),
-                        TexelKind::Uint | TexelKind::Float => format!(
-                            "int(({name}.inner[uint({expr_out}) >> 2u] >> ((uint({expr_out}) & 3u) << 3u)) & 0xFFu)"
-                        ),
-                    };
+            // One texel is one byte, so the word is `index / 4` and the byte inside it is
+            // selected by `(index % 4) * 8`.
+            //
+            // The byte is *signed* for an `isamplerBuffer`: `CloudRenderer#encodeFace`
+            // writes `cellX >> 1` of a coordinate that is negative for every cell west or
+            // north of the camera, and the shader shifts the fetched value back up. Reading
+            // it as an unsigned byte put those cells 2*|x| cells away instead of |x| cells
+            // away - so the whole western and northern half of the cloud layer was drawn
+            // outside the fog, and what was left was the two-by-two cells around the player.
+            // `(byte ^ 0x80) - 0x80` is sign extension without depending on how the backend
+            // shifts a signed value; a `usamplerBuffer` gets the plain zero-extended byte,
+            // which is what GL would have handed it.
+            let byte = match kind {
+                TexelKind::Int => format!(
+                    "((int(({name}.inner[uint({expr_out}) >> 2u] >> ((uint({expr_out}) & 3u) << 3u)) & 0xFFu) ^ 0x80) - 0x80)"
+                ),
+                TexelKind::Uint | TexelKind::Float => format!(
+                    "int(({name}.inner[uint({expr_out}) >> 2u] >> ((uint({expr_out}) & 3u) << 3u)) & 0xFFu)"
+                ),
+            };
 
-                    // An out-of-range `texelFetch` is undefined in GL, and this was where a clamp
-                    // belonged - `i >> 2 < inner.length() ? ... : 0`. It cannot be written: naga
-                    // 29's GLSL front end lowers `.length()` on a runtime-sized array member to a
-                    // `Load` of the array itself, and the validator rejects that ("Expression is
-                    // invalid / Loading of ... can't be done"), which fails the whole shader module
-                    // and takes the process down with it. Nothing is lost by leaving it out: WebGPU
-                    // requires robust buffer access, so an out-of-bounds read of a storage buffer
-                    // reads zero rather than the word after the mesh - which is what the clamp was
-                    // for. What *was* missing is the sign extension below, and it is the difference
-                    // between a cloud layer and one square of it.
-                    //
-                    // `ivec4`, not `ivec2`, because an `isamplerBuffer` fetch returns four
-                    // components and `.g`/`.b`/`.a` would otherwise not compile; a texel buffer's
-                    // unused components are zero and alpha is one.
-                    *expression_base = Expr::parse(format!(
-                        "ivec4({byte}, 0, 0, 1)"
-                    ))
-                    .unwrap();
-                }
-            }
+            // An out-of-range `texelFetch` is undefined in GL, and this was where a clamp
+            // belonged - `i >> 2 < inner.length() ? ... : 0`. It cannot be written: naga
+            // 29's GLSL front end lowers `.length()` on a runtime-sized array member to a
+            // `Load` of the array itself, and the validator rejects that ("Expression is
+            // invalid / Loading of ... can't be done"), which fails the whole shader module
+            // and takes the process down with it. Nothing is lost by leaving it out: WebGPU
+            // requires robust buffer access, so an out-of-bounds read of a storage buffer
+            // reads zero rather than the word after the mesh - which is what the clamp was
+            // for. What *was* missing is the sign extension below, and it is the difference
+            // between a cloud layer and one square of it.
+            //
+            // `ivec4`, not `ivec2`, because an `isamplerBuffer` fetch returns four
+            // components and `.g`/`.b`/`.a` would otherwise not compile; a texel buffer's
+            // unused components are zero and alpha is one.
+            *expression_base = Expr::parse(format!("ivec4({byte}, 0, 0, 1)")).unwrap();
         }
 
         Visit::Children
@@ -730,17 +721,14 @@ impl VisitorMut for UniformAnnotator {
     }
 
     fn visit_type_qualifier(&mut self, qual: &mut TypeQualifier) -> Visit {
-        match self.uniform_binding.take() {
-            Some((set, binding)) => {
-                qual.qualifiers.0.insert(
-                    0,
-                    TypeQualifierSpec::parse(format!("layout(set = {set}, binding = {binding})"))
-                        .unwrap(),
-                );
+        if let Some((set, binding)) = self.uniform_binding.take() {
+            qual.qualifiers.0.insert(
+                0,
+                TypeQualifierSpec::parse(format!("layout(set = {set}, binding = {binding})"))
+                    .unwrap(),
+            );
 
-                return Visit::Parent;
-            }
-            None => {}
+            return Visit::Parent;
         }
 
         Visit::Children
@@ -911,11 +899,7 @@ impl VisitorMut for InAnnotator {
                     // the pipeline does provide keeps the shader valid and makes wgpu report the
                     // missing attribute by number, instead of naga handing it location 0 and
                     // colliding with an input that is provided.
-                    let next = self
-                        .map
-                        .values()
-                        .max()
-                        .map_or(0, |location| location + 1);
+                    let next = self.map.values().max().map_or(0, |location| location + 1);
 
                     let mut available: Vec<&str> =
                         self.map.keys().map(|key| key.as_str()).collect();
@@ -937,14 +921,11 @@ impl VisitorMut for InAnnotator {
     }
 
     fn visit_type_qualifier(&mut self, qual: &mut glsl::syntax::TypeQualifier) -> Visit {
-        match self.insert_location.take() {
-            Some(offset) => {
-                qual.qualifiers.0.insert(
-                    0,
-                    TypeQualifierSpec::parse(format!("layout(location = {offset})")).unwrap(),
-                );
-            }
-            None => {}
+        if let Some(offset) = self.insert_location.take() {
+            qual.qualifiers.0.insert(
+                0,
+                TypeQualifierSpec::parse(format!("layout(location = {offset})")).unwrap(),
+            );
         }
 
         Visit::Children
@@ -976,14 +957,11 @@ impl VisitorMut for IncrementingAnnotator {
     }
 
     fn visit_type_qualifier(&mut self, qual: &mut glsl::syntax::TypeQualifier) -> Visit {
-        match self.insert_location.take() {
-            Some(offset) => {
-                qual.qualifiers.0.insert(
-                    0,
-                    TypeQualifierSpec::parse(format!("layout(location = {offset})")).unwrap(),
-                );
-            }
-            None => {}
+        if let Some(offset) = self.insert_location.take() {
+            qual.qualifiers.0.insert(
+                0,
+                TypeQualifierSpec::parse(format!("layout(location = {offset})")).unwrap(),
+            );
         }
 
         Visit::Children
@@ -1002,20 +980,18 @@ pub fn fix_version(shader_stage: &mut ShaderStage) {
 
 /// The name of the `in` variable an external declaration declares, if it declares one.
 fn declared_input_name(declaration: &ExternalDeclaration) -> Option<&str> {
-    let ExternalDeclaration::Declaration(Declaration::InitDeclaratorList(list)) = declaration else {
+    let ExternalDeclaration::Declaration(Declaration::InitDeclaratorList(list)) = declaration
+    else {
         return None;
     };
 
-    let is_input = list
-        .head
-        .ty
-        .qualifier
-        .as_ref()
-        .is_some_and(|qualifier| {
-            qualifier.qualifiers.0.iter().any(|spec| {
-                matches!(spec, TypeQualifierSpec::Storage(StorageQualifier::In))
-            })
-        });
+    let is_input = list.head.ty.qualifier.as_ref().is_some_and(|qualifier| {
+        qualifier
+            .qualifiers
+            .0
+            .iter()
+            .any(|spec| matches!(spec, TypeQualifierSpec::Storage(StorageQualifier::In)))
+    });
 
     if !is_input {
         return None;
@@ -1108,7 +1084,7 @@ pub fn apply_layouts(
         buffers: vec![],
         kinds: HashMap::new(),
         current_kind: TexelKind::default(),
-        uniform_sets: &uniform_map,
+        uniform_sets: uniform_map,
     };
 
     vert_stage.visit_mut(&mut rewriter);
@@ -1237,11 +1213,8 @@ pub fn process_shaders(
 
     //Whatever the shaders declare gets a binding, whether or not the pipeline asked for it.
     let mut uniform_locations = uniform_locations.clone();
-    let implicit_uniforms = add_implicit_uniforms(
-        &vert_stage_ast,
-        &frag_stage_ast,
-        &mut uniform_locations,
-    );
+    let implicit_uniforms =
+        add_implicit_uniforms(&vert_stage_ast, &frag_stage_ast, &mut uniform_locations);
 
     //Apply the set and binding layouts to the uniforms
     apply_layouts(
@@ -1297,7 +1270,6 @@ pub fn shim_samplers(
 
     for (index, ext) in shader_stage.0.0.iter().enumerate() {
         let mut finder = SamplerFinder {
-            layout_qualifiers: None,
             names: HashMap::new(),
             uniform: false,
             sampler: None,
@@ -1347,7 +1319,7 @@ pub fn shim_samplers(
     let mut expander = SamplerExpansion {
         samplers: sampler_uniform_names
             .iter()
-            .map(|(l, r)| (l.clone(), get_sampler_constructor_for_glsl_type(&r)))
+            .map(|(l, r)| (l.clone(), get_sampler_constructor_for_glsl_type(r)))
             .collect(),
         local_functions: vec![],
     };
@@ -1427,7 +1399,13 @@ mod texel_buffer_tests {
             };
 
             assert_eq!(
-                (decoded_x, decoded_z, dir_and_flags & 7, (dir_and_flags & 16) == 16, (dir_and_flags & 32) == 32),
+                (
+                    decoded_x,
+                    decoded_z,
+                    dir_and_flags & 7,
+                    (dir_and_flags & 16) == 16,
+                    (dir_and_flags & 32) == 32
+                ),
                 expected,
                 "face {face} decoded to the wrong cell"
             );
@@ -1473,7 +1451,10 @@ mod texel_buffer_tests {
             "}",
         ]);
 
-        assert!(printed.contains("uint[] inner"), "the SSBO is not a uint array: {printed}");
+        assert!(
+            printed.contains("uint[] inner"),
+            "the SSBO is not a uint array: {printed}"
+        );
         // The printer writes `0xFFu` as `255u`, so the mask is matched by its value.
         assert!(
             printed.contains(">>2u") && printed.contains("&3u") && printed.contains("&255u"),
@@ -1526,7 +1507,7 @@ mod texel_buffer_tests {
         });
 
         let mut printed = String::new();
-        show_translation_unit(&mut printed, &mut stage);
+        show_translation_unit(&mut printed, &stage);
         println!("{printed}");
         printed
     }
@@ -1612,20 +1593,24 @@ mod roundtrip_tests {
     /// that multiplication into a subtraction makes every RGSS-filtered surface four times too
     /// bright - which is what a terrain drawn as a white void turned out to be.
     fn roundtrip(source: &str) -> String {
-        let mut stage = ShaderStage::parse(source.to_string()).unwrap();
+        let stage = ShaderStage::parse(source).unwrap();
         let mut out = String::new();
-        show_translation_unit(&mut out, &mut stage);
+        show_translation_unit(&mut out, &stage);
         out
     }
 
     #[test]
     fn compound_assignment_survives_parsing_alone() {
-        let printed = roundtrip("void main() { float a = 1.0; a *= 0.25; a /= 2.0; a += 1.0; a -= 3.0; }");
+        let printed =
+            roundtrip("void main() { float a = 1.0; a *= 0.25; a /= 2.0; a += 1.0; a -= 3.0; }");
         println!("parse+print: {printed}");
         // The *operators*, not the exact spacing: the printer is free to reflow whitespace, and
         // naga does not care. What it may not do is change which operator is there.
         for operator in ["*=", "/=", "+=", "-="] {
-            assert!(printed.contains(operator), "{operator} is missing from: {printed}");
+            assert!(
+                printed.contains(operator),
+                "{operator} is missing from: {printed}"
+            );
         }
     }
 
@@ -1633,11 +1618,17 @@ mod roundtrip_tests {
     fn compound_assignment_survives_the_preprocessor() {
         let preprocessed = cyntax::preprocess_str("void main() { float a = 1.0; a *= 0.25; }", &[]);
         println!("cyntax: {preprocessed}");
-        assert!(preprocessed.contains("a *= 0.25"), "the preprocessor rewrote it: {preprocessed}");
+        assert!(
+            preprocessed.contains("a *= 0.25"),
+            "the preprocessor rewrote it: {preprocessed}"
+        );
 
         let printed = roundtrip(&preprocessed);
         println!("cyntax+parse+print: {printed}");
-        assert!(printed.contains("*="), "multiplication was rewritten after preprocessing: {printed}");
+        assert!(
+            printed.contains("*="),
+            "multiplication was rewritten after preprocessing: {printed}"
+        );
     }
 }
 
@@ -1647,7 +1638,9 @@ mod operator_matrix {
     /// glance rather than inferred from one broken shader.
     #[test]
     fn every_compound_assignment_through_the_preprocessor() {
-        for operator in ["=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>="] {
+        for operator in [
+            "=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>=",
+        ] {
             let source = format!("void main() {{ float a = 1.0; a {operator} 0.25; }}");
             let printed = cyntax::preprocess_str(&source, &[]);
             let kept = printed.contains(&format!("a {operator} 0.25"));

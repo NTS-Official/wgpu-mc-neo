@@ -1,15 +1,12 @@
 use std::sync::Arc;
 
-use futures::executor::block_on;
-use jni::{JavaVM, objects::JValue};
-use once_cell::sync::OnceCell;
-use parking_lot::lock_api::{Mutex, RwLock};
 use once_cell::sync::Lazy;
+use once_cell::sync::OnceCell;
+use parking_lot::lock_api::Mutex;
 use wgpu_mc::{
-    Gpu, WmRenderer,
-    render::graph::Geometry,
+    WmRenderer,
     wgpu::{
-        self, BufferAddress, BufferBindingType, PresentMode,
+        self, BufferAddress, BufferBindingType,
         util::{BufferInitDescriptor, DeviceExt},
     },
 };
@@ -146,19 +143,15 @@ pub fn upload_terrain_matrices(wm: &WmRenderer) {
         return;
     };
 
-    wm.gpu.queue.write_buffer(
-        &buffers.model,
-        0,
-        bytemuck::cast_slice(&matrices.0),
-    );
+    wm.gpu
+        .queue
+        .write_buffer(&buffers.model, 0, bytemuck::cast_slice(&matrices.0));
     wm.gpu
         .queue
         .write_buffer(&buffers.view, 0, bytemuck::cast_slice(&matrices.1));
-    wm.gpu.queue.write_buffer(
-        &buffers.projection,
-        0,
-        bytemuck::cast_slice(&matrices.2),
-    );
+    wm.gpu
+        .queue
+        .write_buffer(&buffers.projection, 0, bytemuck::cast_slice(&matrices.2));
 }
 
 fn create_matrix_buffer(wm: &WmRenderer) -> Arc<wgpu::Buffer> {

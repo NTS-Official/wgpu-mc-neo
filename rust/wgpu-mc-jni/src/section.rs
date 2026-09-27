@@ -109,6 +109,10 @@ pub struct SectionBlocks {
 /// MC's `FluidState#getAmount`: 8 for a source, lower for a flowing block, and the height a fluid
 /// surface sits at is `amount / 9` - which is MC's own `getOwnHeight`, so the arithmetic is the same
 /// on both sides.
+///
+/// [`SectionBlocks::fluid`] hands the raw byte on, so nothing decodes a byte with this yet: it is the
+/// written-down form of the encoding that doc comment points at.
+#[allow(dead_code)]
 pub fn fluid_of(byte: u8) -> (u8, u8, bool) {
     (byte & 0b11, (byte >> 2) & 0b1111, byte & 0b0100_0000 != 0)
 }
@@ -253,7 +257,8 @@ impl WorldSections {
         self.last_trim = self.tick;
 
         let center = IVec2::new(target.x, target.z);
-        let far = |pos: &IVec3| (IVec2::new(pos.x, pos.z) - center).abs().max_element() > TRIM_RADIUS;
+        let far =
+            |pos: &IVec3| (IVec2::new(pos.x, pos.z) - center).abs().max_element() > TRIM_RADIUS;
 
         self.blocks.retain(|pos, _| !far(pos));
         self.light.retain(|pos, _| !far(pos));
@@ -263,6 +268,8 @@ impl WorldSections {
         self.blocks.len().max(self.light.len())
     }
 
+    /// Read by the trim's own test rather than by the trim, which walks the maps it keeps directly.
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.blocks.is_empty() && self.light.is_empty()
     }
@@ -302,7 +309,9 @@ pub const CENTER: usize = 13;
 /// masked to its width so a negative coordinate packs as the complement `SectionPos.x/y/z` sign
 /// extends back.
 pub fn section_key(pos: IVec3) -> i64 {
-    ((pos.x as i64 & 0x3F_FFFF) << 42) | ((pos.z as i64 & 0x3F_FFFF) << 20) | (pos.y as i64 & 0xF_FFFF)
+    ((pos.x as i64 & 0x3F_FFFF) << 42)
+        | ((pos.z as i64 & 0x3F_FFFF) << 20)
+        | (pos.y as i64 & 0xF_FFFF)
 }
 
 /// One parsed call: what arrived with it.
@@ -399,7 +408,8 @@ impl Payload {
             let longs_offset = read_word(record, 13) as usize;
             let fluids_offset = read_word(record, 14) as usize;
 
-            let palette_bytes = bytes.get(palette_offset..palette_offset.checked_add(palette_len * 4)?)?;
+            let palette_bytes =
+                bytes.get(palette_offset..palette_offset.checked_add(palette_len * 4)?)?;
             let palette: Box<[u32]> = (0..palette_len)
                 .map(|i| read_word(palette_bytes, i))
                 .collect();
@@ -659,7 +669,7 @@ mod tests {
         for (i, block) in blocks.iter().enumerate() {
             let at = records_at + i * BLOCK_RECORD_WORDS;
             let palette_offset = blob;
-            let longs_offset = (blob + block.palette.len() * 4 + 7) / 8 * 8;
+            let longs_offset = (blob + block.palette.len() * 4).div_ceil(8) * 8;
 
             bytes.resize(longs_offset + block.longs.len() * 8, 0);
 
@@ -737,10 +747,7 @@ mod tests {
         let longs = [0x10i64]; // the second nibble is 1, so the position (1, 0, 0)
         let palette = [0u32, key];
 
-        let bytes = payload(
-            &[nibbles(&longs, &palette, &[0, 0b0000_1010])],
-            &[],
-        );
+        let bytes = payload(&[nibbles(&longs, &palette, &[0, 0b0000_1010])], &[]);
         let parsed = Payload::parse(&bytes, TEST_GENERATION).expect("a payload this build writes");
 
         assert_eq!(parsed.present, 1 << 13);
@@ -752,7 +759,11 @@ mod tests {
         // The fluid channel rides on the same palette index as the block key: kind 2 (lava) with
         // amount 2, which is a flowing block rather than a source.
         assert_eq!(section.fluid(1, 0, 0), 0b0000_1010);
-        assert_eq!(section.fluid(0, 0, 0), 0, "the entry with no fluid byte carries none");
+        assert_eq!(
+            section.fluid(0, 0, 0),
+            0,
+            "the entry with no fluid byte carries none"
+        );
         assert_eq!(
             section.key(2, 0, 0),
             Some(BlockstateKey::from(0u32)),
@@ -765,10 +776,7 @@ mod tests {
         let longs = [0x50i64]; // the second nibble is 5, past the end of the table
         let palette = [0u32, 1];
 
-        let bytes = payload(
-            &[nibbles(&longs, &palette, &[0, 0b0000_1010])],
-            &[],
-        );
+        let bytes = payload(&[nibbles(&longs, &palette, &[0, 0b0000_1010])], &[]);
         let parsed = Payload::parse(&bytes, TEST_GENERATION).expect("a payload this build writes");
         let section = parsed.blocks[13].as_ref().expect("the section it carried");
 
@@ -804,13 +812,17 @@ mod tests {
         let palette = [0u32, 1];
 
         let mut block = vec![0u8; LIGHT_BYTES];
-        let mut sky = vec![0u8; LIGHT_BYTES];
+        let sky = vec![0u8; LIGHT_BYTES];
         block[0] = 0x3f;
 
         let bytes = payload(&[nibbles(&longs, &palette, &[])], &[(0, block, sky)]);
         let parsed = Payload::parse(&bytes, TEST_GENERATION).expect("a payload this build writes");
 
-        assert_eq!(parsed.present, 1 << 13, "the fixture's block record is index 13");
+        assert_eq!(
+            parsed.present,
+            1 << 13,
+            "the fixture's block record is index 13"
+        );
         assert_eq!(parsed.light.len(), 1);
         assert_eq!(parsed.light[0].0, 0);
         assert_eq!(parsed.light[0].1.block[0], 0x3f);
@@ -836,30 +848,44 @@ mod tests {
         let longs = [0x10i64];
         let palette = [0u32, key];
 
-        let mut bytes = payload(&[nibbles(&longs, &palette, &[])], &[(0, vec![9; LIGHT_BYTES], vec![0; LIGHT_BYTES])]);
+        let mut bytes = payload(
+            &[nibbles(&longs, &palette, &[])],
+            &[(0, vec![9; LIGHT_BYTES], vec![0; LIGHT_BYTES])],
+        );
 
         // Patch the block record's generation word, and the light record's, to the world before this
         // one. Word 15 of the first block record, word 3 of the first light record.
         let block_generation_at = (HEADER_WORDS + BLOCK_RECORD_GENERATION_WORD) * 4;
-        let light_generation_at = (HEADER_WORDS + SECTIONS * BLOCK_RECORD_WORDS + LIGHT_RECORD_GENERATION_WORD) * 4;
-        bytes[block_generation_at..block_generation_at + 4].copy_from_slice(&(TEST_GENERATION - 1).to_le_bytes());
-        bytes[light_generation_at..light_generation_at + 4].copy_from_slice(&(TEST_GENERATION - 1).to_le_bytes());
+        let light_generation_at =
+            (HEADER_WORDS + SECTIONS * BLOCK_RECORD_WORDS + LIGHT_RECORD_GENERATION_WORD) * 4;
+        bytes[block_generation_at..block_generation_at + 4]
+            .copy_from_slice(&(TEST_GENERATION - 1).to_le_bytes());
+        bytes[light_generation_at..light_generation_at + 4]
+            .copy_from_slice(&(TEST_GENERATION - 1).to_le_bytes());
 
-        let mut parsed = Payload::parse(&bytes, TEST_GENERATION).expect("a payload this build writes");
+        let mut parsed =
+            Payload::parse(&bytes, TEST_GENERATION).expect("a payload this build writes");
 
         assert_eq!(
             parsed.stale,
             (1 << 13) | 1,
             "the block record is the fixture's index 13 and the light record is index 0"
         );
-        assert_eq!(parsed.present, 0, "a refused record is not a present section");
+        assert_eq!(
+            parsed.present, 0,
+            "a refused record is not a present section"
+        );
         assert_eq!(parsed.absent, 0, "and it is not a section to forget either");
         assert!(parsed.light.is_empty(), "nor is its light applied");
 
         let mut world = WorldSections::default();
         let rejected = parsed.apply(&mut world, IVec3::new(0, 0, 0));
 
-        assert_eq!(rejected, (1 << 13) | 1, "the caller is told which slots it refused");
+        assert_eq!(
+            rejected,
+            (1 << 13) | 1,
+            "the caller is told which slots it refused"
+        );
         assert!(
             world.is_empty(),
             "and nothing of the old world reached the cache the new one reads"
@@ -874,14 +900,17 @@ mod tests {
         let palette = [0u32, key];
 
         let bytes = payload(&[nibbles(&longs, &palette, &[])], &[]);
-        let mut parsed = Payload::parse(&bytes, TEST_GENERATION).expect("a payload this build writes");
+        let mut parsed =
+            Payload::parse(&bytes, TEST_GENERATION).expect("a payload this build writes");
 
         let mut world = WorldSections::default();
         let rejected = parsed.apply(&mut world, IVec3::new(0, 0, 0));
 
         assert_eq!(rejected, 0);
         assert_eq!(
-            world.blocks(neighbour_offset(13)).map(|blocks| blocks.key(1, 0, 0)),
+            world
+                .blocks(neighbour_offset(13))
+                .map(|blocks| blocks.key(1, 0, 0)),
             Some(Some(BlockstateKey::from(key))),
             "the section the payload carried is in the cache, at the slot its index names"
         );
@@ -911,7 +940,11 @@ mod tests {
             (1 << 13, 1 << 13),
             "nothing is cached yet"
         );
-        assert_eq!(world.missing(target, 0, 0), (0, 0), "an empty mask asks for nothing");
+        assert_eq!(
+            world.missing(target, 0, 0),
+            (0, 0),
+            "an empty mask asks for nothing"
+        );
 
         world.set_light(
             target + neighbour_offset(13),
@@ -948,7 +981,11 @@ mod tests {
         // And the middle is the slot the bake calls *about*: a reject bit for it is the answer "the
         // section you offered was not baked", which is the only one of the 27 that is about that
         // section rather than about its neighbours.
-        assert_eq!(neighbour_offset(CENTER), IVec3::ZERO, "CENTER is the middle slot");
+        assert_eq!(
+            neighbour_offset(CENTER),
+            IVec3::ZERO,
+            "CENTER is the middle slot"
+        );
         assert_eq!(CENTER, 13);
     }
 
@@ -968,6 +1005,9 @@ mod tests {
     /// keeps - and the decode here is written the way `SectionPos.x/y/z` read it back.
     #[test]
     fn a_section_key_is_what_section_pos_as_long_writes() {
+        // The `<< 0` is Minecraft's own `SectionPos.x`: the three decoders are the same expression
+        // with different shifts, and writing it out is what keeps them comparable.
+        #[allow(clippy::identity_op)]
         fn x(key: i64) -> i32 {
             (key << 0 >> 42) as i32
         }
@@ -979,9 +1019,17 @@ mod tests {
         }
 
         assert_eq!(section_key(IVec3::new(0, 0, 0)), 0);
-        assert_eq!(section_key(IVec3::new(1, 0, 0)), 1 << 42, "x is the high field");
+        assert_eq!(
+            section_key(IVec3::new(1, 0, 0)),
+            1 << 42,
+            "x is the high field"
+        );
         assert_eq!(section_key(IVec3::new(0, 1, 0)), 1, "y is the low one");
-        assert_eq!(section_key(IVec3::new(0, 0, 1)), 1 << 20, "z sits between them");
+        assert_eq!(
+            section_key(IVec3::new(0, 0, 1)),
+            1 << 20,
+            "z sits between them"
+        );
         assert_eq!(
             section_key(IVec3::new(-1, -1, -1)),
             -1,

@@ -382,7 +382,10 @@ pipelines:
         else {
             panic!("shadow_ortho_mat4 is a longhand resource");
         };
-        assert!(matches!(typed, TypeResourceConfig::Mat4(Mat4ValueOrMult::Value { .. })));
+        assert!(matches!(
+            typed,
+            TypeResourceConfig::Mat4(Mat4ValueOrMult::Value { .. })
+        ));
 
         let Some(ShorthandResourceConfig::Longhand(LonghandResourceConfig { typed, .. })) =
             resources.get("model_view_mat4")
@@ -399,7 +402,10 @@ pipelines:
         else {
             panic!("ortho_mat3 is a longhand resource");
         };
-        assert!(matches!(typed, TypeResourceConfig::Mat3(Mat3ValueOrMult::Mult { .. })));
+        assert!(matches!(
+            typed,
+            TypeResourceConfig::Mat3(Mat3ValueOrMult::Mult { .. })
+        ));
 
         // A pipeline, field by field, including the defaults of the ones it leaves out.
         let terrain = config
@@ -421,7 +427,10 @@ pipelines:
         let Some(BindGroupDef::Entries(entries)) = terrain.bind_groups.get(&0) else {
             panic!("bind group 0 is written out entry by entry");
         };
-        assert_eq!(entries.get(&0).map(String::as_str), Some("shadow_ortho_mat4"));
+        assert_eq!(
+            entries.get(&0).map(String::as_str),
+            Some("shadow_ortho_mat4")
+        );
         assert_eq!(entries.get(&1).map(String::as_str), Some("model_view_mat4"));
 
         assert!(matches!(

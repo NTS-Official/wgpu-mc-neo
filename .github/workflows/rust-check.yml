@@ -92,4 +92,4 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml') }}
           restore-keys: |
             ${{ runner.os }}-cargo-
-      - run: cargo clippy --manifest-path rust/Cargo.toml -- -D warnings
+      - run: cargo clippy --manifest-path rust/Cargo.toml --all-targets -- -D warnings

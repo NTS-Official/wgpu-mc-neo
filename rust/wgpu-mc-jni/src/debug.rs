@@ -15,10 +15,18 @@
 //! Two of them are not read on the draw path at all. `terrain_no_cull` and `terrain_greater_depth`
 //! are state built into a pipeline when it is created, so they are handed to the crate that creates
 //! them and the graph is built again when either moves - see [`rebuild_pipelines_if_stale`].
+//!
+//! Three of the accessors have no caller in this crate: [`diagnostics`], [`gpu_timestamps`] and
+//! [`section_timing`] are read where the work they describe is done, and the switches that do have
+//! callers - [`logging`], [`pix_capture`], the two pipeline-state flags - go through the same shape.
+//! They are kept as the complete set, one per switch, so that a new call site reads its flag the way
+//! every existing one does rather than reaching for the atomic itself.
 
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use log::warn;
 
 use crate::settings::{DebugSettings, Settings};
 
@@ -38,6 +46,47 @@ static BIND_GROUP_CACHE: AtomicBool = AtomicBool::new(true);
 
 /// Whether uniform bindings carry their offset dynamically instead of baking it into the set.
 static DYNAMIC_OFFSETS: AtomicBool = AtomicBool::new(true);
+
+/// Whether the `dynamic offsets` switch has been read yet. See [`set_dynamic_offsets`].
+static DYNAMIC_OFFSETS_READ: AtomicBool = AtomicBool::new(false);
+
+/// The `dynamic offsets` switch, which is read **once for the session** and then never again.
+///
+/// It was a live switch, on the reasoning that turning it off should take effect on the next draw
+/// rather than on the next launch. It cannot: what the switch decides is whether a uniform offset
+/// travels with the draw or is baked into the bind group it is bound with, and that is part of what
+/// the JVM side mints a *number* for - the identity of a draw's bind groups. Two draws of one frame
+/// numbered under one policy and drawn under the other disagree about what a bind group is, and the
+/// way that surfaces is the process ending: the game died the first time anyone flipped it in a
+/// running world.
+///
+/// So it is latched at the first read - the settings arriving, before anything is drawn - and a later
+/// change is reported and ignored. Off is also the *slow* setting, and worth saying out loud when it
+/// is taken: a baked offset makes every distinct offset a bind group of its own, which in a world of
+/// thousands of draws a frame is thousands of bind groups a frame. See `dynamic_offset` in `blaze.rs`.
+fn set_dynamic_offsets(value: bool) {
+    if DYNAMIC_OFFSETS_READ.swap(true, Ordering::Relaxed) {
+        if DYNAMIC_OFFSETS.load(Ordering::Relaxed) != value {
+            warn!(
+                "wgpu-mc: the `dynamic offsets` setting cannot be changed while the game is running - \
+                 it decides whether a uniform offset travels with the draw or is baked into the bind \
+                 group, which is part of how a draw identifies its bind groups. Restart to apply it."
+            );
+        }
+
+        return;
+    }
+
+    set(&DYNAMIC_OFFSETS, value);
+
+    if !value {
+        warn!(
+            "wgpu-mc: `dynamic offsets` is off: every distinct uniform offset becomes a bind group of \
+             its own, which is thousands of them a frame in a world - the feature is measured on, and \
+             off is for diagnosis rather than for play"
+        );
+    }
+}
 
 /// Whether every draw's bindings are logged, which is a line per draw.
 static TRACE_DYNAMIC_OFFSETS: AtomicBool = AtomicBool::new(false);
@@ -82,6 +131,7 @@ static TERRAIN_GREATER_DEPTH: AtomicBool = AtomicBool::new(false);
 /// [`rebuild_pipelines_if_stale`], which is what spends it.
 static PIPELINES_STALE: AtomicBool = AtomicBool::new(false);
 
+#[allow(dead_code)]
 #[inline]
 pub fn diagnostics() -> bool {
     DIAGNOSTICS.load(Ordering::Relaxed)
@@ -118,6 +168,7 @@ pub fn dump_shaders() -> bool {
     DUMP_SHADERS.load(Ordering::Relaxed)
 }
 
+#[allow(dead_code)]
 #[inline]
 pub fn gpu_timestamps() -> bool {
     GPU_TIMESTAMPS.load(Ordering::Relaxed)
@@ -132,6 +183,7 @@ pub fn pix_capture() -> bool {
 ///
 /// Read on Minecraft's chunk-build threads, once per rebuild, so the switch is what keeps the clock
 /// reads out of the path entirely when it is off.
+#[allow(dead_code)]
 #[inline]
 pub fn section_timing() -> bool {
     SECTION_TIMING.load(Ordering::Relaxed)
@@ -176,15 +228,12 @@ pub fn apply(settings: &Settings) {
     } = settings.debug();
 
     set(&LOGGING, logging || marker("wgpu-logging"));
+    set_dynamic_offsets(dynamic_offsets && !marker("wgpu-no-dynamic-offsets"));
     set(&DIAGNOSTICS, diagnostics || marker("wgpu-dump-frames"));
     // These two markers are spelled as the *off* switch, so the file wins over the setting.
     set(
         &BIND_GROUP_CACHE,
         bind_group_cache && !marker("wgpu-no-bind-group-cache"),
-    );
-    set(
-        &DYNAMIC_OFFSETS,
-        dynamic_offsets && !marker("wgpu-no-dynamic-offsets"),
     );
     set(
         &TRACE_DYNAMIC_OFFSETS,
@@ -196,13 +245,15 @@ pub fn apply(settings: &Settings) {
     );
     set(&DUMP_SHADERS, dump_shaders || marker("wgpu-dump-shaders"));
     set(&GPU_BASED_VALIDATION, gpu_based_validation);
-
     // These two are not flags to be read somewhere: they *are* the action, so the switch does
     // something the moment it moves. Both are gated on the setting alone - a marker file has no way
     // to end a capture, and a capture that never ends is worse than none.
     set(&GPU_TIMESTAMPS, gpu_timestamps);
     set(&PIX_CAPTURE, pix_capture);
-    set(&SECTION_TIMING, section_timing || marker("wgpu-section-timing"));
+    set(
+        &SECTION_TIMING,
+        section_timing || marker("wgpu-section-timing"),
+    );
 
     // The two pipeline-state switches are the odd ones out: they are not flags the draw path reads
     // but state built into every pipeline, which is why they are handed to the crate that builds
@@ -222,7 +273,8 @@ pub fn apply(settings: &Settings) {
 
     // The `wgpu-mc` crate writes lines of its own - the per-bake report, for one - and the switch
     // that decides whether they are sampled or written is the same one this file just resolved.
-    wgpu_mc::mc::chunk::DIAGNOSTIC_LOGGING.store(LOGGING.load(Ordering::Relaxed), Ordering::Relaxed);
+    wgpu_mc::mc::chunk::DIAGNOSTIC_LOGGING
+        .store(LOGGING.load(Ordering::Relaxed), Ordering::Relaxed);
 
     crate::timing::set_enabled(gpu_timestamps);
     crate::pix::set_capturing(pix_capture);

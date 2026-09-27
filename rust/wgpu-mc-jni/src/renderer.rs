@@ -1,17 +1,15 @@
 use byteorder::LittleEndian;
+use jni::JNIEnv;
 use jni::objects::{AutoElements, JClass, JFloatArray, ReleaseMode};
-use jni::sys::{jfloat, jint, jlong};
-use jni::{JNIEnv, objects::JString};
+use jni::sys::{jfloat, jint};
 use jni_fn::jni_fn;
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
-use std::cell::OnceCell;
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::slice;
-use std::{sync::Arc, time::Instant};
-use wgpu_mc::mc::RenderEffectsData;
-use wgpu_mc::mc::entity::{BundledEntityInstances, InstanceVertex};
+use std::sync::Arc;
+use wgpu_mc::mc::entity::BundledEntityInstances;
 use wgpu_mc::texture::BindableTexture;
 
 use crate::RENDERER;
@@ -75,15 +73,20 @@ pub fn scheduleStop(_env: JNIEnv, _class: JClass) {
     let _ = SHOULD_STOP.set(());
 }
 
+// The texture and entity-instance tables are the JVM side's, declared here before the calls that
+// fill them arrived: nothing in this crate reads either, and `WgpuNative` has no binding for them
+// yet. Marked rather than deleted so that the day one arrives, the table it fills is already here.
+#[allow(dead_code)]
 #[derive(Copy, Clone, Hash, Eq, PartialEq)]
 pub enum MCTextureId {
     BlockAtlas,
     Lightmap,
 }
 
+#[allow(dead_code)]
 pub static ENTITY_INSTANCES: Lazy<Mutex<HashMap<String, BundledEntityInstances>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
+#[allow(dead_code)]
 pub static MC_TEXTURES: Lazy<Mutex<HashMap<MCTextureId, Arc<BindableTexture>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
-

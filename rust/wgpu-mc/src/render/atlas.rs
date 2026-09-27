@@ -223,8 +223,8 @@ impl Atlas {
         // or larger textures than 2048x2048 holds has nowhere to put the ones that do not fit.
         // Skipping them is the same trade as above: a texture that is not in the map is a face that
         // is not drawn, rather than a panic on the block cache thread.
-        let Some(allocation) = allocator
-            .allocate(Size2D::new(image.width() as i32, image.height() as i32))
+        let Some(allocation) =
+            allocator.allocate(Size2D::new(image.width() as i32, image.height() as i32))
         else {
             log::warn!(
                 "wgpu-mc: {}x{} {path} does not fit in the {}x{} atlas; skipping it",
@@ -249,10 +249,8 @@ impl Atlas {
             .get_string(&mcmeta_path)
             .and_then(|string| serde_json::from_str::<schemas::texture::Texture>(&string).ok());
 
-        if let Some(texture) = mcmeta {
-            if let Some(animation) = texture.animation {
-                animated_textures.push(animation)
-            }
+        if let Some(animation) = mcmeta.and_then(|texture| texture.animation) {
+            animated_textures.push(animation)
         }
 
         map.insert(
@@ -458,7 +456,8 @@ fn halve(image: &ImageBuffer<Rgba<u8>, Vec<u8>>) -> ImageBuffer<Rgba<u8>, Vec<u8
             let mut alpha_sum = 0u32;
 
             for (dx, dy) in [(0u32, 0u32), (1, 0), (0, 1), (1, 1)] {
-                let source = image.get_pixel((x * 2 + dx).min(width - 1), (y * 2 + dy).min(height - 1));
+                let source =
+                    image.get_pixel((x * 2 + dx).min(width - 1), (y * 2 + dy).min(height - 1));
                 let alpha = source[3] as u32;
 
                 for channel in 0..3 {
@@ -471,11 +470,12 @@ fn halve(image: &ImageBuffer<Rgba<u8>, Vec<u8>>) -> ImageBuffer<Rgba<u8>, Vec<u8
             let alpha = alpha_sum / 4;
 
             let colour = |channel: u32| -> u8 {
-                if alpha == 0 {
-                    0
-                } else {
-                    (channel / 4 * 255 / alpha).min(255) as u8
-                }
+                // `alpha` is the average of the four samples and only ever zero when all four are, in
+                // which case there is no colour to un-premultiply and the answer is a transparent
+                // black; the division is spelled as a checked one so that it stays an answer.
+                (channel / 4 * 255)
+                    .checked_div(alpha)
+                    .map_or(0, |value| value.min(255) as u8)
             };
 
             out.put_pixel(

@@ -38,7 +38,7 @@ const PAIR_BYTES: u64 = 16;
 /// "Resolve buffer offset has to be aligned to QUERY_RESOLVE_BUFFER_ALIGNMENT" - and a validation
 /// error on the render thread ends the process. Each frame therefore gets its own 256-byte slice of
 /// the resolve buffer, of which the first 16 bytes are used.
-const RESOLVE_STRIDE: u64 = wgpu::QUERY_RESOLVE_BUFFER_ALIGNMENT as u64;
+const RESOLVE_STRIDE: u64 = wgpu::QUERY_RESOLVE_BUFFER_ALIGNMENT;
 
 /// Whether the switch is on. Read on the recording path, so it is an atomic load and not a lock.
 static ENABLED: AtomicBool = AtomicBool::new(false);
@@ -77,7 +77,8 @@ struct GpuTimers {
 impl GpuTimers {
     fn new(wm: &WmRenderer) -> Option<GpuTimers> {
         let device = &wm.gpu.device;
-        let required = wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
+        let required =
+            wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
 
         if !device.features().contains(required) {
             log::error!(
@@ -102,7 +103,7 @@ impl GpuTimers {
         });
 
         let slots = (0..SLOTS)
-            .map(|index| Slot {
+            .map(|_index| Slot {
                 readback: device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("wgpu-mc timestamp readback"),
                     size: PAIR_BYTES,
@@ -244,7 +245,13 @@ pub fn frame_end(encoder: &mut wgpu::CommandEncoder, wm: &WmRenderer) {
 
         encoder.write_timestamp(&timers.query_set, first + 1);
         encoder.resolve_query_set(&timers.query_set, first..first + 2, &timers.resolve, offset);
-        encoder.copy_buffer_to_buffer(&timers.resolve, offset, &timers.slots[slot].readback, 0, PAIR_BYTES);
+        encoder.copy_buffer_to_buffer(
+            &timers.resolve,
+            offset,
+            &timers.slots[slot].readback,
+            0,
+            PAIR_BYTES,
+        );
 
         timers.frame_open = false;
         timers.slots[slot].awaiting_map = true;

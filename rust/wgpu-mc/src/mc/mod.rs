@@ -145,7 +145,7 @@ impl Block {
                                     |(variant_property_key, variant_property_value)| {
                                         key_map
                                             .get(&variant_property_key[..])
-                                            .map_or(false, |v| v == &variant_property_value)
+                                            .is_some_and(|v| v == &variant_property_value)
                                     },
                                 )
                         })?;
@@ -314,7 +314,8 @@ impl Scene {
                 "ssbo",
             )),
             pending_arena_growth: AtomicU32::new(0),
-            arena_cap_slots: (wm.gpu.device.limits().max_buffer_size / 4).min(u32::MAX as u64) as u32,
+            arena_cap_slots: (wm.gpu.device.limits().max_buffer_size / 4).min(u32::MAX as u64)
+                as u32,
             indirect_buffer: Arc::new(indirect_buffer),
 
             entity_instances: Default::default(),
@@ -356,12 +357,13 @@ impl Scene {
 
         // The old buffer goes when the last frame that recorded a draw from it is done with it: the
         // pass holds its own reference, and this drops ours.
-        self.chunk_buffer.store(Arc::new(BindableBuffer::new_deferred(
-            wm,
-            slots as u64 * 4,
-            ARENA_USAGE,
-            "ssbo",
-        )));
+        self.chunk_buffer
+            .store(Arc::new(BindableBuffer::new_deferred(
+                wm,
+                slots as u64 * 4,
+                ARENA_USAGE,
+                "ssbo",
+            )));
 
         true
     }
@@ -458,7 +460,10 @@ impl MinecraftState {
                 // One missing or malformed blockstate file must not take the game down: this runs on
                 // a background thread whose panics abort the JVM.
                 let Some(json) = self.resource_provider.get_string(block_state) else {
-                    log::warn!("wgpu-mc: {} has no blockstate file; skipping it", block_state.0);
+                    log::warn!(
+                        "wgpu-mc: {} has no blockstate file; skipping it",
+                        block_state.0
+                    );
                     return;
                 };
 

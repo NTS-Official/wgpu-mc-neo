@@ -79,7 +79,7 @@ impl AtlasPosition {
     }
 }
 
-pub fn tmd_to_wm(name: String, part: &ModelPartData, ap: [u16; 2]) -> Option<EntityPart> {
+pub fn tmd_to_wm(name: String, part: &ModelPartData) -> Option<EntityPart> {
     Some(EntityPart {
         name,
         transform: PartTransform {
@@ -161,7 +161,7 @@ pub fn tmd_to_wm(name: String, part: &ModelPartData, ap: [u16; 2]) -> Option<Ent
         children: part
             .children
             .iter()
-            .map(|(name, part)| tmd_to_wm(name.clone(), part, ap))
+            .map(|(name, part)| tmd_to_wm(name.clone(), part))
             .collect::<Option<Vec<EntityPart>>>()?,
     })
 }
@@ -191,7 +191,9 @@ pub fn registerEntities(mut env: JNIEnv, _class: JClass, string: JString) {
     let raw: HashMap<String, serde_json::Value> = match serde_json::from_str(&entities_json) {
         Ok(raw) => raw,
         Err(err) => {
-            log::error!("wgpu-mc: the entity models could not be read ({err}); keeping the ones already registered");
+            log::error!(
+                "wgpu-mc: the entity models could not be read ({err}); keeping the ones already registered"
+            );
             return;
         }
     };
@@ -199,13 +201,15 @@ pub fn registerEntities(mut env: JNIEnv, _class: JClass, string: JString) {
     let mut skipped = Vec::new();
     let mpd: HashMap<String, ModelPartData> = raw
         .into_iter()
-        .filter_map(|(name, value)| match serde_json::from_value::<Wrapper1>(value) {
-            Ok(wrapper) => Some((name, wrapper.data.data)),
-            Err(err) => {
-                skipped.push(format!("{name} ({err})"));
-                None
-            }
-        })
+        .filter_map(
+            |(name, value)| match serde_json::from_value::<Wrapper1>(value) {
+                Ok(wrapper) => Some((name, wrapper.data.data)),
+                Err(err) => {
+                    skipped.push(format!("{name} ({err})"));
+                    None
+                }
+            },
+        )
         .collect();
 
     if !skipped.is_empty() {
@@ -241,8 +245,10 @@ pub fn registerEntities(mut env: JNIEnv, _class: JClass, string: JString) {
         .filter_map(|(name, mpd)| {
             // The same trade as above: a layer whose parts do not describe a single cuboid is one
             // entity that does not draw, rather than an upload that ends the process.
-            let Some(entity_part) = tmd_to_wm("root".into(), mpd, [0, 0]) else {
-                log::warn!("wgpu-mc: entity model {name} has parts this side cannot read; skipping it");
+            let Some(entity_part) = tmd_to_wm("root".into(), mpd) else {
+                log::warn!(
+                    "wgpu-mc: entity model {name} has parts this side cannot read; skipping it"
+                );
                 return None;
             };
 

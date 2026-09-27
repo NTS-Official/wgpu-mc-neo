@@ -1,9 +1,4 @@
-use jni::JNIEnv;
-use jni::objects::JClass;
-use jni::sys::jlong;
-use jni_fn::jni_fn;
-use std::alloc::{GlobalAlloc, Layout, alloc, dealloc};
-use std::ptr;
+use std::alloc::{Layout, alloc, dealloc};
 
 /*
    Special thanks to burger and JellySquid
@@ -12,10 +7,15 @@ use std::ptr;
    https://github.com/CaffeineMC/sodium-fabric/blob/1.20/graph-rework-rust-wip-morton/native/core/src/mem.rs
 */
 
+// Exported through the C ABI rather than called from this crate: nothing here allocates through them
+// yet, so `dead_code` cannot see a caller. Kept because the JVM side is the caller they are written
+// for - the same reason `#[no_mangle] extern "C"` functions elsewhere in this crate look unused.
+#[allow(dead_code)]
 pub extern "C" fn alloc_bytes(size: u64, align: u64) -> *mut u8 {
     unsafe { alloc(Layout::from_size_align(size as _, align as _).unwrap()) }
 }
 
+#[allow(dead_code)]
 pub extern "C" fn dealloc_bytes(size: u64, align: u64) {
     unsafe {
         dealloc(

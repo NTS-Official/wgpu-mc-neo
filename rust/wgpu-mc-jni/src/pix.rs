@@ -26,7 +26,7 @@
 //!
 //! Everything here is Windows-only. The capture is a no-op elsewhere.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 
 /// The capture type flags of `pix3.h`. They are flags, not an enumeration: a `DWORD` with one bit
 /// set, and `PIX_CAPTURE_TIMING` is the system timing capture this asks for.
@@ -228,12 +228,14 @@ fn marker_exists(name: &str) -> bool {
 fn rtss_module() -> Option<&'static str> {
     use winapi::um::libloaderapi::GetModuleHandleW;
 
-    ["RTSSHooks64.dll", "RTSSHooks.dll"].into_iter().find(|name| {
-        let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+    ["RTSSHooks64.dll", "RTSSHooks.dll"]
+        .into_iter()
+        .find(|name| {
+            let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
 
-        // Safety: the name is NUL-terminated and lives for the call.
-        !unsafe { GetModuleHandleW(wide.as_ptr()) }.is_null()
-    })
+            // Safety: the name is NUL-terminated and lives for the call.
+            !unsafe { GetModuleHandleW(wide.as_ptr()) }.is_null()
+        })
 }
 
 #[cfg(not(windows))]
@@ -292,7 +294,8 @@ fn is_elevated() -> bool {
 /// The loading happens while the device is being created, and this crate's logger is installed by
 /// the JVM *after* that - a line logged there is never seen. So the line is kept here and printed
 /// from the first frame instead, which is also the first place a log line can be read.
-static CAPTURER_REPORT: parking_lot::Mutex<Vec<(Report, String)>> = parking_lot::Mutex::new(Vec::new());
+static CAPTURER_REPORT: parking_lot::Mutex<Vec<(Report, String)>> =
+    parking_lot::Mutex::new(Vec::new());
 
 /// How loud a line from the capturer loading is, decided while there is no logger to ask.
 ///
@@ -364,13 +367,13 @@ fn load_capturer(file_name: &str, purpose: &str) {
     }
 }
 
-
 /// The loaded runtime, or `None` if this machine has no usable PIX.
 ///
 /// Loaded once: the DLLs either exist or they do not, and a capture that failed for a missing DLL
 /// will fail again.
 fn runtime() -> Option<&'static PixRuntime> {
-    static RUNTIME: once_cell::sync::OnceCell<Option<PixRuntime>> = once_cell::sync::OnceCell::new();
+    static RUNTIME: once_cell::sync::OnceCell<Option<PixRuntime>> =
+        once_cell::sync::OnceCell::new();
 
     RUNTIME
         .get_or_init(|| {
@@ -393,7 +396,7 @@ fn runtime() -> Option<&'static PixRuntime> {
 
 #[cfg(windows)]
 unsafe fn load_windows_runtime() -> Option<PixRuntime> {
-    use winapi::um::libloaderapi::{GetProcAddress, LoadLibraryW};
+    use winapi::um::libloaderapi::GetProcAddress;
 
     // A programmatic *timing* capture needs both halves, and PIX ships only one of them:
     //
@@ -443,8 +446,16 @@ unsafe fn load_windows_runtime() -> Option<PixRuntime> {
 
     Some(PixRuntime {
         // Safety: the two symbols are exported with these signatures by every WinPixEventRuntime.
-        begin: unsafe { std::mem::transmute::<_, BeginCapture>(begin) },
-        end: unsafe { std::mem::transmute::<_, EndCapture>(end) },
+        // The casts name them because `GetProcAddress` can only hand back an `FARPROC` - one
+        // `extern "system" fn()` - and the two entry points are not that.
+        begin: unsafe {
+            std::mem::transmute::<*mut winapi::shared::minwindef::__some_function, BeginCapture>(
+                begin,
+            )
+        },
+        end: unsafe {
+            std::mem::transmute::<*mut winapi::shared::minwindef::__some_function, EndCapture>(end)
+        },
     })
 }
 
@@ -455,8 +466,6 @@ const PIX_INSTALL_ROOT: &str = r"C:\Program Files\Microsoft PIX";
 /// Loads the event runtime, preferring the one beside the game over the one PIX ships.
 #[cfg(windows)]
 unsafe fn load_event_runtime() -> Option<(winapi::shared::minwindef::HMODULE, &'static str)> {
-    use winapi::um::libloaderapi::LoadLibraryW;
-
     for name in ["WinPixEventRuntime.dll", "WinPixEventRuntime_OneCore.dll"] {
         // Safety: loading a library by name and keeping it for the life of the process.
         let module = unsafe { load_library(name, false) };
@@ -548,7 +557,11 @@ unsafe fn load_library(name: &str, by_path: bool) -> winapi::shared::minwindef::
         LoadLibraryExW(
             wide.as_ptr(),
             std::ptr::null_mut(),
-            if by_path { LOAD_WITH_ALTERED_SEARCH_PATH } else { 0 },
+            if by_path {
+                LOAD_WITH_ALTERED_SEARCH_PATH
+            } else {
+                0
+            },
         )
     }
 }
@@ -583,7 +596,9 @@ pub fn tick() {
             if FRAMES.fetch_add(1, Ordering::Relaxed) + 1 >= CAPTURE_FRAMES {
                 end();
                 STATE.store(FINISHED, Ordering::Relaxed);
-                log::info!("wgpu-mc: PIX timing capture reached its {CAPTURE_FRAMES} frames and stopped");
+                log::info!(
+                    "wgpu-mc: PIX timing capture reached its {CAPTURE_FRAMES} frames and stopped"
+                );
             }
         }
         // The switch went off while a capture was running: stop it.
@@ -623,9 +638,7 @@ fn begin() -> bool {
         let file = file.clone();
 
         move || {
-            let Some(runtime) = runtime() else {
-                return None;
-            };
+            let runtime = runtime()?;
 
             // The parameters take a wide string, so the UTF-16 buffer has to outlive the call.
             let mut name: Vec<u16> = file.to_string_lossy().encode_utf16().collect();

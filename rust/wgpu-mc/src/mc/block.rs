@@ -253,9 +253,17 @@ fn nearest_direction(v: Vec3) -> Direction {
     let abs = v.abs();
 
     if abs.x >= abs.y && abs.x >= abs.z {
-        if v.x >= 0.0 { Direction::East } else { Direction::West }
+        if v.x >= 0.0 {
+            Direction::East
+        } else {
+            Direction::West
+        }
     } else if abs.y >= abs.z {
-        if v.y >= 0.0 { Direction::Up } else { Direction::Down }
+        if v.y >= 0.0 {
+            Direction::Up
+        } else {
+            Direction::Down
+        }
     } else if v.z >= 0.0 {
         Direction::South
     } else {
@@ -407,9 +415,7 @@ fn face_data(
         // `get_atlas_uv` above already found this sprite in the same map under the same key, so this
         // cannot be what makes a locked face disappear - it is here so that the sprite's rectangle is
         // read from one place rather than threaded through.
-        let Some(sprite) = atlas.uv_map.read().get(&texture).copied() else {
-            return None;
-        };
+        let sprite = atlas.uv_map.read().get(&texture).copied()?;
 
         lock_uv(uv, sprite, uv_lock_matrix(rotation, declared))
     } else {
@@ -681,13 +687,12 @@ fn resolve_model(
 /// reference that got this far is a sprite the atlas will not have, and the face that samples it is
 /// dropped without a word - so the description is what the caller puts in the error it reports.
 fn unresolved_texture(model: &schemas::Model) -> Option<String> {
-    if let Some(textures) = &model.textures {
-        if let Some((key, value)) = textures
+    if let Some((key, value)) = model.textures.as_ref().and_then(|textures| {
+        textures
             .iter()
             .find(|(_key, value)| value.reference().is_some())
-        {
-            return Some(format!("key: {key} value: {value:?}"));
-        }
+    }) {
+        return Some(format!("key: {key} value: {value:?}"));
     }
 
     model
@@ -776,7 +781,9 @@ impl ModelMesh {
 
                 let model_json = resource_provider
                     .get_string(&model_resource_path)
-                    .ok_or_else(|| MeshBakeError::UnresolvedResourcePath(model_resource_path.clone()))?;
+                    .ok_or_else(|| {
+                        MeshBakeError::UnresolvedResourcePath(model_resource_path.clone())
+                    })?;
 
                 //Recursively resolve the model using it's parents if it has any
                 let (model, layer): (schemas::Model, Option<RenderLayer>) = resolve_model(
@@ -818,8 +825,8 @@ impl ModelMesh {
                     let uv_map = block_atlas.uv_map.read();
 
                     let unallocated_textures: Vec<ResourcePath> = textures
-                        .iter()
-                        .filter_map(|(_, texture)| {
+                        .values()
+                        .filter_map(|texture| {
                             let texture_id: ResourcePath = (&texture.0).into();
                             if !uv_map.contains_key(&texture_id) {
                                 //Block UV atlas doesn't contain a texture, so we add it
@@ -882,32 +889,45 @@ impl ModelMesh {
                         let north = element
                             .faces
                             .get(&schemas::models::BlockFace::North)
-                            .and_then(|tex| face_data(tex, Direction::North, block_atlas, rotation, uv_lock));
+                            .and_then(|tex| {
+                                face_data(tex, Direction::North, block_atlas, rotation, uv_lock)
+                            });
 
                         let east = element
                             .faces
                             .get(&schemas::models::BlockFace::East)
-                            .and_then(|tex| face_data(tex, Direction::East, block_atlas, rotation, uv_lock));
+                            .and_then(|tex| {
+                                face_data(tex, Direction::East, block_atlas, rotation, uv_lock)
+                            });
 
                         let south = element
                             .faces
                             .get(&schemas::models::BlockFace::South)
-                            .and_then(|tex| face_data(tex, Direction::South, block_atlas, rotation, uv_lock));
+                            .and_then(|tex| {
+                                face_data(tex, Direction::South, block_atlas, rotation, uv_lock)
+                            });
 
                         let west = element
                             .faces
                             .get(&schemas::models::BlockFace::West)
-                            .and_then(|tex| face_data(tex, Direction::West, block_atlas, rotation, uv_lock));
+                            .and_then(|tex| {
+                                face_data(tex, Direction::West, block_atlas, rotation, uv_lock)
+                            });
 
-                        let up = element
-                            .faces
-                            .get(&schemas::models::BlockFace::Up)
-                            .and_then(|tex| face_data(tex, Direction::Up, block_atlas, rotation, uv_lock));
+                        let up =
+                            element
+                                .faces
+                                .get(&schemas::models::BlockFace::Up)
+                                .and_then(|tex| {
+                                    face_data(tex, Direction::Up, block_atlas, rotation, uv_lock)
+                                });
 
                         let down = element
                             .faces
                             .get(&schemas::models::BlockFace::Down)
-                            .and_then(|tex| face_data(tex, Direction::Down, block_atlas, rotation, uv_lock));
+                            .and_then(|tex| {
+                                face_data(tex, Direction::Down, block_atlas, rotation, uv_lock)
+                            });
 
                         let rot = &element.rotation;
                         let matrix = match rot.axis {
@@ -1267,7 +1287,8 @@ mod texture_resolution_tests {
         let (resolved, _) = resolve_model(model, None, &provider).expect("it resolves");
 
         assert_eq!(
-            north_face(&resolved).texture.0, "minecraft:block/stone",
+            north_face(&resolved).texture.0,
+            "minecraft:block/stone",
             "the face samples the sprite its `textures` map names, not the reference"
         );
         assert!(unresolved_texture(&resolved).is_none());
@@ -1309,7 +1330,11 @@ mod rotation_tests {
 
         assert_eq!(turn.rotate_direction(Direction::North), Direction::East);
         assert_eq!(turn.rotate_direction(Direction::East), Direction::South);
-        assert_eq!(turn.rotate_direction(Direction::Up), Direction::Up, "the axis it turns about");
+        assert_eq!(
+            turn.rotate_direction(Direction::Up),
+            Direction::Up,
+            "the axis it turns about"
+        );
     }
 
     /// A quarter turn about X tips the model's top towards -z: the up face ends up pointing **north**.
@@ -1323,7 +1348,11 @@ mod rotation_tests {
 
         assert_eq!(tip.rotate_direction(Direction::Up), Direction::North);
         assert_eq!(tip.rotate_direction(Direction::South), Direction::Up);
-        assert_eq!(tip.rotate_direction(Direction::East), Direction::East, "the axis it turns about");
+        assert_eq!(
+            tip.rotate_direction(Direction::East),
+            Direction::East,
+            "the axis it turns about"
+        );
 
         // And the position form has to agree with it, both ways round: the quad a single-face model
         // draws on `up` ends at the north boundary, and the one it draws on `north` ends at the bottom.
@@ -1484,10 +1513,7 @@ mod rotation_tests {
         ] {
             let out = matrix * corner;
 
-            assert!(
-                (out - corner).length() < 1e-5,
-                "{corner} landed on {out}"
-            );
+            assert!((out - corner).length() < 1e-5, "{corner} landed on {out}");
         }
     }
 
@@ -1522,7 +1548,12 @@ mod rotation_tests {
     fn a_lock_transform_is_a_rotation_of_the_sprite() {
         for x in [0, 90, 180, 270] {
             for y in [0, 90, 180, 270] {
-                for declared in [Direction::North, Direction::East, Direction::Up, Direction::Down] {
+                for declared in [
+                    Direction::North,
+                    Direction::East,
+                    Direction::Up,
+                    Direction::Down,
+                ] {
                     let matrix = uv_lock_matrix(ModelRotation::new(x, y), declared);
 
                     for corner in [
@@ -1553,7 +1584,12 @@ mod rotation_tests {
     fn the_corners_stay_the_corners() {
         for x in [0, 90, 180, 270] {
             for y in [0, 90, 180, 270] {
-                for declared in [Direction::North, Direction::South, Direction::Up, Direction::Down] {
+                for declared in [
+                    Direction::North,
+                    Direction::South,
+                    Direction::Up,
+                    Direction::Down,
+                ] {
                     let matrix = uv_lock_matrix(ModelRotation::new(x, y), declared);
                     let mut landed: Vec<(i32, i32)> =
                         [(-0.5, -0.5), (0.5, -0.5), (0.5, 0.5), (-0.5, 0.5)]

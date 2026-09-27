@@ -1,4 +1,3 @@
-use glam::ivec3;
 use linked_hash_map::LinkedHashMap;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -179,7 +178,7 @@ impl ResourceBacking {
         }
     }
 
-    pub fn get_bind_group_entries(&self, index: u32) -> Vec<wgpu::BindGroupEntry> {
+    pub fn get_bind_group_entries(&self, index: u32) -> Vec<wgpu::BindGroupEntry<'_>> {
         match self {
             ResourceBacking::Buffer(buffer, _buffer_ty) => vec![wgpu::BindGroupEntry {
                 binding: index,
@@ -338,7 +337,7 @@ impl RenderGraph {
                     "@pc_parts_per_entity" => 4,
                     "@pc_electrum_color" => 16,
                     "@pc_environment_data" => 68,
-                    _ => unimplemented!(),
+                    _ => unimplemented!("immediate {index} ({name}) has no size"),
                 })
                 .sum();
 
@@ -346,7 +345,13 @@ impl RenderGraph {
             // layout without it with a validation error rather than a `None` - which, on this path, is
             // the process ending. There is no way to draw such a pipeline differently, so it is
             // skipped with the reason.
-            if immediate_size > 0 && !wm.gpu.device.features().contains(wgpu::Features::IMMEDIATES) {
+            if immediate_size > 0
+                && !wm
+                    .gpu
+                    .device
+                    .features()
+                    .contains(wgpu::Features::IMMEDIATES)
+            {
                 log::error!(
                     "wgpu-mc: the render graph's '{pipeline_name}' pipeline passes {immediate_size} \
                      byte(s) of immediates per draw, and this device was created without the \
@@ -539,8 +544,10 @@ impl RenderGraph {
                             // JVM, and a pipeline that names it is then skipped by `create_pipelines` -
                             // which is one pipeline fewer and a line in the log, not a game that ends
                             // the first time it draws a world.
-                            let Some(bytes) =
-                                wm.mc.resource_provider.get_bytes(&ResourcePath::from(&src[..]))
+                            let Some(bytes) = wm
+                                .mc
+                                .resource_provider
+                                .get_bytes(&ResourcePath::from(&src[..]))
                             else {
                                 log::warn!(
                                     "wgpu-mc: the render graph's {resource_id} names {src}, which \
@@ -793,10 +800,8 @@ impl RenderGraph {
                         }
                     }
 
-                    render_pass.set_index_buffer(
-                        chunk_buffer.buffer.slice(..),
-                        wgpu::IndexFormat::Uint32,
-                    );
+                    render_pass
+                        .set_index_buffer(chunk_buffer.buffer.slice(..), wgpu::IndexFormat::Uint32);
 
                     let sections = scene.section_storage.write();
                     let translation = Vec3::new(
@@ -1117,7 +1122,7 @@ pub fn set_push_constants(
             .and_then(|others| others.get(resource))
         {
             None => unimplemented!("Unknown push constant resource value"),
-            Some((data, stages)) => render_pass.set_immediates(*offset as u32, data),
+            Some((data, _stages)) => render_pass.set_immediates(*offset as u32, data),
         }
     });
 }
@@ -1226,15 +1231,17 @@ mod culling_tests {
             // Relative rather than absolute: the far plane's `w` is the far distance itself (256 here),
             // and the two `glam` constructors reach it through different divisions, so their last bits
             // differ. A wrong depth range moves a plane by its whole length, which this still catches.
-            let scale = 1.0
-                + gl.x.abs().max(gl.y.abs()).max(gl.z.abs()).max(gl.w.abs());
+            let scale = 1.0 + gl.x.abs().max(gl.y.abs()).max(gl.z.abs()).max(gl.w.abs());
             assert!(
                 difference < 1e-3 * scale,
                 "plane {index} differs by {difference}: converted {from_zero_to_one:?}, native {gl:?}"
             );
         }
 
-        for (name, frustum) in [("converted 0..1", &converted), ("native -1..1", &already_gl)] {
+        for (name, frustum) in [
+            ("converted 0..1", &converted),
+            ("native -1..1", &already_gl),
+        ] {
             for (label, bounds) in [
                 ("the camera's own section", &around_the_camera),
                 ("a section in front of it", &in_front),

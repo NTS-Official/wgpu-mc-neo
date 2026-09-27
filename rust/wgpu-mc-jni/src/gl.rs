@@ -1,22 +1,9 @@
-use std::cmp::max;
-use std::collections::HashMap;
-use std::mem::align_of;
-use std::ops::Range;
-use std::sync::Arc;
 use std::vec::Vec;
 
 use bytemuck::{Pod, Zeroable};
-use glam::Mat4;
-use once_cell::sync::Lazy;
-use parking_lot::RwLock;
 
-use wgpu_mc::render::graph::{
-    BoundPipeline, Geometry, RenderGraph, WmBindGroup, set_push_constants,
-};
-use wgpu_mc::texture::BindableTexture;
-use wgpu_mc::util::WmArena;
-use wgpu_mc::wgpu::{Buffer, IndexFormat, vertex_attr_array};
-use wgpu_mc::{WmRenderer, wgpu};
+use wgpu_mc::wgpu;
+use wgpu_mc::wgpu::vertex_attr_array;
 
 #[derive(Debug, Pod, Zeroable, Copy, Clone)]
 #[repr(C)]
@@ -36,6 +23,11 @@ impl ElectrumVertex {
     ];
 }
 
+// The vertex mappers are the ABI's own vertex layouts - six floats of position and colour, five of
+// position and UV, and so on - and the calls that used them went with the paths that fed them. They
+// are kept rather than deleted because they are the written-down form of what `ElectrumVertex` means
+// for each layout, and a new GL call site needs one of them.
+#[allow(dead_code)]
 impl ElectrumVertex {
     pub fn map_pos_col_float3(verts: &[[f32; 6]]) -> Vec<ElectrumVertex> {
         verts
