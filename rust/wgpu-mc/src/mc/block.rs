@@ -872,6 +872,96 @@ fn get_game_atlas_uv(face: &schemas::models::ElementFace, rect: [f32; 4]) -> UV 
     (to_game(corners.0), to_game(corners.1))
 }
 
+/// One corner of an element's box, as a bit an axis: bit 0 is x, bit 1 is y, bit 2 is z, each set when
+/// that axis takes the element's `to` bound rather than its `from`. So `6` is `p110`.
+type Corner = u8;
+
+/// Where one vertex of a face samples its sprite: `(the rectangle's high u, the rectangle's high v)`.
+type SpriteCorner = (bool, bool);
+
+/// The four vertices of one face of an element's box: **which corner of the box**, and **which corner of
+/// the sprite's `uv` rectangle** it samples, in the order the baker writes them.
+///
+/// Two tables in the game - `FaceInfo`, which gives the corner of the box for each vertex index, and
+/// `CuboidFace.UVs#getVertexU`/`#getVertexV`, which give the sprite's corner for the same index:
+///
+/// ```java
+/// public float getVertexU(int index) { return index != 0 && index != 1 ? this.maxU : this.minU; }
+/// public float getVertexV(int index) { return index != 0 && index != 3 ? this.maxV : this.minV; }
+/// ```
+///
+/// and one table here, because it is the *pairing* of the two that has to be right: a corner of the box
+/// joined to the wrong corner of its sprite is that face turned by a quarter turn about its own middle.
+/// Which is invisible on a texture with no direction to it and plain on every texture that has one:
+///
+/// > some blocks' faces are rotated against the game's - 90, 180 or 270 degrees
+///
+/// The **corner orders** here are this baker's own - they are what its index list and its winding are
+/// written against - and the **sprite corners** are the game's, read off `FaceBakery#defaultFaceUV`,
+/// which is the same table written as six lines of arithmetic:
+///
+/// ```java
+/// case DOWN  -> new UVs(from.x(), 16.0F - to.z(), to.x(), 16.0F - from.z());
+/// case UP    -> new UVs(from.x(), from.z(), to.x(), to.z());
+/// case NORTH -> new UVs(16.0F - to.x(), 16.0F - to.y(), 16.0F - from.x(), 16.0F - from.y());
+/// case SOUTH -> new UVs(from.x(), 16.0F - to.y(), to.x(), 16.0F - from.y());
+/// case WEST  -> new UVs(from.z(), 16.0F - to.y(), to.z(), 16.0F - from.y());
+/// case EAST  -> new UVs(16.0F - to.z(), 16.0F - to.y(), 16.0F - from.z(), 16.0F - from.y());
+/// ```
+///
+/// so `u` runs along `+x` on an UP face and along `+z` on a WEST one, and `v` runs *down* every side face.
+/// The test below checks this against those six lines rather than against itself, which is how the two
+/// faces that were a quarter turn out - an UP face and a DOWN one - were found.
+fn face_vertices(dir: Direction) -> [(Corner, SpriteCorner); 4] {
+    // The sprite's four corners, walking around its rectangle: `(min u, min v)`, `(min u, max v)`,
+    // `(max u, max v)`, `(max u, min v)`. That walk is `getVertexU`/`getVertexV` for the four indices.
+    const AROUND: [SpriteCorner; 4] = [(false, false), (false, true), (true, true), (true, false)];
+
+    // The same walk, started at one of the four corners: a face whose first vertex is not the sprite's
+    // low corner starts somewhere else in it and goes round the same way.
+    let from =
+        |start: usize| -> [SpriteCorner; 4] { std::array::from_fn(|i| AROUND[(start + i) % 4]) };
+
+    match dir {
+        Direction::Down => {
+            let uv = from(1);
+            [(0, uv[0]), (1, uv[1]), (5, uv[2]), (4, uv[3])]
+        }
+        Direction::Up => {
+            let uv = from(0);
+            [(2, uv[0]), (6, uv[1]), (7, uv[2]), (3, uv[3])]
+        }
+        Direction::North => {
+            let uv = from(2);
+            [(0, uv[0]), (2, uv[1]), (3, uv[2]), (1, uv[3])]
+        }
+        Direction::South => {
+            let uv = from(2);
+            [(5, uv[0]), (7, uv[1]), (6, uv[2]), (4, uv[3])]
+        }
+        Direction::West => {
+            let uv = from(2);
+            [(4, uv[0]), (6, uv[1]), (2, uv[2]), (0, uv[3])]
+        }
+        Direction::East => {
+            let uv = from(2);
+            [(1, uv[0]), (3, uv[1]), (7, uv[2]), (5, uv[3])]
+        }
+    }
+}
+
+/// The four vertices of one face, ready to bake: the corner of the box each one is at, and the point of
+/// the face's sprite it samples. See [`face_vertices`] for the table itself.
+fn sprite_vertices(dir: Direction, corners: &[glam::Vec3; 8], uv: UV) -> [BlockMeshVertex; 4] {
+    face_vertices(dir).map(|(corner, (max_u, max_v))| BlockMeshVertex {
+        position: corners[corner as usize],
+        tex_coords: [
+            if max_u { uv.1.0 } else { uv.0.0 },
+            if max_v { uv.1.1 } else { uv.0.1 },
+        ],
+    })
+}
+
 pub struct RenderSettings {
     pub opaque: bool,
 }
@@ -1147,26 +1237,15 @@ impl ModelMesh {
                             element.to[2] / 16.0,
                         ));
 
+                        // The eight corners of the box, indexed the way [`Corner`] is: `x` is 1, `y` is 2
+                        // and `z` is 4. [`face_vertices`] names the four of each face.
+                        let p = [
+                            p000, p100, p010, p110, p001, p101, p011, p111,
+                        ];
+
                         let mut faces = vec![];
                         faces.extend(south.map(|south_face| BlockModelFace {
-                            vertices: [
-                                BlockMeshVertex {
-                                    position: p101,
-                                    tex_coords: [south_face.uv.1.0, south_face.uv.1.1],
-                                },
-                                BlockMeshVertex {
-                                    position: p111,
-                                    tex_coords: [south_face.uv.1.0, south_face.uv.0.1],
-                                },
-                                BlockMeshVertex {
-                                    position: p011,
-                                    tex_coords: [south_face.uv.0.0, south_face.uv.0.1],
-                                },
-                                BlockMeshVertex {
-                                    position: p001,
-                                    tex_coords: [south_face.uv.0.0, south_face.uv.1.1],
-                                },
-                            ],
+                            vertices: sprite_vertices(Direction::South, &p, south_face.uv),
                             normal: rotation.direction(vec3(0.0, 0.0, 1.0)),
                             tint_index: south_face.tint_index,
                             uv_flags: south_face.uv_flags,
@@ -1174,24 +1253,7 @@ impl ModelMesh {
                             cull: south_face.cull,
                         }));
                         faces.extend(west.map(|west_face| BlockModelFace {
-                            vertices: [
-                                BlockMeshVertex {
-                                    position: p001,
-                                    tex_coords: [west_face.uv.1.0, west_face.uv.1.1],
-                                },
-                                BlockMeshVertex {
-                                    position: p011,
-                                    tex_coords: [west_face.uv.1.0, west_face.uv.0.1],
-                                },
-                                BlockMeshVertex {
-                                    position: p010,
-                                    tex_coords: [west_face.uv.0.0, west_face.uv.0.1],
-                                },
-                                BlockMeshVertex {
-                                    position: p000,
-                                    tex_coords: [west_face.uv.0.0, west_face.uv.1.1],
-                                },
-                            ],
+                            vertices: sprite_vertices(Direction::West, &p, west_face.uv),
                             normal: rotation.direction(vec3(-1.0, 0.0, 0.0)),
                             tint_index: west_face.tint_index,
                             uv_flags: west_face.uv_flags,
@@ -1199,24 +1261,7 @@ impl ModelMesh {
                             cull: west_face.cull,
                         }));
                         faces.extend(north.map(|north_face| BlockModelFace {
-                            vertices: [
-                                BlockMeshVertex {
-                                    position: p000,
-                                    tex_coords: [north_face.uv.1.0, north_face.uv.1.1],
-                                },
-                                BlockMeshVertex {
-                                    position: p010,
-                                    tex_coords: [north_face.uv.1.0, north_face.uv.0.1],
-                                },
-                                BlockMeshVertex {
-                                    position: p110,
-                                    tex_coords: [north_face.uv.0.0, north_face.uv.0.1],
-                                },
-                                BlockMeshVertex {
-                                    position: p100,
-                                    tex_coords: [north_face.uv.0.0, north_face.uv.1.1],
-                                },
-                            ],
+                            vertices: sprite_vertices(Direction::North, &p, north_face.uv),
                             normal: rotation.direction(vec3(0.0, 0.0, -1.0)),
                             tint_index: north_face.tint_index,
                             uv_flags: north_face.uv_flags,
@@ -1224,24 +1269,7 @@ impl ModelMesh {
                             cull: north_face.cull,
                         }));
                         faces.extend(east.map(|east_face| BlockModelFace {
-                            vertices: [
-                                BlockMeshVertex {
-                                    position: p100,
-                                    tex_coords: [east_face.uv.1.0, east_face.uv.1.1],
-                                },
-                                BlockMeshVertex {
-                                    position: p110,
-                                    tex_coords: [east_face.uv.1.0, east_face.uv.0.1],
-                                },
-                                BlockMeshVertex {
-                                    position: p111,
-                                    tex_coords: [east_face.uv.0.0, east_face.uv.0.1],
-                                },
-                                BlockMeshVertex {
-                                    position: p101,
-                                    tex_coords: [east_face.uv.0.0, east_face.uv.1.1],
-                                },
-                            ],
+                            vertices: sprite_vertices(Direction::East, &p, east_face.uv),
                             normal: rotation.direction(vec3(1.0, 0.0, 0.0)),
                             tint_index: east_face.tint_index,
                             uv_flags: east_face.uv_flags,
@@ -1249,24 +1277,7 @@ impl ModelMesh {
                             cull: east_face.cull,
                         }));
                         faces.extend(up.map(|up_face| BlockModelFace {
-                            vertices: [
-                                BlockMeshVertex {
-                                    position: p010,
-                                    tex_coords: [up_face.uv.1.0, up_face.uv.1.1],
-                                },
-                                BlockMeshVertex {
-                                    position: p011,
-                                    tex_coords: [up_face.uv.1.0, up_face.uv.0.1],
-                                },
-                                BlockMeshVertex {
-                                    position: p111,
-                                    tex_coords: [up_face.uv.0.0, up_face.uv.0.1],
-                                },
-                                BlockMeshVertex {
-                                    position: p110,
-                                    tex_coords: [up_face.uv.0.0, up_face.uv.1.1],
-                                },
-                            ],
+                            vertices: sprite_vertices(Direction::Up, &p, up_face.uv),
                             normal: rotation.direction(vec3(0.0, 1.0, 0.0)),
                             tint_index: up_face.tint_index,
                             uv_flags: up_face.uv_flags,
@@ -1275,24 +1286,7 @@ impl ModelMesh {
                         }));
 
                         faces.extend(down.map(|down_face| BlockModelFace {
-                            vertices: [
-                                BlockMeshVertex {
-                                    position: p000,
-                                    tex_coords: [down_face.uv.1.0, down_face.uv.1.1],
-                                },
-                                BlockMeshVertex {
-                                    position: p100,
-                                    tex_coords: [down_face.uv.1.0, down_face.uv.0.1],
-                                },
-                                BlockMeshVertex {
-                                    position: p101,
-                                    tex_coords: [down_face.uv.0.0, down_face.uv.0.1],
-                                },
-                                BlockMeshVertex {
-                                    position: p001,
-                                    tex_coords: [down_face.uv.0.0, down_face.uv.1.1],
-                                },
-                            ],
+                            vertices: sprite_vertices(Direction::Down, &p, down_face.uv),
                             normal: rotation.direction(vec3(0.0, -1.0, 0.0)),
                             tint_index: down_face.tint_index,
                             uv_flags: down_face.uv_flags,
@@ -1368,6 +1362,131 @@ impl ModelMesh {
 
 /// Resolving a model, and the check that catches what resolution could not do. See [`resolve_model`]
 /// and [`unresolved_texture`].
+/// The pairing of a face's four corners with the four corners of its sprite. See [`face_vertices`].
+#[cfg(test)]
+mod face_orientation_tests {
+    use super::*;
+
+    /// **The bug this test is for.** A face whose corners are joined to the wrong corners of its sprite is
+    /// that face turned by a quarter turn, and the report was exactly that:
+    ///
+    /// > some blocks' faces are rotated against the game's - 90, 180 or 270 degrees
+    ///
+    /// The check is against `FaceBakery#defaultFaceUV` rather than against the table itself, because that
+    /// is the independent statement of the same thing: six lines that say which way round each face's
+    /// texture goes, and from which both the axis a face's `u` runs along *and* its direction fall out.
+    ///
+    /// ```java
+    /// case DOWN  -> new UVs(from.x(), 16.0F - to.z(), to.x(), 16.0F - from.z());
+    /// case UP    -> new UVs(from.x(), from.z(), to.x(), to.z());
+    /// case NORTH -> new UVs(16.0F - to.x(), 16.0F - to.y(), 16.0F - from.x(), 16.0F - from.y());
+    /// case SOUTH -> new UVs(from.x(), 16.0F - to.y(), to.x(), 16.0F - from.y());
+    /// case WEST  -> new UVs(from.z(), 16.0F - to.y(), to.z(), 16.0F - from.y());
+    /// case EAST  -> new UVs(16.0F - to.z(), 16.0F - to.y(), 16.0F - from.z(), 16.0F - from.y());
+    /// ```
+    ///
+    /// `from` is the element's low corner and `to` its high one, so each line is two facts: **which world
+    /// axis the sprite's `u` runs along** (`x` on an UP face, `z` on a WEST one, and the negative of one
+    /// where the line is written `16 - to`), and **which way the sprite's `v` runs** - down every side
+    /// face, along `+z` on an UP face, along `-z` on a DOWN one. A pairing that reverses either is the
+    /// face turned, which is invisible on a texture with no direction to it and plain on every texture
+    /// that has one; the table here had an UP face a half turn out and a DOWN face a quarter turn.
+    #[test]
+    fn a_face_pairs_its_corners_with_its_sprite_the_way_the_game_does() {
+        // `(direction, the axis u runs along, its sign, the axis v runs along, its sign)` - the six lines
+        // above, one row each. The axes are `0 = x, 1 = y, 2 = z`.
+        for (dir, u_axis, u_sign, v_axis, v_sign) in [
+            (Direction::Up, 0, 1, 2, 1),
+            (Direction::Down, 0, 1, 2, -1),
+            (Direction::North, 0, -1, 1, -1),
+            (Direction::South, 0, 1, 1, -1),
+            (Direction::West, 2, 1, 1, -1),
+            (Direction::East, 2, -1, 1, -1),
+        ] {
+            let vertices = face_vertices(dir);
+
+            for (axis, sign, is_u) in [(u_axis, u_sign, true), (v_axis, v_sign, false)] {
+                // The sprite coordinate this check is about, of one vertex's sprite corner.
+                let coordinate = |sprite: SpriteCorner| if is_u { sprite.0 } else { sprite.1 };
+
+                // The two vertices that differ only along this axis are the two ends of it: the sprite
+                // coordinate has to grow from the low one to the high one when the sign is positive, and
+                // shrink when it is negative.
+                for first in 0..4 {
+                    for second in 0..4 {
+                        let (first_corner, first_sprite) = vertices[first];
+                        let (second_corner, second_sprite) = vertices[second];
+
+                        if first_corner ^ second_corner != 1 << axis {
+                            continue;
+                        }
+
+                        // `low` is the end of the axis the element's `from` is at, whichever of the two
+                        // vertices that is, and `high` the end its `to` is at.
+                        let (low, high) = if first_corner & (1 << axis) == 0 {
+                            (first_sprite, second_sprite)
+                        } else {
+                            (second_sprite, first_sprite)
+                        };
+
+                        assert_ne!(
+                            coordinate(low),
+                            coordinate(high),
+                            "{dir:?}: two corners of the face that differ only along {axis} sample the \
+                             same edge of the sprite, so the face is squashed rather than turned"
+                        );
+
+                        assert_eq!(
+                            coordinate(high),
+                            sign > 0,
+                            "{dir:?}: {} runs the wrong way - the sprite's {} has to grow towards the \
+                             world's {axis} (or shrink, where the game's line is written `16 - to`). \
+                             This is the face turned by a quarter turn",
+                            if is_u { "u" } else { "v" },
+                            if is_u { "high u" } else { "high v" }
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The four sides of a block all walk their sprite the same way round, which is what makes them one
+    /// table entry rather than four, and an UP face walks it from the corner its first vertex is at.
+    #[test]
+    fn the_six_faces_walk_their_sprites_the_same_way_round() {
+        for dir in [
+            Direction::Up,
+            Direction::Down,
+            Direction::North,
+            Direction::South,
+            Direction::West,
+            Direction::East,
+        ] {
+            let corners = face_vertices(dir);
+
+            // Adjacent vertices are adjacent corners of the box, and their sprite corners are adjacent
+            // too: a walk that jumped across the rectangle would mirror or turn the face.
+            for i in 0..4 {
+                let (corner, sprite) = corners[i];
+                let (next_corner, next_sprite) = corners[(i + 1) % 4];
+
+                assert_eq!(
+                    (corner ^ next_corner).count_ones(),
+                    1,
+                    "{dir:?}: vertices {i} and {} are not neighbours on the box",
+                    (i + 1) % 4
+                );
+
+                assert_ne!(
+                    sprite, next_sprite,
+                    "{dir:?}: two neighbouring vertices sample the same corner of the sprite"
+                );
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod texture_resolution_tests {
     use super::*;

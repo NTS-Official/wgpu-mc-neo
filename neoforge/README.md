@@ -460,6 +460,29 @@ a way to check it.
   which matters on hybrid-graphics laptops where the two backends may enumerate the same GPU
   differently.
 
+### The Rust side has a lint gate, and it is the one CI runs
+
+Nothing Rust-side counts as finished until it passes the same two commands
+`.github/workflows/rust-check.yml` runs - from `rust/`, on the toolchain `rust-toolchain.toml` pins
+(`nightly-2026-09-26`, so a workstation and the runner agree):
+
+```sh
+cargo fmt --all
+cargo clippy --all-targets -- -D warnings
+```
+
+`fmt` is not cosmetic here: rustfmt is free to reflow between nightlies and clippy to grow lints, which is
+why the toolchain is a *dated* nightly rather than `nightly` - the pin is what makes a red job say something
+about the commit instead of about the day. `--all-targets` is the part that catches test code, which is where
+the lints in this tree have actually come from (a `doc_lazy_continuation` in a new doc comment and two
+bindings a rewritten loop stopped using).
+
+Two things the gate does *not* cover, and both are noise rather than debt: this tree's vendored GLSL
+preprocessor (`rust/cyntax`, its own workspace, reached as a path dependency) has six clippy warnings and
+four of its own, and `cargo clippy -- -D warnings` only applies that flag to the workspace members - so they
+print and do not fail. The `unused dependency` lines under them are cargo's manifest lint, not clippy's, and
+`-D warnings` does not reach those either.
+
 ## What has actually been run
 
 Everything below was observed by launching `:wgpu-mc-neoforge:runClient`, not inferred:
@@ -2627,6 +2650,54 @@ part of the variant rather than of the model file, so it has to be applied insid
 `ModelProperties`, before the faces of several properties are merged into the one mesh. Rotating a
 finished mesh could not express a multipart block whose two variants are turned differently, and doing
 it per state would rebuild meshes that are shared.
+
+### A face was turned by a quarter turn, and no uniform texture could show it
+
+Two tables decide which way round a face's texture goes, and both live in the game:
+
+- **`FaceInfo`** says which corner of the element's box each of a face's four vertices is;
+- **`CuboidFace.UVs#getVertexU`/`#getVertexV`** says which corner of the sprite that vertex samples:
+
+```java
+public float getVertexU(int index) { return index != 0 && index != 1 ? this.maxU : this.minU; }
+public float getVertexV(int index) { return index != 0 && index != 3 ? this.maxV : this.minV; }
+```
+
+This baker had both, hand-written out six times - once per direction, as literal `p101`-style vertices
+with literal `uv.1.0`/`uv.0.1` expressions beside them - and **two of the six pairs were wrong**: the UP
+face walked its sprite from the wrong corner (a half turn) and the DOWN face from one corner along (a
+quarter turn). The four side faces were right, which is what made the report so specific:
+
+> the Rust terrain is nearly identical to the game now; a new one: one or some of a block's faces are
+> rotated against the game's - some stones' top faces by 90, 180 or 270 degrees
+
+A rotation of a face is invisible on a texture with no direction to it - which is why "stone" is exactly
+the kind of block this is hard to *see* on and easy to *measure*: the pairing is checkable against the
+game's own arithmetic without a screen. `FaceBakery#defaultFaceUV` is the same two facts as six lines:
+
+```java
+case DOWN  -> new UVs(from.x(), 16.0F - to.z(), to.x(), 16.0F - from.z());
+case UP    -> new UVs(from.x(), from.z(), to.x(), to.z());
+case NORTH -> new UVs(16.0F - to.x(), 16.0F - to.y(), 16.0F - from.x(), 16.0F - from.y());
+case SOUTH -> new UVs(from.x(), 16.0F - to.y(), to.x(), 16.0F - from.y());
+case WEST  -> new UVs(from.z(), 16.0F - to.y(), to.z(), 16.0F - from.y());
+case EAST  -> new UVs(16.0F - to.z(), 16.0F - to.y(), 16.0F - from.z(), 16.0F - from.y());
+```
+
+and each line is two facts: **which world axis the sprite's `u` runs along** (`x` on an UP face, `z` on a
+WEST one, the negative of one where the line is written `16 - to`) and **which way `v` runs** - down every
+side, along `+z` on an UP face and `-z` on a DOWN one.
+
+The six hand-written blocks are one table now (`face_vertices`, the corner of the box and the corner of
+the sprite side by side, because it is the *pairing* that has to be right), the two faces are corrected,
+and the test checks the table against those six lines rather than against itself: for each face, take the
+two vertices that differ only along the axis `u` runs on and assert that the sprite's `u` grows with the
+world's - or shrinks, where the game subtracts. Run against the old pairings it fails on the UP face with
+`u runs the wrong way`, and the walk-around check catches a table that jumps across the rectangle.
+
+The corner *orders* stayed this baker's own: they are what its index list and its winding are written
+against, and the game's order is not the same thing - vanilla re-sorts its vertices afterwards
+(`recalculateWinding`), so its table order says nothing about which way the triangles face here.
 
 ### The title screen wrote a warning per frame
 
