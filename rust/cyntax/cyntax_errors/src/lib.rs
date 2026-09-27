@@ -33,25 +33,41 @@ pub trait Diagnostic: Sized {
                 LabelKind::Secondary => codespan_reporting::diagnostic::LabelStyle::Secondary,
                 LabelKind::Help => unimplemented!(),
             };
-            diag.labels.push(codespan_reporting::diagnostic::Label::new(style, label.location.file_id, label.location.range).with_message(label.message));
+            diag.labels.push(
+                codespan_reporting::diagnostic::Label::new(
+                    style,
+                    label.location.file_id,
+                    label.location.range,
+                )
+                .with_message(label.message),
+            );
         }
 
         diag
     }
 }
 impl<T, C: HasContext> UnwrapDiagnostic<T> for C {
-    fn unwrap_with_diagnostic<F: FnOnce(&mut Self) -> Result<T, codespan_reporting::diagnostic::Diagnostic<usize>>>(&mut self, value: F) -> T {
+    fn unwrap_with_diagnostic<
+        F: FnOnce(&mut Self) -> Result<T, codespan_reporting::diagnostic::Diagnostic<usize>>,
+    >(
+        &mut self,
+        value: F,
+    ) -> T {
         let result = value(self);
         self.unwrap_diagnostic(result)
     }
-    fn unwrap_diagnostic(&self, value: Result<T, codespan_reporting::diagnostic::Diagnostic<usize>>) -> T {
+    fn unwrap_diagnostic(
+        &self,
+        value: Result<T, codespan_reporting::diagnostic::Diagnostic<usize>>,
+    ) -> T {
         match value {
             Ok(value) => value,
             Err(err) => {
                 let config = codespan_reporting::term::Config::default();
                 let mut output_buffer = Vec::new();
                 let mut ansi_writer = Ansi::new(&mut output_buffer);
-                codespan_reporting::term::emit(&mut ansi_writer, &config, &self.ctx().files, &err).unwrap();
+                codespan_reporting::term::emit(&mut ansi_writer, &config, &self.ctx().files, &err)
+                    .unwrap();
 
                 panic!("{}", String::from_utf8(output_buffer).unwrap())
             }
@@ -60,6 +76,14 @@ impl<T, C: HasContext> UnwrapDiagnostic<T> for C {
 }
 pub mod errors;
 pub trait UnwrapDiagnostic<T> {
-    fn unwrap_diagnostic(&self, value: Result<T, codespan_reporting::diagnostic::Diagnostic<usize>>) -> T;
-    fn unwrap_with_diagnostic<F: FnOnce(&mut Self) -> Result<T, codespan_reporting::diagnostic::Diagnostic<usize>>>(&mut self, value: F) -> T;
+    fn unwrap_diagnostic(
+        &self,
+        value: Result<T, codespan_reporting::diagnostic::Diagnostic<usize>>,
+    ) -> T;
+    fn unwrap_with_diagnostic<
+        F: FnOnce(&mut Self) -> Result<T, codespan_reporting::diagnostic::Diagnostic<usize>>,
+    >(
+        &mut self,
+        value: F,
+    ) -> T;
 }

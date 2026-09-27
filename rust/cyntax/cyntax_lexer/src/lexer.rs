@@ -65,9 +65,7 @@ impl<'src> Iterator for Lexer<'src> {
         let token = match next {
             first_character @ span!(nondigit!()) => {
                 let identifier = self.lex_identifier(&first_character);
-                Some(identifier.map(|identifier| {
-                    PreprocessingToken::Identifier(identifier)
-                }))
+                Some(identifier.map(|identifier| PreprocessingToken::Identifier(identifier)))
             }
 
             // Literals, technically we should've parse string literals (or escaped char literals) but it hasn't been a problem yet

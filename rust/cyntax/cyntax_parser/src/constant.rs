@@ -55,7 +55,10 @@ impl<'a> ConstantParser<'a> {
             number_part: String::new(),
             base: 10,
             stage: Stage::Prefix,
-            suffix: Suffix { signed: Signedness::None, width: Width::None },
+            suffix: Suffix {
+                signed: Signedness::None,
+                width: Width::None,
+            },
         }
     }
     pub fn lex(mut self) -> PResult<IntConstant> {
@@ -92,15 +95,21 @@ impl<'a> ConstantParser<'a> {
                     self.stage = Stage::Number;
                 }
             }
-            Some(span!(c @ ('0'..='9' | 'a'..='f' | 'A'..='F') )) if self.base == 16 && matches!(self.stage, Stage::Number | Stage::Prefix) => {
+            Some(span!(c @ ('0'..='9' | 'a'..='f' | 'A'..='F') ))
+                if self.base == 16 && matches!(self.stage, Stage::Number | Stage::Prefix) =>
+            {
                 self.stage = Stage::Number;
                 self.number_part.push(c);
             }
-            Some(span!(c @ '0'..='9')) if self.base == 10 && matches!(self.stage, Stage::Number | Stage::Prefix) => {
+            Some(span!(c @ '0'..='9'))
+                if self.base == 10 && matches!(self.stage, Stage::Number | Stage::Prefix) =>
+            {
                 self.stage = Stage::Number;
                 self.number_part.push(c);
             }
-            Some(span!(c @ '0'..='7')) if self.base == 8 && matches!(self.stage, Stage::Number | Stage::Prefix) => {
+            Some(span!(c @ '0'..='7'))
+                if self.base == 8 && matches!(self.stage, Stage::Number | Stage::Prefix) =>
+            {
                 self.stage = Stage::Number;
                 self.number_part.push(c);
             }
@@ -113,11 +122,23 @@ impl<'a> ConstantParser<'a> {
                 match self.suffix.width {
                     Width::None => self.suffix.width = Width::Long,
                     Width::Long => self.suffix.width = Width::LongLong,
-                    Width::LongLong => return Err(SimpleError(s, "expected maximum of two suffix width specifiers".to_string()).into_codespan_report()),
+                    Width::LongLong => {
+                        return Err(SimpleError(
+                            s,
+                            "expected maximum of two suffix width specifiers".to_string(),
+                        )
+                        .into_codespan_report());
+                    }
                 }
             }
 
-            Some(span!(s,  c @('8' | '9'))) if self.base == 8 => return Err(SimpleError(s, format!("invalid character {c} for base {} constant", self.base)).into_codespan_report()),
+            Some(span!(s,  c @('8' | '9'))) if self.base == 8 => {
+                return Err(SimpleError(
+                    s,
+                    format!("invalid character {c} for base {} constant", self.base),
+                )
+                .into_codespan_report());
+            }
             _ => {
                 return Err(SimpleError(
                     Location {

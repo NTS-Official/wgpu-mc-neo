@@ -1,7 +1,9 @@
 use std::path::Prefix;
 
 use crate::Spanned;
-use crate::ast::{Expression, InfixOperator, Operator, PostfixOperator, PrefixOperator, Token, TypeName};
+use crate::ast::{
+    Expression, InfixOperator, Operator, PostfixOperator, PrefixOperator, Token, TypeName,
+};
 use crate::{PResult, Parser};
 use cyntax_common::ast::{Keyword, Punctuator};
 use cyntax_common::span;
@@ -32,9 +34,15 @@ impl<'src> Parser<'src> {
             // Right associative
             InfixOperator::Assign => (10, 9),
             InfixOperator::AddAssign | InfixOperator::SubtractAssign => (8, 7),
-            InfixOperator::MultiplyAssign | InfixOperator::DivideAssign | InfixOperator::ModuloAssign => (6, 5),
-            InfixOperator::BitwiseShiftLeftAssign | InfixOperator::BitwiseShiftRightAssign => (4, 3),
-            InfixOperator::BitwiseAndAssign | InfixOperator::BitwiseXorAssign | InfixOperator::BitwiseOrAssign => (2, 1),
+            InfixOperator::MultiplyAssign
+            | InfixOperator::DivideAssign
+            | InfixOperator::ModuloAssign => (6, 5),
+            InfixOperator::BitwiseShiftLeftAssign | InfixOperator::BitwiseShiftRightAssign => {
+                (4, 3)
+            }
+            InfixOperator::BitwiseAndAssign
+            | InfixOperator::BitwiseXorAssign
+            | InfixOperator::BitwiseOrAssign => (2, 1),
         };
 
         Some(bp)
@@ -56,7 +64,9 @@ impl<'src> Parser<'src> {
             span!(Token::Punctuator(Punctuator::Plus)) => Some(InfixOperator::Add),
             span!(Token::Punctuator(Punctuator::Minus)) => Some(InfixOperator::Subtract),
             span!(Token::Punctuator(Punctuator::LeftLeft)) => Some(InfixOperator::BitwiseShiftLeft),
-            span!(Token::Punctuator(Punctuator::RightRight)) => Some(InfixOperator::BitwiseShiftRight),
+            span!(Token::Punctuator(Punctuator::RightRight)) => {
+                Some(InfixOperator::BitwiseShiftRight)
+            }
             span!(Token::Punctuator(Punctuator::Left)) => Some(InfixOperator::Less),
             span!(Token::Punctuator(Punctuator::LeftEqual)) => Some(InfixOperator::LessEqual),
             span!(Token::Punctuator(Punctuator::Right)) => Some(InfixOperator::Greater),
@@ -71,13 +81,21 @@ impl<'src> Parser<'src> {
             span!(Token::Punctuator(Punctuator::Equal)) => Some(InfixOperator::Assign),
             span!(Token::Punctuator(Punctuator::PlusEqual)) => Some(InfixOperator::AddAssign),
             span!(Token::Punctuator(Punctuator::MinusEqual)) => Some(InfixOperator::SubtractAssign),
-            span!(Token::Punctuator(Punctuator::AsteriskEqual)) => Some(InfixOperator::MultiplyAssign),
+            span!(Token::Punctuator(Punctuator::AsteriskEqual)) => {
+                Some(InfixOperator::MultiplyAssign)
+            }
             span!(Token::Punctuator(Punctuator::SlashEqual)) => Some(InfixOperator::DivideAssign),
             span!(Token::Punctuator(Punctuator::PercentEqual)) => Some(InfixOperator::ModuloAssign),
-            span!(Token::Punctuator(Punctuator::LeftLeftEqual)) => Some(InfixOperator::BitwiseShiftLeftAssign),
-            span!(Token::Punctuator(Punctuator::RightRightEqual)) => Some(InfixOperator::BitwiseShiftRightAssign),
+            span!(Token::Punctuator(Punctuator::LeftLeftEqual)) => {
+                Some(InfixOperator::BitwiseShiftLeftAssign)
+            }
+            span!(Token::Punctuator(Punctuator::RightRightEqual)) => {
+                Some(InfixOperator::BitwiseShiftRightAssign)
+            }
             span!(Token::Punctuator(Punctuator::AndEqual)) => Some(InfixOperator::BitwiseAndAssign),
-            span!(Token::Punctuator(Punctuator::CaretEqual)) => Some(InfixOperator::BitwiseXorAssign),
+            span!(Token::Punctuator(Punctuator::CaretEqual)) => {
+                Some(InfixOperator::BitwiseXorAssign)
+            }
             span!(Token::Punctuator(Punctuator::PipeEqual)) => Some(InfixOperator::BitwiseOrAssign),
 
             _ => None,
@@ -114,7 +132,10 @@ impl<'src> Parser<'src> {
         self.parse_expression_bp(0)
     }
     /// THANKS!!! https://matklad.github.io/2020/04/13/simple-but-powerful-pratt-parsing.html
-    pub fn parse_expression_bp(&mut self, minimum_binding_power: u8) -> PResult<Spanned<Expression>> {
+    pub fn parse_expression_bp(
+        &mut self,
+        minimum_binding_power: u8,
+    ) -> PResult<Spanned<Expression>> {
         if self.peek_token().is_err() {
             return Ok(Spanned::new(Location::new(), Expression::Null));
         }
@@ -128,35 +149,69 @@ impl<'src> Parser<'src> {
 
             let expression = match (&prefix_operator, can_start_type_name) {
                 (PrefixOperator::SizeOf, _) => {
-                    let _ = self.expect_token(Token::Punctuator(Punctuator::LeftParen), "to open sizeof expression")?;
+                    let _ = self.expect_token(
+                        Token::Punctuator(Punctuator::LeftParen),
+                        "to open sizeof expression",
+                    )?;
                     let type_name = self.parse_typename()?;
-                    let closer = self.expect_token(Token::Punctuator(Punctuator::RightParen), "to close sizeof expression")?;
-                    prefix_op_span.until(&closer.location).into_spanned(Expression::Sizeof(type_name))
+                    let closer = self.expect_token(
+                        Token::Punctuator(Punctuator::RightParen),
+                        "to close sizeof expression",
+                    )?;
+                    prefix_op_span
+                        .until(&closer.location)
+                        .into_spanned(Expression::Sizeof(type_name))
                 }
                 (PrefixOperator::CastOrParen, true) => {
                     let type_name = self.parse_typename()?;
-                    self.expect_token(Token::Punctuator(Punctuator::RightParen), "to close cast expression")?;
+                    self.expect_token(
+                        Token::Punctuator(Punctuator::RightParen),
+                        "to close cast expression",
+                    )?;
                     let expr = self.parse_expression_bp(right_binding_power)?;
-                    type_name.location.until(&expr.location).into_spanned(Expression::Cast(type_name, Box::new(expr)))
+                    type_name
+                        .location
+                        .until(&expr.location)
+                        .into_spanned(Expression::Cast(type_name, Box::new(expr)))
                 }
                 (PrefixOperator::CastOrParen, false) => {
                     let expr = self.parse_expression()?;
-                    self.expect_token(Token::Punctuator(Punctuator::RightParen), "to close paren expression")?;
+                    self.expect_token(
+                        Token::Punctuator(Punctuator::RightParen),
+                        "to close paren expression",
+                    )?;
                     expr
                 }
                 _ => {
                     let expression = self.parse_expression_bp(right_binding_power)?;
-                    prefix_op_span.until(&expression.location).into_spanned(Expression::UnaryOp(Spanned::new(prefix_op_span.clone(), prefix_operator), Box::new(expression)))
+                    prefix_op_span
+                        .until(&expression.location)
+                        .into_spanned(Expression::UnaryOp(
+                            Spanned::new(prefix_op_span.clone(), prefix_operator),
+                            Box::new(expression),
+                        ))
                 }
             };
 
             expression
         } else {
             match self.next_token()? {
-                span!(span, Token::Identifier(identifier)) => span.to_spanned(Expression::Identifier(span.to_spanned(identifier))),
-                span!(span, Token::Constant(iconst)) => span.to_spanned(Expression::IntConstant(span.to_spanned(iconst))),
-                span!(span, Token::StringLiteral(iconst)) => span.to_spanned(Expression::StringLiteral(span.to_spanned(iconst))),
-                s => return Err(SimpleError(s.location, "unrecognized char while parsing expression".into()).into_codespan_report()),
+                span!(span, Token::Identifier(identifier)) => {
+                    span.to_spanned(Expression::Identifier(span.to_spanned(identifier)))
+                }
+                span!(span, Token::Constant(iconst)) => {
+                    span.to_spanned(Expression::IntConstant(span.to_spanned(iconst)))
+                }
+                span!(span, Token::StringLiteral(iconst)) => {
+                    span.to_spanned(Expression::StringLiteral(span.to_spanned(iconst)))
+                }
+                s => {
+                    return Err(SimpleError(
+                        s.location,
+                        "unrecognized char while parsing expression".into(),
+                    )
+                    .into_codespan_report());
+                }
             }
         };
 
@@ -175,30 +230,49 @@ impl<'src> Parser<'src> {
                 }
                 let span!(post_fix_operator_span, _) = self.next_token()?; // bump past postfix operator
 
-                lhs = match post_fix_operator {
-                    PostfixOperator::Call => {
-                        let args = self.parse_argument_expression_list()?;
-                        post_fix_operator_span.until(&lhs.location).into_spanned(Expression::Call(Box::new(lhs), args))
-                    }
-                    PostfixOperator::Subscript => {
-                        let expr = self.parse_expression()?;
-                        let closer = self.expect_token(Token::Punctuator(Punctuator::RightBracket), "to close array subscript")?;
-                        lhs.location.until(&closer.location).into_spanned(Expression::Subscript(Box::new(lhs), Box::new(expr)))
-                    }
-                    PostfixOperator::Ternary => {
-                        let then = self.parse_expression()?;
-                        let seperator = self.expect_token(Token::Punctuator(Punctuator::Colon), "to seperate ternary true and false branches")?;
-                        let elze = self.parse_expression_bp(left_binding_power)?;
+                lhs =
+                    match post_fix_operator {
+                        PostfixOperator::Call => {
+                            let args = self.parse_argument_expression_list()?;
+                            post_fix_operator_span
+                                .until(&lhs.location)
+                                .into_spanned(Expression::Call(Box::new(lhs), args))
+                        }
+                        PostfixOperator::Subscript => {
+                            let expr = self.parse_expression()?;
+                            let closer = self.expect_token(
+                                Token::Punctuator(Punctuator::RightBracket),
+                                "to close array subscript",
+                            )?;
+                            lhs.location
+                                .until(&closer.location)
+                                .into_spanned(Expression::Subscript(Box::new(lhs), Box::new(expr)))
+                        }
+                        PostfixOperator::Ternary => {
+                            let then = self.parse_expression()?;
+                            let seperator = self.expect_token(
+                                Token::Punctuator(Punctuator::Colon),
+                                "to seperate ternary true and false branches",
+                            )?;
+                            let elze = self.parse_expression_bp(left_binding_power)?;
 
-                        lhs.location.until(&seperator.location).into_spanned(Expression::Ternary(Box::new(lhs), Box::new(then), Box::new(elze)))
-                    }
-                    _ => post_fix_operator_span.until(&lhs.location).into_spanned(Expression::PostfixOp(post_fix_operator_span.into_spanned(post_fix_operator), Box::new(lhs))),
-                };
+                            lhs.location.until(&seperator.location).into_spanned(
+                                Expression::Ternary(Box::new(lhs), Box::new(then), Box::new(elze)),
+                            )
+                        }
+                        _ => post_fix_operator_span.until(&lhs.location).into_spanned(
+                            Expression::PostfixOp(
+                                post_fix_operator_span.into_spanned(post_fix_operator),
+                                Box::new(lhs),
+                            ),
+                        ),
+                    };
                 continue;
             }
 
             if let Some(infix_operator) = Self::as_infix_operator(peeked) {
-                let (left_binding_power, right_binding_power) = Self::infix_binding_power(&infix_operator).unwrap();
+                let (left_binding_power, right_binding_power) =
+                    Self::infix_binding_power(&infix_operator).unwrap();
 
                 if left_binding_power < minimum_binding_power {
                     break;
@@ -206,7 +280,14 @@ impl<'src> Parser<'src> {
                 let span!(infix_operator_span, _) = self.next_token()?; // bump infix operator
 
                 let rhs = self.parse_expression_bp(right_binding_power)?;
-                lhs = lhs.location.until(&rhs.location).into_spanned(Expression::BinOp(infix_operator_span.into_spanned(infix_operator), Box::new(lhs), Box::new(rhs)));
+                lhs = lhs
+                    .location
+                    .until(&rhs.location)
+                    .into_spanned(Expression::BinOp(
+                        infix_operator_span.into_spanned(infix_operator),
+                        Box::new(lhs),
+                        Box::new(rhs),
+                    ));
                 continue;
             }
             break;
@@ -216,14 +297,22 @@ impl<'src> Parser<'src> {
     }
     pub fn parse_argument_expression_list(&mut self) -> PResult<Vec<Spanned<Expression>>> {
         let mut arguments = vec![];
-        while !self.eat_if_next(Token::Punctuator(Punctuator::RightParen))? || self.consider_comma(&arguments)? {
+        while !self.eat_if_next(Token::Punctuator(Punctuator::RightParen))?
+            || self.consider_comma(&arguments)?
+        {
             if arguments.len() > 0 {
-                self.expect_token(Token::Punctuator(Punctuator::Comma), "to seperate arguments")?;
+                self.expect_token(
+                    Token::Punctuator(Punctuator::Comma),
+                    "to seperate arguments",
+                )?;
             }
 
             // recover from trailing comma
             if let Some(token) = self.eat_next(Token::Punctuator(Punctuator::RightParen))? {
-                self.diagnostics.push(SimpleError(token.location, format!("Trailing comma is not allowed")).into_codespan_report());
+                self.diagnostics.push(
+                    SimpleError(token.location, format!("Trailing comma is not allowed"))
+                        .into_codespan_report(),
+                );
                 break;
             }
             arguments.push(self.parse_expression()?);
@@ -255,10 +344,16 @@ impl<'src> Parser<'src> {
         assert!(sq.len() > 0);
         let d = self.parse_abstract_declarator()?;
 
-        Ok(start.until(&d.location).into_spanned(TypeName { specifier_qualifiers: sq, declarator: d }))
+        Ok(start.until(&d.location).into_spanned(TypeName {
+            specifier_qualifiers: sq,
+            declarator: d,
+        }))
     }
     pub fn next_is_semicolon(&mut self) -> bool {
-        matches!(self.peek_token(), Ok(span!(Token::Punctuator(Punctuator::Semicolon))))
+        matches!(
+            self.peek_token(),
+            Ok(span!(Token::Punctuator(Punctuator::Semicolon)))
+        )
     }
     pub fn next_is_eof(&mut self) -> bool {
         matches!(self.peek_token(), Err(_))

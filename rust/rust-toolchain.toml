@@ -1,3 +1,8 @@
 [toolchain]
-channel = "nightly"
+# A dated nightly, not `nightly` - see the comment in .github/workflows/rust-check.yml. A floating
+# nightly means the `fmt` job can go red on a commit that changed nothing it looks at, because
+# rustfmt's line breaking is allowed to move between nightlies and clippy's lint set is allowed to
+# grow. The date is the CI pin; move both together, then run
+# `cargo fmt --all` and `cargo clippy -- -D warnings` and commit what they ask for.
+channel = "nightly-2026-09-26"
 components = ["rust-analyzer", "rust-src"]

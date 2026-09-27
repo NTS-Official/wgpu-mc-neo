@@ -22,7 +22,13 @@ pub struct Delimited {
     pub inner_tokens: Vec<Spanned<PreprocessingToken>>,
 }
 impl PreprocessingToken {
-    pub fn as_delimited(self) -> (Spanned<PreprocessingToken>, Spanned<PreprocessingToken>, Vec<Spanned<PreprocessingToken>>) {
+    pub fn as_delimited(
+        self,
+    ) -> (
+        Spanned<PreprocessingToken>,
+        Spanned<PreprocessingToken>,
+        Vec<Spanned<PreprocessingToken>>,
+    ) {
         match self {
             PreprocessingToken::Delimited(d) => (d.opener, d.closer, d.inner_tokens),
             _ => panic!(),
@@ -33,7 +39,11 @@ impl PreprocessingToken {
 #[derive(Debug)]
 pub enum Directive {
     DefineObject(Spanned<String>, Vec<Spanned<PreprocessingToken>>),
-    DefineFunction(Spanned<String>, Spanned<Vec<Spanned<PreprocessingToken>>>, Vec<Spanned<PreprocessingToken>>),
+    DefineFunction(
+        Spanned<String>,
+        Spanned<Vec<Spanned<PreprocessingToken>>>,
+        Vec<Spanned<PreprocessingToken>>,
+    ),
     Undefine(Spanned<String>),
 }
 #[derive(Debug, PartialEq, Clone)]

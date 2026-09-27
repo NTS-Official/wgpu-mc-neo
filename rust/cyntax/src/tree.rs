@@ -203,10 +203,10 @@ impl<'src, I: Iterator<Item = &'src Spanned<PreprocessingToken>>> IntoTokenTree<
                     macro_name: macro_name.value,
                 };
             }
-             _ if directive_name == "else" => {
+            _ if directive_name == "else" => {
                 return ControlLine::Else;
             }
-    
+
             _ if directive_name == "elif" => {
                 skip_whitespace(&mut tokens_iter);
                 let condition = tokens_iter.collect::<Vec<_>>();

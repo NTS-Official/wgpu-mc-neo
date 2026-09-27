@@ -50,6 +50,14 @@ jobs:
   dependency-submission:
 
     runs-on: ubuntu-latest
+    # The submission API answers `The Dependency graph is disabled for this repository` on this
+    # repository (a fork), so this job's one step fails on every push and takes the whole workflow
+    # with it - six minutes of a green `build` job reported as a red Java CI check, on every commit.
+    # Nothing about the commit is being reported when it does; the graph is a repository setting this
+    # file cannot turn on. The attempt is kept rather than the job deleted, because an uploaded graph
+    # is what Dependabot alerts read, and the day the setting is on this job starts working again on
+    # its own.
+    continue-on-error: true
     permissions:
       contents: write
 

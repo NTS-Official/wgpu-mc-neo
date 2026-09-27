@@ -2,9 +2,7 @@ use std::{collections::HashMap, fmt::Debug};
 
 use cyntax_common::{
     ast::{PreprocessingToken, Punctuator},
-    ctx::{
-        ParseContext,
-    },
+    ctx::ParseContext,
     span,
     spanned::{Location, Spanned},
 };
@@ -68,9 +66,7 @@ impl<'a, I: Debug + Iterator<Item = Spanned<PreprocessingToken>>> Iterator
                 Self::stringify_tokens(a.iter(), &mut self.stringify_string);
                 self.replacements.prepend(Spanned::new(
                     token.location.clone(),
-                    PreprocessingToken::StringLiteral(
-                        self.stringify_string.clone(),
-                    ),
+                    PreprocessingToken::StringLiteral(self.stringify_string.clone()),
                 ));
                 self.stringify_next_token = false;
                 self.stringify_string.clear();
@@ -100,8 +96,7 @@ impl<'a, I: Debug + Iterator<Item = Spanned<PreprocessingToken>>> Iterator
                 Some(expanded)
             }
             span!(PreprocessingToken::Identifier(identifier))
-                if self.is_variadic
-                    && *identifier == "__VA_ARGS__" =>
+                if self.is_variadic && *identifier == "__VA_ARGS__" =>
             {
                 Some(
                     self.variadic_args

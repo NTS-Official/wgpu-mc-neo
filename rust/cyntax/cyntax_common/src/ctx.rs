@@ -19,11 +19,15 @@ impl ParseContext {
     pub fn find_bracketed_header(&self, name: &str) -> Option<String> {
         if let Ok(src) = std::fs::read_to_string(name) {
             return Some(src);
-        } else if let Ok(src) = std::fs::read_to_string(format!("/usr/lib/gcc/x86_64-linux-gnu/13/include/{}", name)) {
+        } else if let Ok(src) =
+            std::fs::read_to_string(format!("/usr/lib/gcc/x86_64-linux-gnu/13/include/{}", name))
+        {
             return Some(src);
         } else if let Ok(src) = std::fs::read_to_string(format!("/usr/local/include/{}", name)) {
             return Some(src);
-        } else if let Ok(src) = std::fs::read_to_string(format!("/usr/include/x86_64-linux-gnu/{}", name)) {
+        } else if let Ok(src) =
+            std::fs::read_to_string(format!("/usr/include/x86_64-linux-gnu/{}", name))
+        {
             return Some(src);
         } else if let Ok(src) = std::fs::read_to_string(format!("/usr/include/{}", name)) {
             return Some(src);

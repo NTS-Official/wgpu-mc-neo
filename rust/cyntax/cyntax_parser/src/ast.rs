@@ -163,7 +163,11 @@ pub enum Statement {
     Break,
     Error,
     Return(Option<Spanned<Expression>>),
-    If(Spanned<Expression>, Box<Spanned<Statement>>, Option<Box<Spanned<Statement>>>),
+    If(
+        Spanned<Expression>,
+        Box<Spanned<Statement>>,
+        Option<Box<Spanned<Statement>>>,
+    ),
     Switch(Spanned<Expression>, Box<Spanned<Statement>>),
 }
 #[derive(Debug)]
@@ -215,7 +219,11 @@ pub enum Expression {
     IntConstant(Spanned<IntConstant>),
     StringLiteral(Spanned<String>),
     Parenthesized(Box<Spanned<Self>>),
-    BinOp(Spanned<InfixOperator>, Box<Spanned<Self>>, Box<Spanned<Self>>),
+    BinOp(
+        Spanned<InfixOperator>,
+        Box<Spanned<Self>>,
+        Box<Spanned<Self>>,
+    ),
     UnaryOp(Spanned<PrefixOperator>, Box<Spanned<Self>>),
     PostfixOp(Spanned<PostfixOperator>, Box<Spanned<Self>>),
     Cast(Spanned<TypeName>, Box<Spanned<Self>>),

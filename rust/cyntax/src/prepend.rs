@@ -23,13 +23,18 @@ where
 }
 impl<I: Iterator + Debug> PrependingPeekableIterator<I> {
     pub fn new(i: I) -> Self {
-        Self { queue: VecDeque::new(), inner: i.peekmore() }
+        Self {
+            queue: VecDeque::new(),
+            inner: i.peekmore(),
+        }
     }
     pub fn peek(&mut self) -> Option<&I::Item> {
         self.peek_nth(0)
     }
     pub fn peek_nth(&mut self, n: usize) -> Option<&I::Item> {
-        self.queue.get(n).or_else(|| self.inner.peek_nth(n - self.queue.len()))
+        self.queue
+            .get(n)
+            .or_else(|| self.inner.peek_nth(n - self.queue.len()))
     }
     pub fn prepend(&mut self, item: I::Item) {
         self.queue.insert(0, item);

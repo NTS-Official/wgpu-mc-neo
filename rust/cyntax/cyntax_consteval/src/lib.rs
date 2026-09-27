@@ -21,8 +21,12 @@ impl<'src> ConstantEvalutator<'src> {
     pub fn evaluate(&mut self, expr: &Spanned<Expression>) -> PResult<Value> {
         #[allow(unused_variables)]
         match expr {
-            span!(Expression::Identifier(identifier)) if identifier.value == "true" => Ok(Value::Int(1)),
-            span!(Expression::Identifier(identifier)) if identifier.value == "false" => Ok(Value::Int(0)),
+            span!(Expression::Identifier(identifier)) if identifier.value == "true" => {
+                Ok(Value::Int(1))
+            }
+            span!(Expression::Identifier(identifier)) if identifier.value == "false" => {
+                Ok(Value::Int(0))
+            }
             // undefined macros expand to 0, we assume every identifier at this point is an undefined macro
             span!(Expression::Identifier(_)) => Ok(Value::Int(0)),
             span!(Expression::IntConstant(constant)) => self.constant(constant),
@@ -46,7 +50,12 @@ impl<'src> ConstantEvalutator<'src> {
         let val = i64::from_str_radix(&constant.value.number, constant.value.base.into()).unwrap();
         Ok(Value::Int(val))
     }
-    fn bin_op(&mut self, op: &Spanned<InfixOperator>, left: &Spanned<Expression>, right: &Spanned<Expression>) -> PResult<Value> {
+    fn bin_op(
+        &mut self,
+        op: &Spanned<InfixOperator>,
+        left: &Spanned<Expression>,
+        right: &Spanned<Expression>,
+    ) -> PResult<Value> {
         match op {
             span!(InfixOperator::LogicalAnd) => {
                 let left_val = self.evaluate(left)?;
@@ -102,7 +111,11 @@ impl<'src> ConstantEvalutator<'src> {
             }
         }
     }
-    fn un_op(&mut self, op: &Spanned<PrefixOperator>, expr: &Spanned<Expression>) -> PResult<Value> {
+    fn un_op(
+        &mut self,
+        op: &Spanned<PrefixOperator>,
+        expr: &Spanned<Expression>,
+    ) -> PResult<Value> {
         let expr_val = self.evaluate(expr)?;
         match op {
             span!(PrefixOperator::Plus) => Ok(expr_val), // Unary plus is a no-op for integers
@@ -111,9 +124,18 @@ impl<'src> ConstantEvalutator<'src> {
             _ => todo!(),
         }
     }
-    fn ternary(&mut self, cond: &Spanned<Expression>, then: &Spanned<Expression>, elze: &Spanned<Expression>) -> PResult<Value> {
+    fn ternary(
+        &mut self,
+        cond: &Spanned<Expression>,
+        then: &Spanned<Expression>,
+        elze: &Spanned<Expression>,
+    ) -> PResult<Value> {
         let cond = self.evaluate(cond)?;
-        if cond.bool()? { return self.evaluate(then) } else { return self.evaluate(elze) }
+        if cond.bool()? {
+            return self.evaluate(then);
+        } else {
+            return self.evaluate(elze);
+        }
     }
 }
 impl Value {
@@ -155,27 +177,47 @@ impl Value {
     }
     pub fn equal(self, other: Self) -> PResult<Self> {
         match (self, other) {
-            (Value::Int(lv), Value::Int(rv)) => Ok(if lv == rv { Value::Int(1) } else { Value::Int(0) }),
+            (Value::Int(lv), Value::Int(rv)) => Ok(if lv == rv {
+                Value::Int(1)
+            } else {
+                Value::Int(0)
+            }),
         }
     }
     pub fn greater(self, other: Self) -> PResult<Self> {
         match (self, other) {
-            (Value::Int(lv), Value::Int(rv)) => Ok(if lv > rv { Value::Int(1) } else { Value::Int(0) }),
+            (Value::Int(lv), Value::Int(rv)) => Ok(if lv > rv {
+                Value::Int(1)
+            } else {
+                Value::Int(0)
+            }),
         }
     }
     pub fn greater_eq(self, other: Self) -> PResult<Self> {
         match (self, other) {
-            (Value::Int(lv), Value::Int(rv)) => Ok(if lv >= rv { Value::Int(1) } else { Value::Int(0) }),
+            (Value::Int(lv), Value::Int(rv)) => Ok(if lv >= rv {
+                Value::Int(1)
+            } else {
+                Value::Int(0)
+            }),
         }
     }
     pub fn less_eq(self, other: Self) -> PResult<Self> {
         match (self, other) {
-            (Value::Int(lv), Value::Int(rv)) => Ok(if lv <= rv { Value::Int(1) } else { Value::Int(0) }),
+            (Value::Int(lv), Value::Int(rv)) => Ok(if lv <= rv {
+                Value::Int(1)
+            } else {
+                Value::Int(0)
+            }),
         }
     }
     pub fn less(self, other: Self) -> PResult<Self> {
         match (self, other) {
-            (Value::Int(lv), Value::Int(rv)) => Ok(if lv < rv { Value::Int(1) } else { Value::Int(0) }),
+            (Value::Int(lv), Value::Int(rv)) => Ok(if lv < rv {
+                Value::Int(1)
+            } else {
+                Value::Int(0)
+            }),
         }
     }
     pub fn negate(self) -> PResult<Self> {

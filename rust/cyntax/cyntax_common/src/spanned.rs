@@ -2,7 +2,10 @@ use std::{fmt::Debug, ops::Range};
 #[macro_export]
 macro_rules! span {
     ($l: pat, $p: pat) => {
-        Spanned { value: $p, location: $l }
+        Spanned {
+            value: $p,
+            location: $l,
+        }
     };
     ($p: pat) => {
         Spanned { value: $p, .. }
@@ -21,7 +24,10 @@ pub struct Spanned<T> {
 
 impl Location {
     pub fn new() -> Self {
-        Self { range: 0..0, file_id: 0 }
+        Self {
+            range: 0..0,
+            file_id: 0,
+        }
     }
     pub fn until(&self, other: &Self) -> Self {
         // if self.file_id == other.file_id && self.range.start < other.range.end {
@@ -39,22 +45,37 @@ impl Location {
         self.until(end)
     }
     pub fn as_fallback_for_vec<T>(&self, other: &Vec<Spanned<T>>) -> Self {
-        let first = other.first().map(|s| s.location.clone()).unwrap_or(self.clone());
-        let last = other.first().map(|s| s.location.clone()).unwrap_or(self.clone());
+        let first = other
+            .first()
+            .map(|s| s.location.clone())
+            .unwrap_or(self.clone());
+        let last = other
+            .first()
+            .map(|s| s.location.clone())
+            .unwrap_or(self.clone());
 
         first.until(&last)
     }
     pub fn into_spanned<T>(self, value: T) -> Spanned<T> {
-        Spanned { value, location: self }
+        Spanned {
+            value,
+            location: self,
+        }
     }
     pub fn to_spanned<T>(&self, value: T) -> Spanned<T> {
-        Spanned { value, location: self.clone() }
+        Spanned {
+            value,
+            location: self.clone(),
+        }
     }
 }
 
 impl<T> Spanned<T> {
     pub fn new(location: Location, value: T) -> Spanned<T> {
-        Spanned { value: value, location }
+        Spanned {
+            value: value,
+            location,
+        }
     }
     pub fn map<U, F: FnMut(T) -> U>(self, mut f: F) -> Spanned<U> {
         Spanned {
@@ -91,6 +112,10 @@ impl<T: PartialEq> PartialEq for Spanned<T> {
 }
 impl<T: Debug> Debug for Spanned<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if f.alternate() { write!(f, "{:#?}", self.value) } else { write!(f, "{:?}", self.value) }
+        if f.alternate() {
+            write!(f, "{:#?}", self.value)
+        } else {
+            write!(f, "{:?}", self.value)
+        }
     }
 }
