@@ -21,7 +21,7 @@
   "wgpu_mc.option.terrain": "Rust terrain",
   "wgpu_mc.option.dump_frames": "Dump frames",
   "wgpu_mc.option.dump_frames.tooltip": "Write out the next N frames the renderer presents, as raw files under wgpu-frames, and zero for none. A dump is about the frame that is on screen, and one frame rarely settles a flicker: a handful in a row is what says whether what you are looking at is there on every frame or on every other one. Turning it to zero and up again asks for another handful.",
-  "wgpu_mc.option.terrain.tooltip": "Draw the terrain from the meshes the Rust baker builds, in the pass Minecraft's own solid layer would have used. The cutout and translucent layers, the entities and everything else drawn afterwards stay Minecraft's, against the depth this fills. Off is Minecraft's own terrain. Turning it on asks Minecraft to rebuild its sections, so it takes a second or so to show.",
+  "wgpu_mc.option.terrain.tooltip": "Draw the terrain from the meshes the Rust baker builds, in the pass Minecraft's own solid layer would have used. That pass is the game's opaque section-layer group, so the cutout layer is drawn from the same meshes too - it is the same render pass. The translucent layer, the entities and everything else drawn afterwards stay Minecraft's, against the depth this fills. Off is Minecraft's own terrain. Turning it on asks Minecraft to rebuild its sections, so it takes a second or so to show.",
   "wgpu_mc.option.gpu_based_validation": "GPU-based validation",
   "wgpu_mc.option.logging": "Logging",
   "wgpu_mc.option.diagnostics": "Diagnostics",

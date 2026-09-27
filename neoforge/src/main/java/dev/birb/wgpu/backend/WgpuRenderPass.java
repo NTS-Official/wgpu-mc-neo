@@ -409,8 +409,10 @@ public class WgpuRenderPass implements RenderPassBackend {
      * recorded, so this is where the two meet rather than a reordering of the frame.
      *
      * <p>The colour and depth views are the ones this pass was opened with, which is what makes the
-     * graph's terrain the terrain of *this* frame: the cutout and translucent layers, the entities and
-     * everything else Minecraft draws afterwards test against the depth this pass fills.
+     * graph's terrain the terrain of *this* frame: the translucent layer, the entities and everything
+     * else Minecraft draws afterwards test against the depth this pass fills. The pass being replaced
+     * is the game's opaque group, which draws the solid layer and then the cutout one inside one
+     * render pass, so both of those come out of the arena here - see {@code @geo_terrain}.
      */
     private void takeOverTerrainPass() {
         invoke(WmNative.dropRenderPass, nativePass);

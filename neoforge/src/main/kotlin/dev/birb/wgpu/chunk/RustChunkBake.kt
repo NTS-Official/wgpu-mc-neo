@@ -10,6 +10,7 @@ import net.minecraft.world.level.material.Fluids
 
 import dev.birb.wgpu.rust.RendererSettings
 import dev.birb.wgpu.rust.WgpuNative
+import dev.birb.wgpu.rust.WmNative
 import net.minecraft.client.Minecraft
 import net.minecraft.client.renderer.chunk.RenderSectionRegion
 import net.minecraft.core.SectionPos
@@ -46,10 +47,27 @@ import kotlin.math.min
  *    over as one bit in a mask instead of a few kilobytes. Light especially: a rebuild of one section
  *    needs the light of 27, and re-sending all of them was 108 KB of copying, 54 array allocations and
  *    54 JNI calls each time, for data that changes when a torch is placed rather than when a chunk is
- *    re-meshed.
+ *    re-meshed. What that bookkeeping has to get right is the difference between "nothing to say" and
+ *    "there is nothing there": a section with no blocks is sent as *absent* every time rather than
+ *    left out, and [sent] records that as an entry with a null in it - a missing entry would make the
+ *    next rebuild compare `null` against nothing and find nothing to say, and the copy Rust kept would
+ *    be meshed for the rest of the session;
  *  - **Everything goes in one call.** The payload is written into one reusable off-heap buffer and
  *    handed over as an address; the old shape was ~57 JNI calls and 60 arrays per rebuild, and it
  *    allocated all of them per rebuild as well.
+ *
+ * The two sides also have to agree on *which world* they are describing, which is what [generation]
+ * is for: a rebuild that was already running when the player changed dimension would otherwise write
+ * the old world's blocks under the new world's coordinates, and be recorded as sent besides. Every
+ * record carries the number, the native side refuses the ones that are not current - it answers with
+ * a bit per refused slot - and only the accepted ones are recorded. A refusal costs one re-send, which
+ * is the next rebuild of that section; the two ends of a level change are `forgetAll` here and
+ * `clearSections` there, both called from `LevelRenderer#setLevel`.
+ *
+ * A third way the two sides can disagree is the arena: a section it has no room for is one this side
+ * has been told was baked and which is not drawn at all, and its rebuild has already happened. The
+ * refusal counter is polled with the settings switch, and growth in it drops [sent] - one re-send per
+ * section rather than a hole that stays for the session.
  *
  * Three things about the shape of the data are worth naming, because each is easy to get wrong:
  *
@@ -104,8 +122,22 @@ object RustChunkBake {
 	private const val LIGHT_RECORD_BYTES = 16L
 	private const val BLOBS_AT = HEADER_BYTES + SECTIONS * BLOCK_RECORD_BYTES + SECTIONS * LIGHT_RECORD_BYTES
 
+	/**
+	 * Where a record says which world it describes: the last word of each record shape, which both
+	 * had spare. See [RustChunkBake.forgetAll] and the `SECTION_GENERATION` docs in
+	 * `rust/wgpu-mc-jni/src/section.rs`.
+	 */
+	private const val BLOCK_RECORD_GENERATION_WORD = 15
+	private const val LIGHT_RECORD_GENERATION_WORD = 3
+
 	/** Must match `PAYLOAD_MAGIC` in `rust/wgpu-mc-jni/src/section.rs`. */
 	private const val MAGIC = 0x574D5332
+
+	/** Must match `REJECTED_MASK` in `rust/wgpu-mc-jni/src/section.rs`: which slots were refused. */
+	private const val REJECTED_MASK = 0x07FF_FFFF
+
+	/** Must match `RESYNC` in `rust/wgpu-mc-jni/src/section.rs`: send the neighbourhood again. */
+	private const val RESYNC = 1 shl 27
 
 	/**
 	 * One buffer per build thread, big enough for the worst case: 27 sections of a 32-bit-per-entry
@@ -155,6 +187,10 @@ object RustChunkBake {
 		val previous = enabled
 		enabled = RendererSettings.bool(SETTING) ?: true
 
+		// Once a second, and cheap: this is what turns "the arena dropped a section" from a silent
+		// staleness into a re-send. See [noteRefusals].
+		noteRefusals()
+
 		if (enabled == previous && reportedState) {
 			return
 		}
@@ -176,6 +212,42 @@ object RustChunkBake {
 	private var reported = 0L
 	private var resyncs = 0L
 
+	/** How many sections the arena had refused when this side last looked. See [noteRefusals]. */
+	private var refusedSeen = 0
+
+	/**
+	 * What the arena's refusal counter was, and what to do when it grows.
+	 *
+	 * A section the arena had no room for is a section this side has already been told was baked and
+	 * which is not drawn at all - and its rebuild has happened, so nothing would offer it again: stale
+	 * for the rest of the session, and silent. Dropping the "what have I sent" table turns that into
+	 * one visible thing instead: the next rebuild of each section carries its data again, so the ones
+	 * that were refused get another chance once the pool has room.
+	 */
+	private fun noteRefusals() {
+		val refused = try {
+			WmNative.terrainSectionsRefused.invokeExact() as Int
+		} catch (error: Throwable) {
+			// The renderer may not exist yet; nothing has been baked, so nothing can have been refused.
+			return
+		}
+
+		val grown = refused - refusedSeen
+		if (grown <= 0) {
+			return
+		}
+
+		refusedSeen = refused
+		sent.clear()
+
+		WgpuMcMod.LOGGER.warn(
+			"wgpu: the section arena refused {} more section(s), {} in total; forgetting what has " +
+				"been sent, so the next rebuild of each section carries its data again",
+			grown,
+			refused,
+		)
+	}
+
 	/** The offer count the timing report was last written at, so it is sampled like the offer line. */
 	private var reportedTiming = 0L
 
@@ -185,6 +257,44 @@ object RustChunkBake {
 
 	/** What Rust has been told about each section, so the next rebuild can send only what changed. */
 	private val sent = ConcurrentHashMap<Long, Sent>()
+
+	/**
+	 * Which world [sent] describes, as the native side last numbered it.
+	 *
+	 * Every record in a payload is stamped with this, and the native side refuses a record stamped
+	 * with anything but its own number: a chunk build that was already running when the player changed
+	 * dimension would otherwise install the old world's blocks under the new world's coordinates, and
+	 * - because it would be recorded as sent - they would never be offered again.
+	 *
+	 * The number is the *native* side's, adopted in [forgetAll] from the call that bumps it: one
+	 * counter with one owner, so the two sides cannot drift into a state where every payload is
+	 * refused.
+	 */
+	@Volatile
+	private var generation = 0
+
+	/**
+	 * Forgets everything this side has told Rust about the world, for a level change.
+	 *
+	 * Called from `LevelRenderer#setLevel` - a new world, a dimension change, and `setLevel(null)`
+	 * when the player goes back to the title screen all arrive there - and the native side is asked to
+	 * do the same (`clearSections`), which is also where [generation] comes from.
+	 *
+	 * Without this, the two sides keep describing the world that was left behind: Rust would go on
+	 * baking against its cache, this side would go on believing sections it had sent are there, and
+	 * nothing rebuilds a section whose blocks have not changed - so the new world would draw the old
+	 * world's ground at the coordinates the two happen to share.
+	 */
+	@JvmStatic
+	fun forgetAll(generation: Int) {
+		sent.clear()
+		this.generation = generation
+
+		WgpuMcMod.LOGGER.info(
+			"wgpu: the section bake was forgotten on both sides (generation {})",
+			generation,
+		)
+	}
 
 	/**
 	 * Offers the middle section of [region] to the Rust baker. Called from the head of the compile
@@ -348,12 +458,16 @@ object RustChunkBake {
 		var lightNanos = 0L
 		var blockNanos = 0L
 
-		// The sections this call changes, applied to [sent] after it returns. A null value is a
-		// section to forget.
-		val updates = ArrayList<Pair<Long, Sent?>>(SECTIONS)
+		// The sections this call changes, applied to [sent] after it returns.
+		val updates = ArrayList<Update>(SECTIONS)
 
 		val payload = Payload.ofThread()
 		payload.begin()
+
+		// One read for the whole payload: every record in it describes the same world. A level change
+		// while it is being written is exactly what the stamp is for - the records that were already
+		// written for the old world are refused by the other side rather than applied.
+		val stamp = generation
 
 		for (index in 0 until SECTIONS) {
 			// x fastest, then y, then z - the order the Rust provider indexes, and the order the region
@@ -379,32 +493,36 @@ object RustChunkBake {
 			val blocksChanged = force || blocks != entry?.blocks
 			val lightChanged = force || light != entry?.light
 
-			if (blocksChanged) {
-				if (blocks == null) {
-					payload.writeAbsentBlock(index)
-				} else {
-					payload.writeBlock(index, blocks)
-				}
-			} else if (blocks != null) {
+			// "This section has no blocks" is said *every* time rather than only when it changed: a
+			// payload that says nothing about a slot leaves whatever the other side already had for
+			// it, so a section that was unloaded - or that came back as air - would go on being meshed
+			// from the copy Rust kept. Nobody would notice: the stale data is blocks, and the next
+			// rebuild would compare against it and find nothing to say.
+			if (blocks == null) {
+				payload.writeAbsentBlock(index, stamp)
+			} else if (blocksChanged) {
+				payload.writeBlock(index, blocks, stamp)
+			} else {
 				// Rust has this section and this call does not carry it.
 				knownBlocks = knownBlocks or (1 shl index)
 			}
 
 			if (timing) blockNanos += System.nanoTime() - blocksStarted
 
-			if (lightChanged) {
-				if (light == null) {
-					payload.writeAbsentLight(index)
-				} else {
-					payload.writeLight(index, light)
-				}
-			} else if (light != null) {
+			if (light == null) {
+				payload.writeAbsentLight(index, stamp)
+			} else if (lightChanged) {
+				payload.writeLight(index, light, stamp)
+			} else {
 				knownLight = knownLight or (1 shl index)
 			}
 
-			when {
-				blocks == null && light == null -> updates.add(key to null)
-				blocksChanged || lightChanged -> updates.add(key to Sent(blocks, light))
+			// What this call told the other side about the section, including the nothings. Dropping
+			// the entry instead - "nothing to say" and "remember nothing" are not the same thing -
+			// would make the next rebuild compare `null` against a missing entry and conclude there
+			// was nothing to say, which is how the stale blocks above stay stale.
+			if (blocksChanged || lightChanged || blocks == null || light == null) {
+				updates.add(Update(index, key, Sent(blocks, light)))
 			}
 		}
 
@@ -427,8 +545,14 @@ object RustChunkBake {
 		}
 
 		val callStarted = if (timing) System.nanoTime() else 0L
-		val resync = WgpuNative.bakeSections(targetX, targetY, targetZ, payload.address, payload.length)
+		val answer = WgpuNative.bakeSections(targetX, targetY, targetZ, payload.address, payload.length)
 		val callNanos = if (timing) System.nanoTime() - callStarted else 0L
+
+		// Two answers in one word: which records the other side refused - written for a world it has
+		// since forgotten - and whether it is missing part of the neighbourhood, which is the older
+		// cue to send everything again.
+		val rejected = answer and REJECTED_MASK
+		val resync = answer and RESYNC != 0
 
 		if (timing) {
 			WgpuMcMod.TIME_SPENT_SECTION_LIGHT.add(lightNanos)
@@ -443,12 +567,16 @@ object RustChunkBake {
 		}
 
 		if (!resync) {
-			for ((key, entry) in updates) {
-				if (entry == null) {
-					sent.remove(key)
-				} else {
-					sent[key] = entry
+			for (update in updates) {
+				// A refused record was written for a world that is gone, so it says nothing about the
+				// one the other side is describing now: keeping it out of the table is what makes the
+				// next rebuild of that section carry its data again, rather than leaving a hole the
+				// two sides both believe was filled.
+				if (rejected and (1 shl update.index) != 0) {
+					continue
 				}
+
+				sent[update.key] = update.entry
 			}
 		}
 
@@ -640,6 +768,15 @@ object RustChunkBake {
 	private class Sent(val blocks: Blocks?, val light: Light?)
 
 	/**
+	 * One entry a call changes in [sent], kept with the payload slot it was written at.
+	 *
+	 * The slot is what the other side's answer names: a record it refused - because the world was
+	 * replaced between this payload being written and being read - is one this side must not record as
+	 * sent, and it is the slot, not the section key, that the answer is about.
+	 */
+	private class Update(val index: Int, val key: Long, val entry: Sent)
+
+	/**
 	 * Hashes rather than the identities of the objects the data came from.
 	 *
 	 * Minecraft mutates a `PalettedContainer`'s storage in place - `SimpleBitStorage#set` writes into
@@ -703,7 +840,7 @@ object RustChunkBake {
 		}
 
 		/** A section Rust should keep, or replace what it had. */
-		fun writeBlock(index: Int, section: Blocks) {
+		fun writeBlock(index: Int, section: Blocks, generation: Int) {
 			val at = blocksAt(blocks)
 
 			val paletteOffset = cursor
@@ -737,19 +874,21 @@ object RustChunkBake {
 			word(at + 48, section.longs.size)
 			word(at + 52, longsOffset.toInt())
 			word(at + 56, fluidsOffset.toInt())
+			word(at + BLOCK_RECORD_GENERATION_WORD * 4, generation)
 
 			blocks++
 		}
 
 		/** A section Rust should forget: it is air, or it is not loaded any more. */
-		fun writeAbsentBlock(index: Int) {
+		fun writeAbsentBlock(index: Int, generation: Int) {
 			val at = blocksAt(blocks)
 			word(at, index)
 			word(at + 4, 0)
+			word(at + BLOCK_RECORD_GENERATION_WORD * 4, generation)
 			blocks++
 		}
 
-		fun writeLight(index: Int, light: Light) {
+		fun writeLight(index: Int, light: Light, generation: Int) {
 			val at = lightAt(lights)
 
 			val blockOffset = cursor
@@ -763,6 +902,7 @@ object RustChunkBake {
 			word(at, index)
 			word(at + 4, blockOffset.toInt())
 			word(at + 8, skyOffset.toInt())
+			word(at + LIGHT_RECORD_GENERATION_WORD * 4, generation)
 
 			lights++
 		}
@@ -772,11 +912,12 @@ object RustChunkBake {
 		 * is therefore nothing rather than dark. Both blob offsets are zero, which no written record
 		 * can be: the blobs start after the records.
 		 */
-		fun writeAbsentLight(index: Int) {
+		fun writeAbsentLight(index: Int, generation: Int) {
 			val at = lightAt(lights)
 			word(at, index)
 			word(at + 4, 0)
 			word(at + 8, 0)
+			word(at + LIGHT_RECORD_GENERATION_WORD * 4, generation)
 			lights++
 		}
 

@@ -354,11 +354,27 @@ object WgpuNative {
 	 * that changed - followed by masks saying which sections the native side is expected to have. The
 	 * layout is written down in `rust/wgpu-mc-jni/src/section.rs`.
 	 *
-	 * Answers whether the native side is missing part of that neighbourhood, in which case it queued
-	 * no bake and the caller should forget what it has sent and call once more with everything.
+	 * Every record in it is stamped with the world it describes, and this is the answer:
+	 *
+	 *  - bits 0..26 (the rejected mask): those records were written for another world - a level change
+	 *    while this chunk build was already running - so they were not applied. The caller must not
+	 *    record them as sent, or the section stays a hole;
+	 *  - bit 27 (the resync bit): the native side is missing part of the neighbourhood this call
+	 *    described, so the caller forgets what it has sent and calls once more with everything.
 	 */
 	@JvmStatic
-	external fun bakeSections(x: Int, y: Int, z: Int, address: Long, length: Int): Boolean
+	external fun bakeSections(x: Int, y: Int, z: Int, address: Long, length: Int): Int
+
+	/**
+	 * Forgets every section of the world the bake was built against, and answers the new generation.
+	 *
+	 * Called from `LevelRenderer#setLevel`, which is a new world, a dimension change and the way back
+	 * to the title screen alike. The number returned is what the caller stamps its own payloads with;
+	 * the native side refuses any record stamped with anything else, which is what keeps a chunk build
+	 * that was already running from writing the old world's blocks under the new one's coordinates.
+	 */
+	@JvmStatic
+	external fun clearSections(): Int
 
 	@JvmStatic
 	external fun setMatrix(type: Int, mat: FloatArray)

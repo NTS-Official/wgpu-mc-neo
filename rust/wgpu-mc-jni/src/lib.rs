@@ -45,8 +45,8 @@ use wgpu_mc::wgpu::{self, CurrentSurfaceTexture, TextureFormat};
 use wgpu_mc::{Frustum, WmRenderer};
 
 use crate::section::{
-    CachedBlockstateProvider, Payload, SECTIONS, SectionBlocks, SectionLight, WORLD,
-    neighbour_offset,
+    CachedBlockstateProvider, Payload, REJECTED_MASK, RESYNC, SECTIONS, SectionBlocks, SectionLight,
+    WORLD, bump_section_generation, neighbour_offset, section_generation,
 };
 use crate::settings::Settings;
 
@@ -569,10 +569,16 @@ impl<'a> BlockStateProvider for MinecraftBlockStateProviderWrapper<'a> {
 /// a handle per section, because the old shape was ~57 JNI calls and 60 arrays per rebuild, all of it
 /// for data the JVM already had in exactly this form.
 ///
-/// Returns whether the caller has to send the whole neighbourhood again: this side keeps the light of
-/// each section and drops the ones far from the player, so a section the JVM counts as already sent
-/// can be gone here. `true` means that happened, no bake was queued, and the caller should clear its
-/// own bookkeeping and call once more with everything it has.
+/// Returns an answer the JVM reads as two things: a bit per section record it did *not* accept (see
+/// [`REJECTED_MASK`]), and whether the caller has to send the whole neighbourhood again
+/// ([`RESYNC`]).
+///
+/// A record is refused when it was written for another generation of the world - a level change while
+/// this chunk build was already running - and the JVM's reaction is to leave those sections out of
+/// its "what have I sent" table, so the next rebuild carries them again. The resync bit is the older
+/// signal: this side keeps the light of each section and drops the ones far from the player, so a
+/// section the JVM counts as already sent can be gone here, and then the caller has to clear its
+/// bookkeeping and call once more with everything it has.
 #[jni_fn("dev.birb.wgpu.rust.WgpuNative")]
 pub fn bakeSections(
     _env: JNIEnv,
@@ -582,10 +588,12 @@ pub fn bakeSections(
     z: jint,
     address: jlong,
     length: jint,
-) -> jboolean {
+) -> jint {
     // A rebuild can arrive before the client has cached block states, and the cache itself cannot
     // build anything while no block atlas is registered. `AIR` is the registry's, so without it
     // there is no way to tell a hole from a block: say so once and let the caller try again later.
+    // Nothing was accepted, which is what the answer says - the sections stay unsent on the JVM side
+    // and come back with the next rebuild.
     let Some(air) = *AIR else {
         static WARNED: AtomicBool = AtomicBool::new(false);
         if !WARNED.swap(true, Ordering::Relaxed) {
@@ -594,23 +602,25 @@ pub fn bakeSections(
                  skipping until it is built"
             );
         }
-        return false as jboolean;
+        return REJECTED_MASK as jint;
     };
 
     if length <= 0 || address == 0 {
         log::error!("wgpu-mc: a section bake arrived with no payload; dropping it");
-        return false as jboolean;
+        return RESYNC as jint;
     }
 
     // The caller's buffer, read and left alone: everything kept is copied out below, before this
     // returns and the JVM writes the next payload over it.
     let bytes = unsafe { slice::from_raw_parts(address as *const u8, length as usize) };
 
+    let generation = section_generation();
+
     // A payload this side cannot read is one it did not receive. Saying so - rather than answering
     // "all good" - is what makes the JVM forget what it thought had been sent and hand the whole
     // neighbourhood over again, which is the only way back to a cache the two sides agree on.
-    let Some(mut payload) = Payload::parse(bytes) else {
-        return true as jboolean;
+    let Some(mut payload) = Payload::parse(bytes, generation) else {
+        return RESYNC as jint;
     };
 
     let target = ivec3(x, y, z);
@@ -620,25 +630,7 @@ pub fn bakeSections(
     // Apply the payload first, so a bake queued below never sees a half-applied neighbourhood: the
     // sections the caller sent replace what was held for them, and the ones it says to forget are
     // dropped - those are the sections that became air or were unloaded.
-    for (index, slot) in payload.blocks.iter_mut().enumerate() {
-        let pos = target + neighbour_offset(index);
-
-        if payload.absent & (1 << index) != 0 {
-            world.remove_blocks(pos);
-        } else if let Some(blocks) = slot.take() {
-            world.set_blocks(pos, Arc::new(blocks));
-        }
-    }
-
-    for (index, light) in &payload.light {
-        world.set_light(target + neighbour_offset(*index), light.clone());
-    }
-
-    for index in 0..SECTIONS {
-        if payload.light_absent & (1 << index) != 0 {
-            world.remove_light(target + neighbour_offset(index));
-        }
-    }
+    let rejected = payload.apply(&mut world, target);
 
     // A section the JVM marked as "already yours" but that this side does not have - a cache that was
     // trimmed, a new world, a section that became empty under us - means a bake against holes. The
@@ -662,7 +654,7 @@ pub fn bakeSections(
         }
 
         // What did arrive stays: it is the newest version of those sections either way.
-        return true as jboolean;
+        return (rejected | RESYNC) as jint;
     }
 
     let mut blocks: [Option<Arc<SectionBlocks>>; SECTIONS] = Default::default();
@@ -690,7 +682,7 @@ pub fn bakeSections(
         Ok(jvm) => jvm,
         Err(err) => {
             log::error!("wgpu-mc: could not get the JVM handle for a bake: {err}");
-            return false as jboolean;
+            return rejected as jint;
         }
     };
 
@@ -701,7 +693,7 @@ pub fn bakeSections(
         THREAD_POOL.spawn(move || task.run());
     }
 
-    false as jboolean
+    rejected as jint
 }
 /// The pool the section bakes run on.
 ///
@@ -814,6 +806,59 @@ impl BakeTask {
 #[jni_fn("dev.birb.wgpu.rust.WgpuNative")]
 pub fn blocksCached(_env: JNIEnv, _class: JClass) -> jboolean {
     BLOCKS_CACHED.load(Ordering::Acquire) as jboolean
+}
+
+/// Forgets every section of the world the bake was built against, and answers the new generation.
+///
+/// Called from `LevelRenderer#setLevel`, so it covers a dimension change, a new world and the return
+/// to the title screen (`setLevel(null)`) alike. Three things go, and each is a way the old world
+/// would otherwise come back:
+///
+///  - the cached 27-section neighbourhoods, which is what a bake reads its neighbours from;
+///  - the bakes *already queued* for the arena, which are the old world's geometry on its way in;
+///  - the arena itself, whose contents are the old world's meshes - parked for the frames that may
+///    still draw them rather than dropped, exactly as a section walking out of view is (see
+///    `SectionStorage::forget`).
+///
+/// What cannot be cancelled is a bake already running on the pool: it lands in the queue after this
+/// returns and puts one section of the old world into the arena. That is a flash rather than a
+/// permanent state, because the JVM forgets its own bookkeeping at the same moment - every section
+/// the game rebuilds after the switch is sent again in full, and the new world's mesh for that
+/// position replaces it.
+///
+/// The returned number is what the JVM stamps its payloads with; a record stamped with anything else
+/// is refused rather than applied, which is how a chunk build that was already running is kept from
+/// writing the old world's blocks under the new one's coordinates.
+#[jni_fn("dev.birb.wgpu.rust.WgpuNative")]
+pub fn clearSections(_env: JNIEnv, _class: JClass) -> jint {
+    let generation = bump_section_generation();
+
+    WORLD.write().clear();
+
+    let mut queued = 0usize;
+    let mut freed = 0usize;
+
+    if let Some(wm) = RENDERER.get() {
+        {
+            let receiver = wm.chunk_update_queue.1.lock();
+            while receiver.try_recv().is_ok() {
+                queued += 1;
+            }
+        }
+
+        if let Some(scene) = wm.scene() {
+            let mut storage = scene.section_storage.write();
+            freed = storage.len();
+            storage.forget();
+        }
+    }
+
+    log::info!(
+        "wgpu-mc: the section bake was cleared for a level change: generation {generation}, {queued} \
+         queued bake(s) dropped, {freed} section(s) released from the arena"
+    );
+
+    generation as jint
 }
 
 #[jni_fn("dev.birb.wgpu.rust.WgpuNative")]

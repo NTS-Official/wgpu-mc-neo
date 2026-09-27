@@ -188,10 +188,29 @@ impl SectionStorage {
         self.pool
     }
 
-    pub fn clear(&mut self) {
-        self.allocator.reset();
+    /// Drops every stored section, for a world the renderer is no longer drawing.
+    ///
+    /// The ranges go to the deferred buckets rather than back to the allocator, for the reason every
+    /// other free does: the frame already recorded - but not yet submitted - may still be reading
+    /// them, so handing them out again immediately is a section drawn from another section's bytes.
+    /// They come back [`SectionStorage::free_deferred`] calls later, which is a frame or two, and the
+    /// new world's sections are baked over seconds rather than in one frame - so the pool is not
+    /// exhausted in between. What it *is* is finite: a section offered while every slot is parked is
+    /// refused, which the caller answers by keeping the old geometry and the diagnostics count.
+    pub fn forget(&mut self) {
+        let mut deferred = Vec::new();
+
+        for section in self.storage.values() {
+            for layer in &section.layers {
+                if let Some(ranges) = layer {
+                    deferred.push(ranges.vertex_range.clone());
+                    deferred.push(ranges.index_range.clone());
+                }
+            }
+        }
+
         self.storage.clear();
-        self.deferred.clear();
+        self.defer_free(deferred);
     }
     /// How far the arena reaches from the camera, in chunks.
     pub fn width(&self) -> i32 {

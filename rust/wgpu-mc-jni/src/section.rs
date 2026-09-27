@@ -22,6 +22,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use glam::{IVec2, IVec3};
 use once_cell::sync::Lazy;
@@ -42,9 +43,50 @@ pub const SECTIONS: usize = 27;
 /// Bytes in one light layer: 4096 nibbles, indexed by `(y << 8) | (z << 4) | x`.
 pub const LIGHT_BYTES: usize = 2048;
 
+/// The bits a bake call answers with: which of the 27 section records it refused, and whether the
+/// caller has to send the whole neighbourhood again.
+///
+/// A refused index is one whose record was written for another *generation* - the JVM built the
+/// payload against a world this side has since forgotten (see [`section_generation`]) - so it was not
+/// applied and the JVM must not record it as sent.
+pub const REJECTED_MASK: u32 = 0x07FF_FFFF;
+
+/// The `bakeSections` answer's resync bit: this side is missing part of the neighbourhood the JVM
+/// counts as sent, so the caller clears its bookkeeping and sends everything again.
+pub const RESYNC: u32 = 1 << 27;
+
 const HEADER_WORDS: usize = 8;
 const BLOCK_RECORD_WORDS: usize = 16;
 const LIGHT_RECORD_WORDS: usize = 4;
+
+/// Which world a record describes, in the last word of its record.
+///
+/// Both record shapes were one word short of the boundary they are laid out on, so this costs no
+/// space: the block record is 16 words and used 15, the light record 4 and used 3.
+const BLOCK_RECORD_GENERATION_WORD: usize = 15;
+const LIGHT_RECORD_GENERATION_WORD: usize = 3;
+
+/// Which world the section cache describes.
+///
+/// Bumped by [`bump_section_generation`] when the level changes and the bake is forgotten, and read
+/// by every payload: a record stamped with an older generation describes the world that was thrown
+/// away, and applying it would put those blocks under the new world's coordinates - which is what a
+/// chunk build that was already running when the player changed dimension looks like.
+static SECTION_GENERATION: AtomicU32 = AtomicU32::new(0);
+
+/// The world the section cache is describing. See [`SECTION_GENERATION`].
+pub fn section_generation() -> u32 {
+    SECTION_GENERATION.load(Ordering::Relaxed)
+}
+
+/// Forgets which world the cache describes, and answers the new generation.
+///
+/// Called from `clearSections`, and the number it returns is what the JVM stamps its own records
+/// with - one counter, owned here, so the two sides cannot disagree about which world they are
+/// describing.
+pub fn bump_section_generation() -> u32 {
+    SECTION_GENERATION.fetch_add(1, Ordering::Relaxed) + 1
+}
 
 /// One section's block data, decoded the way Minecraft would decode it.
 #[derive(Debug)]
@@ -224,6 +266,15 @@ impl WorldSections {
     pub fn is_empty(&self) -> bool {
         self.blocks.is_empty() && self.light.is_empty()
     }
+
+    /// Drops every section, for a world this side is no longer describing.
+    ///
+    /// The tick counters stay where they are: they are only a clock for the trim, and a fresh world
+    /// that happens to be smaller than the soft limit should not be trimmed on the first bake.
+    pub fn clear(&mut self) {
+        self.blocks.clear();
+        self.light.clear();
+    }
 }
 
 /// The offset of neighbour `index` from the section being baked, in the order the payload uses:
@@ -246,6 +297,9 @@ pub struct Payload {
     pub present: u32,
     /// Which slots the payload says to forget: the section became air, or it was unloaded.
     pub absent: u32,
+    /// Which slots were written for another world. Their records are dropped rather than applied -
+    /// see [`Payload::apply`] - and the caller is told which they were.
+    pub stale: u32,
     /// Which slots the JVM believes this side already has block data for.
     pub known_blocks: u32,
     /// The light that changed, by slot.
@@ -259,11 +313,15 @@ pub struct Payload {
 impl Payload {
     /// Reads a payload written by `RustChunkBake`.
     ///
+    /// `generation` is the world this side is describing: a record stamped with anything else is
+    /// reported in [`Payload::stale`] and otherwise ignored, because the blocks it carries belong to
+    /// a world that was thrown away - a level change while a chunk build was already running.
+    ///
     /// Every field is read as little-endian bytes out of the buffer, so the writer does not have to
     /// align anything and this cannot fault: a length or an offset that runs past the end of the
     /// buffer is `None`, which the caller reports as a dropped bake rather than as a panic on a JNI
     /// frame.
-    pub fn parse(bytes: &[u8]) -> Option<Self> {
+    pub fn parse(bytes: &[u8], generation: u32) -> Option<Self> {
         let magic = read_word(bytes, 0);
         if magic != PAYLOAD_MAGIC {
             log::error!(
@@ -297,6 +355,11 @@ impl Payload {
 
             let index = read_word(record, 0) as usize;
             if index >= SECTIONS {
+                continue;
+            }
+
+            if read_word(record, BLOCK_RECORD_GENERATION_WORD) != generation {
+                payload.stale |= 1 << index;
                 continue;
             }
 
@@ -367,6 +430,11 @@ impl Payload {
                 continue;
             }
 
+            if read_word(record, LIGHT_RECORD_GENERATION_WORD) != generation {
+                payload.stale |= 1 << index;
+                continue;
+            }
+
             let block_offset = read_word(record, 1) as usize;
             let sky_offset = read_word(record, 2) as usize;
 
@@ -395,6 +463,38 @@ impl Payload {
         }
 
         Some(payload)
+    }
+
+    /// Applies this payload to the world cache, and answers which of the 27 slots it refused.
+    ///
+    /// The refused ones are exactly the records that arrived stamped with another generation: the
+    /// world they describe was forgotten while the chunk build that wrote them was running, and
+    /// installing them would put the old world's blocks at coordinates the new one is about to use.
+    /// Nothing else about the call changes - a payload carrying a mix of both is applied for the
+    /// records that are still current - and the caller hands the mask back to the JVM so that those
+    /// sections are not recorded as sent, which is what makes the next rebuild carry them again.
+    pub fn apply(&mut self, world: &mut WorldSections, target: IVec3) -> u32 {
+        for (index, slot) in self.blocks.iter_mut().enumerate() {
+            let pos = target + neighbour_offset(index);
+
+            if self.absent & (1 << index) != 0 {
+                world.remove_blocks(pos);
+            } else if let Some(blocks) = slot.take() {
+                world.set_blocks(pos, Arc::new(blocks));
+            }
+        }
+
+        for (index, light) in &self.light {
+            world.set_light(target + neighbour_offset(*index), light.clone());
+        }
+
+        for index in 0..SECTIONS {
+            if self.light_absent & (1 << index) != 0 {
+                world.remove_light(target + neighbour_offset(index));
+            }
+        }
+
+        self.stale
     }
 }
 
@@ -501,6 +601,10 @@ impl BlockStateProvider for CachedBlockstateProvider {
 mod tests {
     use super::*;
 
+    /// The world the fixture's records are written for. A test that wants a stale record writes
+    /// another number into it.
+    const TEST_GENERATION: u32 = 3;
+
     /// One section's worth of what the JVM writes, so the reader is tested against a writer rather
     /// than against itself.
     struct BlockFixture<'a> {
@@ -514,6 +618,10 @@ mod tests {
     }
 
     fn payload(blocks: &[BlockFixture<'_>], light: &[(usize, Vec<u8>, Vec<u8>)]) -> Vec<u8> {
+        // Every record is stamped with the world the fixture describes; a test that wants a stale one
+        // patches the word afterwards, which is also the shape of the race it stands for.
+        let generation = TEST_GENERATION;
+
         // The two record regions are fixed, exactly as `Payload` writes them: 27 block slots, then 27
         // light slots, then the blobs. Writing the light after however many block records there happen
         // to be is what the reader used to assume, and it is the bug this fixture now cannot repeat.
@@ -567,6 +675,7 @@ mod tests {
             put(&mut bytes, at + 12, block.longs.len() as u32);
             put(&mut bytes, at + 13, longs_offset as u32);
             put(&mut bytes, at + 14, fluids_offset as u32);
+            put(&mut bytes, at + BLOCK_RECORD_GENERATION_WORD, generation);
 
             blob = fluids_offset + block.palette.len();
         }
@@ -581,6 +690,7 @@ mod tests {
             put(&mut bytes, at, *index as u32);
             put(&mut bytes, at + 1, blob as u32);
             put(&mut bytes, at + 2, (blob + LIGHT_BYTES) as u32);
+            put(&mut bytes, at + LIGHT_RECORD_GENERATION_WORD, generation);
 
             blob += LIGHT_BYTES * 2;
         }
@@ -613,7 +723,7 @@ mod tests {
             &[nibbles(&longs, &palette, &[0, 0b0000_1010])],
             &[],
         );
-        let parsed = Payload::parse(&bytes).expect("a payload this build writes");
+        let parsed = Payload::parse(&bytes, TEST_GENERATION).expect("a payload this build writes");
 
         assert_eq!(parsed.present, 1 << 13);
 
@@ -641,7 +751,7 @@ mod tests {
             &[nibbles(&longs, &palette, &[0, 0b0000_1010])],
             &[],
         );
-        let parsed = Payload::parse(&bytes).expect("a payload this build writes");
+        let parsed = Payload::parse(&bytes, TEST_GENERATION).expect("a payload this build writes");
         let section = parsed.blocks[13].as_ref().expect("the section it carried");
 
         // Index 5 is past the end of a two-entry table.
@@ -658,7 +768,7 @@ mod tests {
         sky[0] = 0x0f;
 
         let bytes = payload(&[], &[(13, block, sky)]);
-        let parsed = Payload::parse(&bytes).expect("a payload this build writes");
+        let parsed = Payload::parse(&bytes, TEST_GENERATION).expect("a payload this build writes");
 
         assert_eq!(parsed.light.len(), 1);
         assert_eq!(parsed.light[0].0, 13);
@@ -680,7 +790,7 @@ mod tests {
         block[0] = 0x3f;
 
         let bytes = payload(&[nibbles(&longs, &palette, &[])], &[(0, block, sky)]);
-        let parsed = Payload::parse(&bytes).expect("a payload this build writes");
+        let parsed = Payload::parse(&bytes, TEST_GENERATION).expect("a payload this build writes");
 
         assert_eq!(parsed.present, 1 << 13, "the fixture's block record is index 13");
         assert_eq!(parsed.light.len(), 1);
@@ -693,7 +803,70 @@ mod tests {
         let mut bytes = payload(&[], &[]);
         bytes[0] = 0x00;
 
-        assert!(Payload::parse(&bytes).is_none());
+        assert!(Payload::parse(&bytes, TEST_GENERATION).is_none());
+    }
+
+    /// A record written for a world this side has forgotten is refused rather than applied.
+    ///
+    /// This is the level change: a chunk build was already running when the player left the world, and
+    /// its payload arrives after the cache was cleared. Installing it would put the old world's blocks
+    /// under coordinates the new world is about to use, and the JVM would go on believing they were
+    /// sent - so those sections would never be sent again.
+    #[test]
+    fn a_record_from_another_world_is_refused_and_not_applied() {
+        let key = (7u32 << 16) | 3;
+        let longs = [0x10i64];
+        let palette = [0u32, key];
+
+        let mut bytes = payload(&[nibbles(&longs, &palette, &[])], &[(0, vec![9; LIGHT_BYTES], vec![0; LIGHT_BYTES])]);
+
+        // Patch the block record's generation word, and the light record's, to the world before this
+        // one. Word 15 of the first block record, word 3 of the first light record.
+        let block_generation_at = (HEADER_WORDS + BLOCK_RECORD_GENERATION_WORD) * 4;
+        let light_generation_at = (HEADER_WORDS + SECTIONS * BLOCK_RECORD_WORDS + LIGHT_RECORD_GENERATION_WORD) * 4;
+        bytes[block_generation_at..block_generation_at + 4].copy_from_slice(&(TEST_GENERATION - 1).to_le_bytes());
+        bytes[light_generation_at..light_generation_at + 4].copy_from_slice(&(TEST_GENERATION - 1).to_le_bytes());
+
+        let mut parsed = Payload::parse(&bytes, TEST_GENERATION).expect("a payload this build writes");
+
+        assert_eq!(
+            parsed.stale,
+            (1 << 13) | 1,
+            "the block record is the fixture's index 13 and the light record is index 0"
+        );
+        assert_eq!(parsed.present, 0, "a refused record is not a present section");
+        assert_eq!(parsed.absent, 0, "and it is not a section to forget either");
+        assert!(parsed.light.is_empty(), "nor is its light applied");
+
+        let mut world = WorldSections::default();
+        let rejected = parsed.apply(&mut world, IVec3::new(0, 0, 0));
+
+        assert_eq!(rejected, (1 << 13) | 1, "the caller is told which slots it refused");
+        assert!(
+            world.is_empty(),
+            "and nothing of the old world reached the cache the new one reads"
+        );
+    }
+
+    /// The records a payload carries for the *current* world are applied, and the answer says so.
+    #[test]
+    fn a_record_from_this_world_is_applied_and_accepted() {
+        let key = (7u32 << 16) | 3;
+        let longs = [0x10i64];
+        let palette = [0u32, key];
+
+        let bytes = payload(&[nibbles(&longs, &palette, &[])], &[]);
+        let mut parsed = Payload::parse(&bytes, TEST_GENERATION).expect("a payload this build writes");
+
+        let mut world = WorldSections::default();
+        let rejected = parsed.apply(&mut world, IVec3::new(0, 0, 0));
+
+        assert_eq!(rejected, 0);
+        assert_eq!(
+            world.blocks(neighbour_offset(13)).map(|blocks| blocks.key(1, 0, 0)),
+            Some(Some(BlockstateKey::from(key))),
+            "the section the payload carried is in the cache, at the slot its index names"
+        );
     }
 
     #[test]
@@ -705,7 +878,7 @@ mod tests {
         bytes.truncate(bytes.len() - 4);
 
         assert!(
-            Payload::parse(&bytes).is_none(),
+            Payload::parse(&bytes, TEST_GENERATION).is_none(),
             "a record whose blob is not in the buffer is dropped, not read past the end"
         );
     }
