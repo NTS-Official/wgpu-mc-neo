@@ -47,13 +47,18 @@ struct VertexResult {
     @location(18) color: vec4<f32>
 };
 
-// The section this draw is for, as three integers rather than a vec3i: an immediate has to be a
-// struct for the HLSL backend (push-constant ... has non-struct type is what a bare vector gets),
-// and three i32 members are twelve bytes with no padding - which is the size the pass declares.
+// What one terrain draw is told about itself: the section it draws, and the alpha cutoff its layer
+// asks for. Three integers rather than a vec3i because an immediate has to be a struct for the HLSL
+// backend (push-constant ... has non-struct type is what a bare vector gets), and four members are
+// sixteen bytes with no padding - which is the size the pass declares for them (see
+// `@pc_section_position` in `graph.yaml` and the sizes in `RenderGraph::new`).
 struct SectionPosition {
     x: i32,
     y: i32,
     z: i32,
+    // `0.5` for the cutout layer, `0.0` for the solid one: Minecraft's own two terrain pipelines,
+    // where the first defines `ALPHA_CUTOUT` and the second defines nothing.
+    alpha_cutout: f32,
 };
 
 var<immediate> section_pos: SectionPosition;
@@ -192,7 +197,17 @@ fn frag(
 
 //    let light = textureSample(lightmap_texture, lightmap_sampler, vec2(max(in.light_coords.x, in.light_coords.y), 0.0));
 
-    if(col.a == 0.0f){
+    // The cutout test, at the cutoff the layer being drawn declares.
+    //
+    // This read `if (col.a == 0.0f)` for as long as the atlas had one mip level, where "transparent"
+    // and "exactly zero alpha" are the same texel. The atlas has a mip chain now (`ATLAS_MIP_LEVELS`,
+    // sampled with `mipmap_filter: Linear`), and a hole in a leaf texture is only zero at level 0: at
+    // any level above it, the hole is an *average* of leaves and gaps, a small non-zero alpha - so
+    // nothing was discarded and the face was painted whole, at full strength, because this pass
+    // replaces the target rather than blending into it. Leaves therefore came out solid beyond the
+    // distance at which a sprite stops covering enough pixels to stay on level 0, and the boundary
+    // between the two moved with the camera's distance, angle and field of view.
+    if(col.a < section_pos.alpha_cutout){
         discard;
     }
     return col;

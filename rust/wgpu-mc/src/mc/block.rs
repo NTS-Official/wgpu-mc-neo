@@ -603,8 +603,17 @@ fn recurse_model_parents(
             MeshBakeError::JsonError(err)
         })?;
 
-        recurse_model_parents(&parent, resource_provider, models)?;
+        // The direct parent *first*, then its own ancestors: the resolver takes each answer from the
+        // first model in the chain that has one, and that has to be the nearest ancestor rather than
+        // the root. It was the root's, because this pushed after recursing - so a model whose chain
+        // overrides its elements halfway up got the *grandparent's* geometry. `glazed_terracotta` is
+        // the one that showed it: `template_glazed_terracotta` overrides `cube`'s elements to sample
+        // one `#pattern`, the flattened chain put `cube` first, and the faces came out sampling
+        // `#up`/`#down`/... - keys the template never defines - so every one of the sixteen colours
+        // failed to bake in all four facings and was drawn as bedrock. See
+        // `ModelResolver::resolve_elements`, whose own docs say "increasing level of parenthood".
         models.push(parent_path);
+        recurse_model_parents(&parent, resource_provider, models)?;
     }
 
     Ok(())

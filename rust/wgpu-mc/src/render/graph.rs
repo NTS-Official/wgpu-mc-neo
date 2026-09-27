@@ -327,12 +327,17 @@ impl RenderGraph {
                 })
                 .collect::<Vec<(u32, WmBindGroup)>>();
 
+            // The sizes the shaders themselves declare for these, in bytes: an immediate whose
+            // layout is smaller than the struct the shader reads out of it is a draw that reads
+            // whatever follows in the buffer. `@pc_section_position` is four four-byte members - the
+            // section's position, and the alpha cutoff of the layer being drawn - which is what the
+            // terrain shader's `SectionPosition` spells out and what the pass writes there.
             let immediate_size: u32 = pipeline_config
                 .immediates
                 .iter()
                 .map(|(index, name)| match &name[..] {
                     "@pc_mat4_model" => 64,
-                    "@pc_section_position" => 12,
+                    "@pc_section_position" => 16,
                     "@pc_total_sections" => 4,
                     "@pc_parts_per_entity" => 4,
                     "@pc_electrum_color" => 16,
@@ -825,6 +830,16 @@ impl RenderGraph {
                     // the shader discards the texels a cutout texture leaves empty - so what separates
                     // them here is only which range of the arena is drawn.
                     for layer_index in [RenderLayer::Solid as usize, RenderLayer::Cutout as usize] {
+                        // The alpha test the layer's own pipeline asks for: Minecraft's cutout terrain
+                        // pipeline defines `ALPHA_CUTOUT` as 0.5, and its solid one defines nothing -
+                        // which is a cutoff of zero here, a test no alpha fails, and the reason a
+                        // solid texture is never erased by its own alpha.
+                        let alpha_cutout: f32 = if layer_index == RenderLayer::Cutout as usize {
+                            0.5
+                        } else {
+                            0.0
+                        };
+
                         for (pos, section) in sections.iter() {
                             // The section's *own* position: the view matrix carries the camera's
                             // translation, so a draw is placed by naming where it is, not by naming
@@ -862,11 +877,18 @@ impl RenderGraph {
                             };
 
                             let mut pc: HashMap<String, (Vec<u8>, ShaderStages)> = HashMap::new();
+                            // Sixteen bytes in the layout the shader's `SectionPosition` spells out:
+                            // the three integers, then the layer's alpha cutoff.
+                            let mut constants = [0u8; 16];
+                            constants[..12]
+                                .copy_from_slice(bytemuck::cast_slice(&rel_pos.to_array()));
+                            constants[12..].copy_from_slice(&alpha_cutout.to_ne_bytes());
+
                             pc.insert(
                                 "@pc_section_position".to_string(),
                                 (
-                                    bytemuck::cast_slice(&rel_pos.to_array()).to_vec(),
-                                    ShaderStages::VERTEX,
+                                    constants.to_vec(),
+                                    ShaderStages::VERTEX | ShaderStages::FRAGMENT,
                                 ),
                             );
                             set_push_constants(pipeline_config, &mut render_pass, Some(pc));

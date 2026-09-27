@@ -1106,11 +1106,26 @@ fn bind_groups_for_call(
     // the buffer lookups behind it are skipped together.
     let numbering = call.combo != 0;
 
-    let mut key = if numbering {
-        COMBO_TAG | call.combo as u64
-    } else {
-        plan.salt
-    };
+    // The plan's salt is part of the key in both arms, because a bind group belongs to a *layout*: the
+    // JVM mints its number from the slots as they are bound - the plan, the resource, the length and
+    // any baked offset - and that does not say which pipeline's layout those slots will be bound
+    // under. Two pipelines that bind the same texture, the same uniform and the same buffer in the
+    // same order therefore mint the *same* number, and the pass is then holding bind groups built for
+    // the other pipeline's layout.
+    //
+    // That is not hypothetical: `animate_sprite_interpolate` and `animate_sprite_blit` do exactly
+    // that while the sprite atlas is uploaded, and the frame died at startup with
+    // "Assigned entry with binding 3 not found in expected bind group layout" - the sprite blit
+    // pipeline being handed the interpolate pipeline's set. See `stampOf` on the JVM side for the
+    // other half of this, and `salt` for why a plan has an identity at all.
+    let mut key = fold(
+        if numbering {
+            COMBO_TAG | call.combo as u64
+        } else {
+            0
+        },
+        plan.salt,
+    );
     let mut slot = 0usize;
 
     // Numbered, and the table left behind: the number covers every binding and the offsets are all

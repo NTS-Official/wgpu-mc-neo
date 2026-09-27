@@ -266,10 +266,11 @@ lazy_static! {
             "Bind uniform buffers with an offset instead of baking the offset into the bind group. \
             On by default, and it is what makes the bind group cache worth having: Minecraft \
             re-binds a buffer at a new offset for almost every draw. Turning it off bakes the \
-            offset again, which is what the renderer did before dynamic offsets existed - more bind \
-            groups built, and more memory spent on them. This is the `wgpu-no-dynamic-offsets` \
-            marker as a switch.",
-            false,
+            offset again, which is what the renderer did before dynamic offsets existed - a bind group \
+            per distinct offset, which in a world is thousands a frame, so off is for diagnosis \
+            rather than for play. This is the `wgpu-no-dynamic-offsets` marker as a switch, and like \
+            the marker it is read once: see the restart below.",
+            true,
         ),
         trace_dynamic_offsets: SettingInfo::debug(
             "Log every draw's bindings - the plan, each binding in slot order, and the offset that \
@@ -1178,15 +1179,16 @@ mod tests {
     fn only_gpu_based_validation_needs_a_restart() {
         let info: serde_json::Value = serde_json::from_str(&SETTINGS_INFO_JSON).expect("schema");
 
-        // Two of them are decided while the device is being created and cannot be revisited: the
-        // instance flag, and PIX's capturers, which have to be in the process before the first
-        // D3D12 call. The rest are read on the draw path, so applying them takes effect on the next
-        // frame.
-        for name in ["gpu_based_validation", "pix_capture"] {
+        // `dynamic_offsets` is the third, and the one this test got wrong first: it was declared
+        // live, on the reasoning that it is only read as a draw is recorded - but *what* it decides
+        // is whether a uniform's offset is part of the number the JVM identifies a draw's bind groups
+        // by, and a pass that is holding bind groups built under the other answer cannot follow it.
+        // Flipping it in a running world ended the process. See `set_dynamic_offsets` in `debug.rs`.
+        for name in ["gpu_based_validation", "pix_capture", "dynamic_offsets"] {
             assert_eq!(
                 info[name]["needs_restart"],
                 serde_json::Value::Bool(true),
-                "{name} is decided while the device is created"
+                "{name} cannot change under a frame that is already numbered"
             );
         }
 
@@ -1194,7 +1196,6 @@ mod tests {
             "logging",
             "diagnostics",
             "bind_group_cache",
-            "dynamic_offsets",
             "trace_dynamic_offsets",
             "binding_verbosity",
             "dump_shaders",

@@ -162,8 +162,19 @@ that can be replaced while the game runs. It is declared `needs_restart: true` i
 Applied settings are written to disk by the Rust side (`sendSettings`), which is what makes the
 restart actually pick the new backend up.
 
-**`vsync` does not need one, and no longer asks for it.** It only chooses the swapchain's present
-mode, and a surface can be reconfigured whenever the game likes - this backend already does it on
+**`dynamic_offsets` now asks for one too, and it is the case that shows why the flag has to be the
+honest one.** It was declared `needs_restart: false` and was live - the switch decides whether a
+uniform offset travels with the draw or is baked into the bind group it is bound with, and the JVM
+side mints a *number* for a set of bindings which is what the bind group cache is keyed by. Which
+of those two a binding is decides whether the offset is part of that number, so flipping the switch
+between two draws of one frame leaves the pass holding bind groups built for the other rule - and
+the game died the first time anyone flipped it in a running world. The switch is now latched at the
+first read (`set_dynamic_offsets` in `rust/wgpu-mc-jni/src/debug.rs`, which also warns and ignores a
+later change) *and* declared `needs_restart: true`, so the UI says so before anyone tries. Off is
+also the slow setting - a bind group per distinct offset rather than per binding set - which is why
+the tooltip says it is for diagnosis rather than for play.
+
+**`vsync` does not need one, and no longer asks for it.** It only chooses the swapchain's presentmode, and a surface can be reconfigured whenever the game likes - this backend already does it on
 every resize and whenever the swapchain goes stale. `sendSettings` therefore re-resolves the mode
 from the settings it has just stored and reconfigures the surface if it changed
 (`reapply_present_mode` in `device.rs`); `configure_surface_inner` compares the present mode along
@@ -2575,6 +2586,65 @@ part of the variant rather than of the model file, so it has to be applied insid
 finished mesh could not express a multipart block whose two variants are turned differently, and doing
 it per state would rebuild meshes that are shared.
 
+### A face between the lines of the vertex format
+
+A baked vertex holds its position in **sixteenths of a block**: eight bits an axis, plus one bit for
+"this coordinate is exactly 256". Everything a model normally asks for is on that grid, and geometry
+that is on it is drawn exactly where it was baked. A model is free to ask for something that is not,
+and the leaf litter does: `template_leaf_litter_*` is **one quad at 0.25/16 of a block**, with an `up`
+face and a `down` face, and the block below it draws its own top face at the boundary.
+
+Truncating to the grid - which is what the encoder used to do - puts that quad at y = 0, which is
+*exactly* the plane the ground's top face is on. Two coplanar surfaces are then decided per pixel by
+the last bits of two projected z values that are equal only to within rounding, so the leaf texture and
+the ground show through each other in patches that move as the camera **turns** and not at all as it
+**moves** - moving both surfaces together leaves their difference where it was. That is the flicker,
+and it is the same bug for pink petals, flower clusters and anything else that sits lower than a
+sixteenth.
+
+The encoder rounds **up** now, so a face between the lines is drawn on the line above it rather than the
+one below: 1/64 of a block becomes 1/16, a third of a pixel at any distance, and it no longer shares a
+plane with the block it is lying on. On-grid geometry does not move at all, and the rule is monotone, so
+nothing crosses anything.
+
+### The cutout test stopped testing anything when the atlas got a mip chain
+
+The terrain shader is inherited from the demo, and so was its alpha test:
+
+```wgsl
+if (col.a == 0.0f) { discard; }
+```
+
+That is a correct cutout test on an atlas with **one mip level**, where a texel is either leaf or hole
+and a hole is exactly zero. The mod's atlas is not that atlas: it is built with a mip chain
+(`ATLAS_MIP_LEVELS`, full image and three halves) and sampled with `mipmap_filter: Linear`. At level 0 a
+hole is still exactly zero and the equality holds - so **near** leaves were cut out correctly, which is
+why the bug looked like a rendering *region* rather than a bug. At any level above 0 the hole is no
+longer a texel: it is the average of leaves and gaps, a small non-zero alpha, the equality fails for
+every texel of the face, and since the terrain pass **replaces** the target rather than blending into it
+(`blending: replace`), the whole quad is painted at full strength. Leaves went solid, in exactly the
+places where the sprite stops covering enough pixels to stay on level 0.
+
+The derivative that picks the mip level is screen-space, so the boundary between the two is a
+screen-space iso-line: it follows **distance, viewing angle and field of view**, and on the flat leaves
+of a canopy it is one or a few straight lines. Reported as "high quality inside a range, opaque outside
+it, and the range moves with the camera" - which is a description of `log2(texels per pixel)` crossing
+1.0, not of a culling frustum.
+
+The test now reads the cutoff from the layer being drawn:
+
+```wgsl
+if (col.a < section_pos.alpha_cutout) { discard; }
+```
+
+`0.5` for the cutout layer and `0.0` for the solid one, which is what Minecraft's own two terrain
+pipelines say - `CUTOUT_TERRAIN` defines `ALPHA_CUTOUT` as `0.5F` and `SOLID_TERRAIN` defines nothing,
+and a cutoff of zero is a test nothing fails. The value travels in the immediate the pass already hands
+each draw, so it costs no extra binding: `@pc_section_position` is sixteen bytes now - the section
+position and a float - and the shader's `SectionPosition` struct is what fixes that size. A wider struct
+than the layout declares is a draw reading past its own data, so the size in `RenderGraph::new`'s table
+and the struct in `terrain.wgsl` are the two halves of one number and have to be changed together.
+
 ### Known gaps
 
 - **A sprite is classified as a whole, not per face.** The layer table `Atlas::sprite_layer` fills in
@@ -2584,6 +2654,15 @@ it per state would rebuild meshes that are shared.
   part opaque and part cutout, a face that only samples the opaque part is put in the cutout layer as
   well. That is the safe direction (Minecraft's own pass draws it, correctly), and closing it needs
   the face's UV rectangle handed down to the atlas rather than the sprite's name.
+
+- **The vertex position is on a 1/16-block grid, and a model can ask for less than that.** Eight bits
+  an axis plus one flag holds 0..16 blocks in sixteenths, and the leaf litter's 1/64 is not on it -
+  see "A face between the lines of the vertex format", where rounding up is what keeps it off the
+  ground's plane. What rounding cannot fix is geometry *thinner* than 1/16: a 1/64-thick plate's two
+  faces both land on the line above, so it is drawn as nothing rather than as a plate. The honest fix
+  is two bytes an axis at 1/256 (six bytes of position instead of three, a `u16` decode in
+  `shaders/terrain.wgsl`, and 16 → 20 bytes a vertex, which is a quarter more arena for every section
+  in the world), and it is worth doing when a block that is thinner than a sixteenth actually matters.
 
 - **The Fabric module's C header is a snapshot from before the 26.1 work.** `fabric/src/main/wgpu-mc.h`
   is what the Fabric backend's `jextract` bindings are generated from, and it is not

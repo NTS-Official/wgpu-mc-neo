@@ -1,9 +1,11 @@
 # "wgpu-mc" — Minecraft Rendering Engine Built in Rust
 <img  src="media/logo.png" width="280" alt="">
+<p>
 <img alt="Static Badge" src="https://img.shields.io/badge/Powered_by-WebGPU-orange?logo=webgpu&logoSize=auto&link=https%3A%2F%2Fwebgpu.org%2F">
 <img alt="Static Badge" src="https://img.shields.io/badge/Discord_-5865F2?style=flat-square&logo=discord&logoColor=fff&link=https%3A%2F%2Fdiscord.gg%2FNTuK8bQ2hn">
 <img alt="Static Badge" src="https://img.shields.io/badge/Matrix_-000?style=flat-square&logo=matrix&logoColor=fff&link=%20https%3A%2F%2Fmatrix.to%2F%23%2F%23wgpu-mc%3Amatrix.org">
-<img alt="Dynamic Badge" src="https://img.shields.io/github/actions/workflow/status/NTS-Official/wgpu-mc-neo/build.yml"><br>
+<img alt="Dynamic Badge" src="https://img.shields.io/github/actions/workflow/status/NTS-Official/wgpu-mc-neo/build.yml">
+</p>
 
 > [!WARNING]
 > Original project wgpu-mc is in **Beta**. [Contributions appreciated](https://github.com/wgpu-mc/wgpu-mc/labels/engine).<br>
