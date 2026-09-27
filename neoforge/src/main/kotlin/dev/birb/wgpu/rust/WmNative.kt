@@ -532,6 +532,24 @@ object WmNative {
         handle("terrain_sections_refused", FunctionDescriptor.of(INT))
 
     /**
+     * How many of those refusals were handed to this side by [WgpuNative.refusedSections].
+     *
+     * The return channel's other half: `RustChunkBake` counts what it drains, and the two totals have
+     * to agree - a refusal that never arrived is a section this side still believes was baked, which
+     * nothing will offer again.
+     */
+    @JvmField val terrainSectionsRefusedReported: MethodHandle =
+        handle("terrain_sections_refused_reported", FunctionDescriptor.of(INT))
+
+    /**
+     * How many refusals were never handed over: past the native list's cap, or cleared by a level
+     * change. `refused == reported + dropped` is the invariant, so a mismatch that is not explained
+     * by this number is a broken channel.
+     */
+    @JvmField val terrainSectionsRefusedDropped: MethodHandle =
+        handle("terrain_sections_refused_dropped", FunctionDescriptor.of(INT))
+
+    /**
      * Restricts drawing in [createRenderPass]'s pass to a rectangle of its colour target.
      *
      * Coordinates are OpenGL's - measured from the target's origin row - which is the convention

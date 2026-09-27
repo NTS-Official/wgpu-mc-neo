@@ -263,6 +263,12 @@ impl WmRenderer {
         // waited for. Doing it per update would free a range parked earlier in the *same* frame.
         scene.section_storage.write().free_deferred();
 
+        // The arena's buffer, held for the whole drain: it is replaced when the arena is resized, and
+        // the ranges being written below were handed out by the pool that goes with the buffer that is
+        // loaded here. One load for all of them, so a resize cannot land between two writes of the
+        // same frame.
+        let chunk_buffer = scene.chunk_buffer.load_full();
+
         updates.for_each(|(pos, layers)| {
             moved += 1;
 
@@ -283,12 +289,12 @@ impl WmRenderer {
             for (i, ranges) in section.layers.iter().enumerate() {
                 if let Some(ranges) = ranges {
                     self.gpu.queue.write_buffer(
-                        &scene.chunk_buffer.buffer,
+                        &chunk_buffer.buffer,
                         ranges.vertex_range.start as u64 * 4,
                         &layers[i].vertices,
                     );
                     self.gpu.queue.write_buffer(
-                        &scene.chunk_buffer.buffer,
+                        &chunk_buffer.buffer,
                         ranges.index_range.start as u64 * 4,
                         &layers[i].indices,
                     );

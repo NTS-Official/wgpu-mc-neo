@@ -12,7 +12,7 @@ use jni::objects::{
     AutoElements, GlobalRef, JByteArray, JClass, JIntArray, JLongArray, JObject, JObjectArray,
     JPrimitiveArray, JString, JValue, JValueOwned, ReleaseMode, WeakRef,
 };
-use jni::sys::{JNI_FALSE, JNI_TRUE, jboolean, jbyte, jint, jlong, jsize, jstring};
+use jni::sys::{JNI_FALSE, JNI_TRUE, jboolean, jbyte, jint, jlong, jlongArray, jsize, jstring};
 use jni::{JNIEnv, JavaVM};
 use jni_fn::jni_fn;
 use once_cell::sync::{Lazy, OnceCell};
@@ -45,8 +45,8 @@ use wgpu_mc::wgpu::{self, CurrentSurfaceTexture, TextureFormat};
 use wgpu_mc::{Frustum, WmRenderer};
 
 use crate::section::{
-    CachedBlockstateProvider, Payload, REJECTED_MASK, RESYNC, SECTIONS, SectionBlocks, SectionLight,
-    WORLD, bump_section_generation, neighbour_offset, section_generation,
+    CENTER, CachedBlockstateProvider, Payload, REJECTED_MASK, RESYNC, SECTIONS, SectionBlocks,
+    SectionLight, WORLD, bump_section_generation, neighbour_offset, section_generation, section_key,
 };
 use crate::settings::Settings;
 
@@ -682,15 +682,26 @@ pub fn bakeSections(
         Ok(jvm) => jvm,
         Err(err) => {
             log::error!("wgpu-mc: could not get the JVM handle for a bake: {err}");
-            return rejected as jint;
+
+            // No bake was queued, so the section this call was about is not on its way to the arena -
+            // and the JVM must not be told it was. Nothing of it will be drawn until it is offered
+            // again, and a rebuild only draws what changed: without this bit the section would be
+            // recorded as sent, the next rebuild would find nothing to say, and the hole would be
+            // permanent. The 26 neighbours *were* applied, and they are still the newest version of
+            // those sections, so the refusal is the one slot.
+            return (rejected | (1 << CENTER)) as jint;
         }
     };
 
     // The Java thread is done with this section: everything the bake needs is owned by now, so it
     // goes to the pool and the caller returns to Minecraft's chunk build. See [BakeTask] for what
     // crosses the thread boundary and what deliberately does not.
-    if let Some(task) = BakeTask::new(target, provider, jvm) {
-        THREAD_POOL.spawn(move || task.run());
+    match BakeTask::new(target, provider, jvm) {
+        Some(task) => THREAD_POOL.spawn(move || task.run()),
+        // The queue is full, so this bake is dropped on the floor - the same hole as above, from the
+        // same cause: the section was applied here and nothing is going to bake it. The warning is
+        // inside `reserve_bake_slot`; this is the bit that makes the JVM offer it again.
+        None => return (rejected | (1 << CENTER)) as jint,
     }
 
     rejected as jint
@@ -808,6 +819,36 @@ pub fn blocksCached(_env: JNIEnv, _class: JClass) -> jboolean {
     BLOCKS_CACHED.load(Ordering::Acquire) as jboolean
 }
 
+/// The sections the arena had no room for since the last call, as the keys the JVM knows them by.
+///
+/// The other half of the refusal counter the terrain line prints: the counter says *how much* of the
+/// view was dropped, and this says *which* - because a section the JVM has been told was baked, and
+/// which never reached the arena, is a hole nothing will fill on its own. Its rebuild has already
+/// happened, and a rebuild carries only what changed; so the JVM takes these keys out of its
+/// "what have I sent" table and the next rebuild of each section carries its blocks again.
+///
+/// Drains, so one call per client tick is the whole protocol: what is not handed over by then is
+/// handed over by the next call. The keys are packed the way the JVM packs them - see
+/// `section::section_key` - so nothing has to be unpacked on either side.
+#[jni_fn("dev.birb.wgpu.rust.WgpuNative")]
+pub fn refusedSections(mut env: JNIEnv, _class: JClass) -> jlongArray {
+    let refused = RENDERER
+        .get()
+        .and_then(|wm| wm.scene())
+        .map(|scene| scene.section_storage.write().refused())
+        .unwrap_or_default();
+
+    let keys: Vec<jlong> = refused.iter().map(|pos| section_key(*pos)).collect();
+
+    let array = env.new_long_array(keys.len() as i32).unwrap();
+
+    if !keys.is_empty() {
+        env.set_long_array_region(&array, 0, &keys).unwrap();
+    }
+
+    array.into_raw()
+}
+
 /// Forgets every section of the world the bake was built against, and answers the new generation.
 ///
 /// Called from `LevelRenderer#setLevel`, so it covers a dimension change, a new world and the return
@@ -816,9 +857,9 @@ pub fn blocksCached(_env: JNIEnv, _class: JClass) -> jboolean {
 ///
 ///  - the cached 27-section neighbourhoods, which is what a bake reads its neighbours from;
 ///  - the bakes *already queued* for the arena, which are the old world's geometry on its way in;
-///  - the arena itself, whose contents are the old world's meshes - parked for the frames that may
-///    still draw them rather than dropped, exactly as a section walking out of view is (see
-///    `SectionStorage::forget`).
+///  - the arena itself, whose contents are the old world's meshes - and whose ranges go straight back
+///    to the pool, the one free in the section storage that is not deferred: a level change arrives
+///    between frames, and the new world needs every slot it has (see `SectionStorage::forget`).
 ///
 /// What cannot be cancelled is a bake already running on the pool: it lands in the queue after this
 /// returns and puts one section of the old world into the arena. That is a flash rather than a

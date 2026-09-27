@@ -4505,6 +4505,23 @@ pub extern "C" fn terrain_sections_refused() -> u32 {
     wgpu_mc::mc::chunk::sections_refused().min(u32::MAX as u64) as u32
 }
 
+/// How many of those refusals were handed to the JVM by `refusedSections`, over the whole run.
+///
+/// The other half of the return channel's diagnostic: the JVM counts what it drains, and the two
+/// numbers have to agree - a refusal that never arrived is a section the JVM still believes was
+/// baked, which nothing will offer again.
+#[unsafe(no_mangle)]
+pub extern "C" fn terrain_sections_refused_reported() -> u32 {
+    wgpu_mc::mc::chunk::sections_refused_reported().min(u32::MAX as u64) as u32
+}
+
+/// How many refusals were never handed over, over the whole run: past the list's cap, or cleared by
+/// a level change. `refused == reported + dropped` is the invariant; see [terrain_sections_refused].
+#[unsafe(no_mangle)]
+pub extern "C" fn terrain_sections_refused_dropped() -> u32 {
+    wgpu_mc::mc::chunk::sections_refused_dropped().min(u32::MAX as u64) as u32
+}
+
 /// How many fluid faces the mesher has drawn, over every bake so far. See [terrain_fluid_blocks].
 #[unsafe(no_mangle)]
 pub extern "C" fn terrain_fluid_quads() -> u32 {
@@ -4587,14 +4604,24 @@ fn ensure_terrain_pipeline(wm: &WmRenderer) -> bool {
 /// since the last frame are moved into the arena here, the ones the camera has left behind are
 /// trimmed, and the depth texture is rebuilt if this frame is a different size from the last one. It
 /// happens *before* the blit records itself, so the buffer writes belong to the frame they are for.
-/// Says how far the arena should reach, in chunks, which is what the arena is trimmed to.
+/// Says how far the arena should reach, in chunks, and sizes it to that.
 ///
 /// The render distance is Minecraft's own - the setting the player moves on the video options
 /// screen - and it is sent rather than guessed because the arena's job is to hold exactly what the
 /// game is drawing: trim it tighter and sections are freed while their meshes are still on screen,
 /// leave it wider and the arena grows with everything the player has ever walked past.
 ///
-/// Once per change, not once per frame: the distance moves when the slider does.
+/// Once per change, not once per frame: the distance moves when the slider does, and the JVM's side
+/// of this (see `sendCameraSection`) sends it whenever it differs from the last one it sent. The
+/// report that matters is the first one, and it arrives when a world is joined - which is the moment
+/// `LevelRenderer#setLevel` has just cleared the arena, so the arena is empty and the size takes.
+/// That is where a session's arena is decided, buffer and all.
+///
+/// What a *later* report cannot do is resize: the arena is one range allocator over one buffer, and
+/// neither can be moved under live sections. The arena keeps the size it was built with, the trim
+/// radius still follows the new distance, and the log says which of the two happened. A report that
+/// arrives before the scene exists is dropped for the same reason it is rare - the JVM counts it as
+/// sent, and the arena keeps the default size it was created with, which is the large one.
 #[jni_fn("dev.birb.wgpu.rust.WgpuNative")]
 pub fn setRenderDistance(_env: JNIEnv, _class: JClass, chunks: jint) {
     let Some(wm) = RENDERER.get() else {
@@ -4602,45 +4629,40 @@ pub fn setRenderDistance(_env: JNIEnv, _class: JClass, chunks: jint) {
     };
 
     let Some(scene) = wm.scene() else {
-        // No scene yet, so nothing to size: the value is a setting, and the JVM sends it again when
-        // the scene exists - the first frame that presents asks for both.
+        // No scene yet, so nothing to size - and this report is not sent again, because the JVM's
+        // side of it fires on a change: the arena keeps the default, large size it was created with.
+        // That is the direction to fail in: a session whose arena was never sized to the game's
+        // render distance has more room than it needs, not less.
         return;
     };
 
     let chunks = chunks.max(0);
     let previous = scene.section_storage.read().width();
-    let wanted = wgpu_mc::mc::chunk::arena_slots(chunks as u32);
-    let wanted = wanted.min(wgpu_mc::mc::chunk::ARENA_SLOTS);
+    // Capped, because a render distance is a slider and the arena is a buffer: `arena_slots` asks for
+    // about 1.7 GB at 64 chunks, and an arena that cannot be created is a renderer that cannot draw.
+    let wanted = wgpu_mc::mc::chunk::arena_slots(chunks as u32).min(wgpu_mc::mc::chunk::ARENA_SLOTS);
 
-    // The pool, not just the trim radius: a render distance is what says how many sections there are to
-    // hold, and the arena is one range allocator that cannot be resized under live sections. The first
-    // report is a frame or two after the window opens, long before the world has anything to bake, so
-    // the pool is set then - and a later change is refused by `set_pool` rather than corrupting what is
-    // already drawn, with a line saying so.
-    let sized = {
-        let mut storage = scene.section_storage.write();
-        let sized = storage.set_pool(wanted);
-
-        if sized {
-            info!(
-                "wgpu-mc: the section arena holds {} slot(s) for {chunks} chunk(s) of view",
-                wanted
-            );
-        }
-
-        sized
-    };
+    // The pool *and* the buffer it lives in, in one call, and only while the arena is empty - see
+    // `Scene::set_arena_slots`. The report arrives when a world is joined, which is the moment the
+    // arena was just cleared for, so this is where a session's arena is sized: to what the game says
+    // it is drawing, rather than to the largest render distance it might have been set to. A later
+    // change is refused rather than resizing under live sections, with a line saying so.
+    let sized = scene.set_arena_slots(wm, wanted);
 
     scene.section_storage.write().set_width(chunks);
 
-    if previous != chunks && !sized {
+    if sized {
+        info!(
+            "wgpu-mc: the section arena holds {} slot(s), {} MB, for {chunks} chunk(s) of view",
+            wanted,
+            wanted as u64 * 4 / (1024 * 1024)
+        );
+    } else if previous != chunks {
         warn!(
             "wgpu-mc: the render distance is now {chunks} chunk(s), which the arena cannot be resized \
              for while it holds sections; it keeps the {} slot(s) it was built with",
             scene.section_storage.read().pool_slots()
         );
-    } else if previous != chunks {
-        info!("wgpu-mc: the section arena now reaches {chunks} chunk(s) from the camera");
     }
 }
 
@@ -4669,6 +4691,17 @@ pub fn setCameraSection(_env: JNIEnv, _class: JClass, x: jint, z: jint) {
     *scene.camera_section_pos.write() = glam::ivec2(x, z);
 }
 
+/// Blits the frame into the swapchain image, and submits it.
+///
+/// The blit is what turns the main target's clip space back over - see `PresentBlit` - and it is
+/// recorded into the shared encoder rather than one of its own: the whole frame is in that encoder,
+/// and this is the submission that carries it, right before the swapchain image is presented.
+///
+/// This is also where the scene is ticked, because it is the one point in a frame that is known to
+/// happen exactly once and to have a framebuffer size behind it: the sections the baker finished
+/// since the last frame are moved into the arena here, the ones the camera has left behind are
+/// trimmed, and the depth texture is rebuilt if this frame is a different size from the last one. It
+/// happens *before* the blit records itself, so the buffer writes belong to the frame they are for.
 #[unsafe(no_mangle)]
 pub extern "C" fn blit_from_texture(
     wm: &WmRenderer,

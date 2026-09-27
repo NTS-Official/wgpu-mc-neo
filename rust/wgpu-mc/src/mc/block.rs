@@ -267,15 +267,22 @@ fn recurse_model_parents(
     Ok(())
 }
 
+/// The model chain of one model, merged into what its faces actually sample.
+///
+/// Every model goes through [`ModelResolver::resolve_model`], including one with no parent at all.
+/// That is not a formality: the resolver is what rewrites the `#name` a *face* carries into the
+/// sprite the model's `textures` map points at, and a model that skipped it reached the baker with
+/// `#all` still in its faces - which `get_atlas_uv` then looked up in the atlas as a sprite called
+/// `#all`, found nothing, and dropped the face. Silently: a parentless model was a block drawn with
+/// no faces at all, and nothing in the log said why.
+///
+/// The layer a model asks for comes back with it: the strongest spelling in the chain wins, because
+/// `force_translucent` sits on the *textures* a child inherits from its parents.
 fn resolve_model(
     model: schemas::Model,
     declared: Option<RenderLayer>,
     resource_provider: &dyn ResourceProvider,
 ) -> Result<(schemas::Model, Option<RenderLayer>), MeshBakeError> {
-    if model.parent.is_none() {
-        return Ok((model, declared));
-    }
-
     let mut parent_paths = Vec::new();
     recurse_model_parents(&model, resource_provider, &mut parent_paths)?;
 
@@ -327,6 +334,32 @@ fn resolve_model(
     }
 
     Ok((schema, layer))
+}
+
+/// The first texture reference left in a resolved model, described, or `None` when every texture it
+/// names is a concrete sprite.
+///
+/// Both places a model names one, because both reach the same lookup: the `textures` map, whose keys
+/// the faces resolve through, and the faces themselves, which are what `get_atlas_uv` is handed. A
+/// reference that got this far is a sprite the atlas will not have, and the face that samples it is
+/// dropped without a word - so the description is what the caller puts in the error it reports.
+fn unresolved_texture(model: &schemas::Model) -> Option<String> {
+    if let Some(textures) = &model.textures {
+        if let Some((key, value)) = textures
+            .iter()
+            .find(|(_key, value)| value.reference().is_some())
+        {
+            return Some(format!("key: {key} value: {value:?}"));
+        }
+    }
+
+    model
+        .elements
+        .iter()
+        .flatten()
+        .flat_map(|element| element.faces.iter())
+        .find(|(_direction, face)| face.texture.reference().is_some())
+        .map(|(direction, face)| format!("face {direction:?} samples {}", face.texture.0))
 }
 
 fn get_atlas_uv(face: &schemas::models::ElementFace, block_atlas: &Atlas) -> Option<UV> {
@@ -412,18 +445,17 @@ impl ModelMesh {
                 // nothing about.
                 let model_layer = layer.unwrap_or(RenderLayer::Solid);
 
-                if let Some(textures) = model.textures {
-                    //Make sure the textures in the model are fully resolved with no references
-                    if let Some(reference) = textures
-                        .iter()
-                        .find(|(_key, value)| value.reference().is_some())
-                    {
-                        return Err(MeshBakeError::UnresolvedTextureReference(format!(
-                            "key: {} value: {:?}",
-                            reference.0, reference.1
-                        )));
-                    }
+                // A `#name` that survived resolution is a face about to be looked up in the atlas as
+                // a sprite called `#name` - which is not there, so the face is dropped and the block
+                // is drawn with a hole in it and nothing in the log. Both places a model can still be
+                // holding one are checked *because* the difference is invisible: the `textures` map,
+                // which names the sprite under a key, and the faces, which sample it. See
+                // `resolve_model` for how a model gets here resolved at all.
+                if let Some(reference) = unresolved_texture(&model) {
+                    return Err(MeshBakeError::UnresolvedTextureReference(reference));
+                }
 
+                if let Some(textures) = model.textures {
                     let uv_map = block_atlas.uv_map.read();
 
                     let unallocated_textures: Vec<ResourcePath> = textures
@@ -922,5 +954,107 @@ impl ModelMesh {
             }
         });
         Ok(result)
+    }
+}
+
+/// Resolving a model, and the check that catches what resolution could not do. See [`resolve_model`]
+/// and [`unresolved_texture`].
+#[cfg(test)]
+mod texture_resolution_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// A resource provider over a fixed set of files, which is all `resolve_model` asks for.
+    struct Files(HashMap<String, String>);
+
+    impl ResourceProvider for Files {
+        fn get_bytes(&self, id: &ResourcePath) -> Option<Vec<u8>> {
+            self.0.get(&id.0).map(|body| body.clone().into_bytes())
+        }
+    }
+
+    fn files(entries: &[(&str, &str)]) -> Files {
+        Files(
+            entries
+                .iter()
+                .map(|(path, body)| (path.to_string(), body.to_string()))
+                .collect(),
+        )
+    }
+
+    /// A model that is nothing but one element facing north, with the texture it samples named by the
+    /// `textures` map.
+    fn one_face_model(texture: &str) -> &'static str {
+        // The strings are leaked rather than threaded through a lifetime: a test that builds a model
+        // out of JSON has nothing to borrow from.
+        Box::leak(
+            format!(
+                r##"{{
+                    "textures": {{ "all": "{texture}" }},
+                    "elements": [
+                        {{
+                            "from": [0, 0, 0],
+                            "to": [16, 16, 16],
+                            "faces": {{ "north": {{ "texture": "#all" }} }}
+                        }}
+                    ]
+                }}"##
+            )
+            .into_boxed_str(),
+        )
+    }
+
+    fn north_face(model: &schemas::Model) -> &schemas::models::ElementFace {
+        model.elements.as_ref().expect("elements")[0]
+            .faces
+            .get(&schemas::models::BlockFace::North)
+            .expect("the face the fixture wrote")
+    }
+
+    /// A model with **no parent** still goes through the resolver, which is what rewrites the `#all`
+    /// in its faces. Skipping that - which is what the early return did - left the face sampling a
+    /// sprite called `#all`: not in the atlas, so the face was dropped and the block was drawn with
+    /// no faces at all, silently.
+    #[test]
+    fn a_parentless_model_has_the_textures_in_its_faces_resolved() {
+        let provider = files(&[(
+            "minecraft:models/block/solo.json",
+            one_face_model("minecraft:block/stone"),
+        )]);
+
+        let json = provider
+            .get_string(&ResourcePath::from("minecraft:models/block/solo.json"))
+            .expect("the fixture's model");
+        let model = parse_model(&json).expect("a model this build can read");
+        assert!(model.parent.is_none(), "the fixture has no parent");
+
+        let (resolved, _) = resolve_model(model, None, &provider).expect("it resolves");
+
+        assert_eq!(
+            north_face(&resolved).texture.0, "minecraft:block/stone",
+            "the face samples the sprite its `textures` map names, not the reference"
+        );
+        assert!(unresolved_texture(&resolved).is_none());
+    }
+
+    /// And what the resolver cannot do is reported rather than left to the atlas lookup, which would
+    /// drop the face without a word.
+    #[test]
+    fn a_reference_nothing_defines_is_reported() {
+        let provider = files(&[(
+            "minecraft:models/block/broken.json",
+            one_face_model("#nothing_defines_this"),
+        )]);
+
+        let json = provider
+            .get_string(&ResourcePath::from("minecraft:models/block/broken.json"))
+            .expect("the fixture's model");
+        let model = parse_model(&json).expect("a model this build can read");
+
+        let described = unresolved_texture(&model).expect("the reference is still there");
+        assert!(
+            described.contains("nothing_defines_this"),
+            "the description has to name it: {described}"
+        );
     }
 }

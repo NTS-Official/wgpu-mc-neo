@@ -287,6 +287,24 @@ pub fn neighbour_offset(index: usize) -> IVec3 {
     )
 }
 
+/// The payload slot of the section being rebuilt: the middle of the 3x3x3, which is index 13 in the
+/// order [`neighbour_offset`] indexes - `x` fastest, then `y`, then `z`, so `(1, 1, 1)` before the
+/// offsets are centred. Both the order and the middle are pinned by tests in this module.
+pub const CENTER: usize = 13;
+
+/// The key Minecraft knows a section by: `SectionPos.asLong(x, y, z)`.
+///
+/// The JVM side keys its "what have I sent" table by exactly this, so a position can be handed over
+/// as the key itself and taken out of that table without being unpacked first - one number per
+/// section, and no chance of the two sides disagreeing about a layout only one of them implements.
+///
+/// The layout is Minecraft's own: x in the high 22 bits, z in the next 22, y in the low 20, each
+/// masked to its width so a negative coordinate packs as the complement `SectionPos.x/y/z` sign
+/// extends back.
+pub fn section_key(pos: IVec3) -> i64 {
+    ((pos.x as i64 & 0x3F_FFFF) << 42) | ((pos.z as i64 & 0x3F_FFFF) << 20) | (pos.y as i64 & 0xF_FFFF)
+}
+
 /// One parsed call: what arrived with it.
 #[derive(Debug, Default)]
 pub struct Payload {
@@ -926,6 +944,12 @@ mod tests {
         assert_eq!(neighbour_offset(9), IVec3::new(-1, -1, 0));
         assert_eq!(neighbour_offset(13), IVec3::new(0, 0, 0));
         assert_eq!(neighbour_offset(26), IVec3::new(1, 1, 1));
+
+        // And the middle is the slot the bake calls *about*: a reject bit for it is the answer "the
+        // section you offered was not baked", which is the only one of the 27 that is about that
+        // section rather than about its neighbours.
+        assert_eq!(neighbour_offset(CENTER), IVec3::ZERO, "CENTER is the middle slot");
+        assert_eq!(CENTER, 13);
     }
 
     #[test]
@@ -938,5 +962,49 @@ mod tests {
         assert_eq!(CachedBlockstateProvider::slot(IVec3::new(0, 16, 0)), 16);
         assert_eq!(CachedBlockstateProvider::slot(IVec3::new(0, 0, -1)), 4);
         assert_eq!(CachedBlockstateProvider::slot(IVec3::new(0, 0, 16)), 22);
+    }
+
+    /// The packed section key is Minecraft's own layout, so the JVM can use it as the key it already
+    /// keeps - and the decode here is written the way `SectionPos.x/y/z` read it back.
+    #[test]
+    fn a_section_key_is_what_section_pos_as_long_writes() {
+        fn x(key: i64) -> i32 {
+            (key << 0 >> 42) as i32
+        }
+        fn y(key: i64) -> i32 {
+            (key << 44 >> 44) as i32
+        }
+        fn z(key: i64) -> i32 {
+            (key << 22 >> 42) as i32
+        }
+
+        assert_eq!(section_key(IVec3::new(0, 0, 0)), 0);
+        assert_eq!(section_key(IVec3::new(1, 0, 0)), 1 << 42, "x is the high field");
+        assert_eq!(section_key(IVec3::new(0, 1, 0)), 1, "y is the low one");
+        assert_eq!(section_key(IVec3::new(0, 0, 1)), 1 << 20, "z sits between them");
+        assert_eq!(
+            section_key(IVec3::new(-1, -1, -1)),
+            -1,
+            "the widest negative coordinate in every field is every bit set"
+        );
+
+        // The fields are *signed*: twenty-two bits of x and z and twenty of y, so a coordinate at the
+        // top of its field is the largest positive one and not the largest unsigned value - which is
+        // what the first version of this test got wrong.
+        for pos in [
+            IVec3::new(0, 0, 0),
+            IVec3::new(-1, -1, -1),
+            IVec3::new(17, -4, 299),
+            IVec3::new(-1234, 250, -56),
+            IVec3::new(0x1F_FFFF, 0x7_FFFF, 0x1F_FFFF),
+            IVec3::new(-0x20_0000, -0x8_0000, -0x20_0000),
+        ] {
+            let key = section_key(pos);
+            assert_eq!(
+                IVec3::new(x(key), y(key), z(key)),
+                pos,
+                "{pos:?} did not survive the round trip the JVM reads it with"
+            );
+        }
     }
 }

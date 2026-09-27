@@ -4,6 +4,8 @@ import org.gradle.api.tasks.Delete
 import org.gradle.api.tasks.compile.JavaCompile
 import org.gradle.jvm.tasks.Jar
 import org.gradle.language.jvm.tasks.ProcessResources
+import org.gradle.process.CommandLineArgumentProvider
+import org.gradle.process.JavaForkOptions
 
 plugins {
 	`java-library`
@@ -241,9 +243,31 @@ tasks.matching { it.name == "runClient" }.configureEach {
 // expected to pass the same flag, and the mod still works if it does not. Both names are needed:
 // the mod's own classes are loaded as the named module `wgpu_mc`, while the FFM calls that reach
 // the JDK from the unnamed module (the class path) are covered by ALL-UNNAMED.
+//
+// The guard is the *interface*, not `JavaExec`: what a run task has to be here is something that
+// forks a JVM and takes arguments for it, which is what `jvmArgs` is a method of. NeoGradle's run
+// tasks happen to *be* `JavaExec` today - `help --task runClient` says so - but that is a property
+// of the plugin, not of the flag: a run task from another plugin, or a decorated one, implements
+// `JavaForkOptions` without extending `JavaExec`, and a guard that named the class would silently
+// stop applying to it.
+//
+// The flag goes on as a *provider*, not through `jvmArgs`, and that is not a style choice: NeoGradle
+// configures the run tasks from its own run config after this block has run, and it *replaces* their
+// argument list. Checked with an init script that read the task back - `runClient.jvmArgs` came out
+// as the plugin's own `[--sun-misc-unsafe-memory-access=allow, --enable-native-access=ALL-UNNAMED,
+// --add-opens, ...]` with this flag nowhere in it, at `projectsEvaluated` and again at
+// `taskGraph.whenReady`. So the dev loop has been running *without* the module half of the flag,
+// which is the half the mod's own classes need - they are loaded as the named module `wgpu_mc`, and
+// `--enable-native-access=ALL-UNNAMED` covers the class path, not them. The symptom is a warning per
+// downcall and nothing else, which is why it went unnoticed.
+//
+// A provider is a second list that the command line is built from, and a later `setJvmArgs` cannot
+// drop it.
 tasks.matching { it.name.startsWith("run") }.configureEach {
-	if (this is JavaExec) {
-		jvmArgs("--enable-native-access=ALL-UNNAMED,wgpu_mc")
+	if (this is JavaForkOptions) {
+		jvmArgumentProviders.add(CommandLineArgumentProvider {
+			listOf("--enable-native-access=ALL-UNNAMED,wgpu_mc")
+		})
 	}
 }
 

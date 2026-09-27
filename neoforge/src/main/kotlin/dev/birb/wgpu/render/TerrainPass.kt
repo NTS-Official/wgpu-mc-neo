@@ -319,6 +319,7 @@ object TerrainPass {
 			"bob (%.2f, %.2f)".format(lastBobX, lastBobY) +
 			", bobView=$lastBobView player=$lastIsPlayer walk=%.2f".format(lastWalk) +
 			"; ${RustChunkBake.fluidDiagnostics}" +
+			"; ${RustChunkBake.refusedDiagnostics}" +
 			"; ${describeCamera()}"
 	} catch (error: Throwable) {
 		"; the native counters could not be read: $error"

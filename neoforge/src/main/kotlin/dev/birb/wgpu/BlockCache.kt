@@ -1,6 +1,7 @@
 package dev.birb.wgpu
 
 import dev.birb.wgpu.chunk.BlockFaceFlags
+import dev.birb.wgpu.chunk.RustChunkBake
 import dev.birb.wgpu.render.Wgpu
 import dev.birb.wgpu.rust.WgpuNative
 import net.minecraft.client.Minecraft
@@ -113,5 +114,10 @@ object BlockCache {
 			sinceReload = ticks + 1
 		}
 		start()
+
+		// The arena's refusals, drained here because a tick is the cheapest place that is reached on
+		// every launch: a section it had no room for is a hole this side would otherwise go on
+		// believing was filled. See `RustChunkBake.forgetRefused`.
+		RustChunkBake.forgetRefused()
 	}
 }

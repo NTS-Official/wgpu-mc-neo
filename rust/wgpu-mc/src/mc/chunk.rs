@@ -147,8 +147,23 @@ pub struct SectionStorage {
     pool: u32,
     /// Whether the last [`SectionStorage::allocate_ranges`] ran out of pool.
     refused: bool,
+    /// The sections an allocation was refused for since the JVM last asked, as their positions.
+    ///
+    /// The boolean above says "this allocation failed"; this says *which* ones, because the two sides
+    /// have to agree about it: a section the JVM has been told was baked, and which the arena had no
+    /// room for, is a hole nothing will ever fill - its rebuild has already happened, and a rebuild
+    /// only carries what changed. So the positions are kept until [`SectionStorage::refused`] hands
+    /// them over, and the JVM forgets what it had recorded for them.
+    refused_positions: Vec<IVec3>,
     width: i32,
 }
+
+/// How many refused positions are kept before the oldest are dropped.
+///
+/// The JVM drains them every client tick, so this is only reached when the arena is refusing
+/// everything - in which case the positions it cannot remember are sections it will be told about
+/// again by the next refusal, and the count is in the log either way.
+const REFUSED_LIMIT: usize = 4096;
 impl SectionStorage {
     pub fn new(range: u32) -> Self {
         SectionStorage {
@@ -160,6 +175,7 @@ impl SectionStorage {
             deferred_depth: 1,
             pool: range,
             refused: false,
+            refused_positions: Vec::new(),
         }
     }
     /// Narrows or widens the pool to a render distance, which is only possible while it is empty.
@@ -190,27 +206,40 @@ impl SectionStorage {
 
     /// Drops every stored section, for a world the renderer is no longer drawing.
     ///
-    /// The ranges go to the deferred buckets rather than back to the allocator, for the reason every
-    /// other free does: the frame already recorded - but not yet submitted - may still be reading
-    /// them, so handing them out again immediately is a section drawn from another section's bytes.
-    /// They come back [`SectionStorage::free_deferred`] calls later, which is a frame or two, and the
-    /// new world's sections are baked over seconds rather than in one frame - so the pool is not
-    /// exhausted in between. What it *is* is finite: a section offered while every slot is parked is
-    /// refused, which the caller answers by keeping the old geometry and the diagnostics count.
+    /// The ranges go **straight back to the allocator**, which is the one free in this file that does
+    /// not go through [`Self::defer_free`], and the difference is deliberate. A deferred range is
+    /// parked for as many frames as the renderer may have in flight, because the frame that draws it
+    /// has not necessarily been submitted yet and a write that reaches it would be a section drawn
+    /// from another section's bytes. A level change is not that moment: it arrives on a client tick,
+    /// between frames - the frame that drew these sections has been submitted, and a
+    /// `queue.write_buffer` is ordered after every submission before it, while the next frame has not
+    /// been recorded at all.
+    ///
+    /// What the difference buys is the whole pool, immediately. The new world's sections are baked
+    /// over the next seconds and the pool has to hold them; ranges parked for `frames_in_flight`
+    /// frames would have the first of them refused, and a refusal now costs a section the JVM has to
+    /// be told about and re-bake (see `refused_positions`) - for a frame that is already gone.
     pub fn forget(&mut self) {
-        let mut deferred = Vec::new();
-
         for section in self.storage.values() {
             for layer in &section.layers {
                 if let Some(ranges) = layer {
-                    deferred.push(ranges.vertex_range.clone());
-                    deferred.push(ranges.index_range.clone());
+                    self.allocator.free_range(ranges.vertex_range.clone());
+                    self.allocator.free_range(ranges.index_range.clone());
                 }
             }
         }
 
         self.storage.clear();
-        self.defer_free(deferred);
+
+        // The refusals described positions in the world that has just been left behind: the JVM is
+        // clearing its own record of them at the same moment (`forgetAll`), and handing them over
+        // afterwards would have it forget sections of the *new* world that share a coordinate. They
+        // are counted as dropped rather than forgotten, so the sum the diagnostic checks still closes.
+        REFUSED_DROPPED.fetch_add(
+            self.refused_positions.len() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        self.refused_positions.clear();
     }
     /// How far the arena reaches from the camera, in chunks.
     pub fn width(&self) -> i32 {
@@ -278,10 +307,35 @@ impl SectionStorage {
         let section = self.allocate_ranges(baked_layers);
 
         if self.refused {
+            // Remembered, not just counted: the JVM has to be told which section it may not record
+            // as sent, or nothing will offer it again. See `refused_positions`.
+            if self.refused_positions.len() < REFUSED_LIMIT {
+                self.refused_positions.push(pos);
+            } else {
+                // Past the cap the position is lost rather than kept: it is counted here so that
+                // `refused == handed_over + dropped` still closes, which is what makes a mismatch
+                // mean a broken channel rather than a full list.
+                REFUSED_DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+
             return None;
         }
 
         Some((section, freed))
+    }
+
+    /// Hands over the sections an allocation was refused for, and forgets them.
+    ///
+    /// Called from the JVM once a tick: what it does with them is drop the record of having sent
+    /// them, so the next rebuild of each carries its blocks again and the section gets another
+    /// chance at the pool. The count handed over is kept in [`REFUSED_REPORTED`], because it is the
+    /// number the JVM's own running total has to match.
+    pub fn refused(&mut self) -> Vec<IVec3> {
+        let refused = std::mem::take(&mut self.refused_positions);
+
+        REFUSED_REPORTED.fetch_add(refused.len() as u64, std::sync::atomic::Ordering::Relaxed);
+
+        refused
     }
 
     /// Queues ranges to be freed once the frames that may still draw them are done. See [`Self::allocate`].
@@ -422,18 +476,57 @@ impl SectionStorage {
 /// sections were being dropped for want of arena space, which looks like ground that comes and goes.
 static REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// How many of those refusals the JVM has been *told* about - handed over by [`SectionStorage::refused`]
+/// rather than only counted.
+///
+/// The pair is the whole diagnostic of the return channel: a section that was refused and not handed
+/// over is one the JVM still believes was baked, and nothing will offer it again. Over a session the
+/// three numbers have to add up exactly -
+///
+/// ```text
+/// refused = handed_over + dropped
+/// ```
+///
+/// - and a run where the JVM has drained fewer than [`sections_refused_reported`] says is a channel
+/// that is not working: a call that threw, a list that was cleared in between, a bridge that stopped
+/// being wired to anything.
+static REFUSED_REPORTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many refusals were never handed over, so that the sum above closes.
+///
+/// Two ways to lose one, and both are by design: the list has a cap ([`REFUSED_LIMIT`], reached only
+/// when the arena is refusing everything), and a level change clears the list along with the arena it
+/// describes. What is *not* by design is a refusal that neither reaches the JVM nor appears here.
+static REFUSED_DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// sections refused for the JVM side. See [REFUSED].
 pub fn sections_refused() -> u64 {
     REFUSED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// How many refusals have been handed to the JVM. See [REFUSED_REPORTED].
+pub fn sections_refused_reported() -> u64 {
+    REFUSED_REPORTED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// How many refusals were never handed over. See [REFUSED_DROPPED].
+pub fn sections_refused_dropped() -> u64 {
+    REFUSED_DROPPED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 fn report_full_arena() {
     let refused = REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if refused < 4 || refused.is_multiple_of(512) {
+        // The two numbers beside the count are the return channel: what the JVM has been told, and
+        // what was lost on the way. `handed + dropped == refused` is the invariant, and the JVM
+        // checks its own drained total against the first of them.
         log::warn!(
             "wgpu-mc: the section arena is full, so this section was left without geometry \
-             ({refused} section(s) refused so far); the arena is a fixed pool and the render \
-             distance is not - see `SectionStorage::replace`"
+             ({refused} section(s) refused so far, {} handed to the JVM, {} dropped before it could \
+             be); the arena is a fixed pool and the render distance is not - see \
+             `SectionStorage::replace`",
+            sections_refused_reported(),
+            sections_refused_dropped()
         );
     }
 }
@@ -1653,6 +1746,124 @@ mod face_culling_tests {
         assert!(
             !face_is_hidden(&manager, state(0), state(7), Direction::Up),
             "block 7 has no model, so there is no geometry to cull against"
+        );
+    }
+}
+
+/// Sizing the arena, and the refusals that come out of it. See [`SectionStorage::set_pool`] and
+/// [`SectionStorage::refused`].
+#[cfg(test)]
+mod arena_tests {
+    use super::*;
+
+    /// How many `u32` slots one quad takes: four vertices of four words each, and six indices.
+    const QUAD_SLOTS: u32 = 4 * 4 + 6;
+
+    /// A pool that holds exactly `quads` quads and not one more, so a test can say what "full" means.
+    fn pool_for(quads: u32) -> u32 {
+        quads * QUAD_SLOTS
+    }
+
+    /// One layer of `quads` quads, in the shape the baker produces: four vertices and six indices,
+    /// each a `u32`.
+    fn layer(quads: usize) -> BakedLayer {
+        BakedLayer {
+            vertices: vec![0u8; quads * 4 * 4 * 4],
+            indices: vec![0u8; quads * 6 * 4],
+        }
+    }
+
+    /// Puts one section into the arena the way the feed does - allocate, then publish - and answers
+    /// whether the pool had room for it.
+    fn put(storage: &mut SectionStorage, pos: IVec3, quads: usize) -> bool {
+        let layers = [layer(quads)];
+
+        match storage.allocate(pos, &layers) {
+            Some((section, freed)) => {
+                storage.insert(pos, section);
+                storage.defer_free(freed);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The arena is sized once, while it is empty - which is what makes a render distance report
+    /// cheap on joining a world and impossible later.
+    #[test]
+    fn the_pool_can_only_be_set_while_the_arena_is_empty() {
+        let mut storage = SectionStorage::new(pool_for(4));
+
+        assert!(storage.set_pool(pool_for(2)), "an empty arena takes a new size");
+        assert_eq!(storage.pool_slots(), pool_for(2));
+
+        assert!(put(&mut storage, IVec3::new(0, 0, 0), 1), "it fits");
+
+        assert!(
+            !storage.set_pool(pool_for(1)),
+            "a section is stored, so the allocator cannot be moved under it"
+        );
+        assert_eq!(
+            storage.pool_slots(),
+            pool_for(2),
+            "and the arena keeps the size it was built with"
+        );
+
+        // Cleared, and the new size takes: this is what makes the report on joining a world work,
+        // since `setLevel` clears the arena at that moment.
+        storage.forget();
+        assert!(storage.set_pool(pool_for(1)));
+        assert_eq!(storage.pool_slots(), pool_for(1));
+    }
+
+    /// A section that does not fit is remembered by position, not just counted - the JVM is told
+    /// which one it may not record as sent.
+    #[test]
+    fn a_refused_section_is_remembered_and_handed_over_once() {
+        // Room for one section of one quad, and not for a second one.
+        let mut storage = SectionStorage::new(pool_for(1));
+
+        assert!(put(&mut storage, IVec3::new(0, 0, 0), 1));
+
+        let refused = IVec3::new(1, 0, 0);
+        assert!(!put(&mut storage, refused, 1), "the pool is full");
+
+        assert_eq!(storage.refused(), vec![refused]);
+        assert!(
+            storage.refused().is_empty(),
+            "handing them over is a drain, so the JVM is not told twice"
+        );
+    }
+
+    /// Forgetting the arena forgets the refusals with it: they describe positions in a world that
+    /// has just been left, and the JVM clears its own record at the same moment.
+    #[test]
+    fn clearing_the_arena_clears_the_refusals() {
+        let mut storage = SectionStorage::new(pool_for(1));
+
+        assert!(put(&mut storage, IVec3::new(0, 0, 0), 1));
+        assert!(!put(&mut storage, IVec3::new(1, 0, 0), 1));
+
+        storage.forget();
+
+        assert!(storage.refused().is_empty());
+        assert_eq!(storage.len(), 0, "and the arena is empty as well");
+    }
+
+    /// The pool follows the render distance, up to the cap the buffer is willing to hold.
+    #[test]
+    fn a_pool_grows_with_the_render_distance() {
+        assert!(arena_slots(8) < arena_slots(16));
+        assert!(arena_slots(16) < arena_slots(24));
+        assert_eq!(
+            arena_slots(32),
+            ARENA_SLOTS,
+            "the cap is the size a session that never reports one gets"
+        );
+        assert_eq!(
+            arena_slots(64),
+            arena_slots(64),
+            "and the const fn caps its own input"
         );
     }
 }

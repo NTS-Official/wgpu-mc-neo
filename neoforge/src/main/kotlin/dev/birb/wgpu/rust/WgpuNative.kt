@@ -376,6 +376,21 @@ object WgpuNative {
 	@JvmStatic
 	external fun clearSections(): Int
 
+	/**
+	 * The sections the section arena had no room for since the last call, as `SectionPos.asLong` keys.
+	 *
+	 * The other half of the refusal counter on the terrain line: the counter says how much of the view
+	 * was dropped, and this says which. A section that was refused is one the caller has been told was
+	 * baked and which is not drawn at all - and since its rebuild has already happened, and a rebuild
+	 * only carries what changed, nothing would offer it again. Taking these keys out of the caller's
+	 * "what have I sent" table is what gives each of them another chance.
+	 *
+	 * Drains: what one call does not take is handed over by the next. Called once a client tick, and
+	 * an empty array in the normal case.
+	 */
+	@JvmStatic
+	external fun refusedSections(): LongArray
+
 	@JvmStatic
 	external fun setMatrix(type: Int, mat: FloatArray)
 

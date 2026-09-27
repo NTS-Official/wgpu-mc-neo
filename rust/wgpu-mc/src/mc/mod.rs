@@ -220,6 +220,17 @@ pub struct RenderEffectsData {
     pub dimension_fog_color: [f32; 4],
 }
 
+/// What the arena's buffer is used for: written by the section feed, read as vertices and indices by
+/// the graph's draws, and bound as a storage buffer by the shader that fetches a section's quads.
+///
+/// One constant rather than the same four flags at both creation sites - the pool and the buffer are
+/// resized together by [`Scene::set_arena_slots`], and the second of those sites is where a missing
+/// flag would be a validation error at the first draw.
+const ARENA_USAGE: wgpu::BufferUsages = wgpu::BufferUsages::COPY_DST
+    .union(wgpu::BufferUsages::VERTEX)
+    .union(wgpu::BufferUsages::STORAGE)
+    .union(wgpu::BufferUsages::INDEX);
+
 pub struct Scene {
     pub section_storage: RwLock<SectionStorage>,
     pub camera_section_pos: RwLock<IVec2>,
@@ -229,7 +240,14 @@ pub struct Scene {
     /// another section rather than once per frame: a frame where the camera stayed put has nothing to
     /// free, and the walk would cost more than the frames it ran on.
     pub trimmed_section_pos: RwLock<IVec2>,
-    pub chunk_buffer: Arc<BindableBuffer>,
+    /// The arena's buffer, and the bind group that reaches it.
+    ///
+    /// Swapped rather than fixed, because the arena is sized from the render distance the game
+    /// reports - and that report arrives when a world is joined, long after the scene was created. An
+    /// `ArcSwap` so the render thread reads it per frame without a lock, and so a frame that is still
+    /// drawing from the old buffer keeps it alive: the recorded pass holds its own reference to it.
+    /// See [`Scene::set_arena_slots`], which is the only thing that replaces it.
+    pub chunk_buffer: ArcSwap<BindableBuffer>,
 
     pub indirect_buffer: Arc<wgpu::Buffer>,
 
@@ -249,21 +267,18 @@ impl Scene {
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::INDIRECT,
             mapped_at_creation: false,
         });
-        // Sized for a large render distance up front, and narrowed to the one the game reports before
-        // anything is baked - see `arena_slots`. A buffer that is too large is video memory; one that is
-        // too small is sections that cannot be baked.
-        let buffer_size = crate::mc::chunk::ARENA_SLOTS as u64 * 4;
+        // Sized for a large render distance up front, so that a session which never reports one still
+        // works, and resized to the one the game reports with [`Scene::set_arena_slots`] - which
+        // happens when a world is joined, before anything has been baked. A buffer that is too large
+        // is video memory; one that is too small is sections that cannot be baked.
         Self {
             section_storage: RwLock::new(SectionStorage::new(crate::mc::chunk::ARENA_SLOTS)),
             camera_section_pos: RwLock::new(ivec2(0, 0)),
             trimmed_section_pos: RwLock::new(ivec2(i32::MAX, i32::MAX)),
-            chunk_buffer: Arc::new(BindableBuffer::new_deferred(
+            chunk_buffer: ArcSwap::from_pointee(BindableBuffer::new_deferred(
                 wm,
-                buffer_size,
-                wgpu::BufferUsages::COPY_DST
-                    | wgpu::BufferUsages::VERTEX
-                    | wgpu::BufferUsages::STORAGE
-                    | wgpu::BufferUsages::INDEX,
+                crate::mc::chunk::ARENA_SLOTS as u64 * 4,
+                ARENA_USAGE,
                 "ssbo",
             )),
             indirect_buffer: Arc::new(indirect_buffer),
@@ -286,6 +301,35 @@ impl Scene {
                 })
                 .into(),
         }
+    }
+
+    /// Sizes the arena to a pool of `slots` u32 slots, and answers whether it took.
+    ///
+    /// The pool and the buffer are one thing and are therefore set in one place: the pool is what the
+    /// allocator hands ranges out of, the buffer is where those ranges live, and a pool larger than
+    /// the buffer is a write past the end of it. Sizing them apart - which is what this replaced - is
+    /// how the buffer came to be fixed at the largest render distance while the pool followed the
+    /// game's: the memory was spent either way, and only the *capacity* moved.
+    ///
+    /// It only takes while the arena is empty, for the reason `SectionStorage::set_pool` gives: a
+    /// range allocator cannot be resized under live allocations, and the bytes in the buffer are the
+    /// only copy of the geometry that is on screen. `false` is a report that arrived after the world
+    /// had been meshed - the arena keeps the size it was built with, and the caller says so.
+    pub fn set_arena_slots(&self, wm: &WmRenderer, slots: u32) -> bool {
+        if !self.section_storage.write().set_pool(slots) {
+            return false;
+        }
+
+        // The old buffer goes when the last frame that recorded a draw from it is done with it: the
+        // pass holds its own reference, and this drops ours.
+        self.chunk_buffer.store(Arc::new(BindableBuffer::new_deferred(
+            wm,
+            slots as u64 * 4,
+            ARENA_USAGE,
+            "ssbo",
+        )));
+
+        true
     }
 
     pub fn resize_depth_texture(&self, wm: &WmRenderer, width: u32, height: u32) {

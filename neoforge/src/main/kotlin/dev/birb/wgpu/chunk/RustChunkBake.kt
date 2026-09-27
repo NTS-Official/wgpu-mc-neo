@@ -66,8 +66,8 @@ import kotlin.math.min
  *
  * A third way the two sides can disagree is the arena: a section it has no room for is one this side
  * has been told was baked and which is not drawn at all, and its rebuild has already happened. The
- * refusal counter is polled with the settings switch, and growth in it drops [sent] - one re-send per
- * section rather than a hole that stays for the session.
+ * arena keeps the *positions* it refused, the JVM drains them once a tick and forgets what it had
+ * recorded for each - one re-send per section rather than a hole that stays for the session.
  *
  * Three things about the shape of the data are worth naming, because each is easy to get wrong:
  *
@@ -187,9 +187,9 @@ object RustChunkBake {
 		val previous = enabled
 		enabled = RendererSettings.bool(SETTING) ?: true
 
-		// Once a second, and cheap: this is what turns "the arena dropped a section" from a silent
-		// staleness into a re-send. See [noteRefusals].
-		noteRefusals()
+		// Once a second, and cheap: the return channel's own arithmetic, which is what tells a broken
+		// bridge apart from a full arena. See `checkRefusalChannel`.
+		checkRefusalChannel()
 
 		if (enabled == previous && reportedState) {
 			return
@@ -212,39 +212,118 @@ object RustChunkBake {
 	private var reported = 0L
 	private var resyncs = 0L
 
-	/** How many sections the arena had refused when this side last looked. See [noteRefusals]. */
-	private var refusedSeen = 0
+	/** How many refused sections this side has drained. See [checkRefusalChannel]. */
+	private var refusedDrained = 0L
+
+	/** The mismatch the channel check last saw, and whether it has been reported. See [checkRefusalChannel]. */
+	private var refusedMissing = 0L
+	private var refusedUnaccounted = 0L
+	private var refusedReported = false
 
 	/**
-	 * What the arena's refusal counter was, and what to do when it grows.
-	 *
-	 * A section the arena had no room for is a section this side has already been told was baked and
-	 * which is not drawn at all - and its rebuild has happened, so nothing would offer it again: stale
-	 * for the rest of the session, and silent. Dropping the "what have I sent" table turns that into
-	 * one visible thing instead: the next rebuild of each section carries its data again, so the ones
-	 * that were refused get another chance once the pool has room.
+	 * Diagnostics: this side's half of the return channel, for the line the terrain pass logs - the
+	 * native side's half is the refusal count already on it. See [checkRefusalChannel] for the
+	 * arithmetic the two have to satisfy.
 	 */
-	private fun noteRefusals() {
+	@JvmStatic
+	val refusedDiagnostics: String
+		get() = "$refusedDrained refused section(s) drained"
+
+	/**
+	 * Forgets the sections the arena had no room for, by the keys the native side hands over.
+	 *
+	 * A refusal is a section this side has been told was baked and which never reached the arena, so
+	 * nothing draws it - and because its rebuild has already happened, and a rebuild carries only what
+	 * changed, nothing would offer it again either: a hole that stays for the session, and silent.
+	 * Dropping its entry from [sent] is what makes the next rebuild of that section carry its blocks
+	 * again, so it gets another chance at the pool; and a section that is refused again is handed over
+	 * again, so the two sides keep converging rather than giving up after one try.
+	 *
+	 * Called once a client tick - often enough that a refusal is undone before the player can see it,
+	 * and it is one native call that returns an empty array in the normal case. The keys are
+	 * `SectionPos.asLong`, which is the key [sent] already uses, so nothing is unpacked.
+	 */
+	@JvmStatic
+	fun forgetRefused() {
+		val refused = try {
+			WgpuNative.refusedSections()
+		} catch (error: Throwable) {
+			// No renderer yet, so nothing has been baked and nothing can have been refused.
+			return
+		}
+
+		if (refused.isEmpty()) {
+			return
+		}
+
+		for (key in refused) {
+			sent.remove(key)
+		}
+
+		refusedDrained += refused.size
+
+		WgpuMcMod.LOGGER.warn(
+			"wgpu: the section arena refused {} section(s); forgetting them, so the next rebuild " +
+				"of each carries its blocks again ({} drained so far)",
+			refused.size,
+			refusedDrained,
+		)
+	}
+
+	/**
+	 * Checks the arena's return channel against this side's own count.
+	 *
+	 * The native side counts three things - the refusals, how many of them it handed over, and how
+	 * many it lost before it could (past its list's cap, or cleared by a level change) - and they add
+	 * up: `refused = handed over + dropped`. This side counts the fourth: what it actually drained.
+	 * So the check is two subtractions, and either one being short is a broken channel rather than a
+	 * full arena - a refusal that was neither delivered nor accounted for is a section this side still
+	 * believes was baked, and nothing will offer it again.
+	 *
+	 * Run with the settings poll, once a second, and it reports a mismatch only once it has been seen
+	 * twice in a row. That is not caution: a drain happening on the render thread right now shows up
+	 * here as one refusal the native side has counted and this side has not, for the microseconds
+	 * between the call returning and the loop that counts it - and this poll runs on whichever thread
+	 * asked for the switch. What stays put across a second is broken; what moves is that race.
+	 */
+	private fun checkRefusalChannel() {
 		val refused = try {
 			WmNative.terrainSectionsRefused.invokeExact() as Int
 		} catch (error: Throwable) {
-			// The renderer may not exist yet; nothing has been baked, so nothing can have been refused.
 			return
 		}
 
-		val grown = refused - refusedSeen
-		if (grown <= 0) {
+		val (reported, dropped) = try {
+			WmNative.terrainSectionsRefusedReported.invokeExact() as Int to
+				WmNative.terrainSectionsRefusedDropped.invokeExact() as Int
+		} catch (error: Throwable) {
 			return
 		}
 
-		refusedSeen = refused
-		sent.clear()
+		val missing = reported.toLong() - refusedDrained
+		val unaccounted = refused.toLong() - reported - dropped
+
+		if (missing != refusedMissing || unaccounted != refusedUnaccounted) {
+			// Numbers that have moved: nothing to say about them until they hold still.
+			refusedMissing = missing
+			refusedUnaccounted = unaccounted
+			refusedReported = false
+			return
+		}
+
+		if ((missing == 0L && unaccounted == 0L) || refusedReported) {
+			return
+		}
+
+		refusedReported = true
 
 		WgpuMcMod.LOGGER.warn(
-			"wgpu: the section arena refused {} more section(s), {} in total; forgetting what has " +
-				"been sent, so the next rebuild of each section carries its data again",
-			grown,
+			"wgpu: the refuse-and-resend channel does not add up: the arena refused {} section(s), " +
+				"handed over {}, this side drained {}, and {} are unaccounted for",
 			refused,
+			reported,
+			refusedDrained,
+			unaccounted,
 		)
 	}
 

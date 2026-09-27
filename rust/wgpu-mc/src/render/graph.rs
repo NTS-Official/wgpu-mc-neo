@@ -769,13 +769,19 @@ impl RenderGraph {
                 "@geo_terrain" => {
                     render_pass.set_pipeline(&bound_pipeline.pipeline);
 
+                    // The arena's buffer, loaded once for this pass and held for all of it: it is
+                    // replaced when the arena is resized (a render distance report on joining a
+                    // world), and a pass that read the two halves of it at different moments could
+                    // bind the new buffer and index the old.
+                    let chunk_buffer = scene.chunk_buffer.load_full();
+
                     for (index, bind_group) in bound_pipeline.bind_groups.iter() {
                         match bind_group {
                             WmBindGroup::Resource(name) => match &name[..] {
                                 "@bg_ssbo_chunks" => {
                                     render_pass.set_bind_group(
                                         *index,
-                                        &scene.chunk_buffer.bind_group,
+                                        &chunk_buffer.bind_group,
                                         &[],
                                     );
                                 }
@@ -788,7 +794,7 @@ impl RenderGraph {
                     }
 
                     render_pass.set_index_buffer(
-                        scene.chunk_buffer.buffer.slice(..),
+                        chunk_buffer.buffer.slice(..),
                         wgpu::IndexFormat::Uint32,
                     );
 
