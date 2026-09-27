@@ -456,7 +456,14 @@ impl RenderGraph {
                                 depth_compare: Some(if TERRAIN_GREATER_DEPTH.load(Ordering::Relaxed) {
                                     wgpu::CompareFunction::Greater
                                 } else {
-                                    wgpu::CompareFunction::Less
+                                    // `DepthStencilState.DEFAULT`, which is what both of the game's
+                                    // terrain pipelines are built with: `LESS_THAN_OR_EQUAL`, not
+                                    // `LESS`. A face that lands on a plane something else has already
+                                    // written - two blocks sharing a boundary, a model's face flush
+                                    // with the block below it - is a draw the game keeps and a `LESS`
+                                    // test drops, and the pixels it drops are a pattern that follows
+                                    // the camera rather than anything in the world.
+                                    wgpu::CompareFunction::LessEqual
                                 }),
                                 stencil: wgpu::StencilState::default(),
                                 bias: Default::default(),

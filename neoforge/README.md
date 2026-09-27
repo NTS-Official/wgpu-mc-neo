@@ -2645,6 +2645,40 @@ position and a float - and the shader's `SectionPosition` struct is what fixes t
 than the layout declares is a draw reading past its own data, so the size in `RenderGraph::new`'s table
 and the struct in `terrain.wgsl` are the two halves of one number and have to be changed together.
 
+### The side of every block was as bright as its top
+
+`DefaultVertexFormat.BLOCK` has no normal in it. The direction of a face reaches the shader in exactly
+one place: the vertex **colour**, which the game builds as `CardinalLighting.DEFAULT.byFace(direction)` -
+down 0.5, up 1.0, north and south 0.8, west and east 0.6 (`BlockModelLighter#prepareQuadFlat` writes it
+as a grey `Color`, and the ambient-occlusion path scales the corner light by it). `terrain.vsh` then
+says all of it in one line:
+
+```glsl
+vertexColor = Color * sample_lightmap(Sampler2, UV2);
+```
+
+The baker's colour was the **tint only** - `get_block_color(pos, tint_index)` where a face had a tint
+index, white where it did not - and the shader multiplied that by its own light and ambient-occlusion
+approximations. Nothing in the baker knew a direction was worth a factor, so every face was drawn at the
+brightness of an upward one: north and south faces 1.25x too bright, east and west 1.67x, the bottoms
+twice. On a world of cubes that is not a subtle thing - it reads as the sides being **overexposed**
+against vanilla, which is how it was reported, and it is invisible in any single-frame test because
+nothing is torn or missing.
+
+The shade is now applied where a face is baked, in the one place both the tint and the direction are
+known (`scale_rgb(color, face_shade(dir))`), so the tint stays a tint and the lightmap keeps doing the
+rest. Fluids go through the same line and get the same table, which is what `FluidRenderer` does with
+`ARGB.scaleRGB(tintColor, up * (north | west))` - for a side, a top and a bottom that is
+`CardinalLighting.DEFAULT.byFace` in every case.
+
+Two things are still not the game's:
+
+- **The nether's table.** `CardinalLighting.NETHER` is 0.9 for up *and* down, and this path does not
+  know which dimension it is baking for; the overworld's table is used everywhere.
+- **`"shade": false`.** A model can turn the directional factor off, and the game then uses `up()` for
+  every face. The baker does not read that flag, so an unshaded model gets the table anyway. Faces in
+  the `any` bucket are the exception - they arrive with `Direction::Up` and are left alone.
+
 ### Known gaps
 
 - **A sprite is classified as a whole, not per face.** The layer table `Atlas::sprite_layer` fills in

@@ -950,6 +950,40 @@ fn read_vertex(bytes: &[u8]) -> Option<(glam::Vec3, glam::Vec3)> {
     Some((position, normal))
 }
 
+/// The brightness vanilla bakes into a face's vertex colour, per direction.
+///
+/// This is `CardinalLighting.DEFAULT` (`net.minecraft.world.level.CardinalLighting`): down 0.5, up
+/// 1.0, north and south 0.8, west and east 0.6. `BlockModelLighter#prepareQuadFlat` writes it as a
+/// grey `Color` and `#prepareQuadAmbientOcclusion` scales the corner light by it, and since
+/// `DefaultVertexFormat.BLOCK` has no normal, that colour is the *only* place the direction of a face
+/// reaches the shader. A baker that leaves it out draws every side face at the brightness of a top
+/// one - the world reads as overexposed from the side, and nothing about the geometry says why.
+///
+/// The game has a second table for the nether (`CardinalLighting.NETHER`, 0.9 for up *and* down);
+/// this path does not know which dimension it is baking for, so it uses the overworld's - see the
+/// README's known gaps.
+fn face_shade(dir: Direction) -> f32 {
+    match dir {
+        Direction::Down => 0.5,
+        Direction::Up => 1.0,
+        Direction::North | Direction::South => 0.8,
+        Direction::West | Direction::East => 0.6,
+    }
+}
+
+/// A face's colour with its red, green and blue bytes scaled by `factor`.
+///
+/// The packing is the one the vertex format reads back - red in the low byte, blue in the third -
+/// and the top byte is left where it was, so a tint that arrives with no alpha keeps having none.
+fn scale_rgb(color: u32, factor: f32) -> u32 {
+    let scale = |byte: u32| ((byte as f32 * factor).round().clamp(0.0, 255.0)) as u32;
+    let r = scale(color & 0xff);
+    let g = scale((color >> 8) & 0xff);
+    let b = scale((color >> 16) & 0xff);
+
+    (color & 0xff00_0000) | (b << 16) | (g << 8) | r
+}
+
 /// The `Direction` a normal is, for the per-direction counts above.
 fn direction_of(normal: glam::Vec3) -> Option<Direction> {
     [
@@ -962,6 +996,47 @@ fn direction_of(normal: glam::Vec3) -> Option<Direction> {
     ]
     .into_iter()
     .find(|direction| direction.to_vec().as_vec3() == normal)
+}
+
+#[cfg(test)]
+mod face_shade_tests {
+    use super::*;
+
+    /// The six values are the game's own, because the picture is compared against the game's world.
+    ///
+    /// A side face one factor too bright is not something a unit test can see - it is a world that
+    /// looks overexposed beside vanilla - so the table itself is what is pinned here, against
+    /// `CardinalLighting.DEFAULT`.
+    #[test]
+    fn the_face_shade_is_the_one_the_game_bakes_into_the_colour() {
+        for (direction, expected) in [
+            (Direction::Down, 0.5),
+            (Direction::Up, 1.0),
+            (Direction::North, 0.8),
+            (Direction::South, 0.8),
+            (Direction::West, 0.6),
+            (Direction::East, 0.6),
+        ] {
+            assert_eq!(face_shade(direction), expected, "{direction:?}");
+        }
+    }
+
+    /// An upward face is the one that does not move: whatever else the table says, up is full
+    /// brightness, which is why a bug here shows on the sides and not on the tops.
+    #[test]
+    fn an_upward_face_keeps_its_colour() {
+        assert_eq!(scale_rgb(0xffff_ffff, face_shade(Direction::Up)), 0xffff_ffff);
+        assert_eq!(scale_rgb(0x00e4_763f, face_shade(Direction::Up)), 0x00e4_763f);
+    }
+
+    /// Scaling touches the three colour bytes and leaves the fourth alone - red in the low one.
+    #[test]
+    fn a_scaled_colour_keeps_its_packing() {
+        assert_eq!(scale_rgb(0xffff_ffff, 0.6), 0xff99_9999);
+        assert_eq!(scale_rgb(0xffff_ffff, 0.5), 0xff80_8080);
+        // A tint is scaled rather than replaced: the water colour at half brightness.
+        assert_eq!(scale_rgb(0x00e4_763f, 0.5), 0x0072_3b20);
+    }
 }
 
 /// The blocks whose faces the baker counts by name: seen, drawn, culled.
@@ -1145,6 +1220,12 @@ fn bake_layers<Provider: BlockStateProvider>(
             const INDICES: [u32; 6] = [0, 3, 1, 1, 3, 2];
             let mut add_quad =
                 |face: &BlockModelFace, _light_level: LightLevel, dir: Direction, color: u32| {
+                    // The face's own share of the light, which is a property of the direction and not
+                    // of where the block is: see `face_shade`. A face in the `any` bucket arrives with
+                    // `Direction::Up` and is left at full brightness, which is what the game does for a
+                    // model that turns shading off.
+                    let color = scale_rgb(color, face_shade(dir));
+
                     let baked_layer = &mut layers[face.layer as usize];
                     let vec_index = baked_layer.vertices.len() / Vertex::VERTEX_LENGTH;
 
@@ -1500,6 +1581,11 @@ fn bake_fluid_faces<Provider: BlockStateProvider>(
                         color: u32,
                         corners: [(glam::Vec3, [u16; 2]); 4]| {
         FLUID_QUADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        // A fluid face is shaded by its direction exactly as a block face is - the game's `FluidRenderer`
+        // writes `tint * up * (north | west)` for a side, `tint * up` for a top and `tint * down` for a
+        // bottom, which is `CardinalLighting.DEFAULT.byFace` in every case.
+        let color = scale_rgb(color, face_shade(dir));
 
         let baked_layer = &mut layers[layer as usize];
         let first = baked_layer.vertices.len() / Vertex::VERTEX_LENGTH;
