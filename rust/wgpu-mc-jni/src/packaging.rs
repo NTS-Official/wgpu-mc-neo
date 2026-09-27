@@ -107,7 +107,9 @@ mod tests {
     #[test]
     fn every_promo_names_a_listed_minecraft_version() {
         let updates = updates();
-        let promos = updates["promos"].as_object().expect("`promos` is an object");
+        let promos = updates["promos"]
+            .as_object()
+            .expect("`promos` is an object");
 
         for (key, version) in promos {
             let minecraft = key

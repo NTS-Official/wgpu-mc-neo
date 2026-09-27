@@ -1468,11 +1468,7 @@ pub const FLUID_TEXTURES: [&str; 4] = ["lava_still", "lava_flow", "water_still",
 /// object like any spreading block. What the game does distinguish is the source from the flowing half,
 /// which is exactly what [`same_fluid`] needs. See the mod's `fluidByte` for the writer's half of it.
 pub fn fluid_of(byte: u8) -> (u8, u8, bool) {
-    (
-        byte & 0b11,
-        (byte >> 2) & 0b1111,
-        byte & 0b0100_0000 != 0,
-    )
+    (byte & 0b11, (byte >> 2) & 0b1111, byte & 0b0100_0000 != 0)
 }
 
 /// The game's `LightCoordsUtil.smoothBlend`: the light one vertex takes from the four cells around its
@@ -1526,12 +1522,8 @@ fn smooth_blend(neighbours: [LightLevel; 3], center: LightLevel) -> LightLevel {
     let lifted = neighbours.map(neighbour);
 
     let average = |channel: fn(&LightLevel) -> u8| {
-        let sum = lifted
-            .iter()
-            .map(channel)
-            .map(u16::from)
-            .sum::<u16>()
-            + u16::from(channel(&center));
+        let sum =
+            lifted.iter().map(channel).map(u16::from).sum::<u16>() + u16::from(channel(&center));
 
         (sum / 4) as u8
     };
@@ -1600,14 +1592,7 @@ mod light_level_tests {
 
         // A cell with some light of its own keeps it: this is a floor under the zeroes, not a maximum.
         assert_eq!(
-            smooth_blend(
-                [
-                    LightLevel::from_sky_and_block(0, 4),
-                    dark,
-                    dark
-                ],
-                lit
-            ),
+            smooth_blend([LightLevel::from_sky_and_block(0, 4), dark, dark], lit),
             LightLevel::from_sky_and_block(0, 11),
             "`(4 + 14 + 14 + 14) / 4` is 11 and a half, floored"
         );
@@ -1764,10 +1749,7 @@ fn sampled_height<Provider: BlockStateProvider>(
     if same_fluid(kind, flowing, other_kind, other_flowing) {
         let (above_kind, _, above_flowing) = fluid_of(state_provider.get_fluid(pos + IVec3::Y));
 
-        return fluid_height(
-            amount,
-            same_fluid(kind, flowing, above_kind, above_flowing),
-        );
+        return fluid_height(amount, same_fluid(kind, flowing, above_kind, above_flowing));
     }
 
     if face_flags(block_manager, state_provider.get_state(pos)).blocks_motion {
@@ -1850,16 +1832,8 @@ fn fluid_corner_height<Provider: BlockStateProvider>(
 ) -> f32 {
     // The two blocks that share this corner with `pos`: the sign of the corner's own y is which way they
     // lie, and the corner's four blocks are `pos` plus those two plus the diagonal between them.
-    let step_x = if corner.x == 0 {
-        -IVec3::X
-    } else {
-        IVec3::X
-    };
-    let step_z = if corner.y == 0 {
-        -IVec3::Z
-    } else {
-        IVec3::Z
-    };
+    let step_x = if corner.x == 0 { -IVec3::X } else { IVec3::X };
+    let step_z = if corner.y == 0 { -IVec3::Z } else { IVec3::Z };
 
     let side_x = sampled_height(state_provider, block_manager, pos + step_x, kind, flowing);
     let side_z = sampled_height(state_provider, block_manager, pos + step_z, kind, flowing);
@@ -1890,7 +1864,11 @@ fn fluid_corner_height<Provider: BlockStateProvider>(
     add_weighted_height(&mut total, side_x);
     add_weighted_height(&mut total, side_z);
 
-    if total.1 == 0.0 { 1.0 } else { total.0 / total.1 }
+    if total.1 == 0.0 {
+        1.0
+    } else {
+        total.0 / total.1
+    }
 }
 
 /// How high a fluid stands, and the one thing that was wrong about it. See [`fluid_height`].
@@ -2325,6 +2303,7 @@ mod fluid_fixtures {
 mod fluid_flow_tests {
     use super::fluid_fixtures::*;
     use super::*;
+    use std::f32::consts::FRAC_1_SQRT_2;
 
     /// Which way the fluid at the origin runs, in the world the test built.
     ///
@@ -2455,7 +2434,7 @@ mod fluid_flow_tests {
         ));
 
         assert!(
-            (x - 0.7071).abs() < 0.001 && (z + 0.7071).abs() < 0.001,
+            (x - FRAC_1_SQRT_2).abs() < 0.001 && (z + FRAC_1_SQRT_2).abs() < 0.001,
             "east and north are both downhill, so the flow is the normalized sum: {x}, {z}"
         );
     }
@@ -2520,7 +2499,7 @@ mod fluid_flow_tests {
             );
         }
 
-        let diagonal = flowing_top_offsets(0.7071, 0.7071);
+        let diagonal = flowing_top_offsets(FRAC_1_SQRT_2, FRAC_1_SQRT_2);
 
         assert!(
             (diagonal[0].0 - 0.5).abs() < 0.001 && (diagonal[0].1 - 0.1464).abs() < 0.001,
@@ -2582,6 +2561,11 @@ mod fluid_geometry_tests {
     }
 
     /// Every quad of a layer, as its four corners in blocks.
+    ///
+    /// `chunks_exact` rather than the `as_chunks` clippy suggests, for the same reason the `quads` walk
+    /// above gives: `as_chunks` is a nightly-only inherent method on slices, and the two agree on the
+    /// length this hands them.
+    #[allow(clippy::chunks_exact_to_as_chunks)]
     fn quads(layer: &BakedLayer) -> Vec<[[f32; 3]; 4]> {
         layer
             .vertices
@@ -2599,7 +2583,10 @@ mod fluid_geometry_tests {
         let mut heights = quad.map(|corner| corner[1]);
         heights.sort_by(f32::total_cmp);
 
-        (heights[..2].try_into().unwrap(), heights[2..].try_into().unwrap())
+        (
+            heights[..2].try_into().unwrap(),
+            heights[2..].try_into().unwrap(),
+        )
     }
 
     /// Bakes the fluids of one section-sized world and answers the quads of the solid layer.
@@ -2707,8 +2694,7 @@ mod fluid_geometry_tests {
                 let (bottom, top) = edges(&quad);
 
                 assert_eq!(
-                    bottom,
-                    [pos.y as f32; 2],
+                    bottom, [pos.y as f32; 2],
                     "the wall of {pos:?} has to start at the bottom of its own block"
                 );
                 assert_eq!(
@@ -2807,13 +2793,12 @@ mod fluid_geometry_tests {
         // landing's fluid and is not drawn at all.
         let step = quads
             .iter()
-            .filter(|quad| quad.iter().all(|corner| corner[0] == 2.0))
+            .find(|quad| quad.iter().all(|corner| corner[0] == 2.0))
             .filter(|quad| {
                 quad.iter()
                     .all(|corner| corner[2] == 0.0 || corner[2] == 1.0)
             })
             .filter(|quad| quad.iter().any(|corner| corner[1] == 3.0))
-            .next()
             .unwrap_or_else(|| {
                 panic!(
                     "no face reaching the top of the column's block at the step, so the band above the \
@@ -2821,7 +2806,7 @@ mod fluid_geometry_tests {
                 )
             });
 
-        let (bottom, top) = edges(&step);
+        let (bottom, top) = edges(step);
 
         assert_eq!(top, [3.0, 3.0], "the face reaches the column's surface");
         assert!(
@@ -2876,7 +2861,10 @@ mod fluid_identity_tests {
         assert!(!same_fluid(2, false, 2, true), "but not each other");
         assert!(!same_fluid(2, true, 2, false));
         assert!(!same_fluid(1, true, 2, true), "and water is not lava");
-        assert!(!same_fluid(0, false, 0, false), "and no fluid is not a fluid");
+        assert!(
+            !same_fluid(0, false, 0, false),
+            "and no fluid is not a fluid"
+        );
     }
 
     /// A flow does not run towards the **other half** of its own fluid, because the game does not consider
@@ -2904,7 +2892,10 @@ mod fluid_identity_tests {
         // The same two blocks with the *same* half on both sides do flow, which is what says the test
         // above is about the fluid object and not about a reading that ignores neighbours.
         let both_flowing = FluidWorld::new(
-            &[(IVec3::ZERO, flowing(2, 8)), (ivec3(1, 0, 0), flowing(2, 3))],
+            &[
+                (IVec3::ZERO, flowing(2, 8)),
+                (ivec3(1, 0, 0), flowing(2, 3)),
+            ],
             &[],
         );
 
@@ -3375,43 +3366,39 @@ fn bake_fluid_faces_with<Provider: BlockStateProvider>(
             // The neighbour's surface is its own - `sampled_height` asks whether *it* has the same fluid
             // above it - and it is measured along the shared edge by the same weighted average this
             // block's corners go through, so the two faces agree about where they meet.
-            let (floor_first, floor_second) = if same_fluid(
-                kind,
-                flowing,
-                neighbour_kind,
-                neighbour_flowing,
-            ) {
-                let neighbour_height = sampled_height(
-                    state_provider,
-                    block_manager,
-                    neighbour,
-                    neighbour_kind,
-                    neighbour_flowing,
-                );
+            let (floor_first, floor_second) =
+                if same_fluid(kind, flowing, neighbour_kind, neighbour_flowing) {
+                    let neighbour_height = sampled_height(
+                        state_provider,
+                        block_manager,
+                        neighbour,
+                        neighbour_kind,
+                        neighbour_flowing,
+                    );
 
-                (
-                    fluid_corner_height(
-                        state_provider,
-                        block_manager,
-                        neighbour,
-                        neighbour_kind,
-                        neighbour_flowing,
-                        neighbour_height,
-                        neighbour_first,
-                    ),
-                    fluid_corner_height(
-                        state_provider,
-                        block_manager,
-                        neighbour,
-                        neighbour_kind,
-                        neighbour_flowing,
-                        neighbour_height,
-                        neighbour_second,
-                    ),
-                )
-            } else {
-                (0.0, 0.0)
-            };
+                    (
+                        fluid_corner_height(
+                            state_provider,
+                            block_manager,
+                            neighbour,
+                            neighbour_kind,
+                            neighbour_flowing,
+                            neighbour_height,
+                            neighbour_first,
+                        ),
+                        fluid_corner_height(
+                            state_provider,
+                            block_manager,
+                            neighbour,
+                            neighbour_kind,
+                            neighbour_flowing,
+                            neighbour_height,
+                            neighbour_second,
+                        ),
+                    )
+                } else {
+                    (0.0, 0.0)
+                };
 
             let (low, high) = (heights[first], heights[second]);
 
