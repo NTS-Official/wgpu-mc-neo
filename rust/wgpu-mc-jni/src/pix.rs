@@ -303,6 +303,9 @@ static CAPTURER_REPORT: parking_lot::Mutex<Vec<(Report, String)>> =
 /// something that works without it - PIX can attach for a GPU capture either way.
 #[derive(Clone, Copy)]
 enum Report {
+    /// Constructed by the Windows half of `load_capturer` only, so a build for anything else has the
+    /// variant and nothing that names it - which is what `dead_code` is looking at.
+    #[cfg_attr(not(windows), allow(dead_code))]
     Info,
     Warning,
     Error,

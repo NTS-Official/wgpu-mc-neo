@@ -14,14 +14,12 @@ use jni_fn::jni_fn;
 use log::{error, info, warn};
 use once_cell::sync::OnceCell;
 use parking_lot::Mutex;
-use raw_window_handle::{
-    RawDisplayHandle, RawWindowHandle, Win32WindowHandle, WindowsDisplayHandle,
-};
+use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
 use std::borrow::Cow;
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::ffi::{CStr, c_char};
-use std::num::{NonZero, NonZeroIsize};
+use std::num::NonZero;
 use std::path::PathBuf;
 use std::ptr;
 use std::sync::Arc;
@@ -310,6 +308,8 @@ fn resolve_present_mode(request: PresentModeRequest, supported: &[PresentMode]) 
 unsafe fn surface_target(display: u64, window: u64) -> wgpu::SurfaceTargetUnsafe {
     #[cfg(windows)]
     {
+        use raw_window_handle::{Win32WindowHandle, WindowsDisplayHandle};
+        use std::num::NonZeroIsize;
         use winapi::shared::windef::HWND;
         use winapi::um::winuser::{GWLP_HINSTANCE, GetWindowLongPtrW};
 
