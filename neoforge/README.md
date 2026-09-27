@@ -996,6 +996,48 @@ neoforge/build/libs/wgpu_mc-<version>-all.jar
 The plain jar is the input to that task and still cannot start on its own. KotlinForForge ships a
 stdlib too, and the run above had both on the classpath, so an instance that has it keeps working.
 
+### The update file, and the version it has to be keyed on
+
+`neoforge.mods.toml` has carried an `updateJSONURL` since the mod was ported, pointing at
+`neoforge/updates.json` - and that file was empty, which NeoForge reads as *no versions at all*. It is
+filled in now, and the one thing about it worth writing down is **which Minecraft version the entries are
+keyed on**, because the [docs](https://docs.neoforged.net/docs/misc/updatechecker/) describe the format and
+not the key.
+
+`VersionChecker#process` is the answer, and it is short:
+
+```java
+var mcVersion = FMLLoader.getCurrent().getVersionInfo().mcVersion();
+String rec = promos.get(mcVersion + "-recommended");
+String lat = promos.get(mcVersion + "-latest");
+ComparableVersion current = new ComparableVersion(mod.getVersion().toString());
+```
+
+`VersionInfo.mcVersion` is not the NeoForge version and not the base game version: `FMLLoader` overwrites
+it with the version of the **`minecraft` mod file** it discovered, which for a 26.1 hotfix carries the
+hotfix - `26.1.2`, not `26.1`. The client's own log says so in as many words:
+
+```text
+Found valid mod file neoforge-26.1.2.109.jar with {minecraft} mods - versions {26.1.2}
+        Minecraft 26.1.2 (minecraft)
+```
+
+So the file keys `promos` and its changelog lists on `26.1.2` (and, since the jar supports the whole
+`[26.1, 26.1.999)` line, on `26.1.1` and `26.1` as well - a user on a hotfix asks about that hotfix). A
+file keyed on the wrong string is not an error anywhere: the checker finds no `promos` entry, reports
+`BETA`, draws no icon, and the mod looks like one that simply has no updates. `packaging.rs` in the JNI
+crate reads both files and asserts that the entry the game will ask about names the version
+`gradle.properties` builds - a version bump that forgets this file is otherwise silent.
+
+`recommended` is deliberately absent. It means "the latest *stable* version", the checker reports `BETA`
+when only `latest` is present, and this mod has no stable releases - `2612.0.7-alpha` - so claiming one
+would be a lie told to the mod list. The moment there is a stable build, adding
+`"<mcversion>-recommended"` is what turns `BETA_OUTDATED` into `OUTDATED`.
+
+The file only takes effect once it is **pushed to `master`**: the URL is the raw GitHub one, so a local
+edit is invisible to every player until then (and `raw.githubusercontent.com` caches for a few minutes,
+which is worth remembering when testing a change to it).
+
 ### NeoForge hands the game a window that was made for OpenGL
 
 With the runtime in the jar the game got further and then aborted, and this one is not a Java
@@ -3158,16 +3200,163 @@ stops a fluid and occludes nothing. The falling branch of the game's function is
 fluid's `FALLING` property, which the payload does not carry - and what it would add is a vertical component
 the caller never reads: the top face only ever wants the horizontal *direction*.
 
+**A fluid is two objects, and only one of them was ever handed over.** The next report was "in a lava fall
+there are gaps between the stepped flowing lava - the flowing state is wrong on the Rust side", and it was:
+
+```java
+// Fluid
+public boolean isSame(Fluid other) { return other == this; }        // identity, not "the same kind"
+
+// LiquidBlock, the fluid state per level
+this.stateCache.add(fluid.getSource(false));                        // level 0: FlowingFluid#getSource
+for (int level = 1; level < 8; level++)
+    this.stateCache.add(fluid.getFlowing(8 - level, false));        // levels 1-7: FlowingFluid#getFlowing
+this.stateCache.add(fluid.getFlowing(8, true));                     // level 8: the *falling* state
+```
+
+So a fluid is a source object and a flowing object (`Fluids.LAVA`, `Fluids.FLOWING_LAVA`), a block answers
+whichever its level came from, and `FLOWING_LAVA.isSame(LAVA)` is **false**. The JVM's `fluidByte` classified
+against the source alone, so every flowing block - every falling block (level 8), every spreading block
+(levels 1-7) - came out as kind 3, "a fluid this mesher does not know", and `bake_fluid_faces` skips those:
+
+```kotlin
+val kind = when {
+    type.`isSame`(Fluids.WATER) || type.`isSame`(Fluids.FLOWING_WATER) -> 1   // was: source only
+    type.`isSame`(Fluids.LAVA) || type.`isSame`(Fluids.FLOWING_LAVA) -> 2     // was: source only
+    else -> 3                                                                 // ...and 3 is not drawn
+}
+```
+
+Which means: a lava lake was drawn only where its blocks were *sources*, a lava fall was not drawn at all
+(its whole column is level 8), and the hole where the fall should be is what read as "gaps between the
+stepped flowing lava". Both halves of each fluid are named now, and a test on the writer's source asserts it
+- the mistake is a missing name, and a missing name is what a test can see.
+
+The same identity comparison is in vanilla's own renderer (`FluidRenderer.isNeighborSameFluid`), where it
+means a *source* and a *flowing* block are different fluids to the height arithmetic: a source next to a
+flowing neighbour averages a `0.0` in. This side merges the two kinds, so its surfaces are *smoother* there -
+continuous where vanilla steps down - which is a deliberate difference rather than an oversight.
+
+**A fluid face is lit by the fluid, not by what it faces.** The second half of the same report was "when
+there is a block above the lava, the lava goes black - you can just about make out the texture, the
+brightness is very low". `FluidRenderer` asks its own `getLightCoords` for every face it writes:
+
+```java
+private int getLightCoords(BlockAndTintGetter level, BlockPos pos) {
+    return LightCoordsUtil.max(LevelRenderer.getLightCoords(level, pos),
+                               LevelRenderer.getLightCoords(level, pos.above()));
+}
+```
+
+so the fluid's **own cell** is half of the answer everywhere - the top face, every side, and (with the cell
+below instead) the underside. This side read a single neighbour: the block above for the surface, the block
+the side faces for a side, the block below for an underside. A solid block has no light in it, so lava with a
+block over it took the light of the *block* as its surface light and came out black; its sides took the
+light of the stone beside them and were black for the same reason. A lava cell holds block light 15 of its
+own, so the brightest of the two is the lava's own emission and a covered lava surface is lit by the lava.
+
+Two things about that `max`: it is `LightCoordsUtil.max`, which takes the maximum of the block nibble and the
+maximum of the sky nibble **separately** - not the larger of the two packed bytes, where the sky nibble being
+the high half makes the darker cell compare as the brighter one - and it is per face, so all four faces of a
+fluid block now read `light_here`.
+
+**A whole block of fluid is not averaged at all.** The gaps in the fall were still there after the fluid
+byte was fixed, and the reason is the second half of the same `if` in `FluidRenderer#tesselate`:
+
+```java
+float heightSelf = this.getHeight(level, type, pos, blockState, fluidState);
+if (heightSelf >= 1.0F) {
+    heightNorthEast = 1.0F;      // no averaging *at all*: a block that stands a whole block tall
+    heightNorthWest = 1.0F;      // - which is every block of a falling column, because the same fluid
+    heightSouthEast = 1.0F;      // is directly above it - has all four corners at its own top
+    heightSouthWest = 1.0F;
+} else {
+    ... the four calculateAverageHeight calls ...
+}
+```
+
+This mesher averaged all four corners for every block. So a full-height block's corner was dragged down by
+whatever was *diagonally* beside it - the thin spreading lava at the foot of the fall, the step it poured
+over - and its side faces stopped below its own top. The block above it starts at the block boundary, and
+the difference between the two is an open slit in the wall: not a full-height hole, a **triangle**, because
+one corner of the face still reached the top and the other did not. Repeated at every block of the column,
+that is what "in a lava fall the stepped flowing lava has gaps between it" was.
+
+The rule is `own_height >= 1.0` now, which is `fluid_height(amount, the block above holds this fluid)` - the
+same `same_above` the surfaces already use. Two things came out of writing it down:
+
+- the geometry is **testable without a GPU**. `bake_fluid_faces` was split into the sprite lookup and
+  `bake_fluid_faces_with`, which takes the sprites as an argument, so a test can mesh a world built by hand
+  and read the quads back out of the vertex bytes (a byte an axis, in sixteenths, plus the flag that means
+  sixteen blocks). The test asserts that **both** top corners of every wall of a full block of fluid are the
+  top of that block, and it was checked against the old code: the north face of the middle block of a
+  synthetic fall comes out `y 1.0 -> 2.0` on the west corner and `1.0 -> 1.6875` on the east one, which is
+  the slit, in numbers;
+- and the other half of the rule has a test too - a *thin* layer of fluid still averages its corners, which
+  is what makes a lake's surface slope and a stream follow its flow. The two are one branch in the game, so a
+  test for one of them is only worth anything next to a test for the other.
+
+The same tool answered the next report in one round. "A purely vertical fall is complete, the cracks only
+appear on a stepped one" is a statement about *where* the two surfaces fail to meet, and it says which face
+is missing: at the foot of a drop the falling column's last block is a whole block tall (the same fluid is
+above it) while the lava it lands in is not, so the landing's surface - averaged, and lower - is below the
+column's, and the band between them is the riser of the step. The face on that band was being skipped for
+holding the same fluid. The synthetic step in the test showed it as an empty list where the column's side
+should have been, and with the rule above the face is there and spans its own block.
+
+**And then a face inside the fluid is not the same as a face on it.** "The internal culling is off too -
+inside the lava you can see the texture of flowing lava that is not exposed to air" is about the *other*
+half of that face: the game draws the whole block, and everything below the neighbour's surface is geometry
+inside the fluid, carrying a flow texture, that nothing can see from outside and a camera *inside* the lava
+looks straight at. So the band is what gets drawn now, not the block: its floor is the neighbour's own
+surface measured at the shared edge, by the same average, and its top is this block's. Two blocks of one
+fluid at one level have no band at all - their corner heights come out of the same four blocks - so a lake
+still pays nothing for it.
+
+**The same report had a second half: the fluid object.** "The lava's flowing state still does not match the
+game" is the other place `Fluid#isSame` being *identity* shows up, and this mesher had been treating the two
+halves as one liquid everywhere:
+
+| the game asks | with |
+| --- | --- |
+| is the same fluid above this block (which decides its height) | `fluidType.isSame(above.getFluidState().getType())` |
+| does this neighbour affect the flow | `neighbourFluid.isEmpty() \|\| neighbourFluid.getType().isSame(this)` |
+| what does this corner average | `getHeight` per block, and `-1.0` for one that is solid and is not this fluid |
+
+A source beside a flowing block is **two liquids that do not join** to all three. That is not a detail about
+mixing: the flow vector decides which way the rotated quarter of the flowing sprite points, so a neighbour
+that should not count turns the pattern, and the height rule decides where the surface is. The byte carries
+the bit now (`fluidByte`'s third field, which used to be documented as "falling" and never written by
+anyone), the mesher draws both halves with one set of sprites and asks the game's question everywhere else,
+and a test on the writer's source asserts that both halves are named:
+
+```kotlin
+val (kind, flowing) = when {
+    type.`isSame`(Fluids.WATER) -> 1 to false
+    type.`isSame`(Fluids.FLOWING_WATER) -> 1 to true
+    type.`isSame`(Fluids.LAVA) -> 2 to false
+    type.`isSame`(Fluids.FLOWING_LAVA) -> 2 to true
+    else -> 3 to false
+}
+```
+
+**And with the halves distinct, the corner average had to become the game's.** This side averaged the corner
+blocks that held the same fluid - a plain mean, and a different *set* of blocks: air contributed nothing at
+all, so a surface came out level where the game's tapers at an open edge, and the other half of the fluid
+was worth a full block where the game gives it a zero. `sampled_height` and `add_weighted_height` are the
+game's `getHeight` and `addWeightedHeight` now, sentinel included: `1.0` for a column, `amount/9` for a
+surface, `0.0` for a block that does not hold this fluid and is not solid (air, a plant, the other half),
+and `-1.0` for one that *is* solid, which the average drops. A height of `0.8` or more counts **ten times**,
+which is what keeps a surface from sagging towards its edges. Two tests pin the arithmetic to one number
+each: a lone `8/9` block in air has corners at `8/9 * 10/12`, and the same block against stone at
+`8/9 * 10/11` - the stone dropped rather than counted.
+
 Still the game's and not ours, in the fluid path:
 
-- the **weighted** corner average. Vanilla's is not a plain mean: a height of 0.8 or more counts ten times,
-  a dry neighbour or a different fluid counts as a zero with weight one (which is what tapers a fluid's
-  edge down to the ground), and a *solid* neighbour is dropped from the average entirely. This side takes
-  the plain mean of the corner blocks that hold the same fluid, so a lake's surface is level where vanilla's
-  dips at an open edge;
 - the faces vanilla **culls** and this does not: a fluid's side against a block whose occlusion shape
-  covers it (`isFaceOccludedByState`), which is a face drawn between two opaque neighbours - invisible
-  either way, and paid for in the arena;
+  covers it (`isFaceOccludedByNeighbor`), which is a face drawn between two opaque neighbours - invisible
+  either way, and paid for in the arena - and `isNeighborStateHidingOverlay`, the rule that lets a
+  half-transparent neighbour hide the fluid face behind it;
 - the last thousandth of a block, and the inside of a fluid. Vanilla lowers a fluid's surface and insets
   every side by `0.001F` so that a fluid face does not fight with the block face it lies against, and
   writes every face that is not a water overlay **twice**, wound both ways (`addBackFace`), so a fluid is
@@ -3176,11 +3365,15 @@ Still the game's and not ours, in the fluid path:
   the terrain pass culls back faces, so a face seen from inside a fluid is not drawn. The surface's own
   height is on that grid too - `8/9` lands on `14/16` - which is a sixteenth of a block below where vanilla
   puts it;
-- the light a fluid face reads. Vanilla takes the brightest of the fluid's own block and the block above it
-  for every face (`getLightCoords`), and the brightest of the block below and the fluid's own for an
-  underside; this side reads a single neighbour - the block above for the top face, the block the side faces
-  for a side, the block below for an underside - so a fluid is a level or two darker than the game's where
-  the light comes from the fluid's own block;
+- the sides between two blocks of one fluid, which this side draws **only where they are exposed**. The game
+  draws all of them - `isNeighborSameFluid` is on the top face alone in 26.1 - and every one that is inside
+  the fluid is invisible from outside; this side leaves those out, which is the same picture for fewer
+  vertices, and the one difference is that a camera *inside* a fluid sees the game's interior faces and not
+  these;
+- `blocks_motion` stands in for `isSolid()` in `sampled_height`, the one place the corner average needs it.
+  The two agree for everything a fluid meets - air, stone, and a fluid itself, which is not solid - and
+  differ for a cobweb and a bamboo sapling, which this then counts as a `0.0` sample where the game drops
+  them;
 - **water**, which is not taken over at all: it belongs in the translucent layer, no pass of ours draws
   that layer yet, and Minecraft still draws its own.
 
