@@ -843,13 +843,44 @@ object RustChunkBake {
 
 	/**
 	 * The fluid a state carries, packed into one byte: kind in the low two bits, MC's
-	 * `FluidState#getAmount` in the next four.
+	 * `FluidState#getAmount` in the next four, and **which half of the fluid it is** in bit 6.
 	 *
 	 * A fluid is not in its block model - lava and water have no model elements at all - so this is
 	 * the only thing that tells the Rust mesher that a section holds lava, and how deep the fluid is
 	 * at that position: MC's own `getOwnHeight` is `amount / 9`, so the surface height is the same
 	 * arithmetic on both sides. Kinds are 1 water, 2 lava, 3 anything else, which the mesher leaves to
 	 * Minecraft rather than drawing with a texture it does not have.
+	 *
+	 * **Both halves of each fluid are the same kind here, and that is not a detail.** A fluid is *two*
+	 * registered objects - a source and a flowing one, `Fluids.LAVA` and `Fluids.FLOWING_LAVA` - and
+	 * `Fluid#isSame` is identity, not "the same kind of fluid":
+	 *
+	 * ```java
+	 * // Fluid
+	 * public boolean isSame(Fluid other) { return other == this; }
+	 * ```
+	 *
+	 * `LiquidBlock` builds one fluid state per level and takes the two from different sides
+	 * (`stateCache`: level 0 is `fluid.getSource(false)`, levels 1 to 7 are `fluid.getFlowing(8 - level,
+	 * false)`, level 8 is `fluid.getFlowing(8, true)` - the falling state), so **a flowing block answers
+	 * `FLOWING_LAVA`**, and `FLOWING_LAVA.isSame(LAVA)` is false.
+	 *
+	 * Classified against the source alone, every flowing block came out as kind 3 - "a fluid this
+	 * mesher does not know" - and the mesher *skips* those. The picture that makes: a lava lake drawn
+	 * only where it is still, every lava *fall* drawn as nothing at all (a fall is all flowing blocks),
+	 * and the ground under it left open - reported as "there are gaps between the stepped flowing lava
+	 * in a lava fall, the flowing state is wrong on the Rust side". It was.
+	 *
+	 * The bit is the other half of the same thing. The mesher draws the two halves with one set of
+	 * sprites - they are one liquid to look at - but it asks the game's question wherever the game does:
+	 * whether the same *object* is above a block (which decides the surface height), whether a neighbour
+	 * affects the flow, and what a corner averages. Getting *that* wrong is what "the lava's flowing
+	 * state still does not match the game" was, because a source beside a flowing block is two liquids
+	 * that do not join.
+	 *
+	 * The bit used to be documented as "falling", which nothing ever wrote: a falling fluid is not a
+	 * different fluid - its `FALLING` property is on the state and its type is the flowing object, like
+	 * any spreading block.
 	 */
 	private fun fluidByte(state: BlockState?): Byte {
 		if (state == null) return 0
@@ -857,13 +888,17 @@ object RustChunkBake {
 		val fluid = state.fluidState
 		if (fluid.isEmpty) return 0
 
-		val kind = when {
-			fluid.type.`isSame`(Fluids.WATER) -> 1
-			fluid.type.`isSame`(Fluids.LAVA) -> 2
-			else -> 3
+		val type = fluid.type
+
+		val (kind, flowing) = when {
+			type.`isSame`(Fluids.WATER) -> 1 to false
+			type.`isSame`(Fluids.FLOWING_WATER) -> 1 to true
+			type.`isSame`(Fluids.LAVA) -> 2 to false
+			type.`isSame`(Fluids.FLOWING_LAVA) -> 2 to true
+			else -> 3 to false
 		}
 
-		return (kind or (fluid.amount shl 2)).toByte()
+		return (kind or (fluid.amount shl 2) or (if (flowing) 0b0100_0000 else 0)).toByte()
 	}
 
 	/** Sections described for the Rust baker this run, and the fluid bytes that went with them. */

@@ -68,6 +68,11 @@ mod timing;
 #[cfg(test)]
 mod abi_tests;
 
+/// Checks the mod's own metadata: the version NeoForge is told in `neoforge/updates.json` against
+/// the version this tree builds. See the module for why nothing else can notice that they disagree.
+#[cfg(test)]
+mod packaging;
+
 #[derive(Debug)]
 struct MinecraftRenderState {
     //draw_queue: Vec<>,
@@ -582,11 +587,9 @@ pub fn registerSprite(
 
     SPRITE_REGISTRATIONS_PENDING.store(true, std::sync::atomic::Ordering::Relaxed);
 
-    SPRITE_REGISTRATIONS.lock().push((
-        name.into(),
-        [u0, v0, u1, v1],
-        layer as u8 & 0b0000_0011,
-    ));
+    SPRITE_REGISTRATIONS
+        .lock()
+        .push((name.into(), [u0, v0, u1, v1], layer as u8 & 0b0000_0011));
 }
 
 /// The layer a registered sprite is filed under. See [`registerSprite`] for the numbers.

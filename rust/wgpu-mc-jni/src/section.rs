@@ -1055,4 +1055,56 @@ mod tests {
             );
         }
     }
+
+    /// The writer classifies **both halves of each fluid**, which is the bug that made every lava fall
+    /// invisible: a fluid is two registered objects - a source and a flowing one - and `Fluid#isSame` is
+    /// identity, so a *flowing* block answers `FLOWING_LAVA` and `FLOWING_LAVA.isSame(LAVA)` is false.
+    ///
+    /// Classified against the source alone, every flowing block came out as kind 3 - "a fluid this
+    /// mesher does not know" - and the mesher skips those, so a lava lake was drawn only where it was
+    /// still and a lava fall was not drawn at all. The picture was reported as "there are gaps between
+    /// the stepped flowing lava in a lava fall; the flowing state is wrong on the Rust side".
+    ///
+    /// This is a test on the writer's *source*, in the same spirit as the ones that check every setting
+    /// has a translation and every declaration has an implementation: the mistake is a missing name, and
+    /// a missing name is exactly what a test can see. It cannot run the game's registries, so what it
+    /// asserts is that both halves are named.
+    #[test]
+    fn the_writer_knows_both_halves_of_every_fluid() {
+        const WRITER: &str =
+            include_str!("../../../neoforge/src/main/kotlin/dev/birb/wgpu/chunk/RustChunkBake.kt");
+
+        // Comments dropped, because the file and this test both quote the mistake.
+        let code = WRITER
+            .lines()
+            .map(str::trim_start)
+            .filter(|line| {
+                !line.starts_with('*') && !line.starts_with("//") && !line.starts_with("/*")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        for name in [
+            "Fluids.WATER",
+            "Fluids.FLOWING_WATER",
+            "Fluids.LAVA",
+            "Fluids.FLOWING_LAVA",
+        ] {
+            assert!(
+                code.contains(name),
+                "`fluidByte` no longer names {name}, so a block carrying that half of the fluid is \
+                 classified as one this mesher does not know - and skipped"
+            );
+        }
+
+        // And the byte's third field, which says *which* half it is: the mesher draws the two halves with
+        // one set of sprites and asks the game's `isSame` question with this bit - the same object above a
+        // block, a neighbour that affects the flow, what a corner averages.
+        assert!(
+            code.contains("0b0100_0000"),
+            "`fluidByte` no longer writes the flowing bit, so the mesher cannot tell a source from the \
+             flowing half of the same fluid: the surfaces and the flow directions come out as one liquid \
+             where the game steps"
+        );
+    }
 }

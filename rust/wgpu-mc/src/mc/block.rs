@@ -1489,7 +1489,8 @@ mod diagnostic_tests {
         for animation_on in [false, true] {
             for atlas_bound in [false, true] {
                 for animated in [false, true] {
-                    let decided = decide_game_atlas(animation_on, atlas_bound, animated, Some(rect));
+                    let decided =
+                        decide_game_atlas(animation_on, atlas_bound, animated, Some(rect));
                     let expected = (animation_on && atlas_bound && animated).then_some(rect);
 
                     assert_eq!(
@@ -1533,7 +1534,11 @@ mod diagnostic_tests {
 
         counters.reset();
 
-        assert_eq!(counters.faces(), 0, "a reload forgets what the last pack lost");
+        assert_eq!(
+            counters.faces(),
+            0,
+            "a reload forgets what the last pack lost"
+        );
         assert!(counters.names().is_empty());
         assert!(
             counters.warn_once(&path),
@@ -1718,8 +1723,7 @@ mod game_atlas_tests {
             with_face(uv, rotation, |face| {
                 let corners = sprite_fractions(face);
 
-                let to_pixels =
-                    |(x, y): (f32, f32)| ((x * 16.0).round(), (y * 16.0).round());
+                let to_pixels = |(x, y): (f32, f32)| ((x * 16.0).round(), (y * 16.0).round());
 
                 assert_eq!(
                     (to_pixels(corners.0), to_pixels(corners.1)),

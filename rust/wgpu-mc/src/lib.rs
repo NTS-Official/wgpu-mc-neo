@@ -69,7 +69,8 @@ use crate::util::BindableBuffer;
 /// written. See `WmRenderer::upload_late_sprites`.
 static LATE_SPRITE_UPLOADS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static LATE_SPRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static LATE_SPRITES_REPORTED_AT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static LATE_SPRITES_REPORTED_AT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// How long a burst of late sprites is allowed to be one line. One second is the interval the terrain
 /// line uses, and for the same reason: long enough that a steady state is one line a second, short

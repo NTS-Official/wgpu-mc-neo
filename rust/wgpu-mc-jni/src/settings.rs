@@ -564,7 +564,9 @@ impl Settings {
     /// See [`Settings::animated_textures`]: `Fancy` (the default) is yes, `Fast` is the frozen picture
     /// this renderer drew before the animated-texture path existed.
     pub fn animated_textures(&self) -> bool {
-        self.animated_textures.get_variant::<AnimatedTextures>().is_on()
+        self.animated_textures
+            .get_variant::<AnimatedTextures>()
+            .is_on()
     }
 }
 

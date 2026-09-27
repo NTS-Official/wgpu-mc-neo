@@ -4603,11 +4603,7 @@ fn report_terrain_transform(
     // the identity), and the view-projection. The culler builds the same box, which is what keeps
     // "where it is drawn" and "what is culled" one place - and the same relative position is what keeps
     // the transform's own precision, see `Scene::camera_section_pos`.
-    let rel = glam::ivec3(
-        pos.x - camera.x,
-        pos.y - camera.y,
-        pos.z - camera.z,
-    );
+    let rel = glam::ivec3(pos.x - camera.x, pos.y - camera.y, pos.z - camera.z);
     let centre = glam::vec3(
         (rel.x as f32 + 0.5) * 16.0,
         (rel.y as f32 + 0.5) * 16.0,

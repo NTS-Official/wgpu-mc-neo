@@ -3101,10 +3101,53 @@ corner shadow in vanilla and ice does, and the only thing that tells them apart 
 That is also why the flag is not the occlusion mask: an "all six faces covered" test, which is what this
 first used, gets ice wrong.
 
-Still not the game's: the **light** curve. Vanilla samples its lightmap *texture*
-(`sample_lightmap(Sampler2, UV2)`), while this shader approximates it with `max(sky, block) * 0.7 + 0.3`
-per vertex - a different and much larger approximation than the corner value was, and the next one to
-take.
+Still not the game's, at that point: the **light** curve. Vanilla samples its lightmap *texture*
+(`sample_lightmap(Sampler2, UV2)`), while this shader approximated it with `max(sky, block) * 0.7 + 0.3` per
+vertex - a different and much larger approximation than the corner value was. The lightmap handover came
+later (see "The lighting was a straight line through a curve the game had already built"), and it brought
+the last piece of the same corner with it.
+
+### The corner was darker than the game's, and it was the light rather than the occlusion
+
+With the lightmap in and the occlusion curve fixed, the next report was "the shadow in corners is darker than
+the game's". The occlusion was not it, and checking that took two reads:
+
+- **the four samples are the same four.** `BlockModelLighter#prepareQuadAmbientOcclusion` takes its samples
+  at `basePosition + info.corners[i]`, and `AdjacencyInfo.corners` are `Direction`s - unit steps in the plane
+  of the face around `basePosition` - with `shadeCorner` being one of each pair summed (`corners[0] +
+  corners[2]`), and `shadeCenter` the cell **in front of the face** for a cubic face
+  (`centerPosition.relative(direction)`) or the owning block for a partial one. That is exactly this side's
+  `p1` (the diagonal), `p2`/`p3` (its two sides) and `pos + dir`;
+- **the average is the same average.** Vanilla's four values are `getShadeBrightness` samples, each `1.0` or
+  `0.2`, so their mean is `1 - 0.2 * count` - the number the vertex carries here. The only place vanilla
+  differs is a shortcut that *darkens* (it reuses `shade0` for the diagonal when both cells beyond the
+  corners are view-blocking, where this side samples the diagonal), so it cannot be why this side was darker.
+
+It was the **light**, one line away, and the game has a rule for it that is easy to read past:
+
+```java
+// LightCoordsUtil.smoothBlend(neighbor1, neighbor2, neighbor3, center)
+if (sky(center) > 2 || block(center) > 2) {
+    if (sky(neighbor1) == 0) neighbor1 |= center & 0xFF0000;   // and the block channel, for all three
+    ...
+}
+return neighbor1 + neighbor2 + neighbor3 + center >> 2 & 16711935;
+```
+
+**Every zero among the three neighbours is lifted to the value of the cell in front of the face**, whenever
+that cell holds any light at all, and only then averaged. Which matters because of what the four cells around
+a corner usually are: the two sides and the diagonal of a corner inside a building are the **insides of solid
+blocks**, and the light stored inside a solid block is nothing at all - so a plain average is dragged down by
+cells no light reaches and no camera sees, and the corner comes out at a fraction of the game's. This side
+averaged the four plainly, per vertex, which is why its corners were dark and its open faces were not.
+
+`smooth_blend` is that function now, per vertex, with the samples it already had - and it is applied to the
+**light**, so the occlusion counts stay as they were. The test pins the rule on the case that made it
+visible: three dark cells and a lit one give the lit one's value, a cell holding `4` keeps its `4` and the
+average of `4, 14, 14, 14` floors to `11`, a cell holding `1` is not worth lifting anything to, and the two
+channels are lifted separately (`15` sky lifts the sky of its neighbours and leaves their block light
+alone). The client's own `options.txt` has `ao:true`, so the game being compared against takes the same
+path - the AO and the smooth light are one method in `BlockModelLighter`, not two settings.
 
 ### The fluid faces: a sprite offset is a fraction, a fluid surface is eight ninths, and lava is neither
 

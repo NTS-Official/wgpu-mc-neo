@@ -284,7 +284,9 @@ impl ResourceBacking {
         match self {
             ResourceBacking::Buffer(..) => ResourceKind::Buffer,
             ResourceBacking::BufferArray(_) => ResourceKind::Storage,
-            ResourceBacking::Texture2D(_) | ResourceBacking::TextureView(_) => ResourceKind::Texture,
+            ResourceBacking::Texture2D(_) | ResourceBacking::TextureView(_) => {
+                ResourceKind::Texture
+            }
             ResourceBacking::Sampler(_) => ResourceKind::Sampler,
         }
     }
@@ -577,9 +579,8 @@ impl RenderGraph {
                 continue;
             }
 
-            let Some(layout) = device_call(
-                &format!("the '{pipeline_name}' pipeline layout"),
-                || {
+            let Some(layout) =
+                device_call(&format!("the '{pipeline_name}' pipeline layout"), || {
                     wm.gpu
                         .device
                         .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -587,8 +588,8 @@ impl RenderGraph {
                             bind_group_layouts: &bind_group_layouts,
                             immediate_size,
                         })
-                },
-            ) else {
+                })
+            else {
                 continue;
             };
 
@@ -636,9 +637,8 @@ impl RenderGraph {
 
             let label = pipeline_name.to_string();
 
-            let Some(render_pipeline) =
-                device_call(&format!("the '{label}' pipeline"), || {
-                    wm.gpu
+            let Some(render_pipeline) = device_call(&format!("the '{label}' pipeline"), || {
+                wm.gpu
                         .device
                         .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                         label: Some(&label),
@@ -740,9 +740,9 @@ impl RenderGraph {
                         cache: None,
                         multiview_mask: None,
                         })
-                }) else {
-                    continue;
-                };
+            }) else {
+                continue;
+            };
 
             self.pipelines.insert(
                 pipeline_name.clone(),
@@ -1619,9 +1619,7 @@ mod binding_visibility_tests {
         ) {
             for statement in block.iter() {
                 match statement {
-                    naga::Statement::Call { function, .. } => {
-                        into(module, *function, seen, out)
-                    }
+                    naga::Statement::Call { function, .. } => into(module, *function, seen, out),
                     naga::Statement::Block(block) => calls_in(module, block, seen, out),
                     naga::Statement::If { accept, reject, .. } => {
                         calls_in(module, accept, seen, out);
@@ -1790,15 +1788,31 @@ mod lightmap_tests {
             [image[at], image[at + 1], image[at + 2], image[at + 3]]
         };
 
-        assert_eq!(texel(0, 0), [77, 77, 77, 255], "no light at all: 0.3 of full");
-        assert_eq!(texel(15, 15), [255, 255, 255, 255], "full light both ways: 1.0");
-        assert_eq!(texel(15, 0), [255, 255, 255, 255], "the brighter of the two is what counts");
+        assert_eq!(
+            texel(0, 0),
+            [77, 77, 77, 255],
+            "no light at all: 0.3 of full"
+        );
+        assert_eq!(
+            texel(15, 15),
+            [255, 255, 255, 255],
+            "full light both ways: 1.0"
+        );
+        assert_eq!(
+            texel(15, 0),
+            [255, 255, 255, 255],
+            "the brighter of the two is what counts"
+        );
         assert_eq!(
             texel(0, 15),
             [255, 255, 255, 255],
             "whichever of the two it is: the old curve took their maximum"
         );
-        assert_eq!(texel(8, 8), [172, 172, 172, 255], "8/15 of the way up the curve");
+        assert_eq!(
+            texel(8, 8),
+            [172, 172, 172, 255],
+            "8/15 of the way up the curve"
+        );
     }
 }
 

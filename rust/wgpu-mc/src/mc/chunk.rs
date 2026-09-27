@@ -29,7 +29,7 @@ pub const CHUNK_HEIGHT: usize = 384;
 pub const CHUNK_SECTION_HEIGHT: usize = 16;
 pub const SECTION_VOLUME: usize = CHUNK_AREA * CHUNK_SECTION_HEIGHT;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LightLevel {
     pub byte: u8,
 }
@@ -39,6 +39,26 @@ impl LightLevel {
         Self {
             byte: (sky << 4) | (block & 0b1111),
         }
+    }
+
+    /// The brighter of two light levels, **component by component** - the game's own
+    /// `LightCoordsUtil.max`:
+    ///
+    /// ```java
+    /// public static int max(int coords1, int coords2) {
+    ///     return pack(Math.max(block(coords1), block(coords2)), Math.max(sky(coords1), sky(coords2)));
+    /// }
+    /// ```
+    ///
+    /// Not the larger of the two bytes: a cell lit by a torch (`block 14, sky 0`) and a cell in daylight
+    /// (`block 0, sky 15`) pack as `0xe0` and `0x0f`, and the byte that is larger by that comparison is
+    /// the *dark* one - the sky nibble is in the high half. Taking the maximum of the two nibbles
+    /// separately is what keeps both.
+    pub fn brightest(self, other: LightLevel) -> LightLevel {
+        Self::from_sky_and_block(
+            self.get_sky_level().max(other.get_sky_level()),
+            self.get_block_level().max(other.get_block_level()),
+        )
     }
 
     pub fn get_sky_level(&self) -> u8 {
@@ -1040,8 +1060,14 @@ mod face_shade_tests {
     /// brightness, which is why a bug here shows on the sides and not on the tops.
     #[test]
     fn an_upward_face_keeps_its_colour() {
-        assert_eq!(scale_rgb(0xffff_ffff, face_shade(Direction::Up)), 0xffff_ffff);
-        assert_eq!(scale_rgb(0x00e4_763f, face_shade(Direction::Up)), 0x00e4_763f);
+        assert_eq!(
+            scale_rgb(0xffff_ffff, face_shade(Direction::Up)),
+            0xffff_ffff
+        );
+        assert_eq!(
+            scale_rgb(0x00e4_763f, face_shade(Direction::Up)),
+            0x00e4_763f
+        );
     }
 
     /// Scaling touches the three colour bytes and leaves the fourth alone - red in the low one.
@@ -1233,141 +1259,131 @@ fn bake_layers<Provider: BlockStateProvider>(
             // triangles puts the outside back; the same triangles in the other order are
             // `[1, 3, 0, 2, 3, 1]`.
             const INDICES: [u32; 6] = [0, 3, 1, 1, 3, 2];
-            let mut add_quad =
-                |face: &BlockModelFace, _light_level: LightLevel, dir: Direction, color: u32| {
-                    // The face's own share of the light, which is a property of the direction and not
-                    // of where the block is: see `face_shade`. A face in the `any` bucket arrives with
-                    // `Direction::Up` and is left at full brightness, which is what the game does for a
-                    // model that turns shading off.
-                    let color = scale_rgb(color, face_shade(dir));
+            let mut add_quad = |face: &BlockModelFace,
+                                _light_level: LightLevel,
+                                dir: Direction,
+                                color: u32| {
+                // The face's own share of the light, which is a property of the direction and not
+                // of where the block is: see `face_shade`. A face in the `any` bucket arrives with
+                // `Direction::Up` and is left at full brightness, which is what the game does for a
+                // model that turns shading off.
+                let color = scale_rgb(color, face_shade(dir));
 
-                    let baked_layer = &mut layers[face.layer as usize];
-                    let vec_index = baked_layer.vertices.len() / Vertex::VERTEX_LENGTH;
+                let baked_layer = &mut layers[face.layer as usize];
+                let vec_index = baked_layer.vertices.len() / Vertex::VERTEX_LENGTH;
 
-                    let dir_vec = dir.to_vec();
+                let dir_vec = dir.to_vec();
 
-                    baked_layer.vertices.extend(
-                        (0..4)
-                            .map(|vert_index| {
-                                let model_vertex = face.vertices[vert_index as usize];
+                baked_layer.vertices.extend(
+                    (0..4)
+                        .map(|vert_index| {
+                            let model_vertex = face.vertices[vert_index as usize];
 
-                                let (occluders, light_level) = if model_mesh.any.is_empty() {
-                                    let vertex_biases = ivec3(
-                                        if model_vertex.position.x as i32 == 0 {
-                                            -1
-                                        } else {
-                                            1
-                                        },
-                                        if model_vertex.position.y as i32 == 0 {
-                                            -1
-                                        } else {
-                                            1
-                                        },
-                                        if model_vertex.position.z as i32 == 0 {
-                                            -1
-                                        } else {
-                                            1
-                                        },
-                                    );
+                            let (occluders, light_level) = if model_mesh.any.is_empty() {
+                                let vertex_biases = ivec3(
+                                    if model_vertex.position.x as i32 == 0 {
+                                        -1
+                                    } else {
+                                        1
+                                    },
+                                    if model_vertex.position.y as i32 == 0 {
+                                        -1
+                                    } else {
+                                        1
+                                    },
+                                    if model_vertex.position.z as i32 == 0 {
+                                        -1
+                                    } else {
+                                        1
+                                    },
+                                );
 
-                                    let axis = dir_vec - vertex_biases; //equivalent to -(vertex_biases - dir_vec)
+                                let axis = dir_vec - vertex_biases; //equivalent to -(vertex_biases - dir_vec)
 
-                                    let mut axes: ArrayVec<IVec3, 2> = ArrayVec::new_const();
+                                let mut axes: ArrayVec<IVec3, 2> = ArrayVec::new_const();
 
-                                    if axis.x != 0 {
-                                        axes.push(ivec3(axis.x, 0, 0));
-                                    }
-
-                                    if axis.y != 0 {
-                                        axes.push(ivec3(0, axis.y, 0));
-                                    }
-
-                                    if axis.z != 0 {
-                                        axes.push(ivec3(0, 0, axis.z));
-                                    }
-
-                                    let p1 = vertex_biases + pos;
-                                    let p2 = p1 + axes[0];
-                                    let p3 = p1 + axes[1];
-
-                                    // The four blocks Minecraft averages for this corner
-                                    // (`BlockModelLighter#prepareQuadAmbientOcclusion`): the neighbour
-                                    // across the face at the corner, the two blocks beside it, and the
-                                    // block the face looks at - `shade0`, `shade1`, the two corner
-                                    // samples and `shadeCenter`, one `getShadeBrightness` each.
-                                    //
-                                    // The count is what the vertex carries, not a brightness: the
-                                    // brightness is `1 - 0.2 * count`, which is the same average, and
-                                    // counting it here keeps the curve in one place - the shader -
-                                    // where a wrong number is one line rather than a re-bake.
-                                    let b1 = shades_corners(block_manager, state_provider.get_state(p1))
-                                        as u8;
-                                    let b2 = shades_corners(block_manager, state_provider.get_state(p2))
-                                        as u8;
-                                    let b3 = shades_corners(block_manager, state_provider.get_state(p3))
-                                        as u8;
-                                    let b4 = shades_corners(
-                                        block_manager,
-                                        state_provider.get_state(pos + dir_vec),
-                                    ) as u8;
-
-                                    let l1 = state_provider.get_light_level(p1);
-                                    let l2 = state_provider.get_light_level(p2);
-                                    let l3 = state_provider.get_light_level(p3);
-                                    let l4 = state_provider.get_light_level(pos + dir_vec);
-
-                                    let average_sky = ((l1.get_sky_level()
-                                        + l2.get_sky_level()
-                                        + l3.get_sky_level()
-                                        + l4.get_sky_level())
-                                        as f32
-                                        / 4.0)
-                                        as u8;
-                                    let average_block = ((l1.get_block_level()
-                                        + l2.get_block_level()
-                                        + l3.get_block_level()
-                                        + l4.get_block_level())
-                                        as f32
-                                        / 4.0)
-                                        as u8;
-
-                                    let light_level =
-                                        LightLevel::from_sky_and_block(average_sky, average_block);
-
-                                    (b1 + b2 + b3 + b4, light_level)
-                                } else {
-                                    (0, state_provider.get_light_level(pos))
-                                };
-
-                                Vertex {
-                                    position: [
-                                        fpos.x + model_vertex.position[0],
-                                        fpos.y + model_vertex.position[1],
-                                        fpos.z + model_vertex.position[2],
-                                    ],
-                                    uv: model_vertex.tex_coords,
-                                    normal: face.normal.to_array(),
-                                    color,
-                                    // Which atlas those coordinates are in, decided when the face was
-                                    // baked: a face whose sprite the game animates is baked with the
-                                    // game's own coordinates and draws from the game's atlas. See
-                                    // `UV_GAME_ATLAS`.
-                                    uv_flags: face.uv_flags,
-                                    lightmap_coords: light_level.byte,
-                                    // How many of the four blocks around this corner fill their whole
-                                    // block, which is what darkens it: see `shades_corners` for the
-                                    // four and the shader for the curve.
-                                    ao: occluders,
+                                if axis.x != 0 {
+                                    axes.push(ivec3(axis.x, 0, 0));
                                 }
-                            })
-                            .flat_map(Vertex::compressed),
-                    );
-                    baked_layer.indices.extend(
-                        INDICES
-                            .iter()
-                            .flat_map(|index| (index + (vec_index as u32)).to_ne_bytes()),
-                    );
-                };
+
+                                if axis.y != 0 {
+                                    axes.push(ivec3(0, axis.y, 0));
+                                }
+
+                                if axis.z != 0 {
+                                    axes.push(ivec3(0, 0, axis.z));
+                                }
+
+                                let p1 = vertex_biases + pos;
+                                let p2 = p1 + axes[0];
+                                let p3 = p1 + axes[1];
+
+                                // The four blocks Minecraft averages for this corner
+                                // (`BlockModelLighter#prepareQuadAmbientOcclusion`): the neighbour
+                                // across the face at the corner, the two blocks beside it, and the
+                                // block the face looks at - `shade0`, `shade1`, the two corner
+                                // samples and `shadeCenter`, one `getShadeBrightness` each.
+                                //
+                                // The count is what the vertex carries, not a brightness: the
+                                // brightness is `1 - 0.2 * count`, which is the same average, and
+                                // counting it here keeps the curve in one place - the shader -
+                                // where a wrong number is one line rather than a re-bake.
+                                let b1 = shades_corners(block_manager, state_provider.get_state(p1))
+                                    as u8;
+                                let b2 = shades_corners(block_manager, state_provider.get_state(p2))
+                                    as u8;
+                                let b3 = shades_corners(block_manager, state_provider.get_state(p3))
+                                    as u8;
+                                let b4 = shades_corners(
+                                    block_manager,
+                                    state_provider.get_state(pos + dir_vec),
+                                ) as u8;
+
+                                let l1 = state_provider.get_light_level(p1);
+                                let l2 = state_provider.get_light_level(p2);
+                                let l3 = state_provider.get_light_level(p3);
+                                let l4 = state_provider.get_light_level(pos + dir_vec);
+
+                                // The game's smooth lighting, per vertex: the three cells around the corner
+                                // and the cell in front of the face, with the game's rule for the zeroes
+                                // between them. See [`smooth_blend`] - this was a plain average of the four,
+                                // which is what made a corner read darker than the game's.
+                                let light_level = smooth_blend([l1, l2, l3], l4);
+
+                                (b1 + b2 + b3 + b4, light_level)
+                            } else {
+                                (0, state_provider.get_light_level(pos))
+                            };
+
+                            Vertex {
+                                position: [
+                                    fpos.x + model_vertex.position[0],
+                                    fpos.y + model_vertex.position[1],
+                                    fpos.z + model_vertex.position[2],
+                                ],
+                                uv: model_vertex.tex_coords,
+                                normal: face.normal.to_array(),
+                                color,
+                                // Which atlas those coordinates are in, decided when the face was
+                                // baked: a face whose sprite the game animates is baked with the
+                                // game's own coordinates and draws from the game's atlas. See
+                                // `UV_GAME_ATLAS`.
+                                uv_flags: face.uv_flags,
+                                lightmap_coords: light_level.byte,
+                                // How many of the four blocks around this corner fill their whole
+                                // block, which is what darkens it: see `shades_corners` for the
+                                // four and the shader for the curve.
+                                ao: occluders,
+                            }
+                        })
+                        .flat_map(Vertex::compressed),
+                );
+                baked_layer.indices.extend(
+                    INDICES
+                        .iter()
+                        .flat_map(|index| (index + (vec_index as u32)).to_ne_bytes()),
+                );
+            };
 
             let mut add_face = |face: &BlockModelFace, dir: Direction| {
                 let color = if face.tint_index != -1 {
@@ -1442,12 +1458,196 @@ fn bake_layers<Provider: BlockStateProvider>(
 /// atlas.
 pub const FLUID_TEXTURES: [&str; 4] = ["lava_still", "lava_flow", "water_still", "water_flow"];
 
-/// The fluid byte a block carries: which fluid (1 water, 2 lava, 3 some other, 0 none), how much of
-/// it there is out of nine, and whether it is falling. The mod writes it and
-/// `wgpu_mc_jni::section` reads the same three fields back out of the same byte, so the three
-/// shifts and masks here are an ABI: the writer is `describe` in the mod's `Payload`.
+/// The fluid a block carries: which fluid (1 water, 2 lava, 3 some other, 0 none), how much of it there
+/// is out of nine, and **which half of the fluid it is** - the source object or the flowing one. The mod
+/// writes it and `wgpu_mc_jni::section` reads the same three fields back out of the same byte, so the
+/// shifts and masks here are an ABI: the writer is `fluidByte` in the mod's `RustChunkBake`.
+///
+/// The third field used to be documented as "falling", which no writer ever set: a falling fluid is not a
+/// different fluid to the game - its `FALLING` property is on the *state*, and its type is the flowing
+/// object like any spreading block. What the game does distinguish is the source from the flowing half,
+/// which is exactly what [`same_fluid`] needs. See the mod's `fluidByte` for the writer's half of it.
 pub fn fluid_of(byte: u8) -> (u8, u8, bool) {
-    (byte & 0b11, (byte >> 2) & 0b1111, byte & 0b0100_0000 != 0)
+    (
+        byte & 0b11,
+        (byte >> 2) & 0b1111,
+        byte & 0b0100_0000 != 0,
+    )
+}
+
+/// The game's `LightCoordsUtil.smoothBlend`: the light one vertex takes from the four cells around its
+/// corner.
+///
+/// ```java
+/// public static int smoothBlend(int neighbor1, int neighbor2, int neighbor3, int center) {
+///     if (sky(center) > 2 || block(center) > 2) {
+///         if (sky(neighbor1) == 0) neighbor1 |= center & 0xFF0000;      // and the block channel, and the
+///         if (block(neighbor1) == 0) neighbor1 |= center & 0xFF;        // same for the other two
+///         ...
+///     }
+///     return neighbor1 + neighbor2 + neighbor3 + center >> 2 & 16711935;
+/// }
+/// ```
+///
+/// The rule in the middle is the one this side did not have, and it is why its corners came out darker than
+/// the game's: **one of the four cells around a corner of a face is usually the inside of a solid block**,
+/// and the light stored inside a solid block is nothing at all - so an average of the four is dragged down
+/// by cells that no light reaches and no camera sees. The game lifts every zero it finds up to the value of
+/// the cell in front of the face, whenever that cell holds any light at all (more than 2 of 15), and only
+/// then averages. A cell that has some light of its own keeps it: this is a floor under the zeroes, not a
+/// maximum.
+///
+/// The average is the plain one, per channel, floored (`>> 2` of the four nibbles packed one per byte) -
+/// which is what the sum of four nibbles cannot carry into the other channel.
+fn smooth_blend(neighbours: [LightLevel; 3], center: LightLevel) -> LightLevel {
+    // `sky(center) > 2 || block(center) > 2`: dim light is not worth lifting anything to, and lifting a
+    // zero to a two would move a corner by a step the game does not move it by.
+    let lift = center.get_sky_level() > 2 || center.get_block_level() > 2;
+
+    let neighbour = |neighbour: LightLevel| {
+        if !lift {
+            return neighbour;
+        }
+
+        LightLevel::from_sky_and_block(
+            if neighbour.get_sky_level() == 0 {
+                center.get_sky_level()
+            } else {
+                neighbour.get_sky_level()
+            },
+            if neighbour.get_block_level() == 0 {
+                center.get_block_level()
+            } else {
+                neighbour.get_block_level()
+            },
+        )
+    };
+
+    let lifted = neighbours.map(neighbour);
+
+    let average = |channel: fn(&LightLevel) -> u8| {
+        let sum = lifted
+            .iter()
+            .map(channel)
+            .map(u16::from)
+            .sum::<u16>()
+            + u16::from(channel(&center));
+
+        (sum / 4) as u8
+    };
+
+    LightLevel::from_sky_and_block(
+        average(LightLevel::get_sky_level),
+        average(LightLevel::get_block_level),
+    )
+}
+
+/// The brighter of two light levels, which is `LightCoordsUtil.max` and not the larger byte. See
+/// [`LightLevel::brightest`], which the fluid faces are lit by.
+#[cfg(test)]
+mod light_level_tests {
+    use super::*;
+
+    /// The two nibbles are maxima of their own: a cell lit by a torch and a cell in daylight are each
+    /// brighter than the other in one half.
+    ///
+    /// Worth a test because the packed byte makes the naive answer *wrong in the dark direction*: the
+    /// sky light is the high nibble, so `0x0f` (sky 0, block 15) compares as *smaller* than `0xe0`
+    /// (sky 14, block 0) and taking the larger byte would light a torch-lit cell with sky light instead.
+    #[test]
+    fn the_brighter_of_two_levels_is_taken_per_component() {
+        let torch = LightLevel::from_sky_and_block(0, 15);
+        let daylight = LightLevel::from_sky_and_block(15, 0);
+
+        assert_eq!(torch.byte, 0x0f);
+        assert_eq!(daylight.byte, 0xf0);
+        assert!(
+            daylight.byte > torch.byte,
+            "the naive comparison says daylight"
+        );
+
+        assert_eq!(
+            torch.brightest(daylight),
+            LightLevel::from_sky_and_block(15, 15),
+            "and the answer keeps both: full sky *and* full block"
+        );
+
+        // A covered lava cell: block light 15 in its own cell, nothing in the block above it - which is
+        // the pair the fluid's surface is lit by, and the reason lava under a block is not black.
+        assert_eq!(
+            LightLevel::from_sky_and_block(7, 15).brightest(LightLevel::from_sky_and_block(0, 0)),
+            LightLevel::from_sky_and_block(7, 15)
+        );
+
+        assert_eq!(torch.brightest(torch), torch);
+    }
+
+    /// The game's smooth-light rule, on the cells that make it matter: one of the four around a corner is
+    /// usually the inside of a solid block, and that cell holds no light at all.
+    ///
+    /// Without the lifting, that zero is averaged in like any other sample and the corner comes out darker
+    /// than the game draws it - which is what "the shadow in corners is darker than the game's" is.
+    #[test]
+    fn a_dark_cell_beside_a_lit_one_is_lifted_to_it() {
+        let lit = LightLevel::from_sky_and_block(0, 14);
+        let dark = LightLevel::from_sky_and_block(0, 0);
+
+        assert_eq!(
+            smooth_blend([dark; 3], lit),
+            lit,
+            "the three zeroes take the lit cell's value, so the average is that value"
+        );
+
+        // A cell with some light of its own keeps it: this is a floor under the zeroes, not a maximum.
+        assert_eq!(
+            smooth_blend(
+                [
+                    LightLevel::from_sky_and_block(0, 4),
+                    dark,
+                    dark
+                ],
+                lit
+            ),
+            LightLevel::from_sky_and_block(0, 11),
+            "`(4 + 14 + 14 + 14) / 4` is 11 and a half, floored"
+        );
+
+        // Nothing lit in front of the face is nothing to lift the zeroes to.
+        assert_eq!(smooth_blend([dark; 3], dark), dark);
+        assert_eq!(
+            smooth_blend(
+                [dark, dark, LightLevel::from_sky_and_block(0, 1)],
+                LightLevel::from_sky_and_block(0, 1)
+            ),
+            dark,
+            "a cell holding 1 of 15 is not worth lifting anything to - the game lifts only above 2"
+        );
+
+        // The two channels are lifted on their own: daylight raises the sky light of its neighbours and
+        // leaves their block light where it was.
+        assert_eq!(
+            smooth_blend(
+                [LightLevel::from_sky_and_block(0, 0); 3],
+                LightLevel::from_sky_and_block(15, 0)
+            ),
+            LightLevel::from_sky_and_block(15, 0)
+        );
+
+        assert_eq!(
+            smooth_blend(
+                [
+                    LightLevel::from_sky_and_block(0, 9),
+                    LightLevel::from_sky_and_block(0, 0),
+                    LightLevel::from_sky_and_block(0, 0)
+                ],
+                LightLevel::from_sky_and_block(15, 0)
+            ),
+            LightLevel::from_sky_and_block(15, 2),
+            "each channel on its own: the sky is lifted to the lit cell's 15, and the block light has \
+             nothing to be lifted to - the cell in front of the face holds none - so the 9 is averaged \
+             with three zeroes and floored to 2"
+        );
+    }
 }
 
 /// How many blocks the fluid mesher has seen holding a fluid, and how many faces it has drawn for
@@ -1502,44 +1702,195 @@ fn fluid_height(amount: u8, same_above: bool) -> f32 {
     }
 }
 
-/// The height of a fluid's surface at one corner of a block, in blocks.
+/// Whether two fluid bytes hold **the same fluid object**, which is what the game's `isSame` asks and is
+/// not the same question as "the same kind of fluid":
 ///
-/// Minecraft averages the fluid in the four blocks that touch that corner - which is what turns a
-/// surface that steps from block to block into one that slopes - and gives the corner the full
-/// block when one of those four holds a *different* fluid, because the two do not join. A corner
-/// with none of this fluid at all is the full block too.
-fn fluid_corner_height<Provider: BlockStateProvider>(
+/// ```java
+/// // Fluid
+/// public boolean isSame(Fluid other) { return other == this; }
+/// ```
+///
+/// A fluid is two registered objects, a source and a flowing one, and a block answers whichever its level
+/// came from (`LiquidBlock`'s state cache: level 0 is `getSource(false)`, levels 1 to 7 and the falling
+/// level 8 are `getFlowing(...)`). So `FLOWING_LAVA.isSame(LAVA)` is false, and vanilla's height and flow
+/// arithmetic treats a source beside a flowing block as **two liquids that do not join**: the flowing half
+/// is not "the same fluid above" for the source, `affectsFlow` is false between them, and a corner between
+/// them takes the other one as a zero.
+///
+/// This side draws the two halves with the same sprite - they are one liquid to look at - but asks this
+/// question wherever vanilla does, which is why the byte carries the bit. Getting that wrong is what "the
+/// lava's flowing state still does not match the game" was: the surfaces and the flow directions came out
+/// as one continuous liquid where vanilla steps.
+pub fn same_fluid(kind: u8, flowing: bool, other_kind: u8, other_flowing: bool) -> bool {
+    kind != 0 && kind == other_kind && flowing == other_flowing
+}
+
+/// What one block contributes to a corner sample: the game's `FluidRenderer#getHeight`, sentinel and all.
+///
+/// ```java
+/// private float getHeight(BlockAndTintGetter level, Fluid fluidType, BlockPos pos, BlockState state,
+///                         FluidState fluidState) {
+///     if (fluidType.isSame(fluidState.getType())) {                       // the *same object*
+///         BlockState aboveState = level.getBlockState(pos.above());
+///         return fluidType.isSame(aboveState.getFluidState().getType()) ? 1.0F : fluidState.getOwnHeight();
+///     } else {
+///         return !state.isSolid() ? 0.0F : -1.0F;
+///     }
+/// }
+/// ```
+///
+/// So a block answers one of four things:
+///
+/// - `1.0` - it holds **this fluid object** with the same one above it, which is a column;
+/// - `amount / 9` - it holds this fluid object without it above;
+/// - `0.0` - it does not hold it and is **not solid**: air, a plant, a different fluid, and the *other
+///   half of this same fluid*. That is the weight-one zero that tapers a fluid's edge;
+/// - `-1.0` - it does not hold it and *is* solid. The average drops those entirely, and it is what keeps
+///   a fluid's surface at its own height where a stone wall rises beside it.
+///
+/// `blocks_motion` stands in for `isSolid()` here, which is `block != COBWEB && block != BAMBOO_SAPLING &&
+/// isSolid()`: the two agree for everything that matters to a fluid - air, stone, and a fluid itself,
+/// which is not solid - and differ for a cobweb and a bamboo sapling, which this then treats as a 0.0
+/// sample rather than dropping.
+fn sampled_height<Provider: BlockStateProvider>(
     state_provider: &Provider,
+    block_manager: &BlockManager,
     pos: IVec3,
     kind: u8,
+    flowing: bool,
+) -> f32 {
+    let (other_kind, amount, other_flowing) = fluid_of(state_provider.get_fluid(pos));
+
+    if same_fluid(kind, flowing, other_kind, other_flowing) {
+        let (above_kind, _, above_flowing) = fluid_of(state_provider.get_fluid(pos + IVec3::Y));
+
+        return fluid_height(
+            amount,
+            same_fluid(kind, flowing, above_kind, above_flowing),
+        );
+    }
+
+    if face_flags(block_manager, state_provider.get_state(pos)).blocks_motion {
+        -1.0
+    } else {
+        0.0
+    }
+}
+
+/// The game's `FluidRenderer#addWeightedHeight`, into a `(sum, weight)` pair:
+///
+/// ```java
+/// private void addWeightedHeight(float[] weightedHeight, float height) {
+///     if (height >= 0.8F) {
+///         weightedHeight[0] += height * 10.0F;
+///         weightedHeight[1] += 10.0F;
+///     } else if (height >= 0.0F) {
+///         weightedHeight[0] += height;
+///         weightedHeight[1]++;
+///     }
+/// }
+/// ```
+///
+/// A height of `0.8` or more counts **ten times**, and a negative one - the `-1.0` a solid block answers
+/// with - is dropped. That weighting is the whole reason a fluid's surface does not sag towards its edges:
+/// the block's own height outweighs the zeroes beside it ten to one.
+fn add_weighted_height(total: &mut (f32, f32), height: f32) {
+    if height >= 0.8 {
+        total.0 += height * 10.0;
+        total.1 += 10.0;
+    } else if height >= 0.0 {
+        total.0 += height;
+        total.1 += 1.0;
+    }
+}
+
+/// The height of a fluid's surface at one corner of a block, in blocks - the game's
+/// `FluidRenderer#calculateAverageHeight`:
+///
+/// ```java
+/// private float calculateAverageHeight(BlockAndTintGetter level, Fluid type, float heightSelf,
+///                                      float height2, float height1, BlockPos cornerPos) {
+///     if (!(height1 >= 1.0F) && !(height2 >= 1.0F)) {
+///         float[] weightedHeight = new float[2];
+///         if (height1 > 0.0F || height2 > 0.0F) {
+///             float heightCorner = this.getHeight(level, type, cornerPos);
+///             if (heightCorner >= 1.0F) {
+///                 return 1.0F;
+///             }
+///             this.addWeightedHeight(weightedHeight, heightCorner);
+///         }
+///         this.addWeightedHeight(weightedHeight, heightSelf);
+///         this.addWeightedHeight(weightedHeight, height1);
+///         this.addWeightedHeight(weightedHeight, height2);
+///         return weightedHeight[0] / weightedHeight[1];
+///     } else {
+///         return 1.0F;
+///     }
+/// }
+/// ```
+///
+/// `side_first` and `side_second` are the two blocks that share this corner with `pos` - north and west
+/// for the north-west corner, north and east for the north-east one, and so on - and they are sampled
+/// from the *same* fluid object as `pos`, which is the caller's job. The diagonal block is only sampled
+/// at all when one of the two sides holds something, which is why a corner out in the open does not
+/// average in the block diagonally behind it.
+///
+/// This used to be a plain mean of the corner blocks that held the same fluid, which is both a different
+/// weighting *and* a different set of blocks: it left out the zeroes air and a different fluid contribute,
+/// so a surface was level where the game's tapers at an open edge, and it returned the full block for a
+/// corner touching another fluid, where the game gives a `0.0` or drops the sample.
+fn fluid_corner_height<Provider: BlockStateProvider>(
+    state_provider: &Provider,
+    block_manager: &BlockManager,
+    pos: IVec3,
+    kind: u8,
+    flowing: bool,
+    self_height: f32,
     corner: IVec2,
 ) -> f32 {
-    let base = pos + ivec3(corner.x - 1, 0, corner.y - 1);
+    // The two blocks that share this corner with `pos`: the sign of the corner's own y is which way they
+    // lie, and the corner's four blocks are `pos` plus those two plus the diagonal between them.
+    let step_x = if corner.x == 0 {
+        -IVec3::X
+    } else {
+        IVec3::X
+    };
+    let step_z = if corner.y == 0 {
+        -IVec3::Z
+    } else {
+        IVec3::Z
+    };
 
-    let mut total = 0.0;
-    let mut counted = 0;
+    let side_x = sampled_height(state_provider, block_manager, pos + step_x, kind, flowing);
+    let side_z = sampled_height(state_provider, block_manager, pos + step_z, kind, flowing);
 
-    for step in [IVec3::ZERO, IVec3::X, IVec3::Z, ivec3(1, 0, 1)] {
-        let (other_kind, amount, _falling) = fluid_of(state_provider.get_fluid(base + step));
+    if side_x >= 1.0 || side_z >= 1.0 {
+        return 1.0;
+    }
 
-        if other_kind == kind {
-            // Each of the four blocks is asked *its own* height, and the one case that lifts it is more
-            // of the same fluid directly above that block - see `fluid_height`.
-            let same_above =
-                fluid_of(state_provider.get_fluid(base + step + IVec3::Y)).0 == kind;
+    let mut total = (0.0, 0.0);
 
-            total += fluid_height(amount, same_above);
-            counted += 1;
-        } else if other_kind != 0 {
+    if side_x > 0.0 || side_z > 0.0 {
+        let corner_height = sampled_height(
+            state_provider,
+            block_manager,
+            pos + step_x + step_z,
+            kind,
+            flowing,
+        );
+
+        if corner_height >= 1.0 {
             return 1.0;
         }
+
+        add_weighted_height(&mut total, corner_height);
     }
 
-    if counted == 0 {
-        1.0
-    } else {
-        total / counted as f32
-    }
+    add_weighted_height(&mut total, self_height);
+    add_weighted_height(&mut total, side_x);
+    add_weighted_height(&mut total, side_z);
+
+    if total.1 == 0.0 { 1.0 } else { total.0 / total.1 }
 }
 
 /// How high a fluid stands, and the one thing that was wrong about it. See [`fluid_height`].
@@ -1570,7 +1921,11 @@ mod fluid_height_tests {
     #[test]
     fn the_block_is_full_only_under_more_of_the_same_fluid() {
         assert_eq!(fluid_height(8, true), 1.0);
-        assert_eq!(fluid_height(4, true), 1.0, "even a thin layer, with more of it above");
+        assert_eq!(
+            fluid_height(4, true),
+            1.0,
+            "even a thin layer, with more of it above"
+        );
 
         for amount in 1..=8u8 {
             assert_eq!(fluid_height(amount, false), amount as f32 / 9.0);
@@ -1678,7 +2033,11 @@ impl FluidSprite {
 
     /// Which atlas a face of this sprite is baked for. See [`UV_GAME_ATLAS`].
     fn flags(&self) -> u32 {
-        if self.game.is_some() { UV_GAME_ATLAS } else { 0 }
+        if self.game.is_some() {
+            UV_GAME_ATLAS
+        } else {
+            0
+        }
     }
 }
 
@@ -1720,9 +2079,15 @@ const MAX_FLUID_HEIGHT: f32 = 0.8888889;
 /// under it, and the fluid there counts as one block's height lower. That is what makes a stream's
 /// surface point at the edge it is about to fall over.
 ///
-/// The falling case of the game's function is left out: it needs the fluid's own `FALLING` property,
-/// which this side's payload does not carry (see `fluid_of`). What it would add is a downward
-/// component, and the only thing the caller uses is the horizontal *direction*.
+/// The falling case of the game's function is left out: the downward part of `getFlow` is chosen by the
+/// fluid's own `FALLING` property, which this side's payload does not carry. What it would add is a
+/// vertical component, and the only thing the caller uses is the horizontal *direction*.
+///
+/// `affectsFlow` is the game's `neighbourFluid.isEmpty() || neighbourFluid.getType().isSame(this)`, which
+/// is *object* identity: the **other half** of this same fluid - a source beside a flowing block - does not
+/// affect the flow, and neither does a different fluid. Getting that wrong is the other half of "the lava's
+/// flowing state still does not match the game": the flow vector decides which way the rotated quarter of
+/// the flowing sprite points, so a neighbour that should not count changes the *direction of the pattern*.
 ///
 /// The result is normalized the way the game normalizes it - `Vec3#normalize` answers zero for a vector
 /// that is already zero rather than dividing by it - because the caller's first question is whether
@@ -1732,6 +2097,7 @@ fn fluid_flow<Provider: BlockStateProvider>(
     block_manager: &BlockManager,
     pos: IVec3,
     kind: u8,
+    flowing: bool,
     own_amount: u8,
 ) -> (f32, f32) {
     let own_height = fluid_height(own_amount, false);
@@ -1745,17 +2111,21 @@ fn fluid_flow<Provider: BlockStateProvider>(
         Direction::West,
     ] {
         let neighbour = pos + dir.to_vec();
-        let (neighbour_kind, neighbour_amount, _) = fluid_of(state_provider.get_fluid(neighbour));
+        let (neighbour_kind, neighbour_amount, neighbour_flowing) =
+            fluid_of(state_provider.get_fluid(neighbour));
 
-        // `affectsFlow`: a fluid flows towards nothing, and towards more of itself.
-        if neighbour_kind != 0 && neighbour_kind != kind {
+        // `affectsFlow`: `neighbourFluid.isEmpty() || neighbourFluid.getType().isSame(this)` - a fluid
+        // flows towards nothing and towards the same fluid object. An **empty** neighbour affects the
+        // flow (it is what the "is there fluid below it" case below is about), a different fluid does
+        // not, and neither does the other half of this one.
+        if neighbour_kind != 0 && !same_fluid(kind, flowing, neighbour_kind, neighbour_flowing) {
             continue;
         }
 
-        let neighbour_height = if neighbour_kind == kind {
-            fluid_height(neighbour_amount, false)
-        } else {
+        let neighbour_height = if neighbour_kind == 0 {
             0.0
+        } else {
+            fluid_height(neighbour_amount, false)
         };
 
         let distance = if neighbour_height == 0.0 {
@@ -1767,15 +2137,18 @@ fn fluid_flow<Provider: BlockStateProvider>(
                 0.0
             } else {
                 let below = neighbour - IVec3::Y;
-                let (below_kind, below_amount, _) = fluid_of(state_provider.get_fluid(below));
+                let (below_kind, below_amount, below_flowing) =
+                    fluid_of(state_provider.get_fluid(below));
 
-                if below_kind != 0 && below_kind != kind {
+                // `affectsFlow` again, and `getOwnHeight` of an *empty* fluid is zero: a neighbour with
+                // nothing under it either leaves the distance at zero.
+                if below_kind != 0 && !same_fluid(kind, flowing, below_kind, below_flowing) {
                     0.0
                 } else {
-                    let below_height = if below_kind == kind {
-                        fluid_height(below_amount, false)
-                    } else {
+                    let below_height = if below_kind == 0 {
                         0.0
+                    } else {
+                        fluid_height(below_amount, false)
                     };
 
                     if below_height > 0.0 {
@@ -1843,25 +2216,31 @@ fn flowing_top_offsets(flow_x: f32, flow_z: f32) -> [(f32, f32); 4] {
     ]
 }
 
-/// The top face of a flowing fluid: which way it runs, and how the flowing sprite is turned to match.
+/// The fluid mesher's worlds, built by hand: what the two test modules below put in front of it.
 #[cfg(test)]
-mod fluid_flow_tests {
+mod fluid_fixtures {
     use super::*;
     use crate::mc::block::BlockstateKey;
 
-    /// A fluid byte in the payload's own packing: which fluid, how much of nine, falling.
-    fn fluid(kind: u8, amount: u8) -> u8 {
+    /// A fluid byte in the payload's own packing: which fluid, how much of nine, and whether it is the
+    /// **flowing** half of that fluid - bit 6, which is the third field `fluid_of` reads.
+    pub fn fluid(kind: u8, amount: u8) -> u8 {
         kind | (amount << 2)
+    }
+
+    /// The same for the other half of a fluid: `Fluids.FLOWING_LAVA` rather than `Fluids.LAVA`.
+    pub fn flowing(kind: u8, amount: u8) -> u8 {
+        fluid(kind, amount) | 0b0100_0000
     }
 
     /// A source block of either fluid: `FluidState#getAmount` is 8 for a source and for a falling
     /// fluid, and never 9 - see `fluid_height`.
-    const SOURCE: u8 = 8;
+    pub const SOURCE: u8 = 8;
 
     /// Solid ground, which stops a fluid, and a plant, which does not: the two answers
     /// `blocksMotion` gives and the only thing in [`fluid_flow`] that is not a height.
-    const SOLID: u16 = 1;
-    const PLANT: u16 = 2;
+    pub const SOLID: u16 = 1;
+    pub const PLANT: u16 = 2;
 
     fn state_of(id: u16) -> ChunkBlockState {
         ChunkBlockState::State(BlockstateKey {
@@ -1871,21 +2250,25 @@ mod fluid_flow_tests {
     }
 
     /// A world holding exactly the fluids and the blocks given, and air everywhere else.
-    struct FluidWorld {
-        fluids: Vec<(IVec3, u8)>,
-        blocks: Vec<(IVec3, u16)>,
+    pub struct FluidWorld {
+        pub fluids: Vec<(IVec3, u8)>,
+        pub blocks: Vec<(IVec3, u16)>,
     }
 
     impl FluidWorld {
+        pub fn new(fluids: &[(IVec3, u8)], blocks: &[(IVec3, u16)]) -> Self {
+            Self {
+                fluids: fluids.to_vec(),
+                blocks: blocks.to_vec(),
+            }
+        }
+
         /// A source of `kind` at the origin, and whatever else the test gives it.
-        fn with(kind: u8, fluids: &[(IVec3, u8)], blocks: &[(IVec3, u16)]) -> Self {
+        pub fn with(kind: u8, fluids: &[(IVec3, u8)], blocks: &[(IVec3, u16)]) -> Self {
             let mut all = vec![(IVec3::ZERO, fluid(kind, SOURCE))];
             all.extend_from_slice(fluids);
 
-            Self {
-                fluids: all,
-                blocks: blocks.to_vec(),
-            }
+            Self::new(&all, blocks)
         }
     }
 
@@ -1918,7 +2301,7 @@ mod fluid_flow_tests {
         }
     }
 
-    fn manager() -> BlockManager {
+    pub fn manager() -> BlockManager {
         let mut manager = BlockManager::new();
 
         for (id, blocks_motion) in [(SOLID, true), (PLANT, false)] {
@@ -1935,10 +2318,21 @@ mod fluid_flow_tests {
 
         manager
     }
+}
+
+/// The top face of a flowing fluid: which way it runs, and how the flowing sprite is turned to match.
+#[cfg(test)]
+mod fluid_flow_tests {
+    use super::fluid_fixtures::*;
+    use super::*;
 
     /// Which way the fluid at the origin runs, in the world the test built.
+    ///
+    /// The fixture's fluids are all **sources** - the byte's third field says which half of a fluid a block
+    /// holds, and a test that wants a flowing one says so - which is also the fluid object the block above
+    /// it has to be for `same_above` to lift it.
     fn flow(world: &FluidWorld) -> (f32, f32) {
-        fluid_flow(world, &manager(), IVec3::ZERO, 2, SOURCE)
+        fluid_flow(world, &manager(), IVec3::ZERO, 2, false, SOURCE)
     }
 
     /// A lava source is `8/9` tall in every direction, so there is no slope and nothing to flow down:
@@ -1977,7 +2371,10 @@ mod fluid_flow_tests {
     fn a_fluid_runs_towards_the_neighbour_that_is_lower() {
         let east = flow(&FluidWorld::with(2, &[(IVec3::X, fluid(2, 4))], &[]));
 
-        assert!(east.0 > 0.99, "east is +x, and the lower block is east: {east:?}");
+        assert!(
+            east.0 > 0.99,
+            "east is +x, and the lower block is east: {east:?}"
+        );
         assert_eq!(east.1, 0.0, "and it is not going along z at all");
 
         let north = flow(&FluidWorld::with(2, &[(-IVec3::Z, fluid(2, 4))], &[]));
@@ -2139,6 +2536,448 @@ mod fluid_flow_tests {
     }
 }
 
+/// The fluid mesher's geometry: the quads it emits for a world built by hand. See
+/// [`bake_fluid_faces_with`], which exists so that this can be a test rather than a screenshot.
+#[cfg(test)]
+mod fluid_geometry_tests {
+    use super::fluid_fixtures::*;
+    use super::*;
+
+    /// The fluid sprites, at rectangles that do not matter here: this is about where the vertices are.
+    fn sprites() -> [Option<(RenderLayer, FluidSprites)>; 2] {
+        let sprite = FluidSprite {
+            atlas: ((0, 0), (16, 16)),
+            game: None,
+        };
+
+        [
+            None,
+            Some((
+                RenderLayer::Solid,
+                FluidSprites {
+                    still: sprite,
+                    flow: sprite,
+                },
+            )),
+        ]
+    }
+
+    /// One vertex of a baked layer, as the position inside the section, in blocks.
+    ///
+    /// The format holds a byte an axis **in sixteenths of a block** - `Vertex::axis_to_sixteenths`, and
+    /// the shader's `f32(v1 & 0xffu) * 0.0625` on the other side of it - plus one flag bit that means
+    /// "sixteen blocks", which is what the byte cannot say.
+    fn position(vertex: &[u8]) -> [f32; 3] {
+        let flags = vertex[11] >> 5;
+
+        [0, 1, 2].map(|axis| {
+            let sixteenths = if flags & (1 << axis) != 0 {
+                256.0
+            } else {
+                vertex[axis] as f32
+            };
+
+            sixteenths / 16.0
+        })
+    }
+
+    /// Every quad of a layer, as its four corners in blocks.
+    fn quads(layer: &BakedLayer) -> Vec<[[f32; 3]; 4]> {
+        layer
+            .vertices
+            .chunks_exact(Vertex::VERTEX_LENGTH)
+            .map(position)
+            .collect::<Vec<_>>()
+            .chunks_exact(4)
+            .map(|quad| [quad[0], quad[1], quad[2], quad[3]])
+            .collect()
+    }
+
+    /// The four corners of a quad with its lowest two and its highest two separated, which is what a
+    /// side face is: a bottom edge and a top edge.
+    fn edges(quad: &[[f32; 3]; 4]) -> ([f32; 2], [f32; 2]) {
+        let mut heights = quad.map(|corner| corner[1]);
+        heights.sort_by(f32::total_cmp);
+
+        (heights[..2].try_into().unwrap(), heights[2..].try_into().unwrap())
+    }
+
+    /// Bakes the fluids of one section-sized world and answers the quads of the solid layer.
+    fn bake(world: &FluidWorld) -> Vec<[[f32; 3]; 4]> {
+        let mut layers = vec![BakedLayer::default(); 3];
+
+        bake_fluid_faces_with(&manager(), world, &sprites(), &mut layers);
+
+        quads(&layers[RenderLayer::Solid as usize])
+    }
+
+    /// The wall of one block in one direction, as the quad that was baked for it - the plane it lies
+    /// in, the two spans it covers and the block's own height band.
+    fn wall_of(
+        quads: &[[[f32; 3]; 4]],
+        pos: IVec3,
+        axis: usize,
+        high: bool,
+    ) -> Option<[[f32; 3]; 4]> {
+        let (x, y, z) = (pos.x as f32, pos.y as f32, pos.z as f32);
+
+        // The plane is the block's low or high boundary on that axis, and the other horizontal axis is
+        // the span the face covers.
+        let (plane, span) = if axis == 0 {
+            (x + if high { 1.0 } else { 0.0 }, [z, z + 1.0])
+        } else {
+            (z + if high { 1.0 } else { 0.0 }, [x, x + 1.0])
+        };
+
+        quads.iter().copied().find(|quad| {
+            let on_plane = quad
+                .iter()
+                .all(|corner| if axis == 0 { corner[0] } else { corner[2] } == plane);
+            let in_span = quad.iter().all(|corner| {
+                let other = if axis == 0 { corner[2] } else { corner[0] };
+                other == span[0] || other == span[1]
+            });
+            let in_band = quad
+                .iter()
+                .all(|corner| corner[1] == y || corner[1] == y + 1.0);
+
+            on_plane && in_span && in_band
+        })
+    }
+
+    /// **The bug this test is for.** A lava fall came out with a gap between every pair of its blocks.
+    ///
+    /// Every block of a falling column stands a whole block tall - the same fluid is directly above it -
+    /// and for a block like that the game does **no corner averaging at all**:
+    ///
+    /// ```java
+    /// // FluidRenderer#tesselate
+    /// float heightSelf = this.getHeight(level, type, pos, blockState, fluidState);
+    /// if (heightSelf >= 1.0F) {
+    ///     heightNorthEast = 1.0F;
+    ///     heightNorthWest = 1.0F;
+    ///     heightSouthEast = 1.0F;
+    ///     heightSouthWest = 1.0F;
+    /// } else {
+    ///     ... the four calculateAverageHeight calls ...
+    /// }
+    /// ```
+    ///
+    /// This mesher averaged them anyway, so a full-height block's corner was pulled down by whatever was
+    /// diagonally beside it - the thin spreading lava at the foot of the fall, the step it poured over -
+    /// and its side faces stopped below its own top. The block above starts at the block boundary, so the
+    /// difference between the two is an open slit in the wall, repeated at every block of the column:
+    /// "in a lava fall the stepped flowing lava has gaps between it".
+    ///
+    /// The slit is a *triangle*, not a full-height hole - one corner of the face reaches the block top and
+    /// the other does not - which is why the assertion is on **both** top corners of every wall rather
+    /// than on the wall's extent.
+    #[test]
+    fn every_wall_of_a_full_block_of_fluid_reaches_its_own_top() {
+        // A column of lava at (0, 2, 0) down to (0, 0, 0) - a fall - with a thin spreading flow
+        // diagonally beside its middle block: `amount` 3 is `3/9` of a block and it has no fluid above
+        // it, so it is exactly the neighbour that used to drag the middle block's corner down.
+        let world = FluidWorld::with(
+            2,
+            &[
+                (ivec3(0, 1, 0), fluid(2, 8)),
+                (ivec3(0, 2, 0), fluid(2, 8)),
+                (ivec3(1, 1, 0), fluid(2, 3)),
+            ],
+            &[],
+        );
+
+        let quads = bake(&world);
+
+        // Both of the column's lower blocks are a whole block tall, and every wall they draw has to run
+        // from the bottom of its own block to the top of it. The middle block has no east wall: the thin
+        // flow is right there, and a face between two blocks of one fluid is not drawn.
+        for (pos, walls) in [
+            (
+                ivec3(0, 0, 0),
+                vec![(0, false), (0, true), (2, false), (2, true)],
+            ),
+            (ivec3(0, 1, 0), vec![(0, false), (2, false), (2, true)]),
+        ] {
+            for (axis, high) in walls {
+                let quad = wall_of(&quads, pos, axis, high).unwrap_or_else(|| {
+                    panic!("no wall for {pos:?} on axis {axis}, high {high}: {quads:?}")
+                });
+
+                let (bottom, top) = edges(&quad);
+
+                assert_eq!(
+                    bottom,
+                    [pos.y as f32; 2],
+                    "the wall of {pos:?} has to start at the bottom of its own block"
+                );
+                assert_eq!(
+                    top,
+                    [pos.y as f32 + 1.0; 2],
+                    "and reach the top of it: a whole block of fluid is a whole block tall, whatever is \
+                     diagonally beside it. A corner short of this is a slit between this block and the \
+                     one above it, which is the gap that was reported in a lava fall."
+                );
+            }
+        }
+    }
+
+    /// A block that is *not* a whole block tall is the other half of the same rule: its corners are
+    /// averaged, which is what makes a lake's surface slope and a stream's surface follow its flow.
+    ///
+    /// The two are the same code path in the game - `heightSelf >= 1.0F` is the branch - so a test for
+    /// the one is only worth anything next to a test for the other.
+    #[test]
+    fn a_thin_layer_of_fluid_still_averages_its_corners() {
+        // A source with a thinner neighbour: `4/9` of a block beside `8/9` of one, both with air above.
+        let world = FluidWorld::with(2, &[(ivec3(1, 0, 0), fluid(2, 4))], &[]);
+
+        let quads = bake(&world);
+
+        // The shared corner of a `8/9` block beside a `4/9` one is the plain mean of the two, which is
+        // this side's average rather than the game's weighted one - see the fluid section of the README.
+        // It shows on the source's **north** wall: the east wall is not drawn at all, because the block
+        // beside it holds the same fluid.
+        let expected = (8.0 / 9.0 + 4.0 / 9.0) / 2.0;
+
+        // `wall_of` bands a face to its own block, which only holds for a face that is a whole block
+        // tall: this one's top edge is the two averaged heights, so it is found by its floor instead.
+        let wall = quads
+            .iter()
+            .find(|quad| {
+                quad.iter().all(|corner| corner[2] == 0.0)
+                    && quad
+                        .iter()
+                        .all(|corner| corner[0] == 0.0 || corner[0] == 1.0)
+                    && quad.iter().filter(|corner| corner[1] == 0.0).count() == 2
+            })
+            .expect("the source's north wall");
+
+        let tops: Vec<f32> = wall
+            .iter()
+            .map(|corner| corner[1])
+            .filter(|y| *y > 0.5)
+            .collect();
+
+        assert!(
+            tops.iter().any(|y| (*y - expected).abs() < 0.07),
+            "the shared corner is the average of the two heights, {expected}, and neither the block's \
+             own height nor a whole block: {tops:?}"
+        );
+
+        assert!(
+            tops.iter().any(|y| *y > expected + 0.05),
+            "and the far corner is the taller of the two - a face that came out flat would mean the \
+             average had been skipped: {tops:?}"
+        );
+    }
+
+    /// **The other half of the same report.** A purely vertical fall came out complete and a *stepped*
+    /// one still had cracks, which is the difference between the two rules this mesher applies to a face
+    /// between two blocks of one fluid.
+    ///
+    /// Where a fall lands, the falling column's last block is a whole block tall - the same fluid is
+    /// above it - and the lava it lands on is not: that block has air above it, so its height is its
+    /// `amount/9` and its corners are averaged. The two surfaces therefore do **not** meet at the edge
+    /// between them: the landing's surface is below the column's, and the band between the two is the
+    /// riser of the step. The face on that band is the one this mesher used to skip for holding the same
+    /// fluid, and skipping it is what left a crack along the foot of every drop.
+    #[test]
+    fn the_riser_between_a_full_block_and_a_lower_one_of_the_same_fluid_is_drawn() {
+        // A fall landing on a step: a falling column at (1, 3, 0) and (1, 2, 0) - the lower of which has
+        // the same fluid above it, so it is a whole block tall - and the lava it lands in at (2, 2, 0),
+        // which is thinner and has air above it. The terrain that holds the step up is solid, so the
+        // only faces at the edge between them are the fluid's own. (Everything is at a positive `y`:
+        // the mesher walks the section's own 0..15, which is where a section's blocks live.)
+        let world = FluidWorld::new(
+            &[
+                (ivec3(1, 3, 0), fluid(2, 8)),
+                (ivec3(1, 2, 0), fluid(2, 8)),
+                (ivec3(2, 2, 0), fluid(2, 6)),
+            ],
+            &[(ivec3(1, 1, 0), SOLID), (ivec3(2, 1, 0), SOLID)],
+        );
+
+        let quads = bake(&world);
+
+        // The face at the step: the plane the two blocks share, x = 2, and it has to reach the **top of
+        // the column's block** - a face that stopped short of it is the crack. It is a band rather than
+        // the whole block: its floor is the landing's own surface where they meet, which the game's
+        // weighted average has already lifted towards the column, and everything below that is inside the
+        // landing's fluid and is not drawn at all.
+        let step = quads
+            .iter()
+            .filter(|quad| quad.iter().all(|corner| corner[0] == 2.0))
+            .filter(|quad| {
+                quad.iter()
+                    .all(|corner| corner[2] == 0.0 || corner[2] == 1.0)
+            })
+            .filter(|quad| quad.iter().any(|corner| corner[1] == 3.0))
+            .next()
+            .unwrap_or_else(|| {
+                panic!(
+                    "no face reaching the top of the column's block at the step, so the band above the \
+                     landing's surface is open - which is the crack. The quads were {quads:?}"
+                )
+            });
+
+        let (bottom, top) = edges(&step);
+
+        assert_eq!(top, [3.0, 3.0], "the face reaches the column's surface");
+        assert!(
+            bottom[0] < 3.0 && bottom[1] < 3.0,
+            "and it is a band: it starts at the landing's surface, which is below the column's - a face \
+             spanning the whole block would be geometry inside the landing's fluid, which is what a \
+             camera inside the lava sees. It starts at {bottom:?}"
+        );
+        assert!(
+            bottom[0] > 2.0 && bottom[1] > 2.0,
+            "the floor of the band is the landing's surface, above the floor of its block: {bottom:?}"
+        );
+    }
+
+    /// The face is *not* drawn where there is nothing to see, which is what keeps a lake from paying
+    /// four extra faces for every block it holds: two blocks of one fluid at one level share the corner
+    /// heights at the edge between them, so the face lies inside the fluid.
+    #[test]
+    fn a_face_inside_a_lake_is_not_drawn() {
+        // Two sources side by side, both with air above and nothing beside them: `8/9` each.
+        let world = FluidWorld::with(2, &[(ivec3(1, 0, 0), fluid(2, 8))], &[]);
+
+        let quads = bake(&world);
+
+        let shared = quads.iter().find(|quad| {
+            quad.iter().all(|corner| corner[0] == 1.0)
+                && quad
+                    .iter()
+                    .all(|corner| corner[2] == 0.0 || corner[2] == 1.0)
+        });
+
+        assert!(
+            shared.is_none(),
+            "the two blocks hold one fluid at one height, so the face between them is inside it:             {shared:?}"
+        );
+    }
+}
+
+/// The fluid *object*, which is the question the game's `isSame` asks and the one this mesher used to get
+/// wrong - see [`same_fluid`].
+#[cfg(test)]
+mod fluid_identity_tests {
+    use super::fluid_fixtures::*;
+    use super::*;
+
+    /// A fluid is two registered objects, a source and a flowing one, and `isSame` is identity: neither
+    /// half is the other, and both are themselves.
+    #[test]
+    fn the_two_halves_of_a_fluid_are_two_fluids() {
+        assert!(same_fluid(2, false, 2, false), "a source is a source");
+        assert!(same_fluid(2, true, 2, true), "and the flowing half itself");
+        assert!(!same_fluid(2, false, 2, true), "but not each other");
+        assert!(!same_fluid(2, true, 2, false));
+        assert!(!same_fluid(1, true, 2, true), "and water is not lava");
+        assert!(!same_fluid(0, false, 0, false), "and no fluid is not a fluid");
+    }
+
+    /// A flow does not run towards the **other half** of its own fluid, because the game does not consider
+    /// it the same liquid. That is the difference the report was about - the flow vector decides which way
+    /// the rotated quarter of the flowing sprite points, so a neighbour that should not count turns the
+    /// pattern.
+    ///
+    /// The two worlds below are the same shape: a flowing block with a source to its east. The source is
+    /// *lower* than the block, so if the halves were one fluid there would be a slope to flow down and the
+    /// answer would be a unit vector east; the game's answer is nothing at all, and the test asserts the
+    /// difference rather than a zero that two different reasons could produce.
+    #[test]
+    fn a_flow_ignores_the_other_half_of_its_own_fluid() {
+        let across_the_halves = FluidWorld::new(
+            &[(IVec3::ZERO, flowing(2, 8)), (ivec3(1, 0, 0), fluid(2, 3))],
+            &[],
+        );
+
+        assert_eq!(
+            fluid_flow(&across_the_halves, &manager(), IVec3::ZERO, 2, true, 8),
+            (0.0, 0.0),
+            "a source is not the fluid this block is, so it is not downhill whatever its height"
+        );
+
+        // The same two blocks with the *same* half on both sides do flow, which is what says the test
+        // above is about the fluid object and not about a reading that ignores neighbours.
+        let both_flowing = FluidWorld::new(
+            &[(IVec3::ZERO, flowing(2, 8)), (ivec3(1, 0, 0), flowing(2, 3))],
+            &[],
+        );
+
+        let (x, z) = fluid_flow(&both_flowing, &manager(), IVec3::ZERO, 2, true, 8);
+
+        assert!(
+            x > 0.99 && z == 0.0,
+            "the lower neighbour is east and the flow runs downhill towards it: {x}, {z}"
+        );
+    }
+
+    /// The game's weighted corner average: a height of `0.8` or more counts **ten** times, a zero counts
+    /// once, and a **solid** block is dropped instead of counted.
+    ///
+    /// The two cases below are chosen so that both weights show up in one number each: a lone `8/9` block
+    /// in air has two zeroes beside it, and the same block against stone has the stone dropped - so the
+    /// corner comes out at `8/9 * 10/12` and `8/9 * 10/11`.
+    ///
+    /// This used to be a plain mean of the corner blocks that held the same fluid, which is a different
+    /// weighting *and* a different set: air was left out of it entirely, so a surface was level where the
+    /// game's tapers at an open edge.
+    #[test]
+    fn a_corner_is_the_weighted_average_of_its_samples() {
+        let manager = manager();
+
+        let in_the_open = FluidWorld::with(2, &[], &[]);
+        let corner = fluid_corner_height(
+            &in_the_open,
+            &manager,
+            IVec3::ZERO,
+            2,
+            false,
+            8.0 / 9.0,
+            IVec2::new(0, 0),
+        );
+
+        let two_zeroes = (8.0 / 9.0) * 10.0 / 12.0;
+
+        assert!(
+            (corner - two_zeroes).abs() < 1e-5,
+            "a lone block is pulled down by the two air neighbours it has: {corner}, wanted {two_zeroes}"
+        );
+        assert!(
+            (corner - 8.0 / 9.0).abs() > 0.1,
+            "and it is not its own height either: {corner}"
+        );
+
+        let against_a_wall = FluidWorld::with(2, &[], &[(ivec3(-1, 0, 0), SOLID)]);
+        let corner = fluid_corner_height(
+            &against_a_wall,
+            &manager,
+            IVec3::ZERO,
+            2,
+            false,
+            8.0 / 9.0,
+            IVec2::new(0, 0),
+        );
+
+        let stone_dropped = (8.0 / 9.0) * 10.0 / 11.0;
+
+        assert!(
+            (corner - stone_dropped).abs() < 1e-5,
+            "a solid neighbour is dropped from the average rather than counted as a zero - which is what \
+             keeps a fluid's surface at its own height against a wall: got {corner}, wanted \
+             {stone_dropped}"
+        );
+        assert!(
+            corner > two_zeroes,
+            "so a wall holds the surface up where open air lets it sag: {corner} against {two_zeroes}"
+        );
+    }
+}
+
 /// The sprites of one fluid and the layer it is drawn in: water is translucent and lava is not.
 struct FluidSprites {
     still: FluidSprite,
@@ -2161,8 +3000,7 @@ fn fluid_sprites(atlas: &Atlas, kind: u8, name: &str) -> Option<(RenderLayer, Fl
         // Reported once per sprite rather than once per bake: a pack without the fluid textures
         // would otherwise write one line per section while the world loads.
         static WARNED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        if rect.is_none() && WARNED.fetch_or(bit, std::sync::atomic::Ordering::Relaxed) & bit == 0
-        {
+        if rect.is_none() && WARNED.fetch_or(bit, std::sync::atomic::Ordering::Relaxed) & bit == 0 {
             log::warn!("wgpu-mc: {path} is not in the block atlas, so {name} is not drawn");
         }
 
@@ -2215,10 +3053,29 @@ fn bake_fluid_faces<Provider: BlockStateProvider>(
 ) {
     // Lava is the only fluid with a layer to draw into yet (see the `match` below). The water sprites
     // are still looked up, so that a pack missing them says so once now rather than on the day water is
-    // drawn.
-    let _water = fluid_sprites(atlas, 1, "water");
-    let lava = fluid_sprites(atlas, 2, "lava");
+    // drawn. Indexed by kind - 1, so the geometry below does not have to know a `FluidSprites` from an
+    // atlas; see [`bake_fluid_faces_with`], which is what a test calls.
+    let sprites = [
+        fluid_sprites(atlas, 1, "water"),
+        fluid_sprites(atlas, 2, "lava"),
+    ];
 
+    bake_fluid_faces_with(block_manager, state_provider, &sprites, layers);
+}
+
+/// The fluid mesher's geometry, for a caller that already has the sprites.
+///
+/// Split out from [`bake_fluid_faces`] so that the shape of a fluid can be tested against a synthetic
+/// world: everything below the sprite lookup is arithmetic on block states and fluid bytes, and the
+/// lookup is the only part that needs a GPU atlas. The alternative was what this file did for a while -
+/// a fluid fall that came out with seams in it, argued about from the code and from screenshots rather
+/// than from the quads.
+fn bake_fluid_faces_with<Provider: BlockStateProvider>(
+    block_manager: &BlockManager,
+    state_provider: &Provider,
+    sprites: &[Option<(RenderLayer, FluidSprites)>; 2],
+    layers: &mut [BakedLayer],
+) {
     // The same index list the block baker emits, for the same reason: a mirror in the clip space
     // (see `preprocessing.rs`) turns every triangle over, so the two triangles of a quad are emitted
     // in the order that comes back out wound counter-clockwise.
@@ -2277,7 +3134,7 @@ fn bake_fluid_faces<Provider: BlockStateProvider>(
 
     for block_index in 0..16 * 16 * 16 {
         let pos = ivec3(block_index & 15, block_index >> 8, (block_index & 255) >> 4);
-        let (kind, amount, _) = fluid_of(state_provider.get_fluid(pos));
+        let (kind, amount, flowing) = fluid_of(state_provider.get_fluid(pos));
 
         // Counted before the sprites are looked at: a fluid whose sprite never made it into the atlas
         // is exactly the case the counters exist to tell apart from a fluid that never arrived.
@@ -2291,7 +3148,7 @@ fn bake_fluid_faces<Provider: BlockStateProvider>(
             // every ocean in the arena, in space the sections that *are* drawn have to share. It comes
             // back the day the translucent pass is taken over.
             1 => continue,
-            2 => &lava,
+            2 => &sprites[1],
             // 3 is "a fluid this mesher does not know": a modded one, or the empty fluid of a block
             // that has none, which is 0.
             _ => continue,
@@ -2304,15 +3161,117 @@ fn bake_fluid_faces<Provider: BlockStateProvider>(
         let (fx, fy, fz) = (pos.x as f32, pos.y as f32, pos.z as f32);
         let color = if kind == 1 { WATER_TINT } else { 0x00ff_ffff };
 
+        // The light every face of this fluid is lit by, and the reason it is not the light of the block
+        // the face is *towards*.
+        //
+        // The game's fluid renderer asks its own `getLightCoords`, which is the brightest of the fluid's
+        // **own** cell and the cell above it, component by component:
+        //
+        // ```java
+        // // FluidRenderer
+        // private int getLightCoords(BlockAndTintGetter level, BlockPos pos) {
+        //     return LightCoordsUtil.max(LevelRenderer.getLightCoords(level, pos),
+        //                                LevelRenderer.getLightCoords(level, pos.above()));
+        // }
+        // ```
+        //
+        // so the fluid's own block is half of the answer wherever the face is. This side read a single
+        // neighbour: the block above for the surface, the block the side faces for a side - and a *solid*
+        // block has no light in it at all, which is why lava with a block over it came out black:
+        //
+        // > when there is a block above the lava, the lava goes black - you can just about make out the
+        // > texture, the brightness is very low
+        //
+        // A lava cell holds block light 15 of its own (the light engine writes a block's emission into
+        // its own cell), so the brightest of the two is 15 and a covered lava surface is lit by the lava
+        // itself, which is what the game shows.
+        let own_light = state_provider.get_light_level(pos);
+        let above_light = state_provider.get_light_level(pos + IVec3::Y);
+
+        // The top face and the sides both read `getLightCoords(pos)`: the fluid's own cell, or the one
+        // above it.
+        let light_here = own_light.brightest(above_light).byte;
+
+        // What is above this block, which is two of the decisions below: whether there is a surface here
+        // at all, and how tall the block is. "This fluid" is the game's `isSame` - the same *object* - so
+        // the other half of the same liquid counts as a different fluid here, see [`same_fluid`].
+        let (above_kind, _, above_flowing) = fluid_of(state_provider.get_fluid(pos + IVec3::Y));
+        let same_above = same_fluid(kind, flowing, above_kind, above_flowing);
+
+        // The block's own height - and the one case in which the game does **not** average the corners.
+        //
+        // ```java
+        // // FluidRenderer#tesselate
+        // float heightSelf = this.getHeight(level, type, pos, blockState, fluidState);
+        // if (heightSelf >= 1.0F) {
+        //     heightNorthEast = 1.0F;
+        //     heightNorthWest = 1.0F;
+        //     heightSouthEast = 1.0F;
+        //     heightSouthWest = 1.0F;
+        // } else {
+        //     ... calculateAverageHeight for each of the four corners ...
+        // }
+        // ```
+        //
+        // A block that stands a whole block tall - which is every block of a falling column, because the
+        // same fluid is directly above it - has **no averaging at all**: all four corners are the top of
+        // its own block. Averaging them anyway is what pulled the walls of a lava fall apart. A
+        // full-height block's corner was dragged down by a lower neighbour diagonally beside it (the
+        // spreading lava at the foot of the fall, the step it poured over), so its side faces stopped
+        // short of its own top while the block above started at the block boundary - and the difference
+        // between the two is a slit you can see straight through, repeated at every block of the column:
+        //
+        // > in a lava fall the stepped flowing lava has gaps between it
+        //
+        // The heights are also *not* averaged for the surface of such a block, so a column's top face is
+        // flat at the full block - which is what the game draws.
+        let own_height = fluid_height(amount, same_above);
+
         // The four corners of the block, in the order (0,0), (1,0), (0,1), (1,1) in x and z, each
         // with the height the fluid stands at there. Both the top face and the sides are cut to
-        // them, and each one walks four blocks to work out, so they are worked out once.
-        let heights = [
-            fluid_corner_height(state_provider, pos, kind, IVec2::new(0, 0)),
-            fluid_corner_height(state_provider, pos, kind, IVec2::new(1, 0)),
-            fluid_corner_height(state_provider, pos, kind, IVec2::new(0, 1)),
-            fluid_corner_height(state_provider, pos, kind, IVec2::new(1, 1)),
-        ];
+        // them, and each one walks four blocks and two weights to work out, so they are worked out once.
+        let heights = if own_height >= 1.0 {
+            [1.0; 4]
+        } else {
+            [
+                fluid_corner_height(
+                    state_provider,
+                    block_manager,
+                    pos,
+                    kind,
+                    flowing,
+                    own_height,
+                    IVec2::new(0, 0),
+                ),
+                fluid_corner_height(
+                    state_provider,
+                    block_manager,
+                    pos,
+                    kind,
+                    flowing,
+                    own_height,
+                    IVec2::new(1, 0),
+                ),
+                fluid_corner_height(
+                    state_provider,
+                    block_manager,
+                    pos,
+                    kind,
+                    flowing,
+                    own_height,
+                    IVec2::new(0, 1),
+                ),
+                fluid_corner_height(
+                    state_provider,
+                    block_manager,
+                    pos,
+                    kind,
+                    flowing,
+                    own_height,
+                    IVec2::new(1, 1),
+                ),
+            ]
+        };
         let corner = [
             (fx, fz),
             (fx + 1.0, fz),
@@ -2321,18 +3280,21 @@ fn bake_fluid_faces<Provider: BlockStateProvider>(
         ];
 
         // The surface, where the fluid ends: no face between two blocks of the same fluid, which is
-        // also what keeps a lake from being drawn a block at a time.
-        if fluid_of(state_provider.get_fluid(pos + IVec3::Y)).0 != kind {
-            let light = state_provider.get_light_level(pos + IVec3::Y).byte;
-
+        // also what keeps a lake from being drawn a block at a time. "The same fluid" is the game's
+        // `isSame`: the same object, so the other half of this liquid has a surface of its own here.
+        if !same_above {
             // Which way the surface is running, which decides both the sprite and how it is cut. A
             // surface that is not going anywhere is the whole of the still sprite - `u` and `v` from 0
             // to 1 over it. A *flowing* one is a quarter of the flowing sprite, turned to point along
             // the flow, which is the game's own top face and the reason a stream reads as a current.
-            let (flow_x, flow_z) = fluid_flow(state_provider, block_manager, pos, kind, amount);
+            let (flow_x, flow_z) =
+                fluid_flow(state_provider, block_manager, pos, kind, flowing, amount);
 
             let (sprite, offsets) = if flow_x == 0.0 && flow_z == 0.0 {
-                (sprites.still, [(0.0, 0.0), (0.0, 1.0), (1.0, 1.0), (1.0, 0.0)])
+                (
+                    sprites.still,
+                    [(0.0, 0.0), (0.0, 1.0), (1.0, 1.0), (1.0, 0.0)],
+                )
             } else {
                 (sprites.flow, flowing_top_offsets(flow_x, flow_z))
             };
@@ -2342,7 +3304,7 @@ fn bake_fluid_faces<Provider: BlockStateProvider>(
             add_quad(
                 *layer,
                 Direction::Up,
-                light,
+                light_here,
                 color,
                 sprite.flags(),
                 [
@@ -2366,48 +3328,119 @@ fn bake_fluid_faces<Provider: BlockStateProvider>(
             );
         }
 
-        // The sides, towards each block that does not hold the same fluid: lava against stone is a
-        // wall of lava, lava against lava is nothing at all.
-        for (dir, first, second) in [
-            (Direction::North, 0, 1),
-            (Direction::South, 2, 3),
-            (Direction::West, 0, 2),
-            (Direction::East, 1, 3),
+        // The sides. A neighbour that does not hold this fluid is a wall - lava against stone - and a
+        // neighbour that *does* hold it leaves only the **riser of a step**: the band between that
+        // block's surface and this one's, and nothing below it.
+        //
+        // The game draws the whole face for that neighbour - `isNeighborSameFluid` is on the top face
+        // alone in 26.1, and a fluid occludes nothing, so a side face is culled only by
+        // `isFaceOccludedByNeighbor` and `isFaceOccludedBySelf`:
+        //
+        // ```java
+        // public static boolean shouldRenderFace(FluidState fluidState, BlockState selfState,
+        //                                       Direction direction, BlockState otherState) {
+        //     return !isNeighborStateHidingOverlay(fluidState, otherState, direction.getOpposite())
+        //         && !isFaceOccludedBySelf(selfState, direction);
+        // }
+        // ```
+        //
+        // and the whole face is what left the texture of a step's flank visible from *inside* the lava:
+        //
+        // > the internal culling is off too - inside the lava you can see the texture of flowing lava
+        // > that is not exposed to air
+        //
+        // Which is exactly what the part below the neighbour's surface is: geometry inside the fluid,
+        // with a flow texture on it, that nothing can see from outside and a camera *inside* the fluid
+        // looks straight at. Vanilla has the same faces, and they are invisible there for the same
+        // reason they are invisible here - from outside. So this side draws the band that is exposed and
+        // measures both of its edges in the fluid's own height: the neighbour's surface where the two
+        // blocks meet, and this block's.
+        //
+        // Two blocks of one fluid at one level have no band at all - their corner heights come out of the
+        // same four blocks - so a lake still pays nothing for this.
+        for (dir, first, second, neighbour_first, neighbour_second) in [
+            (Direction::North, 0, 1, IVec2::new(0, 1), IVec2::new(1, 1)),
+            (Direction::South, 2, 3, IVec2::new(0, 0), IVec2::new(1, 0)),
+            (Direction::West, 0, 2, IVec2::new(1, 0), IVec2::new(1, 1)),
+            (Direction::East, 1, 3, IVec2::new(0, 0), IVec2::new(0, 1)),
         ] {
             let neighbour = pos + dir.to_vec();
+            let (neighbour_kind, _, neighbour_flowing) =
+                fluid_of(state_provider.get_fluid(neighbour));
 
-            if fluid_of(state_provider.get_fluid(neighbour)).0 == kind {
-                continue;
-            }
+            // The floor of the face: the bottom of this block, or the neighbour's own surface where the
+            // neighbour holds the same fluid. The four corner parameters are the ones that name the two
+            // ends of the shared edge, in this block's numbering and in the neighbour's.
+            //
+            // The neighbour's surface is its own - `sampled_height` asks whether *it* has the same fluid
+            // above it - and it is measured along the shared edge by the same weighted average this
+            // block's corners go through, so the two faces agree about where they meet.
+            let (floor_first, floor_second) = if same_fluid(
+                kind,
+                flowing,
+                neighbour_kind,
+                neighbour_flowing,
+            ) {
+                let neighbour_height = sampled_height(
+                    state_provider,
+                    block_manager,
+                    neighbour,
+                    neighbour_kind,
+                    neighbour_flowing,
+                );
+
+                (
+                    fluid_corner_height(
+                        state_provider,
+                        block_manager,
+                        neighbour,
+                        neighbour_kind,
+                        neighbour_flowing,
+                        neighbour_height,
+                        neighbour_first,
+                    ),
+                    fluid_corner_height(
+                        state_provider,
+                        block_manager,
+                        neighbour,
+                        neighbour_kind,
+                        neighbour_flowing,
+                        neighbour_height,
+                        neighbour_second,
+                    ),
+                )
+            } else {
+                (0.0, 0.0)
+            };
 
             let (low, high) = (heights[first], heights[second]);
 
-            if low <= 0.0 && high <= 0.0 {
+            // Nothing to show: this block is not above the neighbour's surface anywhere along the edge.
+            if low <= floor_first && high <= floor_second {
                 continue;
             }
-
-            let light = state_provider.get_light_level(neighbour).byte;
 
             // The flowing sprite, in the quarter of it the game's own fluid renderer samples: `u` from 0
             // to 0.5 - one half of the sprite across - and `v` from `(1 - height) * 0.5` at the fluid's
             // surface down to 0.5, the sprite's middle. The two halves are what makes the flow pattern
-            // tile across a face whose height depends on where the fluid settled.
+            // tile across a face whose height depends on where the fluid settled, and a riser is the same
+            // mapping over a shorter face.
             let v_surface = |height: f32| (1.0 - height.clamp(0.0, 1.0)) * 0.5;
 
             add_quad(
                 *layer,
                 dir,
-                light,
+                light_here,
                 color,
                 sprites.flow.flags(),
                 [
                     (
-                        vec3(corner[first].0, fy, corner[first].1),
-                        sprites.flow.at(0.0, 0.5),
+                        vec3(corner[first].0, fy + floor_first, corner[first].1),
+                        sprites.flow.at(0.0, v_surface(floor_first)),
                     ),
                     (
-                        vec3(corner[second].0, fy, corner[second].1),
-                        sprites.flow.at(0.5, 0.5),
+                        vec3(corner[second].0, fy + floor_second, corner[second].1),
+                        sprites.flow.at(0.5, v_surface(floor_second)),
                     ),
                     (
                         vec3(corner[second].0, fy + high, corner[second].1),
@@ -2424,7 +3457,10 @@ fn bake_fluid_faces<Provider: BlockStateProvider>(
         // The underside, where the fluid does not carry on into the block below - lava pouring over
         // an edge rather than a lake.
         if fluid_of(state_provider.get_fluid(pos - IVec3::Y)).0 != kind {
-            let light = state_provider.get_light_level(pos - IVec3::Y).byte;
+            // The game's `getLightCoords(pos.below())` - the cell below, or the fluid's own.
+            let light = own_light
+                .brightest(state_provider.get_light_level(pos - IVec3::Y))
+                .byte;
 
             add_quad(
                 *layer,
@@ -2435,10 +3471,7 @@ fn bake_fluid_faces<Provider: BlockStateProvider>(
                 [
                     (vec3(fx, fy, fz), sprites.still.at(0.0, 0.0)),
                     (vec3(fx, fy, fz + 1.0), sprites.still.at(0.0, 1.0)),
-                    (
-                        vec3(fx + 1.0, fy, fz + 1.0),
-                        sprites.still.at(1.0, 1.0),
-                    ),
+                    (vec3(fx + 1.0, fy, fz + 1.0), sprites.still.at(1.0, 1.0)),
                     (vec3(fx + 1.0, fy, fz), sprites.still.at(1.0, 0.0)),
                 ],
             );
@@ -2482,7 +3515,11 @@ mod fluid_sprite_tests {
             [96, 160],
             "the frame is square - the strip is 32 wide - so its bottom is 32 down, not 512"
         );
-        assert_eq!(flow.at(0.5, 0.5), [80, 144], "and its middle is the middle of frame 0");
+        assert_eq!(
+            flow.at(0.5, 0.5),
+            [80, 144],
+            "and its middle is the middle of frame 0"
+        );
     }
 
     /// The offsets the fluid mesher passes are the ones it passed before, for the sprite sizes vanilla
