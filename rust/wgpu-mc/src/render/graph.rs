@@ -110,6 +110,106 @@ fn report_terrain_pass() {
     );
 }
 
+/// The game's own block atlas, as the pass that draws the terrain samples it.
+///
+/// Filled by the JVM once the game has stitched one (`WmNative.bindGameBlockAtlas`, called from the
+/// block cache right beside the sprite registration, so that the rectangles a face is baked with and
+/// the atlas that face samples always come from the same stitch). What is kept is the **view**, not
+/// the texture: a `wgpu::TextureView` holds a handle to the texture it was made from, so this side
+/// holding one is what keeps the game's atlas alive for as long as the graph samples it.
+static GAME_BLOCK_ATLAS: parking_lot::RwLock<Option<Arc<wgpu::TextureView>>> =
+    parking_lot::RwLock::new(None);
+
+/// Whether the game's block atlas has been handed over, and so whether a face may be baked with its
+/// coordinates. See [`GAME_BLOCK_ATLAS`].
+///
+/// This is the baker's gate, and it is set by the **handover** rather than by the graph build, because
+/// of what the two halves of an animated texture are: the graph can be built again as often as it
+/// likes, but a block *model* - and every face in it - is baked once, when the block states are
+/// cached, and then drawn from that cache for the rest of the session. A model baked while this was
+/// false would keep this side's copy of its sprite forever, however many times the atlas was bound
+/// afterwards.
+///
+/// What makes that safe is the ordering around it, and it is the ordering `bind_game_block_atlas`
+/// arranges: the handover marks the graph stale, the graph is replaced at the end of a frame
+/// (`rebuild_pipelines_if_stale`), and the arena is fed in that same end-of-frame step - so there is no
+/// frame in which a face flagged for the game's atlas is drawn by a pass that has not bound it. Until
+/// the handover, every face keeps sampling this side's copy of its sprite, which is exactly what the
+/// renderer did before any of this existed. See `Vertex::uv_flags`' `UV_GAME_ATLAS`.
+static GAME_ATLAS_BOUND: AtomicBool = AtomicBool::new(false);
+
+/// Hands over the game's block atlas. See [`GAME_BLOCK_ATLAS`] and [`GAME_ATLAS_BOUND`]. Called from
+/// the JVM.
+pub fn set_game_block_atlas(view: wgpu::TextureView) {
+    *GAME_BLOCK_ATLAS.write() = Some(Arc::new(view));
+    GAME_ATLAS_BOUND.store(true, Ordering::Relaxed);
+}
+
+/// The game's block atlas, if the JVM has handed one over.
+pub fn game_block_atlas() -> Option<Arc<wgpu::TextureView>> {
+    GAME_BLOCK_ATLAS.read().clone()
+}
+
+/// Whether a face may be baked with the game's atlas coordinates. See [`GAME_ATLAS_BOUND`].
+pub fn game_atlas_bound() -> bool {
+    GAME_ATLAS_BOUND.load(Ordering::Relaxed)
+}
+
+/// The game's **lightmap**: the 16x16 texture Minecraft builds every frame it needs to, and the one
+/// thing that decides how bright a light level is.
+///
+/// The terrain shader reads it exactly as the game's own `terrain.vsh` does - `sample_lightmap(Sampler2,
+/// UV2)`, one fetch per vertex, and the colour interpolated across the quad - so every part of the curve
+/// comes from the game: the gamma and brightness options, the day/night sky light, the dimension's
+/// ambient light, night vision, the darkness effect. This side's shader used to approximate all of it
+/// with `max(sky, block) * 0.7 + 0.3`, which is a straight line through a curve the game had already
+/// built, and ignores every one of those.
+///
+/// Filled by the JVM (`WmNative.bindGameLightmap`). Like the block atlas it is the **view** that is kept,
+/// so this side holding one keeps the texture alive; unlike the atlas, the game does not build a new one
+/// - it writes into the texture it has - so a handover is a one-off and the values move under it.
+static GAME_LIGHTMAP: parking_lot::RwLock<Option<Arc<wgpu::TextureView>>> =
+    parking_lot::RwLock::new(None);
+
+/// Hands over the game's lightmap. See [`GAME_LIGHTMAP`]. Called from the JVM.
+pub fn set_game_lightmap(view: wgpu::TextureView) {
+    *GAME_LIGHTMAP.write() = Some(Arc::new(view));
+}
+
+/// The game's lightmap, if the JVM has handed one over.
+pub fn game_lightmap() -> Option<Arc<wgpu::TextureView>> {
+    GAME_LIGHTMAP.read().clone()
+}
+
+/// The lightmap this side draws with when the game has not handed one over: the approximation the
+/// shader used before there was a lightmap to sample, baked into a 16x16 texture.
+///
+/// One texel per light pair - `x` is the block light and `y` the sky light, which is the order
+/// Minecraft's own `sample_lightmap` indexes in - and the value is `max(block, sky) / 15 * 0.7 + 0.3` per
+/// channel. So a run whose handover failed draws the picture this renderer has always drawn instead of a
+/// world lit by whatever a one-texel white texture would say, and the two are one line apart in the log
+/// (`wgpu-mc: the game's lightmap is bound to the terrain pass`).
+pub fn fallback_lightmap() -> [u8; 16 * 16 * 4] {
+    let mut image = [0u8; 16 * 16 * 4];
+
+    for sky in 0..16u32 {
+        for block in 0..16u32 {
+            let level = (block.max(sky) as f32) / 15.0;
+            let grey = ((level * 0.7 + 0.3) * 255.0).round().clamp(0.0, 255.0) as u8;
+
+            // The lightmap texture is `RGBA8`, and a light with no colour to it is grey with a full
+            // alpha - the game's own lightmap is not grey, which is the point of sampling its.
+            let texel = ((sky * 16 + block) * 4) as usize;
+            image[texel] = grey;
+            image[texel + 1] = grey;
+            image[texel + 2] = grey;
+            image[texel + 3] = 0xff;
+        }
+    }
+
+    image
+}
+
 pub trait Geometry: Send + Sync {
     fn render<'graph: 'pass + 'arena, 'pass, 'arena: 'pass>(
         &mut self,
@@ -126,16 +226,76 @@ pub enum ResourceBacking {
     Buffer(Arc<wgpu::Buffer>, wgpu::BufferBindingType),
     BufferArray(Vec<Arc<wgpu::Buffer>>),
     Texture2D(Arc<TextureAndView>),
+    /// A view of a texture this renderer does not own: the game created it, and the view keeps it
+    /// alive for as long as the graph does. See [`set_game_block_atlas`].
+    TextureView(Arc<wgpu::TextureView>),
     Sampler(Arc<wgpu::Sampler>),
 }
 
+/// What a binding carries, which is all a bind group layout needs to know about it.
+///
+/// This exists so that the one thing the layout has to *decide* - which stages see the binding - is
+/// decided in one place, [`ResourceKind::visibility`], rather than four times in a `match` where three
+/// of the arms can be right and the fourth wrong. Which is what happened: see that method.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ResourceKind {
+    Buffer,
+    Storage,
+    Texture,
+    Sampler,
+}
+
+impl ResourceKind {
+    /// Which pipeline stages a binding of this kind is visible to: **both, always**.
+    ///
+    /// Not a choice this side gets to make per resource. Which stage samples a binding is a property of
+    /// the *shader*, and the shaders here are the game's and the pack's: Minecraft's own terrain shader
+    /// fetches its lightmap in the **vertex** stage - `vertexColor = Color * sample_lightmap(Sampler2,
+    /// UV2)` - and this side's terrain shader does the same, because the light has to be interpolated as
+    /// a colour rather than looked up per pixel. A texture the vertex stage samples, declared
+    /// fragment-only, is not a pipeline that draws differently: it is one wgpu refuses to build, with
+    /// the pipeline layout named in the error:
+    ///
+    /// ```text
+    /// In Device::create_render_pipeline, label = 'terrain'
+    ///   Error matching ShaderStages(VERTEX) shader requirements against the pipeline
+    ///     Shader global ResourceBinding { group: 0, binding: 7 } is not available in the pipeline layout
+    ///       Visibility flags don't include the shader stage
+    /// ```
+    ///
+    /// That is exactly what the two texture arms and the sampler arm said for the lightmap, and the
+    /// game ended while entering a world - see [`device_call`], which is the other half of this fix.
+    /// Minecraft's own pipeline builder gives every binding both stages for the same reason
+    /// (`blaze.rs`), and a binding of a kind that only one stage could use does not exist: a uniform, a
+    /// storage buffer, a texture and a sampler are all readable from either.
+    pub fn visibility(self) -> ShaderStages {
+        match self {
+            ResourceKind::Buffer
+            | ResourceKind::Storage
+            | ResourceKind::Texture
+            | ResourceKind::Sampler => ShaderStages::VERTEX_FRAGMENT,
+        }
+    }
+}
+
 impl ResourceBacking {
+    /// Which kind of binding this backing is. See [`ResourceKind::visibility`].
+    pub fn kind(&self) -> ResourceKind {
+        match self {
+            ResourceBacking::Buffer(..) => ResourceKind::Buffer,
+            ResourceBacking::BufferArray(_) => ResourceKind::Storage,
+            ResourceBacking::Texture2D(_) | ResourceBacking::TextureView(_) => ResourceKind::Texture,
+            ResourceBacking::Sampler(_) => ResourceKind::Sampler,
+        }
+    }
+
     pub fn get_bind_group_layout_entry(&self, binding: u32) -> wgpu::BindGroupLayoutEntry {
+        let visibility = self.kind().visibility();
+
         match self {
             ResourceBacking::Buffer(_, buffer_ty) => wgpu::BindGroupLayoutEntry {
                 binding,
-                //TODO
-                visibility: ShaderStages::all(),
+                visibility,
                 ty: wgpu::BindingType::Buffer {
                     ty: *buffer_ty,
                     has_dynamic_offset: false,
@@ -145,7 +305,7 @@ impl ResourceBacking {
             },
             ResourceBacking::BufferArray(_buffers) => wgpu::BindGroupLayoutEntry {
                 binding,
-                visibility: ShaderStages::all(),
+                visibility,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Storage { read_only: true },
                     has_dynamic_offset: false,
@@ -153,22 +313,24 @@ impl ResourceBacking {
                 },
                 count: None,
             },
-            ResourceBacking::Texture2D(_) => wgpu::BindGroupLayoutEntry {
-                binding,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Texture {
-                    // Filterable, because the shaders this graph builds sample with `textureSample`
-                    // and the atlas is `Rgba8Unorm`: a layout that says otherwise is not a pipeline
-                    // that draws differently, it is one wgpu refuses to create at all.
-                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                    multisampled: false,
-                },
-                count: None,
-            },
+            ResourceBacking::Texture2D(_) | ResourceBacking::TextureView(_) => {
+                wgpu::BindGroupLayoutEntry {
+                    binding,
+                    visibility,
+                    ty: wgpu::BindingType::Texture {
+                        // Filterable, because the shaders this graph builds sample with `textureSample`
+                        // and the atlas is `Rgba8Unorm`: a layout that says otherwise is not a pipeline
+                        // that draws differently, it is one wgpu refuses to create at all.
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                }
+            }
             ResourceBacking::Sampler(_) => wgpu::BindGroupLayoutEntry {
                 binding,
-                visibility: wgpu::ShaderStages::FRAGMENT,
+                visibility,
                 // Filtering for the same reason: `textureSample` needs one, and the default sampler
                 // this graph binds is a filtering sampler with nearest filtering - non-filtering is
                 // a different binding type, not a different filter mode.
@@ -187,6 +349,10 @@ impl ResourceBacking {
             ResourceBacking::Texture2D(texture) => vec![wgpu::BindGroupEntry {
                 binding: index,
                 resource: wgpu::BindingResource::TextureView(&texture.view),
+            }],
+            ResourceBacking::TextureView(view) => vec![wgpu::BindGroupEntry {
+                binding: index,
+                resource: wgpu::BindingResource::TextureView(view),
             }],
             ResourceBacking::Sampler(sampler) => vec![wgpu::BindGroupEntry {
                 binding: index,
@@ -221,6 +387,52 @@ pub struct RenderGraph {
     pub config: ShaderPackConfig,
     pub pipelines: LinkedHashMap<String, BoundPipeline>,
     pub resources: HashMap<String, ResourceBacking>,
+}
+
+/// What a caught panic said, as one line.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        message
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message
+    } else {
+        "a panic with no message"
+    }
+}
+
+/// Runs a device call wgpu reports a validation error out of by *panicking*, and answers `None` if it
+/// did - with the reason in the log, naming `what`.
+///
+/// The device does not return an error here: an uncaptured validation error panics inside wgpu, and
+/// because the whole renderer runs inside `#[jni_fn]` frames - and a `#[jni_fn]` frame cannot unwind -
+/// that panic does not reach a `catch` anywhere: it takes the process with it. The message the player
+/// gets is
+///
+/// ```text
+/// panicked at library/core/src/panicking.rs:225:5:
+/// panic in a function that cannot unwind
+/// ```
+///
+/// and the game is gone while entering a world, with the actual reason - the wgpu error, above it in
+/// the console - being the only thing that says what happened. This is the same treatment the resource
+/// and shader arms of `create_pipelines` already give their own failures, for the same reason: a graph
+/// that is missing one pipeline still draws the rest of the frame, and the reason belongs in the log
+/// rather than in a process that ended.
+///
+/// It is a guard and not a licence: a pipeline that fails to build is a bug, and the log line is an
+/// error.
+fn device_call<T>(what: &str, build: impl FnOnce() -> T) -> Option<T> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(build)) {
+        Ok(value) => Some(value),
+        Err(payload) => {
+            log::error!(
+                "wgpu-mc: {what} could not be built, so it is skipped: {}",
+                panic_message(&*payload)
+            );
+
+            None
+        }
+    }
 }
 
 impl RenderGraph {
@@ -365,14 +577,20 @@ impl RenderGraph {
                 continue;
             }
 
-            let layout = wm
-                .gpu
-                .device
-                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                    label: None,
-                    bind_group_layouts: &bind_group_layouts,
-                    immediate_size,
-                });
+            let Some(layout) = device_call(
+                &format!("the '{pipeline_name}' pipeline layout"),
+                || {
+                    wm.gpu
+                        .device
+                        .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                            label: None,
+                            bind_group_layouts: &bind_group_layouts,
+                            immediate_size,
+                        })
+                },
+            ) else {
+                continue;
+            };
 
             // A pipeline whose shader cannot be read is skipped, for the same reason the resources above
             // are: the alternative is `unwrap` on a `None` inside a `#[jni_fn]` frame, which aborts the
@@ -418,10 +636,11 @@ impl RenderGraph {
 
             let label = pipeline_name.to_string();
 
-            let render_pipeline =
-                wm.gpu
-                    .device
-                    .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            let Some(render_pipeline) =
+                device_call(&format!("the '{label}' pipeline"), || {
+                    wm.gpu
+                        .device
+                        .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                         label: Some(&label),
                         layout: Some(&layout),
                         vertex: wgpu::VertexState {
@@ -520,7 +739,10 @@ impl RenderGraph {
                         }),
                         cache: None,
                         multiview_mask: None,
-                    });
+                        })
+                }) else {
+                    continue;
+                };
 
             self.pipelines.insert(
                 pipeline_name.clone(),
@@ -613,6 +835,152 @@ impl RenderGraph {
             "@sampler".into(),
             ResourceBacking::Sampler(wm.mc.texture_manager.default_sampler.clone()),
         );
+
+        // The game's own block atlas, for the faces whose sprite the game animates, and the sampler
+        // the game itself samples it with: `LevelRenderer` builds `CLAMP_TO_EDGE`, `LINEAR`, `LINEAR`
+        // for the chunk layers, and every sampler this backend makes for the game pins the sample to
+        // mip 0 (see `create_sampler` in the JNI crate) - the game fills its atlas's mip levels by
+        // rendering into them, and an unfilled level samples the neighbouring sprite.
+        //
+        // Always registered, even before the JVM has handed the atlas over: a named resource that is
+        // missing is a pipeline the graph *skips* (`create_pipelines`), and losing the whole terrain
+        // pass because an animated texture is not ready yet is not a trade worth making. Until then
+        // the binding is a one-texel white texture, which nothing samples - a face is only baked with
+        // the game's coordinates once it has been handed over (`GAME_ATLAS_BOUND`), and the graph is
+        // built again - with the real atlas in this slot - before any such face can be drawn.
+        graph.resources.insert(
+            "@sampler_mc_block_atlas".into(),
+            ResourceBacking::Sampler(Arc::new(wm.gpu.device.create_sampler(
+                &wgpu::SamplerDescriptor {
+                    label: Some("wgpu-mc: the game's block atlas"),
+                    address_mode_u: wgpu::AddressMode::ClampToEdge,
+                    address_mode_v: wgpu::AddressMode::ClampToEdge,
+                    address_mode_w: wgpu::AddressMode::ClampToEdge,
+                    mag_filter: wgpu::FilterMode::Linear,
+                    min_filter: wgpu::FilterMode::Linear,
+                    mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+                    lod_min_clamp: 0.0,
+                    lod_max_clamp: 0.0,
+                    compare: None,
+                    anisotropy_clamp: 1,
+                    border_color: None,
+                },
+            ))),
+        );
+
+        let game_atlas = game_block_atlas();
+
+        match &game_atlas {
+            Some(view) => {
+                graph.resources.insert(
+                    "@texture_mc_block_atlas".into(),
+                    ResourceBacking::TextureView(view.clone()),
+                );
+            }
+            None => {
+                // A white texel, made here rather than left out: see the comment above.
+                match TextureAndView::from_rgb_bytes(
+                    &wm.gpu,
+                    &[0xff, 0xff, 0xff, 0xff],
+                    wgpu::Extent3d {
+                        width: 1,
+                        height: 1,
+                        depth_or_array_layers: 1,
+                    },
+                    Some("wgpu-mc: no game block atlas yet"),
+                    wgpu::TextureFormat::Rgba8Unorm,
+                    1,
+                ) {
+                    Ok(placeholder) => {
+                        graph.resources.insert(
+                            "@texture_mc_block_atlas".into(),
+                            ResourceBacking::Texture2D(Arc::new(placeholder)),
+                        );
+                    }
+                    Err(err) => {
+                        log::warn!(
+                            "wgpu-mc: the placeholder for the game's block atlas could not be \
+                             created ({err}), so the terrain pipeline cannot be built"
+                        );
+                    }
+                }
+            }
+        }
+
+        // The game's lightmap, and the sampler the game samples it with: `Sampler2` for the terrain is
+        // `getClampToEdge(LINEAR)`, and the texture has one mip level, so the clamp is a formality.
+        //
+        // Always registered, like the block atlas above and for the same reason - a missing resource is
+        // a *skipped pipeline* - but with a different fallback: the game may not have handed one over
+        // yet on the first build, and a lightmap of one white texel would draw the world at full
+        // brightness. The fallback is the 16x16 curve this shader used before it sampled the game's, so
+        // an early frame or a failed handover is the picture this renderer has always drawn.
+        graph.resources.insert(
+            "@sampler_game_lightmap".into(),
+            ResourceBacking::Sampler(Arc::new(wm.gpu.device.create_sampler(
+                &wgpu::SamplerDescriptor {
+                    label: Some("wgpu-mc: the game's lightmap"),
+                    address_mode_u: wgpu::AddressMode::ClampToEdge,
+                    address_mode_v: wgpu::AddressMode::ClampToEdge,
+                    address_mode_w: wgpu::AddressMode::ClampToEdge,
+                    mag_filter: wgpu::FilterMode::Linear,
+                    min_filter: wgpu::FilterMode::Linear,
+                    mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+                    lod_min_clamp: 0.0,
+                    lod_max_clamp: 0.0,
+                    compare: None,
+                    anisotropy_clamp: 1,
+                    border_color: None,
+                },
+            ))),
+        );
+
+        let game_lightmap = game_lightmap();
+
+        if game_lightmap.is_none() {
+            log::warn!(
+                "wgpu-mc: the game's lightmap has not been handed over yet; the terrain is drawn with \
+                 this renderer's own light curve until it is (see `GAME_LIGHTMAP`)"
+            );
+        }
+
+        match &game_lightmap {
+            Some(view) => {
+                graph.resources.insert(
+                    "@texture_game_lightmap".into(),
+                    ResourceBacking::TextureView(view.clone()),
+                );
+            }
+            None => {
+                let fallback = fallback_lightmap();
+
+                match TextureAndView::from_rgb_bytes(
+                    &wm.gpu,
+                    &fallback,
+                    wgpu::Extent3d {
+                        width: 16,
+                        height: 16,
+                        depth_or_array_layers: 1,
+                    },
+                    Some("wgpu-mc: no game lightmap yet"),
+                    wgpu::TextureFormat::Rgba8Unorm,
+                    1,
+                ) {
+                    Ok(placeholder) => {
+                        graph.resources.insert(
+                            "@texture_game_lightmap".into(),
+                            ResourceBacking::Texture2D(Arc::new(placeholder)),
+                        );
+                    }
+                    Err(err) => {
+                        log::warn!(
+                            "wgpu-mc: the fallback lightmap could not be created ({err}), so the \
+                             terrain pipeline cannot be built"
+                        );
+                    }
+                }
+            }
+        }
 
         match wm.mc.texture_manager.atlases.read().get(BLOCK_ATLAS) {
             Some(block_atlas) => {
@@ -816,11 +1184,42 @@ impl RenderGraph {
                         .set_index_buffer(chunk_buffer.buffer.slice(..), wgpu::IndexFormat::Uint32);
 
                     let sections = scene.section_storage.write();
-                    let translation = Vec3::new(
-                        model_translation[0],
-                        model_translation[1],
-                        model_translation[2],
-                    );
+
+                    // The section the camera is in, which is the origin every draw is placed *relative
+                    // to*. The alternative - the section's own absolute position - is a number of up to
+                    // thirty million, and `f32` steps by four thousandths of a block out there. That is
+                    // four orders of magnitude more than the depth buffer can forgive, and it is what the
+                    // entity shadows were fighting with: a shadow's piece is a quad lying on the top face
+                    // of a block (`EntityRenderer#extractShadowPiece`), so it is *coplanar* with the face
+                    // this pass draws under it, and which of the two the depth test sees is decided by
+                    // their last bits. The error was a function of the world position and not of the
+                    // camera, which is why the stripes did not move when the camera did.
+                    //
+                    // Relative to the camera's *section* and not to the camera itself, because the
+                    // fractional part of the camera's position is in the view matrix (the JVM builds it
+                    // that way, see `TerrainPass`): `section * 16` stays an exact integer here, the
+                    // subtraction is of two small integers, and the offset within the section is a
+                    // number below sixteen wherever it is applied. Vanilla computes the same sum in its
+                    // own vertex shader - `Position + (ChunkPosition - CameraBlockPos) + CameraOffset` -
+                    // for the same reason.
+                    let camera_section = *scene.camera_section_pos.read();
+
+                    // The frustum the culler below is handed is built from this same view-projection
+                    // matrix, so the boxes have to be in the space that matrix reads - which is
+                    // camera-section-relative blocks, and that is what the model matrix being the
+                    // identity means. Said once rather than once a frame, because a warning that fires
+                    // on every pass is a log with nothing else in it.
+                    static WARNED_ABOUT_MODEL: std::sync::atomic::AtomicBool =
+                        std::sync::atomic::AtomicBool::new(false);
+
+                    if !model_translation.iter().all(|value| *value == 0.0)
+                        && !WARNED_ABOUT_MODEL.swap(true, Ordering::Relaxed)
+                    {
+                        log::warn!(
+                            "wgpu-mc: the terrain pass was handed a model matrix with a translation in \
+                             it ({model_translation:?}); the culling frustum does not account for one"
+                        );
+                    }
 
                     // The layers this pass draws, in the order the pass it stands in for draws them.
                     //
@@ -848,27 +1247,23 @@ impl RenderGraph {
                         };
 
                         for (pos, section) in sections.iter() {
-                            // The section's *own* position: the view matrix carries the camera's
-                            // translation, so a draw is placed by naming where it is, not by naming
-                            // where it is relative to something the draw was told about separately.
-                            // One transform, one truth - a second camera is a second thing that can be
-                            // out of step with the first.
-                            let rel_pos = *pos;
+                            // The section's position *relative to the camera's section*: the view matrix
+                            // carries the camera's offset within its own section and nothing else, so a
+                            // draw is placed by naming where it is with the big part taken out of it.
+                            // See `camera_section` above for the whole of it.
+                            let rel_pos = *pos - camera_section;
 
-                            // The box the section occupies *where the shader draws it*: the section's
-                            // name is absolute in y and section-relative in x and z, and the model
-                            // matrix then translates all three - so a box built from the name alone
-                            // would be compared against a frustum that is measured from the camera,
-                            // and every section below the player would test as if it were above them.
-                            // That is the ground culled out from under the camera, and the sky left in
-                            // its place.
+                            // The box the section occupies *where the shader draws it*: the same
+                            // camera-section-relative position the immediate carries, times sixteen to
+                            // the block units the frustum is measured in. A box built from the absolute
+                            // name instead would be thousands of blocks from the geometry it stands for,
+                            // and the sections around the camera would be culled out of their own frame.
                             let a: Vec3<f32> = [
                                 rel_pos.x as f32 * 16.0,
                                 rel_pos.y as f32 * 16.0,
                                 rel_pos.z as f32 * 16.0,
                             ]
                             .into();
-                            let a = a + translation;
                             let b: Vec3<f32> = a + Vec3::new(16.0, 16.0, 16.0);
 
                             let bounds: AABB<f32> = AABB::new(a.into_array(), b.into_array());
@@ -1178,45 +1573,329 @@ fn with_gl_depth_range(mvp: [[f32; 4]; 4]) -> [[f32; 4]; 4] {
 }
 
 #[cfg(test)]
+mod binding_visibility_tests {
+    use super::*;
+    use crate::wgpu::naga;
+    use naga::valid::{Capabilities, ValidationFlags, Validator};
+
+    /// The shipped terrain shader, which is the one that samples a texture in its **vertex** stage.
+    ///
+    /// The same file the mod ships and `graph.yaml` names, read from this crate's own source tree: two
+    /// levels up from `rust/wgpu-mc` is the repository root. A path that moves has to move this with it,
+    /// which is what a compile error here means.
+    const TERRAIN: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../neoforge/src/main/resources/assets/wgpu_mc/shaders/terrain.wgsl"
+    ));
+
+    /// Every global a function reaches, following the calls it makes.
+    fn globals_used(
+        module: &naga::Module,
+        function: &naga::Function,
+        seen: &mut Vec<usize>,
+        out: &mut Vec<naga::Handle<naga::GlobalVariable>>,
+    ) {
+        fn calls_in(
+            module: &naga::Module,
+            block: &naga::Block,
+            seen: &mut Vec<usize>,
+            out: &mut Vec<naga::Handle<naga::GlobalVariable>>,
+        ) {
+            for statement in block.iter() {
+                match statement {
+                    naga::Statement::Call { function, .. } => {
+                        into(module, *function, seen, out)
+                    }
+                    naga::Statement::Block(block) => calls_in(module, block, seen, out),
+                    naga::Statement::If { accept, reject, .. } => {
+                        calls_in(module, accept, seen, out);
+                        calls_in(module, reject, seen, out);
+                    }
+                    naga::Statement::Switch { cases, .. } => {
+                        for case in cases {
+                            calls_in(module, &case.body, seen, out);
+                        }
+                    }
+                    naga::Statement::Loop {
+                        body, continuing, ..
+                    } => {
+                        calls_in(module, body, seen, out);
+                        calls_in(module, continuing, seen, out);
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        fn into(
+            module: &naga::Module,
+            function: naga::Handle<naga::Function>,
+            seen: &mut Vec<usize>,
+            out: &mut Vec<naga::Handle<naga::GlobalVariable>>,
+        ) {
+            if seen.contains(&function.index()) {
+                return;
+            }
+
+            seen.push(function.index());
+
+            let function = &module.functions[function];
+
+            for (_, expression) in function.expressions.iter() {
+                match expression {
+                    naga::Expression::GlobalVariable(handle) => out.push(*handle),
+                    naga::Expression::CallResult(callee) => into(module, *callee, seen, out),
+                    _ => {}
+                }
+            }
+
+            calls_in(module, &function.body, seen, out);
+        }
+
+        for (_, expression) in function.expressions.iter() {
+            if let naga::Expression::GlobalVariable(handle) = expression {
+                out.push(*handle);
+            }
+        }
+
+        calls_in(module, &function.body, seen, out);
+    }
+
+    /// Which global bindings each stage of every entry point of the shader reaches for, and what the
+    /// graph's layout would call each one. See [`ResourceKind::visibility`].
+    fn sampled(source: &str) -> Vec<(naga::ShaderStage, ResourceKind, u32, u32)> {
+        let module = naga::front::wgsl::parse_str(source).expect("the terrain shader parses");
+
+        // The same front end and the same analysis wgpu runs over a shader before it matches it
+        // against a pipeline layout, so this is the check that failed at runtime - with naga in place
+        // of the device, which is what makes it a test rather than a crash.
+        Validator::new(ValidationFlags::all(), Capabilities::all())
+            .validate(&module)
+            .expect("the terrain shader validates");
+
+        let mut used = Vec::new();
+
+        for entry in &module.entry_points {
+            let mut handles = Vec::new();
+            globals_used(&module, &entry.function, &mut Vec::new(), &mut handles);
+
+            for handle in handles {
+                let variable = &module.global_variables[handle];
+
+                let Some(binding) = variable.binding else {
+                    continue;
+                };
+
+                let kind = match module.types[variable.ty].inner {
+                    naga::TypeInner::Image { .. } => ResourceKind::Texture,
+                    naga::TypeInner::Sampler { .. } => ResourceKind::Sampler,
+                    _ => match variable.space {
+                        naga::AddressSpace::Storage { .. } => ResourceKind::Storage,
+                        _ => ResourceKind::Buffer,
+                    },
+                };
+
+                let usage = (entry.stage, kind, binding.group, binding.binding);
+
+                if !used.contains(&usage) {
+                    used.push(usage);
+                }
+            }
+        }
+
+        used
+    }
+
+    fn stage_flag(stage: naga::ShaderStage) -> ShaderStages {
+        match stage {
+            naga::ShaderStage::Vertex => ShaderStages::VERTEX,
+            naga::ShaderStage::Fragment => ShaderStages::FRAGMENT,
+            naga::ShaderStage::Compute => ShaderStages::COMPUTE,
+            // Nothing else is an entry point of a shader this renderer builds a pipeline for, so a
+            // stage here is a shader that would have to be looked at rather than mapped to a flag.
+            other => panic!("{other:?} is not a stage this renderer builds a pipeline for"),
+        }
+    }
+
+    /// **The bug this test is for.** The terrain vertex stage fetches the game's lightmap - one texel
+    /// per vertex, because the light has to be interpolated as a colour - and the layout this graph
+    /// builds said a texture is visible to the fragment stage only. wgpu refused the pipeline:
+    ///
+    /// ```text
+    /// In Device::create_render_pipeline, label = 'terrain'
+    ///   Error matching ShaderStages(VERTEX) shader requirements against the pipeline
+    ///     Shader global ResourceBinding { group: 0, binding: 7 } is not available in the pipeline layout
+    /// ```
+    ///
+    /// and because the device reports that by panicking inside a `#[jni_fn]` frame - which cannot
+    /// unwind - the game ended while entering a world. The terrain was never drawn at all, so the
+    /// picture was not "wrong", it was absent.
+    #[test]
+    fn a_binding_is_visible_to_the_stage_that_samples_it() {
+        let used = sampled(TERRAIN);
+
+        assert!(
+            used.iter().any(|(stage, kind, group, binding)| {
+                *stage == naga::ShaderStage::Vertex
+                    && *group == 0
+                    && *binding == 7
+                    && *kind == ResourceKind::Texture
+            }),
+            "the terrain vertex stage samples group 0 binding 7 - the game's lightmap. If it no longer \
+             does, this test is about nothing and the layout can be narrowed again: {used:?}"
+        );
+
+        for (stage, kind, group, binding) in used {
+            assert!(
+                kind.visibility().contains(stage_flag(stage)),
+                "group {group} binding {binding} is a {kind:?} that the {stage:?} stage uses, and a \
+                 layout that hides it from that stage is a pipeline wgpu refuses to build"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod lightmap_tests {
+    use super::*;
+
+    /// The fallback lightmap is the curve the shader used before it sampled the game's, texel for
+    /// texel.
+    ///
+    /// Worth a test because it is the *only* thing between a failed handover and a world drawn at full
+    /// brightness: `max(block, sky) / 15 * 0.7 + 0.3`, per the comment on the function, at the texel
+    /// `sample_lightmap` indexes for that pair.
+    #[test]
+    fn the_fallback_lightmap_is_the_curve_this_shader_used_to_apply() {
+        let image = fallback_lightmap();
+
+        let texel = |block: usize, sky: usize| {
+            let at = (sky * 16 + block) * 4;
+            [image[at], image[at + 1], image[at + 2], image[at + 3]]
+        };
+
+        assert_eq!(texel(0, 0), [77, 77, 77, 255], "no light at all: 0.3 of full");
+        assert_eq!(texel(15, 15), [255, 255, 255, 255], "full light both ways: 1.0");
+        assert_eq!(texel(15, 0), [255, 255, 255, 255], "the brighter of the two is what counts");
+        assert_eq!(
+            texel(0, 15),
+            [255, 255, 255, 255],
+            "whichever of the two it is: the old curve took their maximum"
+        );
+        assert_eq!(texel(8, 8), [172, 172, 172, 255], "8/15 of the way up the curve");
+    }
+}
+
+#[cfg(test)]
 mod culling_tests {
     use super::*;
     use glam::Mat4;
 
     /// A section in front of the camera is tested where it is drawn, not where its name points.
     ///
-    /// A section's name is absolute in y and section-relative in x and z, and the model matrix then
-    /// translates all three; the frustum, on the other hand, is measured from the camera. A box built
-    /// from the name alone is therefore `camera.y` blocks away from the geometry it stands for - the
-    /// ground under the player becomes a box in the sky, outside the frustum, and is culled. That is
-    /// terrain missing exactly where the player is looking, with the water and the sky behind it left
-    /// in its place, which reads as "the terrain is not drawn at all".
+    /// The pass works in **camera-section-relative** blocks: the graph writes `(section -
+    /// camera_section)` into the immediate, the view matrix carries the camera's offset inside its own
+    /// section, and the frustum is built from that same pair. A box built from the section's absolute
+    /// name is therefore thousands of blocks away from the geometry it stands for - the ground under
+    /// the player becomes a box outside the frustum and is culled, which is terrain missing exactly
+    /// where the player is looking, with the water and the sky behind it left in its place.
     #[test]
     fn a_section_below_the_camera_is_tested_where_it_is_drawn() {
+        // The camera in its section, and the identity rotation, which is all this test needs: what is
+        // being asked is which *space* the boxes and the frustum are in.
         let camera = glam::Vec3::new(0.0, 100.0, 0.0);
-        let _ = camera;
+        let camera_section = glam::IVec3::new(0, 6, 0);
         let projection = Mat4::perspective_rh(70f32.to_radians(), 16.0 / 9.0, 0.05, 256.0);
-        let frustum =
-            Frustum::from_modelview_projection(with_gl_depth_range(projection.to_cols_array_2d()));
 
-        // The camera is at y 100, so the pass's model matrix translates by -100 in y.
-        let translation = Vec3::new(0.0, -100.0, 0.0);
-        let size = Vec3::new(16.0, 16.0, 16.0);
+        // The view the JVM builds: the rotation with the camera's offset inside its section, which is
+        // `100.0 - 6 * 16 = 4.0` here.
+        let offset = camera - camera_section.as_vec3() * 16.0;
+        let view = Mat4::from_translation(-offset);
+        let frustum = Frustum::from_modelview_projection(with_gl_depth_range(
+            (projection * view).to_cols_array_2d(),
+        ));
 
-        // A section at absolute y 80 - one section under the camera - forty blocks in front of it.
-        let drawn_at = Vec3::new(0.0, 80.0, -40.0) + translation;
-        let bounds = AABB::new(drawn_at.into_array(), (drawn_at + size).into_array());
+        let size = glam::Vec3::new(16.0, 16.0, 16.0);
+
+        // A section one under the camera's own and forty blocks in front of it, in the space the graph
+        // sends: `section - camera_section`.
+        let section = glam::IVec3::new(0, 5, -3);
+        let relative: glam::Vec3 = (section - camera_section).as_vec3() * 16.0;
+        let bounds = AABB::new(relative.to_array(), (relative + size).to_array());
         assert!(
             bounds.coherent_test_against_frustum(&frustum, 0).0,
             "the section in front of the camera was culled where it is drawn"
         );
 
-        // And the same section built from its name alone, which is where that bug put it: eighty
-        // blocks above the camera, out of the frustum, gone.
-        let named_at = Vec3::new(0.0, 80.0, -40.0);
-        let named = AABB::new(named_at.into_array(), (named_at + size).into_array());
+        // And the same section built from its absolute name, which is where a transform that forgot the
+        // camera's section would put it: a hundred blocks up in the air, out of the frustum, gone.
+        let named_at: glam::Vec3 = section.as_vec3() * 16.0;
+        let named = AABB::new(named_at.to_array(), (named_at + size).to_array());
         assert!(
             !named.coherent_test_against_frustum(&frustum, 0).0,
-            "a box built from the name alone is in front of the camera, so the translation is not needed"
+            "a box built from the absolute name is in front of the camera, so the relative position is \
+             not what the frustum is measured in"
+        );
+    }
+
+    /// The reason the transform is camera-section-relative at all: the vertex that reaches the depth
+    /// buffer keeps a millionth of a block of accuracy far from the origin, where the absolute form lost
+    /// four thousandths of one.
+    ///
+    /// This is the entity-shadow stripes, as arithmetic. An entity's shadow is a quad lying on the top
+    /// face of a block (`EntityRenderer#extractShadowPiece`), drawn afterwards with
+    /// `LESS_THAN_OR_EQUAL` - so it is *coplanar* with the terrain face under it, and whether the depth
+    /// test sees the shadow or the ground is decided by the last bits of two positions that are supposed
+    /// to be the same number. The error that decided it was a function of the world position and not of
+    /// the camera, which is why the stripes stayed where they were while the camera moved.
+    ///
+    /// Both arrangements are the same matrix pair applied to the same world point; what differs is where
+    /// the big number is formed. Both are run here the way the shader runs them - the position is summed
+    /// in `f32` and then multiplied by the matrix in `f32` - against an `f64` reference, so what the two
+    /// errors measure is what actually reaches the depth buffer.
+    #[test]
+    fn a_vertex_keeps_its_accuracy_far_from_the_origin() {
+        // A camera and a block on the ground, two hundred thousand blocks out: a world that has been
+        // walked a long way, and not the worst case by any means.
+        let camera = glam::DVec3::new(200_000.37, 71.62, -200_000.19);
+        let section = glam::IVec3::new(12_500, 4, -12_501);
+        let camera_section = glam::IVec3::new(12_500, 4, -12_501);
+
+        // A vertex on a block's top face: the section's own corner, on the sixteenth grid.
+        let local = glam::DVec3::new(13.0, 16.0, 5.0);
+
+        // The whole chain runs in `f32` in the shader, which is the point: the sum is formed there and
+        // the matrix multiplies it there.
+        let turn = glam::Mat4::from_rotation_y(0.7) * glam::Mat4::from_rotation_x(0.3);
+        let exact_turn = glam::DMat4::from_rotation_y(0.7) * glam::DMat4::from_rotation_x(0.3);
+
+        let world = section.as_dvec3() * 16.0 + local;
+        let exact = exact_turn * (world - camera).extend(1.0);
+
+        // What the pass does now: the section relative to the camera's, and the camera's offset inside
+        // its own section in the matrix.
+        let offset = camera - camera_section.as_dvec3() * 16.0;
+        let relative = (section - camera_section).as_dvec3() * 16.0 + local;
+        let now = turn * (relative.as_vec3() - offset.as_vec3()).extend(1.0);
+
+        // What it did before: the section's absolute position, and the camera's position in the matrix.
+        let absolute = section.as_dvec3() * 16.0 + local;
+        let before = turn * (absolute.as_vec3() - camera.as_vec3()).extend(1.0);
+
+        let error = |value: glam::Vec4| (value.as_dvec4() - exact).truncate().length();
+
+        let now_error = error(now);
+        let before_error = error(before);
+
+        assert!(
+            now_error < 1e-4,
+            "the camera-section-relative transform is {now_error} blocks out, which is more than the \
+             depth buffer can absorb"
+        );
+        assert!(
+            before_error > 100.0 * now_error,
+            "the absolute transform should be the one that loses the precision: {before_error} against \
+             {now_error} blocks"
         );
     }
 

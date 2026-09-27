@@ -1,6 +1,8 @@
 package dev.birb.wgpu.render
 
 import dev.birb.wgpu.WgpuMcMod
+import dev.birb.wgpu.backend.bindAtlasToTerrainPass
+import dev.birb.wgpu.backend.bindLightmapToTerrainPass
 import dev.birb.wgpu.chunk.RustChunkBake
 import dev.birb.wgpu.rust.WmNative
 import dev.birb.wgpu.rust.WgpuNative
@@ -105,10 +107,11 @@ object TerrainPass {
 	 * step. Two copies of the same terrain, one on each side of the bob, is what the flickering glass
 	 * was: the triangles of the block behind it and the block itself swapping over every frame.
 	 *
-	 * The model matrix is what makes the shader's own arithmetic camera-relative. It places a section
-	 * at `section * 16` relative to the camera's *section*, and the difference between that and where
-	 * the camera actually is, is what this translates by. Y is not taken relative to a section - the
-	 * graph works in absolute section heights - so the camera's own height is in the matrix as it is.
+	 * The view is the camera's rotation with the camera's offset **within its own section**, and the
+	 * model matrix is the identity: the section the pass draws is placed relative to the camera's
+	 * section by the graph itself, so nothing here has to carry an absolute position. See the comment on
+	 * the translate below for what that buys, and `setCameraSection` on the native side for the section
+	 * it has to agree with.
 	 */
 	fun sendCameraMatrices() {
 		val client = Minecraft.getInstance() ?: return
@@ -128,45 +131,136 @@ object TerrainPass {
 
 		Matrix4f(cameraState.projectionMatrix).mul(bob.last().pose()).get(projection)
 
-		// The view matrix carries the camera's own translation, and the graph offsets a section by its
-		// *absolute* position: the frame's transform is then one matrix pair and nothing else, and the
-		// terrain pass is not told a second camera it could disagree with. `view = R * translate(-p)`,
-		// which is what lets the section be read back out of it - see `derive_camera_section` on the
-		// native side, where the same value is used for the arena's trim.
-		//
-		// The model matrix is the identity for that reason, and the section position the graph sends
-		// with each draw is absolute. The cost is precision far from the origin: `p` is a float in the
-		// matrix, so a world tens of millions of blocks out quantises the terrain. The form this
-		// replaced kept the camera-section offset instead and paid for it with a section that had to be
-		// sent separately - and with the sixteen-block jump that a section sent out of step with these
-		// matrices produced. If far-out precision ever matters more, the honest fix is to send `p` as two
-		// floats (high and low part), not to reintroduce a second camera.
 		val position = cameraState.pos
 
+		// The section the camera is in, which is the origin everything this pass draws is placed
+		// relative to. Sent with the matrices rather than read back out of them: the view no longer
+		// carries the camera's absolute position (below), so this is the only copy of it - and it has to
+		// be the same frame's camera that built the matrix.
+		val sectionX = SectionPos.blockToSectionCoord(position.x)
+		val sectionY = SectionPos.blockToSectionCoord(position.y)
+		val sectionZ = SectionPos.blockToSectionCoord(position.z)
+
+		val originX = SectionPos.sectionToBlockCoord(sectionX).toDouble()
+		val originY = SectionPos.sectionToBlockCoord(sectionY).toDouble()
+		val originZ = SectionPos.sectionToBlockCoord(sectionZ).toDouble()
+
+		// The view is the camera's rotation with the camera's offset **within its own section** in it -
+		// not the camera's position, which is what it used to carry, and the difference is the whole
+		// reason for this arrangement.
+		//
+		// The graph places a section at `(section - cameraSection) * 16`, a number of at most a few
+		// thousand, and this matrix then takes the fractional camera position off it. Both numbers stay
+		// small, so the vertex that reaches the depth buffer is accurate to about a millionth of a block
+		// - while folding in the camera's *absolute* position, as this matrix used to, meant adding a
+		// number like 30000 to a number like 12 in `f32`, where the step is 0.004 blocks. That error is
+		// a function of the world position and not of the camera, and it is what made the ground fight
+		// with the shadow lying on top of it: an entity's shadow is a quad on the top face of a block
+		// (`EntityRenderer#extractShadowPiece`), drawn afterwards with `LESS_THAN_OR_EQUAL`, and which of
+		// the two the depth test saw was decided by their last bits - stripes that stayed where they were
+		// while the camera moved.
+		//
+		// Vanilla reaches the same place from the other side: `terrain.vsh` computes
+		// `Position + (ChunkPosition - CameraBlockPos) + CameraOffset` and its `ModelViewMat` is the
+		// camera's rotation alone, so the big numbers never meet.
 		Matrix4f(cameraState.viewRotationMatrix)
-			.translate(-position.x.toFloat(), -position.y.toFloat(), -position.z.toFloat())
+			.translate(
+				-(position.x - originX).toFloat(),
+				-(position.y - originY).toFloat(),
+				-(position.z - originZ).toFloat(),
+			)
 			.get(view)
 
 		Matrix4f().get(model)
 
-		// The arena's trim hint, and nothing else: the native side reads the section it draws with back
-		// out of the view matrix (`derive_camera_section`), so a hint that is a frame late costs nothing -
-		// while a section that disagreed with these matrices was sixteen blocks of terrain in the wrong
-		// place. This one is still sent because the arena is trimmed whether or not this path is drawn.
-		val sectionX = SectionPos.blockToSectionCoord(position.x)
-		val sectionZ = SectionPos.blockToSectionCoord(position.z)
-
+		// The arena's trim hint, and the transform's own origin: the native side reads it for both
+		// (the trim horizontally, the transform in all three axes). A fraction of a section of lag here
+		// is not a nicety - it is sixteen blocks of terrain in the wrong place - which is why it is sent
+		// on this line rather than on a tick.
 		lastModelX = position.x.toFloat()
 		lastModelY = position.y.toFloat()
 		lastModelZ = position.z.toFloat()
 		lastSectionX = sectionX
 		lastSectionZ = sectionZ
 
-		WgpuNative.setCameraSection(sectionX, sectionZ)
+		WgpuNative.setCameraSection(sectionX, sectionY, sectionZ)
 
 		WgpuNative.setMatrix(MATRIX_PROJECTION, projection)
 		WgpuNative.setMatrix(MATRIX_VIEW, view)
 		WgpuNative.setMatrix(MATRIX_MODEL, model)
+
+		sendFog(cameraState, position.x - originX, position.y - originY, position.z - originZ)
+
+		bindLightmap()
+	}
+
+	/** The fog block the shader reads. See [sendFog] for what goes in it. */
+	private val fog = FloatArray(12)
+
+	/**
+	 * Sends the frame's fog: the game's own numbers, and the camera's offset inside its section.
+	 *
+	 * The eleven are read from `CameraRenderState#fogData`, which is not a copy of the fog - it *is* the
+	 * fog: `GameRenderer.renderLevel` writes that object into the game's fog buffer
+	 * (`FogRenderer#updateBuffer(cameraState.fogData)`) and hands the slice to the level renderer, which
+	 * binds it for the pass this one stands in for. So what arrives here is what the game's own terrain
+	 * would have been drawn with, whatever produced it - water, lava, blindness, the darkness effect, the
+	 * biome's fog, the render distance.
+	 *
+	 * The last three are this side's, and they are not fog at all: the shader computes a position relative
+	 * to the camera's *section* (that is the whole of its precision, see [sendCameraMatrices]) and the fog
+	 * distances are measured from the camera itself, so the offset between the two has to travel with the
+	 * rest. `vec3` plus a padding float, because that is what the shader's struct has.
+	 */
+	private fun sendFog(cameraState: CameraRenderState, offsetX: Double, offsetY: Double, offsetZ: Double) {
+		val fogData = cameraState.fogData
+
+		fog[0] = fogData.color.x
+		fog[1] = fogData.color.y
+		fog[2] = fogData.color.z
+		fog[3] = fogData.color.w
+		fog[4] = fogData.environmentalStart
+		fog[5] = fogData.environmentalEnd
+		fog[6] = fogData.renderDistanceStart
+		fog[7] = fogData.renderDistanceEnd
+		fog[8] = offsetX.toFloat()
+		fog[9] = offsetY.toFloat()
+		fog[10] = offsetZ.toFloat()
+		fog[11] = 0.0f
+
+		WgpuNative.setFogEnvironment(fog)
+	}
+
+	/** The lightmap texture the graph was last handed, so the handover is one call rather than sixty a second. */
+	@Volatile
+	private var boundLightmap: Any? = null
+
+	/**
+	 * Hands the renderer the lightmap of the frame being drawn, the first time it sees it.
+	 *
+	 * The game does not build a new lightmap when the light changes - `Lightmap#render` writes into the
+	 * texture it already has - so the handover is per *texture*, and what follows the light is the
+	 * texture's contents rather than a new binding. Asking every frame is what catches the one case that
+	 * would leave the terrain lit by a stale copy: the game replacing the lightmap. It is a pointer
+	 * comparison and, once, a native call.
+	 *
+	 * Until it lands, the pass draws with the 16x16 fallback the native side builds for itself - the
+	 * light curve this renderer used before it sampled the game's - so the first frames of a world are
+	 * the picture this renderer has always drawn rather than a world lit by a placeholder.
+	 */
+	private fun bindLightmap() {
+		val lightmap = Minecraft.getInstance().gameRenderer.levelLightmap()
+
+		// The game hands out the same view for the life of the lightmap, so this is an identity check
+		// rather than anything about the texture - and the one case it catches is the game replacing the
+		// lightmap, which would leave the terrain lit by a stale one.
+		if (lightmap === boundLightmap) {
+			return
+		}
+
+		boundLightmap = lightmap
+
+		lightmap.bindLightmapToTerrainPass()
 	}
 
 	/** Where the bob pose put the camera on the last frame the pass was sent matrices for. */

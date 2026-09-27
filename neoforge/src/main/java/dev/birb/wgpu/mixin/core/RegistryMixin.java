@@ -1,6 +1,6 @@
 package dev.birb.wgpu.mixin.core;
 
-import dev.birb.wgpu.rust.WgpuNative;
+import dev.birb.wgpu.BlockRegistryFeed;
 import net.minecraft.core.Registry;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.resources.ResourceKey;
@@ -34,6 +34,11 @@ import java.util.stream.Collectors;
  * initializer, after every block is registered. Asking for one here is a null dereference during
  * bootstrap, which is how this crashed the game once. The masks are read on the block cache thread
  * instead, as each state's key is set - see {@code Wgpu#helperSetBlockStateIndex}.
+ *
+ * <p>The call goes through {@code BlockRegistryFeed}, which records what it was given. The game
+ * registers a block once and never again, and the native side drops its copy of the registry with every
+ * bake - so a resource reload has nothing left to read a registry from, and a pack that changes a model
+ * needs one to bake it against. See that class for the whole of it.
  */
 @Mixin(Registry.class)
 public interface RegistryMixin {
@@ -55,7 +60,7 @@ public interface RegistryMixin {
 
         String blockId = key.identifier().toString();
 
-        WgpuNative.registerBlock(blockId);
+        BlockRegistryFeed.registerBlock(blockId);
 
         for (BlockState state : block.getStateDefinition().getPossibleStates()) {
             // 26.1 changed StateHolder#getValues() from a Map to a Stream<Property.Value<?>>,
@@ -63,7 +68,7 @@ public interface RegistryMixin {
             String stateKey = state.getValues()
                     .map(Object::toString)
                     .collect(Collectors.joining(","));
-            WgpuNative.registerBlockState(state, blockId, stateKey);
+            BlockRegistryFeed.registerState(state, blockId, stateKey);
         }
     }
 }

@@ -444,6 +444,36 @@ object RustChunkBake {
 	}
 
 	/**
+	 * Forgets what this side believes Rust already has, so the next offer of every section carries its
+	 * blocks again.
+	 *
+	 * This is what a **resource reload** needs and what nothing else did. A reload does not change the
+	 * blocks, so [send] compares each section's states against what it sent last time, finds them
+	 * identical, and carries nothing - while the *models* those states bake to have just been rebuilt
+	 * from the new pack, and the vertices sitting in the arena are still the old ones. Nothing else
+	 * makes a section stale enough to be offered again: Minecraft only re-meshes what it has thrown
+	 * away, and it throws nothing away for a texture pack.
+	 *
+	 * The generation is deliberately *not* touched. It says which world these sections belong to, and a
+	 * reload is the same world - the stamp on every record has to stay the one the native side is
+	 * accepting, or every payload of the re-mesh would be refused as the last world's.
+	 *
+	 * The light goes with the blocks, because the record that remembers it goes with them: a section
+	 * re-offered after this is a section whose light may be a frame newer, which is not a cost worth a
+	 * second table to avoid.
+	 */
+	@JvmStatic
+	fun forgetSent() {
+		val forgotten = sent.size
+		sent.clear()
+
+		WgpuMcMod.LOGGER.info(
+			"wgpu: {} section(s) will be offered to the Rust baker with their blocks again",
+			forgotten,
+		)
+	}
+
+	/**
 	 * Offers the middle section of [region] to the Rust baker. Called from the head of the compile
 	 * task, on the chunk-build worker thread.
 	 *

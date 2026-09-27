@@ -1200,11 +1200,87 @@ pub extern "C" fn create_texture_view(
     view
 }
 
+/// Hands the render graph the game's own block atlas, for the faces whose sprite the game animates.
+///
+/// Called from the JVM right beside the sprite registration (`BlockCache#start`), so that the
+/// rectangles a face is baked with and the atlas that face samples always come from the same stitch -
+/// the game re-stitches on every resource reload, and a rectangle from one atlas read against another
+/// is a face with the wrong texture on it rather than a face that has not changed.
+///
+/// What is kept is a **view**, not the texture. `wgpu::TextureView` owns a handle to the texture it
+/// was made from, so the graph holding one is what keeps the game's atlas alive for as long as the
+/// pass samples it - including past the game closing its own handle, which it does at the top of
+/// every `TextureAtlas#createTexture` before making the next one.
+///
+/// A texture the game has already closed is refused rather than viewed: `create_view` on a dropped
+/// texture is a wgpu validation error, and a validation error on this path runs the panic hook and
+/// ends the process. Refusing leaves the previous atlas in place, which is what the pass was drawing
+/// from anyway.
+///
+/// The graph is not rebuilt here - this arrives on a tick, and a graph replaced mid-frame would draw
+/// half of that frame one way and half the other - it is only marked stale, and the frame's own end
+/// rebuilds it (`rebuild_pipelines_if_stale`).
+#[unsafe(no_mangle)]
+pub extern "C" fn bind_game_block_atlas(_wm: &WmRenderer, texture: &wgpu::Texture) {
+    if !texture_is_alive(texture) {
+        warn!(
+            "wgpu-mc: the game's block atlas was handed over after it was closed; keeping the atlas \
+             the terrain pass already samples"
+        );
+        return;
+    }
+
+    log::info!(
+        "wgpu-mc: the game's block atlas is bound to the terrain pass: {}x{}, {} mip level(s)",
+        texture.width(),
+        texture.height(),
+        texture.mip_level_count()
+    );
+
+    wgpu_mc::render::graph::set_game_block_atlas(
+        texture.create_view(&wgpu::TextureViewDescriptor::default()),
+    );
+
+    crate::debug::mark_pipelines_stale();
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn drop_render_pass(_: Box<BlazeRenderPass>) {
     LIVE_PASS_COUNT.fetch_sub(1, Ordering::Relaxed);
 }
 
+/// Hands over the game's **lightmap**: the 16x16 texture the terrain shader samples for its lighting.
+///
+/// The same shape as [`bind_game_block_atlas`] and for the same reasons - the view is what is kept, a
+/// closed texture is refused rather than viewed, and the graph is only marked stale so that the rebuild
+/// lands at the end of a frame - with one difference worth knowing: the game does not rebuild this
+/// texture, it *writes into* the one it has (`Lightmap#render`), so one handover is the last one and
+/// every later change of time, brightness or effect arrives by itself. The JVM still asks once a frame,
+/// because asking is a pointer comparison and the texture being replaced is the one thing that would
+/// leave this side sampling a stale light.
+#[unsafe(no_mangle)]
+pub extern "C" fn bind_game_lightmap(_wm: &WmRenderer, texture: &wgpu::Texture) {
+    if !texture_is_alive(texture) {
+        warn!(
+            "wgpu-mc: the game's lightmap was handed over after it was closed; keeping the light the \
+             terrain pass already samples"
+        );
+        return;
+    }
+
+    log::info!(
+        "wgpu-mc: the game's lightmap is bound to the terrain pass: {}x{}, {} mip level(s)",
+        texture.width(),
+        texture.height(),
+        texture.mip_level_count()
+    );
+
+    wgpu_mc::render::graph::set_game_lightmap(
+        texture.create_view(&wgpu::TextureViewDescriptor::default()),
+    );
+
+    crate::debug::mark_pipelines_stale();
+}
 #[unsafe(no_mangle)]
 pub extern "C" fn create_render_pass(
     _encoder: &mut CommandEncoderHandle,
@@ -4449,21 +4525,21 @@ pub extern "C" fn render_terrain_pass(
         multiply(&matrices.projection, &matrices.view)
     };
 
-    // The camera's section, read back out of the matrix this frame is drawn with rather than taken from
-    // a value sent beside it: the view matrix is `R * translate(-p)`, so `p = -R^T * t` and the section
-    // follows. It is used for one thing - the arena's trim - and the JVM's own `setCameraSection` is the
-    // same kind of hint, sent when this path is off so that the arena is still trimmed against a camera.
-    // Nothing in the transform reads either of them.
-    if let Some(scene) = wm.scene() {
-        let matrices = crate::renderer::MATRICES.lock();
-        let view = matrices.view;
+    // The camera's section is *not* read back out of the view matrix any more, and that is the point of
+    // this shape: the view is `R * translate(-o)` where `o` is the camera's offset within its own
+    // section - a number below sixteen - so the matrix no longer knows which section that was. The JVM
+    // sends it (`TerrainPass.sendCameraMatrices`) beside the very matrices it built from the same camera
+    // position, which is one value in one place rather than two derivations that can disagree.
+    //
+    // What it is for is the transform: the graph places every section at `(section - camera_section) *
+    // 16`, so a section and the camera section that names it have to be the same frame's - and a hint
+    // that was a frame late would put the terrain sixteen blocks out, which is why it is sent with the
+    // matrices rather than once per tick.
 
-        *scene.camera_section_pos.write() = derive_camera_section(&view);
-    }
-
-    // The model matrix's translation, which is where the camera is in the space a section's name is
-    // relative to. The culler needs it for the same reason the shader does: without it, a section is
-    // tested where its *name* points rather than where it is drawn.
+    // The model matrix's translation, which the culler would need if the terrain pass used one. It does
+    // not: the section positions the graph sends are already camera-section-relative and the camera's
+    // own offset is inside the view matrix, so the identity is the only model matrix this pass agrees
+    // with - and the graph says so once a frame if it is handed anything else.
     let model_translation = {
         let matrices = crate::renderer::MATRICES.lock();
         let model = matrices.terrain_transformation;
@@ -4486,27 +4562,6 @@ pub extern "C" fn render_terrain_pass(
     });
 
     true
-}
-
-/// The section the camera is in, read out of the level's view matrix.
-///
-/// The matrix is `R * translate(-p)` (see the terrain pass's own side): its three-by-three part is the
-/// camera's rotation and its translation column is `R * (-p)`, so the position is `-R^T * t` - one dot
-/// product per axis. Only the arena's trim wants it: what a draw is placed by is the matrix itself, and
-/// a trim hint that is a frame old trims a frame late, which costs nothing at all.
-fn derive_camera_section(view: &[[f32; 4]; 4]) -> glam::IVec2 {
-    let translation = glam::Vec3::new(view[3][0], view[3][1], view[3][2]);
-
-    let axis = |column: usize| {
-        glam::Vec3::new(view[column][0], view[column][1], view[column][2]).dot(translation)
-    };
-
-    let position = glam::Vec3::new(-axis(0), -axis(1), -axis(2));
-
-    glam::ivec2(
-        (position.x / 16.0).floor() as i32,
-        (position.z / 16.0).floor() as i32,
-    )
 }
 
 /// Diagnostics: what the shader is handed, and where it lands.
@@ -4543,17 +4598,22 @@ fn report_terrain_transform(
         return;
     };
 
-    let rel = glam::ivec3(pos.x - camera.x, pos.y, pos.z - camera.y);
+    // The shader's own arithmetic, in the order it does it: the section's centre *relative to the
+    // camera's section* (which is what the graph writes into the immediate), the model matrix (which is
+    // the identity), and the view-projection. The culler builds the same box, which is what keeps
+    // "where it is drawn" and "what is culled" one place - and the same relative position is what keeps
+    // the transform's own precision, see `Scene::camera_section_pos`.
+    let rel = glam::ivec3(
+        pos.x - camera.x,
+        pos.y - camera.y,
+        pos.z - camera.z,
+    );
     let centre = glam::vec3(
         (rel.x as f32 + 0.5) * 16.0,
         (rel.y as f32 + 0.5) * 16.0,
         (rel.z as f32 + 0.5) * 16.0,
     );
 
-    // The shader's own arithmetic, in the order it does it: the section's centre, the model matrix,
-    // the view (which is the identity here) and the view-projection. The culler is handed the same
-    // translation and builds the same box, which is what keeps "where it is drawn" and "what is
-    // culled" one place.
     let moved = [
         centre.x + model_translation[0],
         centre.y + model_translation[1],
@@ -4567,7 +4627,8 @@ fn report_terrain_transform(
 
     log::info!(
         "wgpu-mc: terrain transform: camera section {camera:?}, first section {pos:?} (relative {rel:?}), \
-         model translation {model_translation:?}, y scale {:+.4}, section centre at {moved:?}, clip {clip:?}",
+         model translation {model_translation:?} (must be zero), y scale {:+.4}, section centre at \
+         {moved:?}, clip {clip:?}",
         view_projection[1][1],
     );
 }
@@ -4842,29 +4903,39 @@ pub fn setRenderDistance(_env: JNIEnv, _class: JClass, chunks: jint) {
     }
 }
 
-/// Says where the camera is, in sections, which is what the arena is trimmed against.
+/// The section the camera is in: what the arena is trimmed against, and the origin the terrain pass
+/// draws every section relative to.
 ///
-/// Called once per frame from the JVM, before the frame is presented. Sections are what the terrain
-/// path is keyed by everywhere - the baker's positions, the arena's ranges, the graph pass's grid -
-/// so this is the one coordinate the renderer needs from the camera, and it is sent rather than
-/// derived because the renderer has no camera of its own: Minecraft's matrices arrive as matrices.
+/// Called once per frame from the JVM, from the same camera state as the matrices that go with it.
+/// Sections are what the terrain path is keyed by everywhere - the baker's positions, the arena's
+/// ranges, the graph pass's grid - so this is the one coordinate the renderer needs from the camera,
+/// and it is sent rather than derived because the renderer has no camera of its own: Minecraft's
+/// matrices arrive as matrices.
 ///
-/// `x` and `z` only: the arena trims horizontally, because a vertical slice of the world is loaded
-/// all at once. This is the signature the Fabric module's `setSectionPos` had, kept for the same
-/// reason it had it.
+/// Sent rather than derived, because the view matrix no longer knows it. The matrix is
+/// `R * translate(-o)`, where `o` is the camera's offset *within this section* - a number below sixteen,
+/// which is the whole point of the arrangement (see [`blit_from_texture`]'s neighbour and
+/// `TerrainPass.sendCameraMatrices`): the terrain is drawn at `(section - this) * 16`, so the numbers
+/// that reach the depth buffer are small, and the ground and the shadow lying on it stop fighting over
+/// their last bits.
+///
+/// The trim wants `x` and `z`, because a vertical slice of the world is loaded all at once; the
+/// transform wants all three. The height is what this signature gained, and it has to be the same
+/// section the JVM built the view matrix against - which is why both come from one call on that side
+/// rather than from two readings of a camera that can move between them.
 #[jni_fn("dev.birb.wgpu.rust.WgpuNative")]
-pub fn setCameraSection(_env: JNIEnv, _class: JClass, x: jint, z: jint) {
+pub fn setCameraSection(_env: JNIEnv, _class: JClass, x: jint, y: jint, z: jint) {
     let Some(wm) = RENDERER.get() else {
         return;
     };
 
     let Some(scene) = wm.scene() else {
-        // No framebuffer yet, so no scene to trim: the position is dropped rather than kept, because
-        // the JVM sends one per frame and the next one is a frame away.
+        // No framebuffer yet, so no scene to trim and nothing to draw: the position is dropped rather
+        // than kept, because the JVM sends one per frame and the next one is a frame away.
         return;
     };
 
-    *scene.camera_section_pos.write() = glam::ivec2(x, z);
+    *scene.camera_section_pos.write() = glam::ivec3(x, y, z);
 }
 
 /// Blits the frame into the swapchain image, and submits it.

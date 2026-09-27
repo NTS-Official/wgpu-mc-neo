@@ -10,6 +10,16 @@ pipelines:
   # The block atlas and the sampler are registered by `RenderGraph::new` itself, and the three
   # matrices are the buffers `application.rs` creates; `@texture_depth` is the scene's own depth
   # texture and `@framebuffer_texture` is whatever the caller hands the pass as its target.
+  #
+  # Bindings 5 and 6 are the *game's* block atlas, for the faces whose sprite the game animates: the
+  # face is baked with the game's own coordinates and flagged for it, and the game animates that atlas
+  # by rendering each due frame into it, so the fire moves without this renderer copying anything. The
+  # sampler is the one the game samples its atlas with - see `RenderGraph::new`.
+  #
+  # Bindings 7 and 8 are the game's **lightmap**, which is what the game's own terrain shader samples
+  # for its lighting (`sample_lightmap(Sampler2, UV2)`): one fetch per vertex, the colour interpolated
+  # across the quad, so the gamma, the brightness option, the time of day, night vision and the
+  # darkness effect all come from the game rather than from a curve written here. See `GAME_LIGHTMAP`.
   terrain:
     geometry: "@geo_terrain"
     depth: "@texture_depth"
@@ -25,6 +35,11 @@ pipelines:
         2: "@mat4_perspective"
         3: "@texture_block_atlas"
         4: "@sampler"
+        5: "@texture_mc_block_atlas"
+        6: "@sampler_mc_block_atlas"
+        7: "@texture_game_lightmap"
+        8: "@sampler_game_lightmap"
+        9: "@fog_environment"
       1: "@bg_ssbo_chunks"
     immediates:
       0: "@pc_section_position"

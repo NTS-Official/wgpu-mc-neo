@@ -105,6 +105,36 @@ class OptionPages : Iterable<OptionPages.Page> {
 
     fun apply() {
         if (hasPendingRestartChanges()) appliedRestartChanges = true
+
+        // The renderer's settings go back as **one document**, and it holds every row on every page
+        // that names one - not the rows of the page being applied.
+        //
+        // That is the renderer's design rather than a convenience here: the document *is* its config,
+        // every field of it has a serde default, and `sendSettings` parses what it is given as the
+        // whole thing - so a page that sent only its own rows would silently reset every setting on
+        // the other pages. It used to be safe by accident, because the renderer's rows were all on
+        // one page; it stopped being safe the day the animated-texture switch moved to the Quality
+        // page, which is mostly Minecraft's own options. See `Page.apply`, which no longer sends.
+        val rendererOptions = pages.flatMap { it.rendererOptions() }
+
+        if (rendererOptions.isNotEmpty()) {
+            val json = GSON.toJson(rendererOptions, SETTINGS_TYPE_TOKEN.type)
+            if (!WgpuNative.sendSettings(json)) {
+                // Nothing is applied on a failed save: half of an Apply is worse than none of it, and
+                // the values the screen is showing are still the ones the player asked for.
+                WgpuMcMod.LOGGER.error("Failed to save the renderer settings")
+                return
+            }
+
+            // `sendSettings` applies what it can immediately - `vsync` reconfigures the swapchain, the
+            // debug switches are read on the next draw, and a setting that is *baked* into geometry
+            // asks this side for a re-bake - so by the time this returns, the renderer is already
+            // running with the new values. This side has its own copy of the diagnostics switch,
+            // because it is the side that dumps frames.
+            Diagnostics.refresh()
+            syncVanillaVsync(rendererOptions)
+        }
+
         pages.forEach { it.apply() }
     }
 
@@ -221,6 +251,13 @@ class OptionPages : Iterable<OptionPages.Page> {
         // in the list rather than as a label on the setting before it.
         var section: String? = null
         for (option in options) {
+            // A setting this screen draws on another page is skipped here: one row, one place. The
+            // animated-texture switch is on the Quality page, next to the graphics preset it is a
+            // sibling of, and it must not also appear at the bottom of this list.
+            if (option.setting in DRAWN_ELSEWHERE) {
+                continue
+            }
+
             val optionSection = SETTINGS_STRUCTURE[option.setting]?.section
 
             if (optionSection != null && optionSection != section) {
@@ -264,6 +301,26 @@ class OptionPages : Iterable<OptionPages.Page> {
             .setOption(options.particles())
             .setFormatter { particleStatus -> particleStatus.caption() }
             .build())
+
+        // The renderer's own row on this page: whether the block textures Minecraft animates - fire,
+        // lava, the campfire - move on the terrain this renderer draws. A quality choice, and it sits
+        // with the ones the graphics preset moves.
+        //
+        // It is the only row here that is not Minecraft's, which is what makes this page a *mixed*
+        // one: see `OptionPages.apply` for why that matters to how the settings are sent, and
+        // `DRAWN_ELSEWHERE` for why the Neolectrum page skips it.
+        val animatedTextures = rendererSetting(ANIMATED_TEXTURES)
+
+        if (animatedTextures == null) {
+            // Not fatal, and not silent: a row that is missing because the renderer's schema did not
+            // arrive is otherwise a setting that looks like it does not exist.
+            WgpuMcMod.LOGGER.warn(
+                "wgpu: the renderer has no `{}` setting to draw on the Quality page",
+                ANIMATED_TEXTURES,
+            )
+        } else {
+            page.add(animatedTextures)
+        }
 
         page.add(BoolOption.Builder()
             .setName(Component.translatable("options.ao"))
@@ -339,33 +396,17 @@ class OptionPages : Iterable<OptionPages.Page> {
         fun hasPendingRestartChanges(): Boolean =
             options().any { it.isChanged() && it.requiresRestart }
 
+        /** Every row on this page that carries one of the renderer's settings. */
+        fun rendererOptions(): List<Option<*>> = options().filter { it.setting != null }
+
         /**
-         * Commits the page's edits, and hands the renderer the ones that are its own.
+         * Commits this page's edits.
          *
-         * Which of the two this is does *not* depend on [name].
-         *
-         * A page holds the renderer's settings exactly when one of its rows carries a setting name,
-         * and the renderer is the side that named them, so this cannot go stale when a label does.
+         * The renderer's settings are *sent* by [OptionPages.apply], which is the only place that sees
+         * every page and can build one complete document; this applies the rows, whichever side of the
+         * bridge they belong to.
          */
         fun apply() {
-            val rendererOptions = options().filter { it.setting != null }
-
-            if (rendererOptions.isNotEmpty()) {
-                val json = GSON.toJson(rendererOptions, SETTINGS_TYPE_TOKEN.type)
-                if (!WgpuNative.sendSettings(json)) {
-                    WgpuMcMod.LOGGER.error("Failed to save the renderer settings")
-                    return
-                }
-                // `sendSettings` applies what it can immediately - `vsync` reconfigures the
-                // swapchain, and the debug switches are read on the next draw - so by the time this
-                // returns, the renderer is already running with the new values. This side has its
-                // own copy of the diagnostics switch, because it is the side that dumps frames.
-                rendererOptions.forEach { it.apply() }
-                Diagnostics.refresh()
-                syncVanillaVsync(rendererOptions)
-                return
-            }
-
             // What changed is read before it is applied and reported after, because the two can
             // disagree: a vanilla option that refuses a value logs an error of its own and keeps the
             // one it had, and the row used to go on showing the value that was asked for. The line
@@ -429,6 +470,34 @@ class OptionPages : Iterable<OptionPages.Page> {
 
         /** The missing-translation report is worth one line per session, not one per screen. */
         private val TRANSLATIONS_REPORTED = java.util.concurrent.atomic.AtomicBoolean()
+
+        /** The name the renderer's animated-texture setting has in the schema. */
+        private const val ANIMATED_TEXTURES = "animated_textures"
+
+        /**
+         * The renderer settings this screen draws somewhere other than the Neolectrum page.
+         *
+         * One row belongs in one place, and the renderer's schema has no way to say *where* a setting
+         * is drawn beyond the section heading it sits under on that page - so a setting that belongs
+         * next to the graphics preset is named here and skipped there. The list is short by design: it
+         * is the exception, and a second entry is a second thing to keep in step.
+         */
+        private val DRAWN_ELSEWHERE = setOf(ANIMATED_TEXTURES)
+
+        /**
+         * One of the renderer's settings, as a row, for a page that is not the renderer's own.
+         *
+         * Read through the same deserializer the Neolectrum page uses, from the same document: the
+         * name, the tooltip and the values are the ones the renderer's schema gives them, and there is
+         * only one way to read them. `null` when the document has no such setting - see the caller,
+         * which says so in the log rather than drawing nothing.
+         */
+        private fun rendererSetting(name: String): Option<*>? {
+            val settings: List<Option<*>> =
+                GSON.fromJson(WgpuNative.getSettings(), SETTINGS_TYPE_TOKEN.type)
+
+            return settings.firstOrNull { it.setting == name }
+        }
 
         private val GSON = GsonBuilder()
             .registerTypeAdapter(SETTINGS_TYPE_TOKEN.type, Option.OptionSerializerDeserializer())

@@ -6,7 +6,7 @@ use std::sync::atomic::AtomicU32;
 
 use arc_swap::ArcSwap;
 use chunk::SectionStorage;
-use glam::{IVec2, ivec2};
+use glam::{IVec2, IVec3, ivec2};
 use indexmap::map::IndexMap;
 use minecraft_assets::schemas;
 use minecraft_assets::schemas::blockstates::multipart::StateValue;
@@ -250,7 +250,21 @@ pub(crate) const ARENA_USAGE: wgpu::BufferUsages = wgpu::BufferUsages::COPY_DST
 
 pub struct Scene {
     pub section_storage: RwLock<SectionStorage>,
-    pub camera_section_pos: RwLock<IVec2>,
+    /// The section the camera is in, sent by the JVM once per frame with the matrices it belongs to.
+    ///
+    /// All three axes, and two things read it:
+    ///
+    ///  - the arena's **trim**, which only needs `x` and `z` - a vertical slice of the world is loaded
+    ///    all at once, so nothing is trimmed by height;
+    ///  - the terrain pass's **transform**, which is where the precision of the whole renderer is
+    ///    decided. A section is drawn at `(section - camera_section) * 16 + a local position`, which is
+    ///    a small number, and the view matrix carries the camera's offset *within its own section*. The
+    ///    absolute position never appears, and that is the point: `x + 30000` in `f32` has a step of
+    ///    0.004 blocks, which is orders of magnitude more than the depth buffer can forgive - and it is
+    ///    what made the ground and the shadow lying on it fight over which of them is in front. See
+    ///    `TerrainPass.sendCameraMatrices` for the other half, and `@geo_terrain` in
+    ///    [`crate::render::graph`] for what is done with it.
+    pub camera_section_pos: RwLock<IVec3>,
     /// The camera section the arena was last trimmed against.
     ///
     /// Trimming walks every section the arena holds, so it happens when the camera crosses into
@@ -305,7 +319,7 @@ impl Scene {
         // is video memory; one that is too small is sections that cannot be baked.
         Self {
             section_storage: RwLock::new(SectionStorage::new(crate::mc::chunk::ARENA_SLOTS)),
-            camera_section_pos: RwLock::new(ivec2(0, 0)),
+            camera_section_pos: RwLock::new(IVec3::ZERO),
             trimmed_section_pos: RwLock::new(ivec2(i32::MAX, i32::MAX)),
             chunk_buffer: ArcSwap::from_pointee(BindableBuffer::new_deferred(
                 wm,
@@ -550,14 +564,23 @@ impl MinecraftState {
         // fluids would be baked untextured. Allocated before the upload, which is what puts them in
         // the texture the pass samples.
         for name in chunk::FLUID_TEXTURES {
+            // Two names for the same texture, and they are not interchangeable: the atlas is keyed by
+            // the name a *model* would use (`minecraft:block/lava_still`), and the resource provider by
+            // the *file* (`minecraft:textures/block/lava_still.png`). Asking the provider for the first
+            // is a `None` on every machine - which is what both fluids reported, "cannot be read",
+            // while the files sat in the jar the whole time - and a fluid whose sprite never reaches the
+            // atlas is a fluid the mesher leaves out. `block.rs` makes the same conversion for the
+            // textures its models name.
             let path = ResourcePath(format!("minecraft:block/{name}"));
 
             if block_atlas.uv_map.read().contains_key(&path) {
                 continue;
             }
 
-            let Some(bytes) = self.resource_provider.get_bytes(&path) else {
-                log::warn!("wgpu-mc: {path} cannot be read, so that fluid is not drawn");
+            let texture_path = path.prepend("textures/").append(".png");
+
+            let Some(bytes) = self.resource_provider.get_bytes(&texture_path) else {
+                log::warn!("wgpu-mc: {texture_path} cannot be read, so that fluid is not drawn");
                 continue;
             };
 

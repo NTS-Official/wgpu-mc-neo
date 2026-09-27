@@ -13,7 +13,7 @@ use jni::objects::{
     AutoElements, GlobalRef, JByteArray, JClass, JObject, JString, JValue, JValueOwned,
     ReleaseMode, WeakRef,
 };
-use jni::sys::{jboolean, jbyte, jint, jlong, jlongArray, jstring};
+use jni::sys::{jboolean, jbyte, jfloat, jint, jlong, jlongArray, jstring};
 use jni::{JNIEnv, JavaVM};
 use jni_fn::jni_fn;
 use once_cell::sync::{Lazy, OnceCell};
@@ -31,7 +31,7 @@ use wgpu_mc::render::graph::{Geometry, RenderGraph};
 
 use wgpu_mc::WmRenderer;
 use wgpu_mc::mc::block::{BlockstateKey, ChunkBlockState, FaceFlags};
-use wgpu_mc::mc::chunk::{BlockStateProvider, LightLevel, bake_section};
+use wgpu_mc::mc::chunk::{BlockStateProvider, LightLevel, RenderLayer, bake_section};
 use wgpu_mc::mc::resource::{ResourcePath, ResourceProvider};
 use wgpu_mc::minecraft_assets::schemas::blockstates::multipart::StateValue;
 use wgpu_mc::render::pipeline::BLOCK_ATLAS;
@@ -416,9 +416,48 @@ pub fn sendSettings(mut env: JNIEnv, _class: JClass, settings: JString) -> bool 
     // The debug switches are read on the draw path, so they are copied out of the settings rather
     // than looked up per draw. This is what makes an option on the debug page take effect the
     // moment it is applied - the switch is on the next draw, not on the next launch.
+    //
+    // Read before the apply, so that what moved can be told apart from what was merely stored: one
+    // setting here (`animated_textures`) is written into baked geometry rather than read per draw.
+    let animated_textures_before = SETTINGS
+        .read()
+        .as_ref()
+        .map(|settings| settings.animated_textures());
+
     crate::debug::apply(&settings);
 
+    let animated_textures_after = settings.animated_textures();
+
     *SETTINGS.write() = Some(settings);
+
+    // A setting that is *baked* cannot be applied by storing it: `animated_textures` decides, face by
+    // face, which atlas that face samples, and the answer went into the vertices when the block models
+    // were baked. So the JVM is asked to bake them again - it owns the block registry and the level
+    // renderer - and it does that on its own thread: see `BlockCache.blockTexturesChanged`.
+    //
+    // Asked for on a *change* rather than on every apply, because the re-bake costs a second or two and
+    // re-meshes every loaded section: an Apply that touched nothing but the debug switches must not
+    // rebuild the world.
+    if animated_textures_before != Some(animated_textures_after) {
+        log::info!(
+            "wgpu-mc: animated block textures are now {}; asking the JVM to bake the block models again",
+            if animated_textures_after { "on" } else { "off" }
+        );
+
+        if let Err(err) = call_static_from_class_loader(
+            &mut env,
+            "dev.birb.wgpu.BlockCache",
+            "blockTexturesChanged",
+            "()V",
+            &[],
+        ) {
+            log::warn!(
+                "wgpu-mc: the animated-texture switch moved, but the JVM could not be asked to bake \
+                 the block models again, so the old answer stays in the world until something else \
+                 bakes them: {err}"
+            );
+        }
+    }
 
     // `vsync` only picks the swapchain's present mode, so unlike `backend` it can be applied here
     // and now: this re-resolves the mode from the settings that were just stored and reconfigures
@@ -493,6 +532,72 @@ pub fn registerBlockState(
     });
 }
 
+/// One sprite's place in the game's atlas and the layer the game files it under, on the way from
+/// [`registerSprite`] to the atlas this side packs.
+///
+/// A queue rather than a direct write, because of when the call arrives: the game registers its sprites
+/// before [`cacheBlockStates`], and the atlas this side packs does not exist until that bake runs. See
+/// [`wgpu_mc::render::atlas::Atlas::register_sprite`].
+static SPRITE_REGISTRATIONS: Mutex<Vec<(String, [f32; 4], u8)>> = Mutex::new(Vec::new());
+
+/// Whether anything is waiting in that queue.
+///
+/// Read by the drain, which sits where a bake holds an atlas - inside a per-state loop, so the question
+/// has to be one atomic load rather than a lock. A flag set by the writer and cleared by the reader,
+/// rather than a "have we drained yet": a resource reload registers every sprite again, and a drain that
+/// only ever ran once would leave that second set in the queue for good.
+static SPRITE_REGISTRATIONS_PENDING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// One sprite of the game's block atlas: where it is, and which layer the game puts it in.
+///
+/// Both in one call on purpose. They are the two things only the game knows - the rectangle is the
+/// game's own atlas layout, and the layer is the game's reading of the sprite's transparency, which
+/// this side otherwise guesses from the pixels - and they are read at the same moment, so splitting
+/// them into two calls would only be two chances to be half-registered.
+///
+/// The layer is one of `WgpuNative`'s `LAYER_*` numbers: 0 solid, 1 cutout, 2 transparent. They are the
+/// numbers this function maps, and they are deliberately *not* taken from the Rust enum's
+/// discriminants: the JVM side names them, so a variant added here cannot silently move what a
+/// registered layer means. Note the one name that differs across the bridge - the game calls its third
+/// chunk layer `TRANSLUCENT` and this side calls it `Transparent` - because a rename that only happens
+/// on one side is a layer that quietly stops matching.
+#[jni_fn("dev.birb.wgpu.rust.WgpuNative")]
+pub fn registerSprite(
+    mut env: JNIEnv,
+    _class: JClass,
+    name: JString,
+    u0: jfloat,
+    v0: jfloat,
+    u1: jfloat,
+    v1: jfloat,
+    layer: jint,
+) {
+    let Ok(name) = env.get_string(&name) else {
+        // A name that is not readable UTF-8 is a sprite this side cannot look up by anything, and
+        // there is nothing to fall back to: the faces that name it keep the sprite they would have had.
+        log::warn!("wgpu-mc: a registered sprite's name could not be read; skipping it");
+        return;
+    };
+
+    SPRITE_REGISTRATIONS_PENDING.store(true, std::sync::atomic::Ordering::Relaxed);
+
+    SPRITE_REGISTRATIONS.lock().push((
+        name.into(),
+        [u0, v0, u1, v1],
+        layer as u8 & 0b0000_0011,
+    ));
+}
+
+/// The layer a registered sprite is filed under. See [`registerSprite`] for the numbers.
+fn registered_layer(layer: u8) -> RenderLayer {
+    match layer {
+        1 => RenderLayer::Cutout,
+        2 => RenderLayer::Transparent,
+        _ => RenderLayer::Solid,
+    }
+}
+
 /// What one block state says about the faces around it, keyed by the packed state key it wears.
 ///
 /// Sent from `Wgpu#helperSetBlockStateIndex` rather than from the registration mixin, and that is not
@@ -511,6 +616,8 @@ pub fn registerBlockStateFaceFlags(
     key: jint,
     occlusion: jint,
     self_hide: jint,
+    shades: jint,
+    blocks_motion: jint,
 ) {
     BLOCK_STATE_FACE_FLAGS.lock().push((
         key as u32,
@@ -519,6 +626,12 @@ pub fn registerBlockStateFaceFlags(
             // directions and are dropped rather than carried into a mask the baker shifts.
             occlusion: occlusion as u8 & 0b0011_1111,
             self_hide: self_hide as u8 & 0b0011_1111,
+            // Whether the block darkens the corners it touches - the game's own
+            // `getShadeBrightness`, which is not a shape question the masks above could answer.
+            shades: shades != 0,
+            // And whether it blocks motion, which is what a fluid looks past when it decides where it
+            // is flowing (`FlowingFluid#getFlow`). See `FaceFlags::blocks_motion`.
+            blocks_motion: blocks_motion != 0,
         },
     ));
 }
@@ -944,9 +1057,108 @@ pub fn registerBlock(mut env: JNIEnv, _class: JClass, name: JString) {
     BLOCKS.lock().push(name);
 }
 
+/// The first half of a bake: forget what the last one was given, so it can be offered again.
+///
+/// Every bake rebuilds the whole block registry from the JVM's registrations, and the native side
+/// *drops* those registrations at the end of each one - the states cross as JNI global references and
+/// are released as soon as their keys are out. So a bake that is not the first needs this first, and
+/// what it forgets depends on what changed:
+///
+///  - the block list and any state still queued, always: the JVM offers the whole registry again
+///    (`BlockRegistryFeed.replay`) and a second copy of every block would bake every model twice;
+///  - the diagnostics, always: they count what the *last* bake failed to read, and a count carried
+///    into the next one describes neither;
+///  - the **block atlas** - its packed rectangles, its animation table, the layer and rectangle tables
+///    the game filled, and its image - only when `reload` says the resource *pack* changed. A reload
+///    can change a sprite's size, so the rectangles packed from one pack are not the next pack's; a
+///    setting that only changes how the models are baked (`animated_textures`) must leave the atlas
+///    alone, because re-packing it would throw away the game's rectangles for the animated sprites and
+///    nothing in this call would ask for them again.
+///
+/// Deliberately *not* cleared either way: the block manager's meshes and the face-flag masks, which are
+/// still being drawn from while this runs on another thread. They are replaced wholesale by the bake
+/// that follows - `bake_blocks` overwrites each block's meshes in place, and the state keys the JVM
+/// holds stay valid because the blocks are registered back in the same order.
+///
+/// Called from the block cache thread. See `BlockCache.Bake` on the JVM side for the three callers.
+#[jni_fn("dev.birb.wgpu.rust.WgpuNative")]
+pub fn beginBlockBake(_env: JNIEnv, _class: JClass, reload: jboolean) {
+    let Some(wm) = RENDERER.get() else {
+        return;
+    };
+
+    BLOCKS.lock().clear();
+    BLOCK_STATES.lock().clear();
+    BLOCK_STATE_FACE_FLAGS.lock().clear();
+
+    EMPTY_MESH_BLOCKS.lock().clear();
+    UNMODELLED_BLOCKS.lock().clear();
+
+    wgpu_mc::mc::block::MISSING_SPRITES.reset();
+    wgpu_mc::mc::block::UNREADABLE_TEXTURES.reset();
+
+    if reload == 0 {
+        log::info!(
+            "wgpu-mc: baking the block models again: the registry and the bake diagnostics are \
+             cleared, the block atlas is kept"
+        );
+
+        return;
+    }
+
+    let atlases = wm.mc.texture_manager.atlases.read();
+
+    if let Some(atlas) = atlases.get(BLOCK_ATLAS) {
+        atlas.clear();
+    }
+
+    log::info!(
+        "wgpu-mc: a resource reload has begun: the block atlas, the sprite tables and the bake \
+         diagnostics are cleared, and the block registry is about to be offered again"
+    );
+}
+
 #[jni_fn("dev.birb.wgpu.rust.WgpuNative")]
 pub fn cacheBlockStates(mut env: JNIEnv, _class: JClass) {
     let wm = RENDERER.get().unwrap();
+
+    // The sprites the game registered before this bake, handed over **before a single model is baked**.
+    //
+    // Where this sits is the whole of whether an animated texture animates. `bake_blocks` below bakes
+    // every `variants` model, and 1074 of the game's 1170 blockstate files are `variants` - the campfire,
+    // the magma block, the sea lantern and every other block whose sprite the game animates among them.
+    // A face baked before this has run has no rectangle in the game's atlas to be sent to, so it is
+    // baked against this side's copy of its sprite and stays on one frame for the whole session; a face
+    // baked after it carries the flag and animates. This used to run inside the per-state loop further
+    // down, which is *after* `bake_blocks`: the only blocks that animated were the 96 `multipart` ones -
+    // fire among them, which is exactly how it behaved.
+    //
+    // See [`registerSprite`] and `Atlas::register_sprite` for the two things a registration carries, and
+    // `Atlas::game_atlas_rect` for the decision it feeds.
+    if SPRITE_REGISTRATIONS_PENDING.swap(false, std::sync::atomic::Ordering::Relaxed) {
+        let atlases = wm.mc.texture_manager.atlases.read();
+
+        match atlases.get(BLOCK_ATLAS) {
+            Some(atlas) => {
+                let registrations = std::mem::take(&mut *SPRITE_REGISTRATIONS.lock());
+
+                for (name, rect, layer) in registrations {
+                    atlas.register_sprite(
+                        &ResourcePath::from(&name[..]),
+                        rect,
+                        registered_layer(layer),
+                    );
+                }
+            }
+            None => {
+                // Nowhere to put them. Left in the queue for the bake that has an atlas rather than
+                // dropped: the registry cannot be built without one either, so this is the same "no
+                // atlas, nothing to do" the rest of this function already reports.
+                SPRITE_REGISTRATIONS_PENDING.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+
     {
         let blocks = BLOCKS.lock();
 
@@ -1048,6 +1260,7 @@ pub fn cacheBlockStates(mut env: JNIEnv, _class: JClass) {
         };
         let atlases = wm.mc.texture_manager.atlases.write();
         let atlas = &atlases[BLOCK_ATLAS];
+
         let wm_block = &block_manager.blocks[id_key];
         let model = wm_block.get_model_by_key(
             key_iter

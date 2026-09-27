@@ -2586,6 +2586,28 @@ part of the variant rather than of the model file, so it has to be applied insid
 finished mesh could not express a multipart block whose two variants are turned differently, and doing
 it per state would rebuild meshes that are shared.
 
+### The title screen wrote a warning per frame
+
+`upload_late_sprites` is the net under the two places that bake block models, and it warned every time
+it caught something:
+
+```
+wgpu-mc: wgpu_mc:atlases/block was uploaded again after the frame: 5 sprite(s) had been added to it
+```
+
+Which is the right thing to say and the wrong thing to say *repeatedly*: the title screen allocates
+sprites while it settles, a resource reload allocates hundreds, and a line per upload is a console with
+nothing else in it - the same argument as the terrain line, so it gets the same answer. At most one line
+a second, carrying the total since the last one and how many uploads it took, and the first upload after
+each line is reported at once so nothing is swallowed.
+
+The other half of that report was worth acting on: a sprite the atlas already holds was being allocated a
+**second rectangle** every time it was pushed again. The map the baker reads kept pointing at whichever
+copy was written last, so nothing looked wrong - but each repeat cost atlas space that cannot be given
+back, and the 2048x2048 atlas has a fixed amount of it. `allocate_one` now returns early for a path that
+is already in the map; a resource reload, which is the one thing that changes the pixels behind a path,
+clears the map first and so still allocates it again.
+
 ### A face between the lines of the vertex format
 
 A baked vertex holds its position in **sixteenths of a block**: eight bits an axis, plus one bit for
@@ -2602,10 +2624,19 @@ the ground show through each other in patches that move as the camera **turns** 
 and it is the same bug for pink petals, flower clusters and anything else that sits lower than a
 sixteenth.
 
-The encoder rounds **up** now, so a face between the lines is drawn on the line above it rather than the
-one below: 1/64 of a block becomes 1/16, a third of a pixel at any distance, and it no longer shares a
-plane with the block it is lying on. On-grid geometry does not move at all, and the rule is monotone, so
-nothing crosses anything.
+The encoder rounds **to the nearest** line now, and a face that is strictly *between* two block
+boundaries is never put on one of them, whichever side it came from. On-grid geometry does not move at
+all, and the rule is monotone, so nothing crosses anything.
+
+Rounding **up** was the first fix here, and the fire found out why it was not enough. Vanilla's fire side
+quads are at `z = 0.01/16` of a block - a hundredth of a texel, and a hundredth of a texel is exactly
+what that offset is for - and the variant that burns against the *opposite* wall is the same quad turned
+by `y: 180`, so it arrives at `15.99/16`. Rounding up sent the first to 1/16, where it is harmless, and
+the second to 16/16, which is the wall's own face: fire that flickers against the wall it is attached to,
+with the wall showing through it in stripes that move as the camera does. A plane one step below a block
+boundary has to stay below it. `0.01/16` needs about 1/1024 of a block to be representable at all, which
+is four more bits an axis than this vertex format has - that is the known gap, and this rule is what
+keeps the two cases the models actually use out of it.
 
 ### The cutout test stopped testing anything when the atlas got a mip chain
 
@@ -2679,7 +2710,641 @@ Two things are still not the game's:
   every face. The baker does not read that flag, so an unshaded model gets the table anyway. Faces in
   the `any` bucket are the exception - they arrive with `Direction::Up` and are left alone.
 
+- **Animated textures animate now, for models.** See "The fire burned still" above for how, and the
+  known gap beside it for the two things it does not cover: fluids, which are meshed by hand rather
+  than from a model, and a resource reload, which moves the game's sprites and is not followed.
+
+### The fire burned still, and the fix is that the game was already animating it
+
+`TextureAtlas#cycleAnimationFrames` renders each due frame of every animated sprite **into the game's
+own block atlas** (an `Animate <atlas>` pass per mip level, which `WgpuCommandEncoder` counts). The
+terrain samples the **atlas this mod packs for itself** (`Atlas`, `ATLAS_DIMENSIONS` 2048, built at
+startup), so every animated sprite in it holds whatever frame it was copied at: fire, lava, water,
+campfire, the lot. The passes above are the only thing that makes an animated texture change, and they
+change a texture nothing draws from.
+
+Two ways out, and the one taken is the cheap one. *Copying* would mean running the game's animation
+passes and then moving the rectangle they wrote - the pass's scissor says which one - out of the game's
+atlas and into this one, per mip level, per frame, with the copy falling behind the game's own clock.
+The other way is to stop copying and **draw the game's atlas where it already is**:
+
+- a face whose sprite the game animates is baked with **the game's own coordinates**
+  (`Atlas::sprite_rects`, which `WgpuNative.registerSprite` fills from the game's stitcher - the same
+  thing that was already being sent for the layer table) and marked in the vertex with one of the ten
+  bits the vertex format has always reserved for an animated UV index;
+- the terrain pipeline binds the game's atlas texture and the sampler the game samples it with, and the
+  fragment stage picks between the two textures on that bit;
+- nothing is copied, nothing is re-uploaded, and the frames are the ones the game is drawing anyway.
+
+Which sprite is animated is *not* sent across the bridge. It is read from the `.mcmeta` files this side
+already downloads while it packs its own atlas (`Atlas::animated_textures`, now keyed by sprite rather
+than a list of anonymous animations), so a sprite is animated here exactly when the game animates it.
+
+That read is the part that had never once succeeded, and it is worth writing down because of how quiet
+it was. A sprite arrives at `Atlas::allocate` under the name a model calls it by (`minecraft:block/fire_0`)
+and its image is fetched as a *file* (`minecraft:textures/block/fire_0.png`), and the metadata was looked
+for by appending `.mcmeta` to the **name** - `minecraft:block/fire_0.mcmeta`, a path no pack ships. A
+missing `.mcmeta` is the ordinary case (most sprites are not animated), so the lookup failed for every
+sprite in the game, silently, for the entire life of the table: `animated_textures` was collected,
+stored, cleared on reload - and empty. The conversion is now one named function
+(`sprite_metadata_path`), with a test, so the two halves cannot drift apart again.
+
+Three details are what make it fit rather than nearly fit:
+
+- **The two atlases are different sizes, so the UVs are quantized differently.** This side's atlas is
+  2048 wide and the shader decodes a coordinate as `value / 2048`; the game's coordinates are `0..1`
+  over an atlas of the game's own size, so they are stored as the sixteen bits filled edge to edge and
+  decoded as `value / 65535`. The shader picks the scale by the same flag that picked the bake, in the
+  vertex stage:
+  ```wgsl
+  let game_atlas = (v3 >> 16u) & 1u;
+  let uv_scale = select(0.00048828125, 1.0 / 65535.0, game_atlas == 1u);
+  ```
+- **The game's rectangle is all the baker needs.** A face's `uv` is a fraction of the *sprite* -
+  sixteen units to the sprite, whatever its size in pixels - so the corners are that fraction of the
+  game's rectangle, and the game's atlas never has to be measured here. That arithmetic is shared with
+  the game's own `Atlas::sprite_rects` rather than derived from this side's atlas layout.
+- **The pass has to have the atlas before a face is baked for it, not merely before it is drawn.**
+  That is the ordering, not an optimization: a block *model* - and every face in it - is baked once,
+  when the block states are cached (`BlockCache#start`), and drawn from that cache for the rest of the
+  session. So the flag the baker reads is set by the **handover** of the atlas, which happens on the
+  line before the bake starts, and not by the graph being built again with it. What makes that safe is
+  where a graph is replaced: at the end of a frame, in the same step that moves the sections the baker
+  finished into the arena - so no frame can draw a face flagged for the game's atlas before the pass
+  that samples it exists. A named resource that is missing is a *skipped pipeline*, so the slot is
+  filled with a one-texel white texture until the real one arrives; nothing samples it, and losing the
+  terrain pass because an animated texture was not ready yet is not a trade worth making.
+
+`wgpu-mc-jni` runs naga over the shipped `terrain.wgsl` in a test, because a WGSL mistake in that file
+is not a shader that draws wrong - it is a validation error while the pipeline is built, which runs the
+panic hook and ends the process.
+
+### The entity shadows fought the ground because the ground was the only thing drawing itself far away
+
+Reported as stripes under entities that flickered, stayed in the same place in the world, and had nothing
+to do with what the entity was standing on. The selection outline was clean, and so was everything else
+Minecraft drew.
+
+An entity's shadow in 26.1 is not a decal with its own depth: it is one or more **pieces**, each a quad
+lying on the top face of a block (`EntityRenderer#extractShadowPiece` builds them from `belowShape`, the
+collision shape of the block under the entity), submitted with the entity's camera-relative position and
+drawn afterwards by `RenderPipelines.ENTITY_SHADOW` - whose depth state is `LESS_THAN_OR_EQUAL` with no
+write. So the shadow and the terrain face under it are **coplanar**, and vanilla relies on the depth test
+seeing the shadow: `<=` passes when the two depths are equal.
+
+Whether they are equal is decided by the last bits of two positions, and this renderer was computing its
+half of that comparison in the worst possible way. The vertex shader was handed the section's **absolute**
+position and the camera's translation was folded into the view matrix:
+
+```wgsl
+var section_origin = vec3<f32>(f32(section_pos.x), f32(section_pos.y), f32(section_pos.z)) * 16.0;
+var world_pos = pos + section_origin;                 // e.g. 20013.0
+vr.pos = mat4_persp * mat4_view * mat4_model * vec4(world_pos, 1.0);   // view = R * translate(-camera)
+```
+
+`f32` steps by `2^-6` - **0.016 blocks** - at 200,000, and by 0.004 at 30,000. That error is a function of
+the *world* position and not of the camera, which is why the stripes stayed put while the camera moved, and
+it applied to the terrain and to nothing else: every other draw in the frame (entities, the shadow, the
+outline, particles) is positioned by Minecraft on the CPU, camera-relative, in doubles.
+
+Vanilla never forms the big number. Its terrain vertex shader says
+
+```glsl
+vec3 pos = Position + (ChunkPosition - CameraBlockPos) + CameraOffset;
+gl_Position = ProjMat * ModelViewMat * vec4(pos, 1.0);
+```
+
+with `ModelViewMat` the camera's rotation *alone*: the difference between two block positions (small
+integers), plus the camera's fraction of a block, plus the position inside the section. Everything in that
+sum is small, so its last bits are worth something.
+
+The pass now does the same thing from this side of the bridge:
+
+- `@pc_section_position` carries the section **relative to the section the camera is in**, so
+  `section_origin` is at most a few thousand blocks and usually a few dozen;
+- the view matrix is `viewRotation * translate(-(cameraPos - cameraSectionOrigin))` - the camera's offset
+  *inside its own section*, a number below sixteen - instead of `translate(-cameraPos)`;
+- the culler builds the same boxes the immediate names, because the frustum comes from that same matrix
+  pair: sections are compared in camera-section-relative blocks, which is the space the matrix reads.
+
+The camera's section therefore has to be sent, and with the matrices rather than beside them: the view
+matrix no longer knows which section it was built against (`-R^T t` now gives the *offset*, not the
+position), so the graph cannot read it back. It is one extra integer per axis on a call that already
+existed, from the same camera state, on the same line - a frame's disagreement being sixteen blocks of
+terrain in the wrong place.
+
+Two tests carry it. One is the culling test, rewritten for the new space: a section in front of the camera
+is inside the frustum when it is placed relative to the camera's section and outside it when placed by its
+absolute name - the "ground culled out from under the camera" failure, which is a world with holes in it.
+The other is the reason for all of it, as arithmetic: the same world point through both arrangements, in
+`f32`, against an `f64` reference. The absolute form is off by hundredths of a block; the relative form by
+millionths, and it is asserted to be at least a hundred times closer.
+
+### A resource reload reloads now, and it is five separate things that had to be told
+
+The renderer used to read the resource pack **once**. Whatever pack was stitched into the first reload
+was the pack it drew for the rest of the session: F3+T, a pack switched in the options, a pack added -
+the game's own atlases, models and textures all reloaded around it and the terrain kept the pictures it
+started with. That was written down as a known gap ("a resource reload re-stitches the game's atlas and
+this side does not follow it"), and closing it means walking everything that came out of a pack:
+
+| what | where it lives | what a reload does to it |
+| --- | --- | --- |
+| the sprites this side packs | `Atlas`'s image, allocator and `uv_map` | cleared, then packed again from the new files |
+| which sprite is animated | `Atlas::animated_textures`, read from `.mcmeta` | cleared; re-read as each sprite is allocated |
+| the game's rectangles and layers | `Atlas::sprite_rects`, `sprite_layers` | cleared, then re-sent from the new stitch |
+| the game's atlas texture | the graph's `@texture_mc_block_atlas` | MC builds a *new* `GpuTexture` per stitch; the new one is bound and the graph rebuilt |
+| the block models | `BlockManager`, baked from blockstate and model JSON | baked again, against the new atlas |
+| the geometry in the arena | every section's vertices, holding baked UVs | every section offered to the baker again |
+| the shaders | `wgpu_mc:shaders/*.wgsl` | already reloaded (`ShaderReloadListener`) |
+
+Two of those are the ones that would have made the rest pointless, and both are silent:
+
+**The atlas map was never cleared.** `Atlas::allocate` skips a path the map already has, so an atlas
+cleared of everything *except* `uv_map` re-packs nothing: the old pixels stay at the old rectangles and
+the result is indistinguishable from a reload that did nothing. `Atlas::clear` cleared the allocator, the
+animation table and the two sprite tables - and not the one the baker reads. It does now, and it marks
+the texture for an upload so a reload that allocates nothing ends blank rather than stale.
+
+**Nothing made a section stale.** The section feed sends only what *changed* since the last offer
+(`RustChunkBake.sent`), and a reload does not change any blocks - the models those blocks bake to changed,
+which is not something the comparison can see. So even with every model re-baked and the atlas re-packed,
+`allChanged` would have offered every section, every offer would have carried nothing, and the arena
+would have gone on drawing launch-day geometry. `RustChunkBake.forgetSent` is the missing half: it drops
+this side's record of what Rust has, without touching the world generation stamp, so the re-mesh carries
+blocks again.
+
+The registry is the third piece, and it is a JVM-side one. The native side *drops* the block registry at
+the end of every bake - the states cross as JNI global references and are released as soon as their keys
+are out, which is the right trade when the registry is built once - but baking a `multipart` model needs
+the states, and the game registers a block exactly once and never again. `BlockRegistryFeed` records what
+`RegistryMixin` offers, in registration order, and replays it. The order matters and is recorded rather
+than re-derived: a block's index is in every state's stored key and in every baked vertex, so a replay in
+a different order would shuffle all of them.
+
+What the reload costs is what the launch costs - a few seconds on the block cache thread - and it happens
+once per reload. The window where it looks wrong is the re-mesh: sections are re-baked one at a time, and
+a section still holding last pack's UVs samples the new atlas at the old rectangles until its turn comes.
+That is a couple of seconds behind the game's own "Reloading Resource Packs" screen.
+
+### Nothing was ever registered: 26.1's atlas manager has two id spaces
+
+Every row of that table was wired and every one of them was silent, because both calls that hand the game's
+own atlas over answered `null` and were wrapped in a `try`/`catch` that logged a `warn`:
+
+```text
+wgpu: the block atlas's sprites were not registered: java.lang.IllegalArgumentException: Invalid atlas id: minecraft:textures/atlas/blocks.png
+wgpu: the block atlas texture was not bound to the terrain pass: java.lang.IllegalArgumentException: Invalid atlas id: minecraft:textures/atlas/blocks.png
+```
+
+`AtlasManager` keeps **two** maps and its `AtlasConfig` carries both ids - a *texture* id
+(`TextureAtlas.LOCATION_BLOCKS`, `minecraft:textures/atlas/blocks.png`, what the atlas is registered under
+in the `TextureManager`) and a *definition* id (`AtlasIds.BLOCKS`, `minecraft:blocks`, the directory of
+sprite sources it is stitched from) - and `getAtlasOrThrow` reads the second:
+
+```java
+// AtlasManager
+private final Map<Identifier, AtlasEntry> atlasByTexture = new HashMap<>();
+private final Map<Identifier, AtlasEntry> atlasById = new HashMap<>();
+
+public TextureAtlas getAtlasOrThrow(Identifier atlasId) {
+    AtlasEntry atlasEntry = this.atlasById.get(atlasId);           // the *definition* id
+    if (atlasEntry == null) throw new IllegalArgumentException("Invalid atlas id: " + atlasId);
+```
+
+So asking for `LOCATION_BLOCKS` throws, and both callers did. What that cost is the whole animated-texture
+path and the whole fluid-sprite path: no rectangle table reached the native side, so no face was ever baked
+for the game's atlas - the fire did not animate, the lava fall did not animate, and every sprite was served
+from this side's frozen copy of it. The `warn` was the only sign, one line each, in a log with hundreds of
+binding-plan lines above it.
+
+It is fixed by asking for the definition id (`AtlasIds.BLOCKS`, named once in `BlockCache.BLOCKS_ATLAS` so
+the next reader does not have to know which of the two the manager wants), and it is worth saying why it
+went unnoticed for a whole round: **a registration that fails leaves a renderer that draws exactly what it
+drew before**, which is the correct fallback and also indistinguishable from a feature that is switched
+off. The line that says the sprites arrived is `wgpu: registered N sprite(s) of the block atlas`, and it is
+the one to look for.
+
+### The fire animated and nothing else did: 1074 blockstates are baked before the atlas is read
+
+The animated-texture path asks two questions per face - does the game animate this sprite, and where is it
+in the game's atlas - and the second one is answered by a table the JVM sends (`registerSprite`), queued
+and drained on the native side.
+
+The drain sat in the middle of `cacheBlockStates`, in the per-state loop. `cacheBlockStates` calls
+`bake_blocks` *before* that loop, and `bake_blocks` is what bakes every `variants` blockstate - which is
+**1074 of the game's 1170 blockstate files**, the campfire and the magma block and the sea lantern among
+them. So those faces were baked with the table still empty, had no rectangle to be sent to, and sampled
+this side's frozen copy; only the 96 `multipart` blocks animated. Fire is `multipart`, which is exactly
+why the fire was the one that worked and nothing else was.
+
+The drain now runs before the first model is baked, with the count in a comment so the ordering is not
+re-discovered: a face is baked for an atlas once, and the table has to be in place before the first one.
+
+### The fire animation is a Quality-page switch, and a setting that is baked is not a setting that is read
+
+`Fire animation` - `Fast` / `Fancy`, on the Quality page next to the graphics preset - decides whether
+the block textures the game animates move on the terrain this renderer draws. `Fancy` (the default)
+draws those faces from the game's own block atlas, which the game animates frame by frame; `Fast` bakes
+them against this renderer's own copy of the sprite, which is one frame - the picture the renderer drew
+before the animated-texture path existed. It is a fidelity choice rather than a speed one, and the
+schema's description says so rather than implying a saving: the game renders those frames either way.
+
+Three things about it are structural rather than cosmetic.
+
+**A setting that is baked is applied by baking again.** The switch is answered once per face while the
+face is baked, and the answer is *in the vertex* - the coordinates are in one atlas's space or the
+other's, and a flag says which. So there is no draw-path read to flip: moving the switch invalidates
+every baked block model, and the only way to apply it is to bake them again. The native side notices the
+change where the settings arrive (`sendSettings`), calls back into the JVM through the class loader
+bridge, and `BlockCache` picks it up on the next client tick - exactly the path a resource reload takes,
+except for one line: a reload forgets the **pack** (the atlas, the game's rectangles, the sprite tables)
+and this forgets only the **bake** (the block list, the state list, the diagnostics). Emptying the atlas
+here would have thrown away the game's rectangles for its animated sprites, and nothing in that call
+would have asked for them again - so `Fast` would have quietly stopped animating anything forever after
+one Apply. That is why the native entry point takes a `reload` flag rather than being two functions or
+one.
+
+**The settings document has to be sent whole, from one place.** `sendSettings` parses what it is given
+as the renderer's entire config, and every field of it has a serde default - so a page that sent only
+its own rows would reset every setting on the other pages. That used to be safe by accident: the
+renderer's rows were all on one page, and the send lived in `Page.apply`. The Quality page is mostly
+Minecraft's own options, so the row made it a *mixed* page, and the send moved up to `OptionPages.apply`,
+which is the only place that sees every page and can build one complete document. A page that sends its
+own rows is a page that silently rewrites the config.
+
+**`#[serde(default)]` on an enum setting is not the enum's default.** `EnumSetting`'s own default is
+`{ selected: 0 }` - the *first* variant, which here is `Fast`, the animation off. So a config file
+written before the setting existed, or hand-edited without it, would have turned the animation off for
+exactly the player who never asked. The field names its default function instead
+(`animated_textures_default`), and a test reads a legacy config and asserts the animation is on.
+
+### The corners were dark in the right places and only a third as deep as the game's
+
+Ambient occlusion is baked, not drawn: in 26.1 the per-corner brightness is computed on the CPU
+(`BlockModelLighter#prepareQuadAmbientOcclusion`) and multiplied into the vertex colour, so the shader
+never sees a corner value as such. What it computes is the **mean of four samples**:
+
+```java
+float lightLevel1 = (shade3 + shade0 + shadeCorner03 + shadeCenter) * 0.25F;
+```
+
+two side neighbours, the diagonal block and the block the face looks at, each through
+`BlockBehaviour#getShadeBrightness` - which is
+
+```java
+return state.isCollisionShapeFullBlock(level, pos) ? 0.2F : 1.0F;
+```
+
+So a corner is one of five values: `1.0`, `0.8`, `0.6`, `0.4`, `0.2`. A fully enclosed corner in
+vanilla is **five times darker** than an unoccluded one.
+
+This renderer had three things wrong with that, and the one that was reported - "the ambient occlusion
+is too weak" - was the smallest of them:
+
+- the **occluder test** was `!state.isAir()`. Everything that is not air darkened the corners it
+  touched, so a torch, a plant, a slab, a pane, a fluid and a glass block all cast the same shadow a
+  stone block does;
+- only **three** samples were taken - the diagonal and the two sides, never the block the face looks at;
+- the value was quantized to `3 - occluders` and then put through `0.6 + 0.4 * corner` in the shader.
+  The curve started at `0.6`, so the darkest a corner could get was 0.6 where vanilla draws 0.2: the
+  shading was in the right *places* on a flat wall and a third as deep, which is a picture that reads as
+  "the AO is weak" rather than as anything being wrong.
+
+The vertex now carries the **count** of the four samples that fill their whole block, and the fragment
+shader turns it back into the brightness with `1 - 0.2 * count` - the same average, in one line, with
+the five steps coming out at `1.0, 0.8, 0.6, 0.4, 0.2`. Carrying the count rather than the brightness
+keeps the curve in one place: a wrong constant there is one line, where a wrong constant in the baker is
+a re-bake of every model in the game. Interpolating the count and then applying the curve is the same as
+the other way round, because the curve is affine - so the blend a pixel gets is the blend vanilla's four
+corner colours get. A test in `chunk.rs` asserts the identity over every count there is, because it is
+the whole reason the integer in the vertex format is equivalent to the float the game bakes.
+
+The occluder test is the game's own answer now, sent per state from the JVM next to the two face masks
+(`registerBlockStateFaceFlags`'s fourth argument, `FaceFlags::shades`). It has to be the game's answer
+rather than something derived here, and the pair that proves it is **glass and ice**: both fill their
+block, both have an empty occlusion shape - they are the same shape by every test this side can make -
+and `TransparentBlock` overrides `getShadeBrightness` to `1.0` while `IceBlock` does not. Glass casts no
+corner shadow in vanilla and ice does, and the only thing that tells them apart is the method itself.
+That is also why the flag is not the occlusion mask: an "all six faces covered" test, which is what this
+first used, gets ice wrong.
+
+Still not the game's: the **light** curve. Vanilla samples its lightmap *texture*
+(`sample_lightmap(Sampler2, UV2)`), while this shader approximates it with `max(sky, block) * 0.7 + 0.3`
+per vertex - a different and much larger approximation than the corner value was, and the next one to
+take.
+
+### The fluid faces: a sprite offset is a fraction, a fluid surface is eight ninths, and lava is neither
+
+A fluid is not a block model - no elements to bake, no variant to look up - so the fluid mesher builds
+its quads itself, out of the four **corner heights** of the block (`FluidRenderer`'s shape - renamed from
+`LiquidBlockRenderer` in 26.1: a
+surface that slopes, sides clipped to it, no face between two blocks of the same fluid). What it samples
+is `*_still` on the top and the underside and `*_flow` on the sides, which is the game's own choice.
+
+Those sprites are animated, and their faces were the last ones still baked against this side's copy of
+them - so a lava fall was a still picture while the fire next to it moved. They go through the same
+decision everything else does now (`FluidSprite::flags` writes the vertex flag, `Atlas::game_atlas_rect`
+makes the call), and because the game's rectangle is one *frame* of the sprite, that also fixes the
+frame: sixteen frames of `lava_flow.png` are sixteen frames, not one face.
+
+Two more things came out of reading the game's `FluidRenderer` next to ours, and the second is the
+picture that was reported as "lava looks like a cube".
+
+**A sprite offset is a fraction.** Every coordinate the game's fluid renderer uses is a fraction of the
+sprite:
+
+```java
+float u0  = sprite.getU(0.0F);                  // the sprite's left edge
+float u1  = sprite.getU(0.5F);                  // its middle
+float v01 = sprite.getV((1.0F - hh0) * 0.5F);   // the fluid's height, in the top half of the sprite
+float v1  = sprite.getV(0.5F);                  // the sprite's middle row
+```
+
+This side's form added whole **pixels** to the rectangle's corner
+(`[sprite.0.0 + u, sprite.0.1 + v]`), and it produced exactly the game's picture for exactly one pack:
+vanilla's, where `water_flow.png` and `lava_flow.png` are 32x32 a frame and the half-sprite offsets *are*
+sixteen pixels. A 16-pixel pack got the whole sprite where the game takes half of it; a 64-pixel pack got
+the top-left sixteenth. The offsets are fractions now (`FluidSprite::at`, which is `getU`/`getV`), a test
+asserts that over every offset the mesher passes the new form lands on the same pixel as the old one *for
+a 32-pixel sprite* - so nothing about a vanilla pack moved - and the frame rule
+(`FluidSprite::frame`: an animated sprite is packed as a strip of square frames, so one frame is as tall
+as the strip is wide) is what keeps a 16x512 strip from putting sixteen frames on one face.
+
+**A fluid surface is `amount / 9`, and lava is not special.** The mesher's own comment said lava was drawn
+at the full block "because lava is thick enough to fill the block it is in", and a falling fluid at the
+full block "because it is a column rather than a surface", and claimed both came from the game's
+`getOwnHeight`. The game says:
+
+```java
+// FluidRenderer#getHeight(level, fluidType, pos, state, fluidState)
+if (fluidType.isSame(fluidState.getType())) {
+    BlockState above = level.getBlockState(pos.above());
+    return fluidType.isSame(above.getFluidState().getType()) ? 1.0F : fluidState.getOwnHeight();
+}
+```
+
+`getOwnHeight` is `amount / 9` for every fluid there is, and a lava **source** is amount 8 - never 9, for
+a source or for a falling fluid. So vanilla draws a lava lake with every surface one ninth of a block
+below the top, and that ninth is the whole difference between a lava lake that reads as a liquid surface
+and one that reads as a floor of lava-coloured cubes: at the full height the sides and the top are one
+unbroken shape with no surface anywhere in it. The only thing that lifts a block to the full height is
+more of the same fluid *directly above it* - which is the column case, and it is a property of the
+neighbours rather than of the fluid. The mesher asks the block above each of the four corner blocks now
+(`fluid_height(amount, same_above)`), and the "falling" bit it used to branch on was never even set: the
+payload writes `kind | amount << 2` and nothing else.
+
+**A moving surface turns its sprite.** `FluidRenderer#tesselate` draws a *still* sprite on the top face only
+when the fluid's own flow is zero. `FlowingFluid#getFlow` is the gradient of the fluid's own height over its
+four horizontal neighbours:
+
+```java
+// FlowingFluid#getFlow
+float distance = fluidState.getOwnHeight() - neighborHeight;   // downhill, or - for a neighbour the fluid
+if (distance != 0.0F) { flowX += step.getStepX() * distance; } // can flow *past* - the fluid one block
+return new Vec3(flowX, 0.0, flowZ).normalize();                // under it, one block down less 8/9
+
+// FluidRenderer#tesselate, when that is not (0, 0)
+float angle = (float)Mth.atan2(flow.z, flow.x) - (float)(Math.PI / 2);
+float s = Mth.sin(angle) * 0.25F;
+float c = Mth.cos(angle) * 0.25F;
+u00 = sprite.getU(0.5F + (-c - s));  v00 = sprite.getV(0.5F + (-c + s));   // and three more
+```
+
+The four offsets that builds are the corners of a square **half the sprite across**, turned by the angle,
+and they go to the face's corners north-west, south-west, south-east, north-east - which is the order the
+four corner heights are already in. `fluid_flow` and `flowing_top_offsets` are the same arithmetic, and a
+test walks sixteen angles asserting the quarter's side is 0.5 *in sprite fractions* whatever the angle: the
+game's `sin * 0.25` and `cos * 0.25` are each half of the quarter's extent in one axis, and reading them as
+the whole extent is the mistake that makes a flowing face a half-sprite square.
+
+The one step of `getFlow` that is not a height is `blocksMotion()`. A neighbour holding none of this fluid
+that the fluid can flow *past* - air, a plant, anything without collision - is looked through to the block
+below it, whose fluid counts as one block down less the eight ninths a falling fluid is drawn short by, and
+that is what points a stream at the edge it is about to pour over. It is the fifth field of the per-state
+flags the JVM sends now (`BlockFaceFlags.kt` reads `blocksMotion()` off the state,
+`registerBlockStateFaceFlags` carries it), and it is independent of the four that were already there: a slab
+stops a fluid and occludes nothing. The falling branch of the game's function is left out - it needs the
+fluid's `FALLING` property, which the payload does not carry - and what it would add is a vertical component
+the caller never reads: the top face only ever wants the horizontal *direction*.
+
+Still the game's and not ours, in the fluid path:
+
+- the **weighted** corner average. Vanilla's is not a plain mean: a height of 0.8 or more counts ten times,
+  a dry neighbour or a different fluid counts as a zero with weight one (which is what tapers a fluid's
+  edge down to the ground), and a *solid* neighbour is dropped from the average entirely. This side takes
+  the plain mean of the corner blocks that hold the same fluid, so a lake's surface is level where vanilla's
+  dips at an open edge;
+- the faces vanilla **culls** and this does not: a fluid's side against a block whose occlusion shape
+  covers it (`isFaceOccludedByState`), which is a face drawn between two opaque neighbours - invisible
+  either way, and paid for in the arena;
+- the last thousandth of a block, and the inside of a fluid. Vanilla lowers a fluid's surface and insets
+  every side by `0.001F` so that a fluid face does not fight with the block face it lies against, and
+  writes every face that is not a water overlay **twice**, wound both ways (`addBackFace`), so a fluid is
+  visible from inside itself. Neither survives this side's vertex format: a position is a sixteenth of a
+  block an axis (see "A face between the lines of the vertex format"), where a thousandth rounds away, and
+  the terrain pass culls back faces, so a face seen from inside a fluid is not drawn. The surface's own
+  height is on that grid too - `8/9` lands on `14/16` - which is a sixteenth of a block below where vanilla
+  puts it;
+- the light a fluid face reads. Vanilla takes the brightest of the fluid's own block and the block above it
+  for every face (`getLightCoords`), and the brightest of the block below and the fluid's own for an
+  underside; this side reads a single neighbour - the block above for the top face, the block the side faces
+  for a side, the block below for an underside - so a fluid is a level or two darker than the game's where
+  the light comes from the fluid's own block;
+- **water**, which is not taken over at all: it belongs in the translucent layer, no pass of ours draws
+  that layer yet, and Minecraft still draws its own.
+
+### The lighting was a straight line through a curve the game had already built
+
+The fragment shader ended its lighting with
+
+```wgsl
+var light = max(lc.x, lc.y) * 0.7 + 0.3;
+```
+
+where `lc` was the vertex's two light levels over fifteen. That is a line from `0.3` at no light to `1.0`
+at full light, and it is the *only* thing the terrain's brightness depended on besides the vertex colour
+and the ambient occlusion. What it ignores is everything the game puts into its lighting:
+
+- the **gamma and brightness options** (the brightness slider), which bend that curve per player;
+- the **time of day**, where the sky light at night is a dim blue rather than a dim grey;
+- **night vision**, the **darkness effect**, and a dimension's own ambient light.
+
+None of those are a curve this side could reproduce anyway, because the game does not use a curve: it
+builds a **16x16 lightmap texture** (`Lightmap`, `RGBA8`, rebuilt by `Lightmap#render` whenever any of
+those inputs move) and its own terrain shader does nothing with it but fetch it:
+
+```glsl
+// terrain.vsh
+vertexColor = Color * sample_lightmap(Sampler2, UV2);
+
+// sample_lightmap.glsl
+vec4 sample_lightmap(sampler2D lightMap, ivec2 uv) {
+    return texture(lightMap, clamp((uv / 256.0) + 0.5 / 16.0, vec2(0.5 / 16.0), vec2(15.5 / 16.0)));
+}
+```
+
+`UV2` is the light pair as a nibble per light scaled by sixteen, so `uv / 256 + 0.5 / 16` is the centre
+of the texel that pair names - one fetch per vertex, and the rasterizer interpolates the resulting colour
+across the quad. That is now what this renderer does, in the same two places the game does it: the vertex
+stage fetches `t_lightmap` at `nibble / 16 + 1/32`, the colour travels to the fragment stage as a varying,
+and the fragment stage multiplies it in with no curve of its own left anywhere.
+
+The texture is handed over the same way the block atlas is (`WmNative.bindGameLightmap` →
+`bind_game_lightmap`, bindings 7 and 8), with one difference that matters: the game does not build a new
+lightmap when the light changes, it **writes into the one it has**. So the handover is per *texture* - the
+JVM asks once a frame and compares view identity, which is one pointer comparison - and what follows the
+time of day afterwards is the texture's contents, not a new binding.
+
+The fallback is the interesting part, because this is the one resource whose absence would be *visible*:
+a missing atlas is a skipped pipeline and a warning, but a missing lightmap would be a world lit at full
+brightness by a white placeholder. So the native side builds itself a 16x16 lightmap holding exactly the
+curve above (`fallback_lightmap`, one texel per light pair, `max(block, sky) / 15 * 0.7 + 0.3`), and a run
+whose handover failed draws the picture this renderer has always drawn. A test reads that image back and
+checks four of its texels against the old formula.
+
+Corrected in passing, because the previous section claimed more than it should have: the **ambient
+occlusion** curve is the game's average, but its *blend* is this renderer's. The four corner counts are
+blended bilinearly across the quad, where vanilla writes four per-vertex colours and lets the rasterizer
+interpolate them across the quad's two triangles - which is why vanilla has a faint diagonal through a
+shaded face and this renderer does not.
+
+Still not the game's, in the same shader: **fog**. Minecraft's terrain shaders end with `apply_fog(...)`
+over `FogEnvironmentalStart`/`End`, `FogRenderDistanceStart`/`End`, `FogColor` and the fog shape, and this
+shader has no such term at all - so distant terrain is unfogged rather than fading into the sky. That,
+rather than the light, is the next thing the picture is missing.
+
+### The terrain had no fog at all, which is a hard edge where the world ends
+
+Minecraft's terrain shaders end with a fog term:
+
+```glsl
+// terrain.vsh
+sphericalVertexDistance = fog_spherical_distance(pos);
+cylindricalVertexDistance = fog_cylindrical_distance(pos);
+
+// terrain.fsh
+fragColor = apply_fog(color, sphericalVertexDistance, cylindricalVertexDistance,
+                      FogEnvironmentalStart, FogEnvironmentalEnd,
+                      FogRenderDistanceStart, FogRenderDistanceEnd, FogColor);
+```
+
+and this shader had nothing of the kind - so the loaded world ended in a **line**: terrain at the render
+distance stayed at full brightness and full colour, and the sky began one pixel later. Of everything the
+terrain has been missing, this was the one a player sees from anywhere in the world.
+
+The fog is now the game's, transposed from `minecraft:fog.glsl` into the shader:
+
+```wgsl
+fn apply_fog(color, spherical, cylindrical, env_start, env_end, render_start, render_end, fog_color) {
+    var fog_value = max(linear_fog_value(spherical, env_start, env_end),
+                        linear_fog_value(cylindrical, render_start, render_end));
+    return vec4(mix(color.rgb, fog_color.rgb, fog_value * fog_color.a), color.a);
+}
+```
+
+with the game's own two distances (`fog_spherical_distance` is `length(pos)`, `fog_cylindrical_distance`
+is `max(length(pos.xz), abs(pos.y))`) and the game's own numbers, which are the interesting part:
+
+- the four distances and the colour are read from **`CameraRenderState#fogData`**, and that object is not
+  a copy of the fog - it *is* the fog. `GameRenderer.renderLevel` writes it into the game's fog buffer
+  (`FogRenderer#updateBuffer(cameraState.fogData)`) and hands the slice to the level renderer, which binds
+  it for the pass this one stands in for. So the water fog, the lava fog, blindness, the darkness effect,
+  the biome's fog and the render-distance fade all arrive already decided, and nothing here has to know
+  which of them is in force;
+- the fog is measured from a **camera-relative** position, and the position this shader computes is
+  relative to the camera's *section* (that is the whole of its precision - see the shadow-stripe section).
+  So the camera's offset inside its own section travels with the fog block, and the shader subtracts it
+  before measuring. The cylindrical distance is why it has to be done in world axes rather than through
+  the view matrix: it is `length(pos.xz)`, a *world* horizontal distance, and rotating it would measure
+  something else;
+- the alpha of the fog colour scales the blend (`fog_value * fogColor.a`), which is how the game fades fog
+  out entirely - and it is also what makes "all zeroes" a safe state to start in: a fog colour of
+  `(0, 0, 0, 0)` blends nothing, so a frame drawn before the first upload is the unfogged picture rather
+  than a world fading to black.
+
+The block travels in a small uniform buffer of its own (`@fog_environment`, binding 9, 48 bytes: the
+colour, the four floats, the camera offset and its padding) because the game rebuilds the fog every frame
+and this is written from the same place the terrain matrices are.
+
+Wired along with it: the ABI test now checks **both** directions of the JNI bridge. It already caught a
+`WgpuNative` declaration with no `#[jni_fn]` behind it - which is an `UnsatisfiedLinkError` at the call -
+and it now also catches the reverse, a `#[jni_fn]` nothing declares, which is the direction that fails
+*silently*: it is a feature that looks implemented on the Rust side and does nothing at all in the game.
+This is exactly how the fog was wired - the Rust half and the shader went in first, and the Kotlin
+declaration was a step the compiler could not ask for.
+
+Not taken over with it: `ChunkVisibility`, the per-section fade the game multiplies in before the fog
+(`color = mix(FogColor * vec4(1, 1, 1, color.a), color, ChunkVisibility)`), so a section that has just
+been meshed appears rather than fades in. The value lives on the game's own render section and changes
+per frame, which is a feed of its own; the picture without it is the one this renderer has always drawn.
+
+### The layout said fragment-only, and the vertex stage fetched the lightmap
+
+Entering a world ended the game. The console had the reason, and it was wgpu refusing the terrain pipeline:
+
+```text
+In Device::create_render_pipeline, label = 'terrain'
+  Error matching ShaderStages(VERTEX) shader requirements against the pipeline
+    Shader global ResourceBinding { group: 0, binding: 7 } is not available in the pipeline layout
+      Visibility flags don't include the shader stage
+```
+
+Binding 7 is the game's lightmap, and the **vertex** stage samples it - that is the whole of the lightmap
+handover, one fetch per vertex with the colour interpolated, `vertexColor = Color * sample_lightmap(Sampler2,
+UV2)` - while the bind group layout this graph builds for its own pipelines declared textures and samplers
+fragment-only:
+
+```rust
+// graph.rs, in `ResourceBacking::get_bind_group_layout_entry`, before
+visibility: wgpu::ShaderStages::FRAGMENT,
+```
+
+Nothing had ever objected because nothing had ever asked a vertex shader for a texture: the buffers were
+allowed in every stage, and the two atlases and their samplers are only sampled in the fragment stage. The
+lightmap was the first, and it took the terrain - the whole layer, not one block - with it.
+
+**One answer for every binding.** Which stage samples a binding is a property of the *shader*, and the
+shaders here belong to the game and to packs; there is no binding this side can be sure only one stage will
+read. `ResourceKind::visibility` is that one answer now - `VERTEX_FRAGMENT`, the same thing the game's own
+pipeline builder gives every entry (`blaze.rs`) - and the four arms of the layout `match` read it rather
+than each spelling out their own. A test reflects the shipped `terrain.wgsl` with naga, the same front end
+and the same analysis wgpu runs before it matches a shader against a layout, and fails if any binding an
+entry point uses is hidden from that entry point's stage. It also fails if the terrain vertex stage stops
+sampling the lightmap, because at that point the test is about nothing and the layout could be narrowed
+again. Run against the old code it fails on binding 7, which is what makes it the guard for this rather
+than a description of it.
+
+**And the reason a layout mistake was a crash rather than a black screen.** wgpu reports an uncaptured
+validation error by *panicking*, and this renderer runs inside `#[jni_fn]` frames - which cannot unwind, so
+the panic does not reach a `catch` anywhere: it ends the process. What the player sees is the reason above
+followed by
+
+```text
+panicked at library/core/src/panicking.rs:225:5:
+panic in a function that cannot unwind
+```
+
+and no game. `device_call` now wraps the two calls that build a pipeline (the pipeline layout and the
+pipeline itself): it catches the panic, logs the wgpu error as an *error* naming the pipeline, and the
+pipeline is skipped - which is what every other failure on that path already does (a missing resource, an
+unreadable shader, a device without `immediates`). A graph missing one pipeline draws the rest of the
+frame, so the next mistake of this kind costs the terrain and a log line rather than the session. It is a
+guard and not a licence: a pipeline that will not build is still a bug, and the message is still an error.
+
 ### Known gaps
+
+- **Fluids animate, stand at the right height, and turn their surface with the flow; it is still not the
+  game's surface.** See "The fluid faces" above: lava's faces sample the game's atlas like everything else,
+  the offsets are the game's own, a source block is `8/9` of a block rather than a full cube, and a moving
+  surface is a quarter of the flowing sprite turned by `getFlow`. What is still different is the weighted
+  corner average, the hidden faces vanilla culls, and water - which belongs to a translucent pass this
+  renderer does not have yet.
+
+- **A resource reload is followed now, with one caveat.** See "A resource reload reloads now" above: the
+  atlas, the models and the arena are all rebuilt against the new pack, and the sections are re-meshed
+  over the couple of seconds after the game's own reload screen closes. What is *not* rebuilt is the
+  entity path, which is Minecraft's own and reloads itself.
 
 - **A sprite is classified as a whole, not per face.** The layer table `Atlas::sprite_layer` fills in
   is one answer per sprite, while the game asks `SpriteContents#computeTransparency(u0, v0, u1, v1)`

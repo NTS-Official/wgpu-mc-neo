@@ -252,7 +252,43 @@ object WgpuNative {
 	 * the end of `Blocks`' class initializer. See `BlockFaceFlags`.
 	 */
 	@JvmStatic
-	external fun registerBlockStateFaceFlags(key: Int, occlusion: Int, selfHide: Int)
+	/**
+	 * One sprite of the game's block atlas, in one call: **where it is, and the layer the game puts it
+	 * in**.
+	 *
+	 * Called before [cacheBlockStates], while the game's atlas is still in hand. The rectangle is the
+	 * game's own layout - this side packs its sprites into an atlas of its own, at coordinates of its
+	 * own - and [layer] is one of the `LAYER_*` numbers below: the game's reading of the sprite's
+	 * transparency, where the Rust side otherwise guesses from the pixels and gets a sprite that is part
+	 * opaque and part cutout wrong.
+	 *
+	 * The rectangle is what makes an animated texture animate: the game animates its atlas by rendering
+	 * the due frame into it, so a face whose sprite the game animates is baked with *these* coordinates
+	 * and samples the game's atlas, and it moves with the game instead of being frozen at whatever was
+	 * copied. See `Atlas::register_sprite`.
+	 */
+	external fun registerSprite(name: String, u0: Float, v0: Float, u1: Float, v1: Float, layer: Int)
+
+	/**
+	 * The layer numbers [registerSprite] carries: the Rust side's three, by name.
+	 *
+	 * Named here rather than taken from an enum's ordinal, because these cross a bridge: a variant added
+	 * on the Rust side must not silently change what a number means on this one. One name differs
+	 * between the two sides and it is the third: the game calls that chunk layer `TRANSLUCENT`, and the
+	 * Rust side calls it `Transparent` - so a sprite the game files under `TRANSLUCENT` is registered
+	 * with [LAYER_TRANSPARENT], deliberately and not by accident of numbering.
+	 */
+	const val LAYER_SOLID = 0
+	const val LAYER_CUTOUT = 1
+	const val LAYER_TRANSPARENT = 2
+
+	external fun registerBlockStateFaceFlags(
+		key: Int,
+		occlusion: Int,
+		selfHide: Int,
+		shades: Int,
+		blocksMotion: Int,
+	)
 
 	@JvmStatic
 	external fun getBackend(): String
@@ -346,6 +382,25 @@ object WgpuNative {
 	external fun cacheBlockStates()
 
 	/**
+	 * The first half of a bake: forget what the last one was given, so it can be offered again.
+	 *
+	 * `reload` says whether the resource **pack** changed as well. When it did, everything this side
+	 * holds that came out of a pack goes - the block list, the block atlas with its packed rectangles
+	 * and its animation table, and the diagnostics that count what the *last* pack failed to read - and
+	 * the JVM re-registers the sprites and hands the atlas texture over before the bake. When it did
+	 * not - a setting that only changes how the models are *baked* - the atlas is kept, and with it the
+	 * game's rectangles for its animated sprites, which nothing here would ask for again.
+	 *
+	 * What it never touches is the block manager's meshes and the state keys, because they are still
+	 * being drawn from while this runs; the bake that follows replaces them block by block, in the same
+	 * order, which is what keeps the keys valid.
+	 *
+	 * Paired with [BlockRegistryFeed.replay] and then [cacheBlockStates], in that order, on the block
+	 * cache thread. See `beginBlockBake` on the native side for what is cleared and why.
+	 */
+	external fun beginBlockBake(reload: Boolean)
+
+	/**
 	 * What the model baker could not draw, as a sentence - empty when it drew everything.
 	 *
 	 * The two ways a block is baked into nothing while looking perfectly registered: a face dropped for
@@ -417,6 +472,19 @@ object WgpuNative {
 	@JvmStatic
 	external fun setMatrix(type: Int, mat: FloatArray)
 
+	/**
+	 * Sends the frame's **fog**, as twelve floats in the order the terrain shader's `FogEnvironment`
+	 * declares them: the colour (`rgba`), `environmentalStart`, `environmentalEnd`,
+	 * `renderDistanceStart`, `renderDistanceEnd`, then the camera's offset inside its own section and a
+	 * padding float.
+	 *
+	 * Eleven of the twelve are the game's own numbers, read from the camera render state's `FogData` -
+	 * the same object the game writes into its terrain fog buffer - and the last three are this side's,
+	 * because the shader measures a fog distance from a *camera-relative* position and the position it
+	 * computes is relative to the camera's section. See `renderer::FOG` and the shader's `apply_fog`.
+	 */
+	external fun setFogEnvironment(values: FloatArray)
+
 	@JvmStatic
 	external fun registerEntities(toString: String)
 
@@ -467,14 +535,18 @@ object WgpuNative {
 	 * Sections are what the terrain path is keyed by - the baker's positions, the arena's vertex and
 	 * index ranges, the graph pass's grid - so this is the one coordinate the renderer needs from the
 	 * camera, and it is sent rather than derived: the renderer has no camera of its own, only the
-	 * matrices Minecraft hands it. The arena is trimmed against it once a frame, and the graph's
-	 * `@geo_terrain` pass will cull against it.
+	 * matrices Minecraft hands it.
 	 *
-	 * The name is the signature the Fabric module's `setSectionPos` had, kept because it is the right
-	 * one: two integers, once a frame, and no state on this side that has to be kept in step.
+	 * All three axes. The arena is trimmed against `x` and `z` (a vertical slice of the world is loaded
+	 * all at once), and the terrain pass *draws* against all three: a section is placed at
+	 * `(section - cameraSection) * 16`, with the camera's offset inside its own section carried by the
+	 * view matrix, so the numbers that reach the depth buffer stay small and the ground stops fighting
+	 * with the shadow lying on it. That is why the height is here and why it is sent by the same code
+	 * that builds the matrices, a frame's disagreement being sixteen blocks of terrain in the wrong
+	 * place.
 	 */
 	@JvmStatic
-	external fun setCameraSection(x: Int, z: Int)
+	external fun setCameraSection(x: Int, y: Int, z: Int)
 
 	/**
 	 * Says how far the section arena should reach, in chunks.

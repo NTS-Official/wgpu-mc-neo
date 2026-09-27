@@ -1,7 +1,9 @@
 package dev.birb.wgpu.chunk
 
 import dev.birb.wgpu.WgpuMcMod
+import net.minecraft.core.BlockPos
 import net.minecraft.core.Direction
+import net.minecraft.world.level.EmptyBlockGetter
 import net.minecraft.world.level.block.state.BlockState
 import net.minecraft.world.phys.shapes.Shapes
 
@@ -89,16 +91,23 @@ object BlockFaceFlags {
 	 *
 	 * A state that cannot be read - one whose cache the game never initialized, the failure this whole
 	 * arrangement exists to avoid - is sent as zeroes, which the baker reads as "occludes nothing, hides
-	 * nothing": every face of that block is drawn, which is more geometry and no hole in the world.
+	 * nothing": every face of that block is drawn, which is more geometry and no hole in the world. The
+	 * same failure for [shadeBrightness] reads as "does not darken", which draws *less* shadow than
+	 * vanilla: the two directions are chosen so that a broken read is a picture with more of it, never a
+	 * hole in it.
 	 */
 	@JvmStatic
 	fun describe(key: Int, state: BlockState) {
 		var occlusion = 0
 		var selfHide = 0
+		var shades = 0
+		var motion = 0
 
 		try {
 			occlusion = occlusion(state)
 			selfHide = selfHide(state)
+			shades = shadeBrightness(state)
+			motion = blocksMotion(state)
 		} catch (error: Throwable) {
 			if (unreadable == 0) {
 				WgpuMcMod.LOGGER.warn(
@@ -111,8 +120,66 @@ object BlockFaceFlags {
 			unreadable++
 		}
 
-		dev.birb.wgpu.rust.WgpuNative.registerBlockStateFaceFlags(key, occlusion, selfHide)
+		dev.birb.wgpu.rust.WgpuNative.registerBlockStateFaceFlags(
+			key,
+			occlusion,
+			selfHide,
+			shades,
+			motion,
+		)
 		described++
+	}
+
+	/**
+	 * Whether this block is one a fluid flows *past*: the game's own `blocksMotion`.
+	 *
+	 * It has exactly one caller on the native side, and that caller is `FlowingFluid#getFlow`'s "is
+	 * there fluid below the neighbour" question - the one that makes a stream's surface point at the
+	 * drop it is about to fall down. The three things this side already sends all look like candidates
+	 * and all answer something else: a plant does not occlude, a slab is not a full cube, and glass does
+	 * not occlude either - while the question is whether the block has collision at all.
+	 *
+	 * The method is deprecated in 26.1 and still the one the game's own flow code calls, which is the
+	 * reason to read it rather than to approximate it: an approximation that disagrees is a fluid
+	 * flowing the wrong way on screen.
+	 */
+	@JvmStatic
+	@Suppress("DEPRECATION")
+	fun blocksMotion(state: BlockState): Int = if (state.blocksMotion()) 1 else 0
+
+	/**
+	 * Whether this block darkens the corners it touches: `getShadeBrightness` below `1.0`.
+	 *
+	 * The game's own answer, and it has to be read rather than derived. The default is
+	 * `isCollisionShapeFullBlock ? 0.2 : 1.0`, so this is "does the block fill its whole block" - but the
+	 * blocks that override it are the ones a player notices: glass and ice are the *same shape*, both
+	 * full cubes with no occlusion, and glass answers `1.0` while ice answers `0.2`. Neither the
+	 * occlusion masks above nor the model can tell those two apart, and only one of them casts a shadow
+	 * in vanilla.
+	 *
+	 * Read with the empty level and the origin, which is what the game's own state cache does for the
+	 * shape question this derives from: a state whose answer depends on where it is standing is a state
+	 * either side of this bridge is guessing about.
+	 */
+	@JvmStatic
+	fun shadeBrightness(state: BlockState): Int {
+		val brightness = state.getShadeBrightness(EmptyBlockGetter.INSTANCE, BlockPos.ZERO)
+
+		return if (brightness >= 1.0f) 0 else 1
+	}
+
+	/**
+	 * Forgets the counts, for a resource reload.
+	 *
+	 * Every state is described again on every reload, because the native side hands every key out
+	 * again - so a count that carries the previous run into this one is a number that describes
+	 * neither. The masks themselves need no clearing: they are recomputed and re-sent under the same
+	 * keys, and the native side drains the ones it is given at the end of the same call.
+	 */
+	@JvmStatic
+	fun reset() {
+		described = 0
+		unreadable = 0
 	}
 
 	/** The line that says whether the masks reached the native side at all. */

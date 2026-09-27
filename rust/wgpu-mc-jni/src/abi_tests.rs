@@ -928,6 +928,22 @@ fn every_jni_declaration_has_an_implementation() {
             "WgpuNative.{name}: the JVM declares {arguments} arguments, Rust takes {rust_arguments}"
         );
     }
+
+    // And the other way round, which is the direction that fails *silently*: a `#[jni_fn]` nothing
+    // declares is a function nobody calls, and a feature that looks implemented on the Rust side and
+    // does nothing at all in the game. This is how the fog block was wired: the Rust half went in with
+    // the shader, and the declaration was a step the compiler could not ask for.
+    for key in implementations.keys() {
+        let name = key
+            .strip_prefix("dev.birb.wgpu.rust.WgpuNative::")
+            .unwrap_or_else(|| panic!("{key} is not a WgpuNative implementation"));
+
+        assert!(
+            declarations.iter().any(|(declared, _)| declared == name),
+            "{key} is implemented in Rust but nothing in WgpuNative.kt declares it, so it is dead \
+             code on that side"
+        );
+    }
 }
 
 #[test]

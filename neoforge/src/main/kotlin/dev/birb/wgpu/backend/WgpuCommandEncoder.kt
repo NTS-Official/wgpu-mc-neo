@@ -660,6 +660,9 @@ class WgpuCommandEncoder(@get:JvmName("device") val device: WgpuDevice) : Comman
         private var sentCameraSectionX = Int.MIN_VALUE
 
         @Volatile
+        private var sentCameraSectionY = Int.MIN_VALUE
+
+        @Volatile
         private var sentCameraSectionZ = Int.MIN_VALUE
 
         /** The render distance last sent, in chunks. */
@@ -985,15 +988,17 @@ class WgpuCommandEncoder(@get:JvmName("device") val device: WgpuDevice) : Comman
         val position = camera?.position() ?: client.player?.position() ?: return
 
         val sectionX = SectionPos.blockToSectionCoord(position.x)
+        val sectionY = SectionPos.blockToSectionCoord(position.y)
         val sectionZ = SectionPos.blockToSectionCoord(position.z)
 
-        if (sectionX == sentCameraSectionX && sectionZ == sentCameraSectionZ) {
+        if (sectionX == sentCameraSectionX && sectionY == sentCameraSectionY && sectionZ == sentCameraSectionZ) {
             return
         }
 
         sentCameraSectionX = sectionX
+        sentCameraSectionY = sectionY
         sentCameraSectionZ = sectionZ
-        WgpuNative.setCameraSection(sectionX, sectionZ)
+        WgpuNative.setCameraSection(sectionX, sectionY, sectionZ)
     }
 
     override fun createFence(): GpuFence = ImmediateFence

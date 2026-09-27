@@ -10,6 +10,7 @@ use serde_derive::{Deserialize, Serialize};
 use crate::mc::direction::Direction;
 use crate::mc::resource::{ResourcePath, ResourceProvider};
 use crate::render::atlas::Atlas;
+use crate::render::pipeline::{UV_GAME_ATLAS, UV_GAME_SCALE};
 use crate::texture::UV;
 
 /// A block position: x, y, z
@@ -69,7 +70,10 @@ pub struct BlockModelFace {
     pub vertices: [BlockMeshVertex; 4],
     pub normal: Vec3,
     pub tint_index: i32,
-    pub animation_uv_offset: u32,
+    /// The ten bits the vertex format reserves per vertex for an animated texture. See
+    /// [`crate::render::pipeline::UV_GAME_ATLAS`]: the one bit that carries anything says this face's
+    /// UVs are in the game's own atlas rather than in this side's copy of its sprite.
+    pub uv_flags: u32,
     /// The direction the model declared for this face's `cullface`, already turned by the variant's
     /// rotation - or `None`, which is the common case and means the face is **never** culled.
     ///
@@ -93,8 +97,8 @@ pub struct BlockModelFace {
 
 /// What a block *state* says about the faces around it, as Minecraft itself answers it.
 ///
-/// Two masks, one bit per direction, both computed on the JVM side when the block is registered
-/// (`RegistryMixin`) and keyed by the state the section palette carries:
+/// Two masks, one bit per direction, and one flag, all computed on the JVM side when the block's key is
+/// handed out (`Wgpu#helperSetBlockStateIndex`) and keyed by the state the section palette carries:
 ///
 /// - `occlusion`: `state.getFaceOcclusionShape(dir) == Shapes.block()`. The state's own shape covers
 ///   that whole face, so a neighbour's face against it is not drawn. Note that this is *not* the
@@ -103,6 +107,17 @@ pub struct BlockModelFace {
 /// - `self_hide`: `state.skipRendering(state, dir)`. The block leaves out the face between itself
 ///   and a neighbour of its own kind - glass against glass, ice against ice, the bars of a pane, a
 ///   fluid against itself.
+/// - `shades`: `state.getShadeBrightness(level, pos) < 1`, which is what the ambient-occlusion corner
+///   test reads: a block that answers `0.2` darkens the corners it touches, and one that answers `1.0`
+///   does not. **Not derivable from the two masks above**, which is why it is sent: `IceBlock` and
+///   `TransparentBlock` are both full cubes with an empty occlusion shape - glass and ice look identical
+///   from up here - and only glass overrides `getShadeBrightness` to `1.0`. Ice darkens corners in
+///   vanilla and glass does not, and nothing but the block's own answer tells them apart.
+/// - `blocks_motion`: `state.blocksMotion()`, the game's own "would a fluid flow past this, or into
+///   it". One caller: `FlowingFluid#getFlow` looks *below* a neighbour that has no fluid of its own and
+///   does not block motion, which is how a stream's surface learns to point at the drop it is about to
+///   fall down. The three things this side has that look similar are all wrong for it - a plant does not
+///   occlude, a slab is not a full cube, and neither of those is "blocks motion" - so it is read.
 ///
 /// The bits are in Java's `Direction.ordinal()` order, because that is the side that computes them;
 /// read them with [`crate::mc::direction::java_mask_has`].
@@ -110,6 +125,8 @@ pub struct BlockModelFace {
 pub struct FaceFlags {
     pub occlusion: u8,
     pub self_hide: u8,
+    pub shades: bool,
+    pub blocks_motion: bool,
 }
 
 impl FaceFlags {
@@ -120,10 +137,18 @@ impl FaceFlags {
     /// left out of the mesh, where being wrong means a hole in the world. So a bit survives only
     /// where every state with this model has it, and a disagreement costs an invisible face between
     /// two blocks rather than a missing one.
+    ///
+    /// `shades` follows the same rule for a different reason: a corner that two states of one key
+    /// disagree about is a corner that is *not* darkened, which is the direction that draws less
+    /// shadow than vanilla rather than shadow where vanilla has none. `blocks_motion` is the same
+    /// trade again: a neighbour that two states disagree about is one a fluid does not look past,
+    /// which is the flow it would have had without the flag at all.
     pub fn and(self, other: FaceFlags) -> FaceFlags {
         FaceFlags {
             occlusion: self.occlusion & other.occlusion,
             self_hide: self.self_hide & other.self_hide,
+            shades: self.shades && other.shades,
+            blocks_motion: self.blocks_motion && other.blocks_motion,
         }
     }
 
@@ -344,6 +369,14 @@ const MISSING_SPRITE_NAMES: usize = 24;
 pub struct MissingSprites {
     faces: std::sync::atomic::AtomicU64,
     names: parking_lot::Mutex<Vec<String>>,
+    /// The paths a warning line has already been written for, so one missing texture is one line
+    /// rather than one per model that names it.
+    ///
+    /// Here rather than in a `static` beside the warning, because a resource reload has to be able to
+    /// forget it: a pack that fixes a texture is a texture whose *absence* has to be reportable again
+    /// if the next pack removes it. A `Vec` rather than a set because it has to be constructible in a
+    /// `static`, and because the list only ever holds the handful of paths a pack could not produce.
+    warned: parking_lot::Mutex<Vec<String>>,
 }
 
 impl MissingSprites {
@@ -351,6 +384,7 @@ impl MissingSprites {
         Self {
             faces: std::sync::atomic::AtomicU64::new(0),
             names: parking_lot::Mutex::new(Vec::new()),
+            warned: parking_lot::Mutex::new(Vec::new()),
         }
     }
 
@@ -366,6 +400,30 @@ impl MissingSprites {
         }
     }
 
+    /// Whether this path has not been warned about yet, and remembers that it has been.
+    pub fn warn_once(&self, path: &ResourcePath) -> bool {
+        let mut warned = self.warned.lock();
+
+        if warned.iter().any(|known| known == &path.0) {
+            return false;
+        }
+
+        warned.push(path.0.clone());
+
+        true
+    }
+
+    /// Forgets everything counted and everything warned about, for the next pack.
+    ///
+    /// Called when a resource reload starts: the counters are what the reload's own diagnostics
+    /// report, and a count that carries the previous pack's failures into the new one is a number that
+    /// describes neither.
+    pub fn reset(&self) {
+        self.faces.store(0, std::sync::atomic::Ordering::Relaxed);
+        self.names.lock().clear();
+        self.warned.lock().clear();
+    }
+
     /// How many faces have been dropped for a sprite the atlas does not have.
     pub fn faces(&self) -> u64 {
         self.faces.load(std::sync::atomic::Ordering::Relaxed)
@@ -377,11 +435,12 @@ impl MissingSprites {
     }
 }
 
-/// One element face, as the baker needs it: the sprite's corners in the atlas, the animation offset,
-/// the tint index, the layer the sprite puts it in, and the direction it declared for culling.
+/// One element face, as the baker needs it: the sprite's corners in whichever atlas the face belongs
+/// to, the vertex flags that say which one that is, the tint index, the layer the sprite puts it in,
+/// and the direction it declared for culling.
 struct FaceData {
     uv: UV,
-    animation_uv_offset: u32,
+    uv_flags: u32,
     tint_index: i32,
     layer: RenderLayer,
     cull: Option<Direction>,
@@ -393,6 +452,12 @@ struct FaceData {
 /// (in [`get_atlas_uv`]) and once by the variant's `uvlock` - and both are applied here, in that
 /// order, because that is the order Minecraft applies them in. The `cullface` is turned too, by the
 /// variant's rotation alone.
+///
+/// Which atlas those UVs are *in* is the other half, and it is decided by
+/// [`Atlas::game_atlas_rect`]: a face whose sprite the game animates and whose atlas the pass can
+/// sample is baked with the game's coordinates and flagged for it, and every other face keeps the
+/// coordinates this side packed. The two are not interchangeable - the scales differ, and so do the
+/// atlases - which is why the flag and the coordinates are written together, here, and never apart.
 fn face_data(
     tex: &schemas::models::ElementFace,
     declared: Direction,
@@ -400,22 +465,39 @@ fn face_data(
     rotation: ModelRotation,
     uv_lock: bool,
 ) -> Option<FaceData> {
-    let Some(uv) = get_atlas_uv(tex, atlas) else {
-        // The one silent way this baker can fail, and the reason `MISSING_SPRITES` exists: the face is
-        // gone, and whether the block is drawn with a hole in it or not at all is not something any
-        // other line in the log can tell you.
-        MISSING_SPRITES.note(&(&tex.texture.0).into());
-
-        return None;
-    };
-
     let texture: ResourcePath = (&tex.texture.0).into();
 
+    // `Some` only for a sprite the game animates in an atlas the built pass samples: see
+    // `Atlas::game_atlas_rect`, which is the whole of the decision.
+    let game_rect = atlas.game_atlas_rect(&texture);
+
+    let (uv, uv_flags) = match game_rect {
+        Some(rect) => (get_game_atlas_uv(tex, rect), UV_GAME_ATLAS),
+        None => {
+            let Some(uv) = get_atlas_uv(tex, atlas) else {
+                // The one silent way this baker can fail, and the reason `MISSING_SPRITES` exists: the
+                // face is gone, and whether the block is drawn with a hole in it or not at all is not
+                // something any other line in the log can tell you.
+                MISSING_SPRITES.note(&texture);
+
+                return None;
+            };
+
+            (uv, 0)
+        }
+    };
+
     let uv = if uv_lock {
-        // `get_atlas_uv` above already found this sprite in the same map under the same key, so this
-        // cannot be what makes a locked face disappear - it is here so that the sprite's rectangle is
-        // read from one place rather than threaded through.
-        let sprite = atlas.uv_map.read().get(&texture).copied()?;
+        // `lock_uv` turns the corners about the middle of the sprite's rectangle, so the rectangle has
+        // to be in the same units as the corners it is given: this side's atlas pixels, or the game's
+        // own coordinates at the same scale the corners went through (`GAME_UV_SCALE`).
+        let sprite = match game_rect {
+            Some(rect) => game_rect_to_bits(rect),
+            // `get_atlas_uv` above already found this sprite in the same map under the same key, so
+            // this cannot be what makes a locked face disappear - it is here so that the sprite's
+            // rectangle is read from one place rather than threaded through.
+            None => atlas.uv_map.read().get(&texture).copied()?,
+        };
 
         lock_uv(uv, sprite, uv_lock_matrix(rotation, declared))
     } else {
@@ -424,11 +506,7 @@ fn face_data(
 
     Some(FaceData {
         uv,
-        animation_uv_offset: *atlas
-            .animated_texture_offsets
-            .read()
-            .get(&texture)
-            .unwrap_or(&0),
+        uv_flags,
         tint_index: tex.tint_index,
         layer: atlas.sprite_layer(&texture).unwrap_or(RenderLayer::Solid),
         // Rotated as Minecraft rotates it, so the direction that comes out is the neighbour this face
@@ -735,6 +813,65 @@ fn get_atlas_uv(face: &schemas::models::ElementFace, block_atlas: &Atlas) -> Opt
         })
 }
 
+/// One face's corners as fractions of the sprite it samples, in the order the model's own vertices
+/// read them: `(0, 0)` is one corner of that sprite and `(1, 1)` the other, whatever the sprite's size
+/// in pixels - with the face's own `rotation` applied, about the middle.
+///
+/// Fractions rather than pixels, because this is the one part of a face that is written the same way
+/// in both atlases: a model's `uv` is sixteen units to the sprite (`[0, 0, 16, 16]` when the model
+/// does not write one), and how many *pixels* that is depends on which atlas the face is being baked
+/// for. The turn is Minecraft's, a quarter turn at a time, and these are the same four cases
+/// [`get_atlas_uv`] writes out in whole pixels of this side's atlas.
+fn sprite_fractions(face: &schemas::models::ElementFace) -> ((f32, f32), (f32, f32)) {
+    let uv = face
+        .uv
+        .unwrap_or([0.0, 0.0, 16.0, 16.0])
+        .map(|unit| unit / 16.0);
+
+    match face.rotation {
+        0 => ((uv[0], uv[1]), (uv[2], uv[3])),
+        90 => ((1.0 - uv[1], uv[0]), (1.0 - uv[3], uv[2])),
+        180 => ((1.0 - uv[0], 1.0 - uv[1]), (1.0 - uv[2], 1.0 - uv[3])),
+        270 => ((uv[1], 1.0 - uv[0]), (uv[3], 1.0 - uv[2])),
+        _ => unreachable!("a model face is turned by one of four quarter turns"),
+    }
+}
+
+/// One game-atlas coordinate, in the sixteen bits a vertex holds it in - and the decode the shader
+/// runs, `value / 65535`, run the other way. See [`UV_GAME_SCALE`].
+pub(crate) fn game_bits(value: f32) -> u16 {
+    (value * UV_GAME_SCALE).round().clamp(0.0, 65535.0) as u16
+}
+
+/// The game's rectangle for a sprite, in the same bits - so that [`lock_uv`], which turns corners
+/// about the middle of the rectangle it is handed, can be given this and the corners together.
+fn game_rect_to_bits(rect: [f32; 4]) -> UV {
+    (
+        (game_bits(rect[0]), game_bits(rect[1])),
+        (game_bits(rect[2]), game_bits(rect[3])),
+    )
+}
+
+/// One face's four corners in **Minecraft's** own atlas, as the vertex holds them.
+///
+/// The face's `uv` is a fraction of the sprite, whatever the sprite's size in pixels, so the corners
+/// are that fraction of the game's rectangle across and down. That is the one arithmetic that works
+/// for both atlases, and the reason the game's atlas never has to be measured here: the sprite's
+/// rectangle already says where it is in an atlas this side does not own. See
+/// [`UV_GAME_ATLAS`] for why a face is sent there at all.
+fn get_game_atlas_uv(face: &schemas::models::ElementFace, rect: [f32; 4]) -> UV {
+    let corners = sprite_fractions(face);
+
+    let to_game = |(x, y): (f32, f32)| {
+        (
+            game_bits(rect[0] + x * (rect[2] - rect[0])),
+            game_bits(rect[1] + y * (rect[3] - rect[1])),
+        )
+    };
+
+    (to_game(corners.0), to_game(corners.1))
+}
+
 pub struct RenderSettings {
     pub opaque: bool,
 }
@@ -866,10 +1003,17 @@ impl ModelMesh {
                                 None => {
                                     UNREADABLE_TEXTURES.note(&texture_path);
 
-                                    log::warn!(
-                                        "wgpu-mc: {texture_path} is named by a model but cannot \
-                                        be read; the faces using it are left untextured"
-                                    );
+                                    // Once per path, not once per model that names it: one block whose
+                                    // texture is missing is a model, a multipart set and every state
+                                    // that selects them, and the line says all of it the first time.
+                                    // The set behind this lives in the counter rather than beside the
+                                    // warning, because a reload has to be able to forget it.
+                                    if UNREADABLE_TEXTURES.warn_once(&texture_path) {
+                                        log::warn!(
+                                            "wgpu-mc: {texture_path} is named by a model but cannot \
+                                            be read; the faces using it are left untextured"
+                                        );
+                                    }
                                     None
                                 }
                             }
@@ -1025,7 +1169,7 @@ impl ModelMesh {
                             ],
                             normal: rotation.direction(vec3(0.0, 0.0, 1.0)),
                             tint_index: south_face.tint_index,
-                            animation_uv_offset: south_face.animation_uv_offset,
+                            uv_flags: south_face.uv_flags,
                             layer: model_layer.stronger(south_face.layer),
                             cull: south_face.cull,
                         }));
@@ -1050,7 +1194,7 @@ impl ModelMesh {
                             ],
                             normal: rotation.direction(vec3(-1.0, 0.0, 0.0)),
                             tint_index: west_face.tint_index,
-                            animation_uv_offset: west_face.animation_uv_offset,
+                            uv_flags: west_face.uv_flags,
                             layer: model_layer.stronger(west_face.layer),
                             cull: west_face.cull,
                         }));
@@ -1075,7 +1219,7 @@ impl ModelMesh {
                             ],
                             normal: rotation.direction(vec3(0.0, 0.0, -1.0)),
                             tint_index: north_face.tint_index,
-                            animation_uv_offset: north_face.animation_uv_offset,
+                            uv_flags: north_face.uv_flags,
                             layer: model_layer.stronger(north_face.layer),
                             cull: north_face.cull,
                         }));
@@ -1100,7 +1244,7 @@ impl ModelMesh {
                             ],
                             normal: rotation.direction(vec3(1.0, 0.0, 0.0)),
                             tint_index: east_face.tint_index,
-                            animation_uv_offset: east_face.animation_uv_offset,
+                            uv_flags: east_face.uv_flags,
                             layer: model_layer.stronger(east_face.layer),
                             cull: east_face.cull,
                         }));
@@ -1125,7 +1269,7 @@ impl ModelMesh {
                             ],
                             normal: rotation.direction(vec3(0.0, 1.0, 0.0)),
                             tint_index: up_face.tint_index,
-                            animation_uv_offset: up_face.animation_uv_offset,
+                            uv_flags: up_face.uv_flags,
                             layer: model_layer.stronger(up_face.layer),
                             cull: up_face.cull,
                         }));
@@ -1151,7 +1295,7 @@ impl ModelMesh {
                             ],
                             normal: rotation.direction(vec3(0.0, -1.0, 0.0)),
                             tint_index: down_face.tint_index,
-                            animation_uv_offset: down_face.animation_uv_offset,
+                            uv_flags: down_face.uv_flags,
                             layer: model_layer.stronger(down_face.layer),
                             cull: down_face.cull,
                         }));
@@ -1322,6 +1466,268 @@ mod texture_resolution_tests {
             described.contains("nothing_defines_this"),
             "the description has to name it: {described}"
         );
+    }
+}
+
+/// The counters a bake reports through, and the reload that has to be able to clear them. See
+/// [`MissingSprites`].
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+
+    /// Which atlas a face belongs to, over every combination of what the decision reads.
+    ///
+    /// The three inputs are a setting (`Fast`/`Fancy` on the options screen), whether the pass that
+    /// would draw the face has the game's atlas, and whether the game animates the sprite at all. A
+    /// truth table rather than three examples because a "yes" that should have been a "no" is a face
+    /// drawn with the wrong texture on it, and that is the one outcome nobody would guess from a still
+    /// picture.
+    #[test]
+    fn a_face_goes_to_the_game_atlas_only_when_every_input_agrees() {
+        let rect = [0.25, 0.25, 0.5, 0.5];
+
+        for animation_on in [false, true] {
+            for atlas_bound in [false, true] {
+                for animated in [false, true] {
+                    let decided = decide_game_atlas(animation_on, atlas_bound, animated, Some(rect));
+                    let expected = (animation_on && atlas_bound && animated).then_some(rect);
+
+                    assert_eq!(
+                        decided, expected,
+                        "animation {animation_on}, atlas bound {atlas_bound}, animated sprite \
+                         {animated}"
+                    );
+                }
+            }
+        }
+
+        // And a sprite with no rectangle to point at is this side's copy whatever the other three say:
+        // there is nowhere in the game's atlas for the face to go.
+        assert_eq!(decide_game_atlas(true, true, true, None), None);
+    }
+
+    /// The switch is on unless something turned it off, which is the game's own behaviour and what a
+    /// player who has never opened the Quality page sees.
+    #[test]
+    fn the_animation_is_on_by_default() {
+        assert!(animated_textures());
+    }
+
+    /// A warning is one line per path, and a reload makes the next one a line again.
+    ///
+    /// The second half is the part worth a test: the set that suppresses repeat warnings is also what
+    /// would suppress the *new* pack's warning about a path the old pack was missing too, and the two
+    /// are the same line of code apart. A pack that fixes a texture, then a pack that drops it again,
+    /// has to be two warnings - otherwise the second failure is silent.
+    #[test]
+    fn a_warning_is_once_per_path_and_comes_back_after_a_reload() {
+        let counters = MissingSprites::new();
+        let path = ResourcePath::from("minecraft:block/missing_thing");
+
+        assert!(counters.warn_once(&path), "the first warning is written");
+        assert!(!counters.warn_once(&path), "and not the second");
+
+        counters.note(&path);
+        assert_eq!(counters.faces(), 1);
+        assert_eq!(counters.names(), vec!["minecraft:block/missing_thing"]);
+
+        counters.reset();
+
+        assert_eq!(counters.faces(), 0, "a reload forgets what the last pack lost");
+        assert!(counters.names().is_empty());
+        assert!(
+            counters.warn_once(&path),
+            "and a path that goes missing again is worth saying again"
+        );
+    }
+}
+
+/// Whether faces whose sprite the game animates are drawn from the game's own atlas.
+///
+/// The options screen's Quality page, as `Fancy` (on, the default) and `Fast` (off), applied from the
+/// settings through [`set_animated_textures`]. On is what the game does: the game animates its block
+/// atlas by rendering each due frame into it, so a face drawn from *that* atlas moves for free. Off is
+/// the picture this renderer drew before any of it existed - every animated sprite frozen on the frame
+/// it was copied at - and it is a fidelity choice rather than a speed one.
+///
+/// Read once per face, while it is baked, which is why the switch costs a re-bake to move: the answer
+/// is written into the vertex, as the flag [`UV_GAME_ATLAS`] and the coordinates that go with it.
+static ANIMATED_TEXTURES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Whether animated block textures move. See [`ANIMATED_TEXTURES`].
+pub fn animated_textures() -> bool {
+    ANIMATED_TEXTURES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Sets [`ANIMATED_TEXTURES`]. Called when the settings are applied.
+///
+/// Nothing is re-baked here: the caller is the settings path, and the bake is asked for separately -
+/// see `BlockCache.blockTexturesChanged` on the JVM side, which the settings path calls.
+pub fn set_animated_textures(enabled: bool) {
+    ANIMATED_TEXTURES.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Which atlas a face belongs to: the game's own rectangle for its sprite, or `None` for this side's.
+///
+/// The whole of the decision, in one place, and it takes three answers that come from three different
+/// places so that each can be checked on its own:
+///
+///  - `animated_sprite` - does the **game** animate this sprite? Read from the `.mcmeta` files this side
+///    downloads while it packs its own atlas, so it is the game's own answer rather than a list;
+///  - `rect` - where the game put that sprite, sent by the JVM (`registerSprite`);
+///  - [`animated_textures`] and [`crate::render::graph::game_atlas_bound`] - whether this is wanted at
+///    all, and whether the pass that would draw it has the atlas.
+///
+/// A "no" anywhere is this side's copy of the sprite: frozen, and correct for everything that is not
+/// animated. A "yes" that should have been a "no" is a face with the wrong texture on it, so every one
+/// of these has to agree.
+pub fn face_uses_game_atlas(animated_sprite: bool, rect: Option<[f32; 4]>) -> Option<[f32; 4]> {
+    decide_game_atlas(
+        animated_textures(),
+        crate::render::graph::game_atlas_bound(),
+        animated_sprite,
+        rect,
+    )
+}
+
+/// The gate itself, with every input handed in rather than read.
+///
+/// Split out so that the decision can be tested: the three globals behind it are a setting, a handed-over
+/// GPU texture and a table the game fills, and none of them can be moved in a test. The truth table is
+/// the contract - all three have to agree, and the failure modes are not symmetric: a "no" is a face
+/// drawn from this side's copy of its sprite, while a "yes" that should have been a "no" is a face with
+/// the wrong texture on it.
+fn decide_game_atlas(
+    animation_on: bool,
+    atlas_bound: bool,
+    animated_sprite: bool,
+    rect: Option<[f32; 4]>,
+) -> Option<[f32; 4]> {
+    if animation_on && atlas_bound && animated_sprite {
+        rect
+    } else {
+        None
+    }
+}
+
+/// The corners of a face in the *game's* atlas, which is the other half of an animated texture. See
+/// [`get_game_atlas_uv`] and [`sprite_fractions`].
+#[cfg(test)]
+mod game_atlas_tests {
+    use super::*;
+
+    /// Runs `check` over one north face of a full cube, with the `uv` and `rotation` written into the
+    /// JSON - the two fields every test here is about.
+    fn with_face(uv: &str, rotation: u32, check: impl FnOnce(&schemas::models::ElementFace)) {
+        let json = format!(
+            r##"{{
+                "textures": {{ "all": "minecraft:block/fire_0" }},
+                "elements": [
+                    {{
+                        "from": [0, 0, 0],
+                        "to": [16, 16, 16],
+                        "faces": {{
+                            "north": {{ "texture": "#all", "uv": {uv}, "rotation": {rotation} }}
+                        }}
+                    }}
+                ]
+            }}"##
+        );
+
+        let model = parse_model(&json).expect("a model this build can read");
+        let elements = model.elements.expect("elements");
+
+        let face = elements[0]
+            .faces
+            .get(&schemas::models::BlockFace::North)
+            .expect("the face the fixture wrote");
+
+        check(face);
+    }
+
+    /// A face that writes no `uv` covers the whole sprite: sixteen units to the sprite, whatever the
+    /// sprite's size in the game's atlas, so the corners are the rectangle's own.
+    #[test]
+    fn a_face_that_names_no_uv_covers_the_whole_sprite() {
+        with_face("[0, 0, 16, 16]", 0, |face| {
+            let corners = get_game_atlas_uv(face, [0.25, 0.5, 0.75, 1.0]);
+
+            assert_eq!(
+                corners,
+                ((16384, 32768), (49151, 65535)),
+                "the game's coordinates, in the sixteen bits a vertex holds them in - the rectangle's \
+                 own corners, rounded to the nearest bit"
+            );
+        });
+    }
+
+    /// The face's `uv` is a fraction of the sprite and not of the atlas, which is the whole reason the
+    /// game's atlas does not have to be measured here: half a sprite is half of the *rectangle*.
+    #[test]
+    fn a_face_is_a_fraction_of_the_sprite_and_not_of_the_atlas() {
+        with_face("[0, 0, 8, 8]", 0, |face| {
+            let corners = get_game_atlas_uv(face, [0.0, 0.0, 0.5, 0.5]);
+
+            assert_eq!(
+                corners,
+                ((0, 0), (16384, 16384)),
+                "the top-left quarter of the sprite, which is a quarter of the rectangle"
+            );
+        });
+    }
+
+    /// A turned face stays on its own sprite, which is what says the turn is about the *sprite's*
+    /// middle and not the atlas's: a corner that named the atlas would land in the next sprite along
+    /// as soon as the sprite was not at the origin.
+    #[test]
+    fn a_quarter_turn_stays_inside_the_sprite() {
+        with_face("[0, 0, 8, 16]", 90, |face| {
+            let rect = [0.25, 0.25, 0.5, 0.5];
+            let corners = get_game_atlas_uv(face, rect);
+
+            for (u, v) in [corners.0, corners.1] {
+                // The bounds are the rectangle through the same rounding the corners went through:
+                // a rectangle edge is a bit like any other, and measuring it another way would test
+                // the test.
+                let inside = game_bits(rect[0])..=game_bits(rect[2]);
+                let down = game_bits(rect[1])..=game_bits(rect[3]);
+
+                assert!(
+                    inside.contains(&u) && down.contains(&v),
+                    "({u}, {v}) is outside the sprite's own rectangle, so a face turned by 90 degrees \
+                     would sample whatever the game packed beside it"
+                );
+            }
+        });
+    }
+
+    /// The fractions are the same four quarter turns [`get_atlas_uv`] writes out in whole pixels of
+    /// this side's atlas, so a face on a sixteen-texel sprite - which is what nearly every block
+    /// texture is - bakes to the corners it always did. This is the regression test for that
+    /// rewrite: the numbers on the right are the old arithmetic, by hand.
+    #[test]
+    fn the_fractions_are_the_pixels_this_side_has_always_baked() {
+        for (uv, rotation, expected) in [
+            ("[0, 0, 4, 8]", 0, ((0.0, 0.0), (4.0, 8.0))),
+            ("[0, 0, 4, 8]", 90, ((16.0, 0.0), (8.0, 4.0))),
+            ("[0, 0, 4, 8]", 180, ((16.0, 16.0), (12.0, 8.0))),
+            ("[0, 0, 4, 8]", 270, ((0.0, 16.0), (8.0, 12.0))),
+            ("[2, 3, 9, 14]", 0, ((2.0, 3.0), (9.0, 14.0))),
+            ("[2, 3, 9, 14]", 180, ((14.0, 13.0), (7.0, 2.0))),
+        ] {
+            with_face(uv, rotation, |face| {
+                let corners = sprite_fractions(face);
+
+                let to_pixels =
+                    |(x, y): (f32, f32)| ((x * 16.0).round(), (y * 16.0).round());
+
+                assert_eq!(
+                    (to_pixels(corners.0), to_pixels(corners.1)),
+                    expected,
+                    "uv {uv} turned by {rotation} degrees"
+                );
+            });
+        }
     }
 }
 

@@ -74,14 +74,34 @@ pub struct Atlas {
     /// The representation of the [Atlas]'s image buffer on the GPU, which can be bound to a draw call
     pub texture: Arc<TextureAndView>,
     /// Not every [Atlas] is used for block textures, but the ones that are store the information for each animated texture here
-    pub animated_textures: RwLock<Vec<schemas::texture::TextureAnimation>>,
-    pub animated_texture_offsets: RwLock<HashMap<ResourcePath, u32>>,
+    /// The sprites the game animates, keyed by the sprite they belong to, with the `.mcmeta` block they
+    /// declared it in.
+    ///
+    /// Keyed rather than a plain list, because the one question this side asks about it is "does the
+    /// game animate *this* sprite": a face whose texture the game animates has to be baked with the
+    /// game's own atlas coordinates and sent to the game's atlas, since that is the atlas the animation
+    /// passes render into (see [`Atlas::sprite_rects`]). The block itself is kept for the day the frame
+    /// timing is needed here as well.
+    pub animated_textures: RwLock<HashMap<ResourcePath, schemas::texture::TextureAnimation>>,
     /// The layer each sprite's own pixels put it in, filled as it is allocated.
     ///
     /// Minecraft decides a face's render layer from the sprite it samples - `force_translucent` on the
     /// model is the other half, and the only one that can be read from JSON - so this is the table the
     /// block model baker asks when it fills in a face's layer. See [`Atlas::sprite_layer`].
     pub sprite_layers: RwLock<HashMap<ResourcePath, RenderLayer>>,
+
+    /// Where each sprite sits in the **game's own** atlas, in the game's coordinates: `[u0, v0, u1,
+    /// v1]`, the four numbers `TextureAtlasSprite#getU0` and its neighbours answer with.
+    ///
+    /// These are for the faces whose texture the game animates. The game animates an atlas by
+    /// *rendering* the due frame into its own atlas texture (`TextureAtlas#cycleAnimationFrames`), so a
+    /// face that samples this side's copy of that sprite shows whatever frame was copied and never
+    /// changes - the fire that burns still. A face whose sprite is animated is therefore baked with
+    /// *these* coordinates and a flag that sends it to the game's atlas instead, and it animates for no
+    /// cost at all: nothing is copied, nothing is re-uploaded, the game does what it already does.
+    ///
+    /// Filled by `WgpuNative.registerSprite`, one call per sprite, before the block states are cached.
+    pub sprite_rects: RwLock<HashMap<ResourcePath, [f32; 4]>>,
     /// How many sprites have been added to the image since the texture on the GPU was last written.
     ///
     /// The one thing that makes [`Atlas::allocate`] and [`Atlas::upload`] two calls rather than one:
@@ -122,9 +142,9 @@ impl Atlas {
             image: RwLock::new(ImageBuffer::new(ATLAS_DIMENSIONS, ATLAS_DIMENSIONS)),
             uv_map: Default::default(),
             texture: Arc::new(tv),
-            animated_textures: RwLock::new(Vec::new()),
-            animated_texture_offsets: Default::default(),
+            animated_textures: RwLock::new(HashMap::new()),
             sprite_layers: Default::default(),
+            sprite_rects: Default::default(),
             sprites_since_upload: std::sync::atomic::AtomicU64::new(0),
             size: ATLAS_DIMENSIONS,
         }
@@ -140,6 +160,44 @@ impl Atlas {
     /// a face that only samples the opaque part of a partly-cutout sprite is put in the cutout layer
     /// too, where Minecraft's own pass draws it correctly. What that costs is this renderer drawing
     /// less of the world, which is the trade to make towards a picture that is right.
+    /// One sprite's place in the game's atlas, and the layer the game files it under.
+    ///
+    /// Both arrive in the same call because both are answers only the game has: the rectangle is the
+    /// game's own layout (this side packs its sprites somewhere else entirely), and the layer is the
+    /// game's reading of the sprite's transparency, which this side otherwise guesses from the pixels -
+    /// and a guess is why a sprite that is part opaque and part cutout is classified as one of them.
+    pub fn register_sprite(&self, path: &ResourcePath, rect: [f32; 4], layer: RenderLayer) {
+        self.sprite_rects.write().insert(path.clone(), rect);
+        self.sprite_layers.write().insert(path.clone(), layer);
+    }
+
+    /// Whether the game animates this sprite. See [`Atlas::animated_textures`].
+    pub fn sprite_is_animated(&self, path: &ResourcePath) -> bool {
+        self.animated_textures.read().contains_key(path)
+    }
+
+    /// Where this sprite sits in the game's own atlas. See [`Atlas::sprite_rects`].
+    pub fn sprite_rect(&self, path: &ResourcePath) -> Option<[f32; 4]> {
+        self.sprite_rects.read().get(path).copied()
+    }
+
+    /// Where an **animated** sprite sits in the game's atlas, or `None` for every other sprite - and
+    /// for every sprite at all while the animated-texture switch is off or the game's atlas has not
+    /// been handed over to the pass that draws the terrain.
+    ///
+    /// One question rather than four because the answers are one decision, and it is
+    /// [`crate::mc::block::face_uses_game_atlas`] that makes it: this only supplies the two the atlas
+    /// owns. A face that gets this wrong keeps its own coordinates rather than being drawn from the
+    /// wrong place, which is the direction to fail in - a "no" is the frozen fire the renderer has
+    /// always had, while a "yes" that should have been a "no" is a face with the wrong texture on it.
+    /// See `Vertex::uv_flags`' `UV_GAME_ATLAS` for the whole of it.
+    pub fn game_atlas_rect(&self, path: &ResourcePath) -> Option<[f32; 4]> {
+        crate::mc::block::face_uses_game_atlas(
+            self.sprite_is_animated(path),
+            self.sprite_rects.read().get(path).copied(),
+        )
+    }
+
     pub fn sprite_layer(&self, path: &ResourcePath) -> Option<RenderLayer> {
         self.sprite_layers.read().get(path).copied()
     }
@@ -172,7 +230,6 @@ impl Atlas {
 
         let mut animated_textures = self.animated_textures.write();
         let mut sprite_layers = self.sprite_layers.write();
-        // let mut animated_texture_offsets = self.animated_texture_offsets.write();
 
         let before = map.len();
 
@@ -205,12 +262,22 @@ impl Atlas {
         image_buffer: &mut ImageBuffer<Rgba<u8>, Vec<u8>>,
         map: &mut HashMap<ResourcePath, UV>,
         allocator: &mut AtlasAllocator,
-        animated_textures: &mut Vec<schemas::texture::TextureAnimation>,
+        animated_textures: &mut HashMap<ResourcePath, schemas::texture::TextureAnimation>,
         sprite_layers: &mut HashMap<ResourcePath, RenderLayer>,
         path: &ResourcePath,
         image_bytes: &[u8],
         resource_provider: &dyn ResourceProvider,
     ) {
+        // A sprite the atlas already holds is not allocated a second time: the same path is the same
+        // image, and the second rectangle is atlas space nothing can give back - while the map, which
+        // is what the baker reads, goes on pointing at whichever of the two was written last. A
+        // resource reload is the one thing that changes the pixels behind a path, and it clears this
+        // map first (see [`Atlas::clear`]), so a reloaded sprite is allocated again rather than
+        // skipped here.
+        if map.contains_key(path) {
+            return;
+        }
+
         // A texture the `image` crate cannot decode - a pack with a mislabelled or truncated file -
         // is skipped rather than unwrapped, and the faces that name it come out untextured, which is
         // what `get_atlas_uv` already does for a texture that is not in the map.
@@ -243,14 +310,14 @@ impl Atlas {
             allocation.rectangle.min.y as i64,
         );
 
-        let mcmeta_path = path.append(".mcmeta");
+        let mcmeta_path = sprite_metadata_path(path);
 
         let mcmeta = resource_provider
             .get_string(&mcmeta_path)
             .and_then(|string| serde_json::from_str::<schemas::texture::Texture>(&string).ok());
 
         if let Some(animation) = mcmeta.and_then(|texture| texture.animation) {
-            animated_textures.push(animation)
+            animated_textures.insert(path.clone(), animation);
         }
 
         map.insert(
@@ -361,15 +428,55 @@ impl Atlas {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Empties the atlas: every sprite is unallocated again, and the next [`Atlas::allocate`] packs it
+    /// from scratch.
+    ///
+    /// This is what a **resource reload** does to it, and the whole thing has to go rather than the
+    /// pixels being written over. A reload can change a sprite's size, so the rectangles packed from
+    /// one pack are only valid for that pack - and every face already baked holds those rectangles in
+    /// its vertices, which is why a reload also re-bakes the block models and has every section meshed
+    /// again.
+    ///
+    /// `uv_map` going with the rest is the part that is easy to leave out and silent when it is.
+    /// [`Atlas::allocate`] skips a path the map already has, so an atlas cleared of everything *but*
+    /// the map re-packs nothing at all: the old pixels stay, at the old rectangles, and the result is
+    /// indistinguishable from a reload that did not happen. The map is also what
+    /// [`Atlas::sprite_is_animated`] and the lock in `face_data` are read from, so it is one table for
+    /// "where is this sprite", not a cache.
+    ///
+    /// The image is wiped and the texture is marked as needing an upload, so a reload that allocates
+    /// nothing ends with a blank atlas rather than with the last pack's pixels.
     pub fn clear(&self) {
         self.allocator.write().clear();
-        self.animated_texture_offsets.write().clear();
+        self.uv_map.write().clear();
         self.animated_textures.write().clear();
         self.sprite_layers.write().clear();
+        self.sprite_rects.write().clear();
         *self.image.write() = ImageBuffer::new(self.size, self.size);
+
+        // One, not zero: the count is what `upload_if_dirty` reads, and what has changed is the atlas
+        // itself rather than a sprite added to it.
         self.sprites_since_upload
-            .store(0, std::sync::atomic::Ordering::Relaxed);
+            .store(1, std::sync::atomic::Ordering::Relaxed);
     }
+}
+
+/// Where a sprite's `.mcmeta` lives, from the name the sprite is packed under.
+///
+/// This is the one place that turns a sprite **name** - `minecraft:block/fire_0`, which is what a
+/// model's `textures` map names and what `uv_map` is keyed by - into the **file** beside it, and it is
+/// the same conversion the callers of [`Atlas::allocate`] do to read the image at all
+/// (`prepend("textures/").append(".png")`, in `get_model_by_key` and in the fluid lookup). The two
+/// have to agree: they are the same sprite.
+///
+/// It used to be `.mcmeta` appended to the sprite *name*, which is a path no resource pack ships -
+/// `minecraft:block/fire_0.mcmeta` is one directory away from the real
+/// `minecraft:textures/block/fire_0.png.mcmeta`. That read failed silently (a missing metadata file
+/// is the normal case, since most sprites are not animated), so **every** animated sprite this side
+/// packed was recorded as a still one, and `Atlas::animated_textures` stayed empty while looking
+/// perfectly well maintained.
+fn sprite_metadata_path(sprite: &ResourcePath) -> ResourcePath {
+    sprite.prepend("textures/").append(".png.mcmeta")
 }
 
 /// The layer a sprite's pixels put it in: opaque, cutout or translucent.
@@ -433,6 +540,37 @@ mod sprite_layer_tests {
         let blended = sprite(2, 1, &[[10, 20, 30, 255], [40, 50, 60, 128]]);
 
         assert_eq!(layer_of_pixels(&blended), RenderLayer::Transparent);
+    }
+}
+
+#[cfg(test)]
+mod sprite_metadata_path_tests {
+    use super::*;
+
+    /// A sprite's metadata lives beside the sprite's **file**, not beside the name a model calls it
+    /// by. Getting this wrong is silent - a `.mcmeta` that is not there is the ordinary case for a
+    /// sprite that is not animated - and it left `animated_textures` empty for the whole life of the
+    /// table, which is what made the fire a still image.
+    #[test]
+    fn a_sprites_metadata_is_looked_for_beside_its_file() {
+        let sprite = ResourcePath::from("minecraft:block/fire_0");
+
+        assert_eq!(
+            sprite_metadata_path(&sprite).0,
+            "minecraft:textures/block/fire_0.png.mcmeta",
+            "which is the file a pack ships, and the one the image was read from plus `.mcmeta`"
+        );
+    }
+
+    /// And the namespace comes along, because a pack's animated sprite is under the pack's namespace.
+    #[test]
+    fn the_namespace_survives_the_conversion() {
+        let sprite = ResourcePath::from("somepack:block/thing");
+
+        assert_eq!(
+            sprite_metadata_path(&sprite).0,
+            "somepack:textures/block/thing.png.mcmeta"
+        );
     }
 }
 

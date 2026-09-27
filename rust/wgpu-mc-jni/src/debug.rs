@@ -131,6 +131,20 @@ static TERRAIN_GREATER_DEPTH: AtomicBool = AtomicBool::new(false);
 /// [`rebuild_pipelines_if_stale`], which is what spends it.
 static PIPELINES_STALE: AtomicBool = AtomicBool::new(false);
 
+/// Says the graph has to be built again, for anything that is decided when it is built.
+///
+/// The two pipeline-state switches above are the usual caller; the other one is the JVM handing over
+/// the game's block atlas (`bind_game_block_atlas`), which is a *resource* a pipeline binds rather
+/// than a flag it reads - and a graph built before that arrived has the placeholder in that slot,
+/// with the terrain pass sampling white texels on the faces that were baked for the game's atlas.
+///
+/// Nothing is rebuilt here. This is called from a tick, and the graph is replaced at the end of a
+/// frame, which is the one point a frame is known to be between: see
+/// [`rebuild_pipelines_if_stale`].
+pub fn mark_pipelines_stale() {
+    PIPELINES_STALE.store(true, Ordering::Relaxed);
+}
+
 #[allow(dead_code)]
 #[inline]
 pub fn diagnostics() -> bool {
@@ -271,6 +285,12 @@ pub fn apply(settings: &Settings) {
         PIPELINES_STALE.store(true, Ordering::Relaxed);
     }
 
+    // The animated-texture switch, which is a *graphics* setting rather than one of the debug switches
+    // above: it decides, per face, which atlas that face samples, and the answer is baked into the
+    // vertex. Moving it therefore invalidates every baked block model, and the re-bake is asked for by
+    // [`sendSettings`], which is the only caller that knows a setting moved rather than was loaded.
+    wgpu_mc::mc::block::set_animated_textures(settings.animated_textures());
+
     // The `wgpu-mc` crate writes lines of its own - the per-bake report, for one - and the switch
     // that decides whether they are sampled or written is the same one this file just resolved.
     wgpu_mc::mc::chunk::DIAGNOSTIC_LOGGING
@@ -297,10 +317,14 @@ pub fn rebuild_pipelines_if_stale(wm: &wgpu_mc::WmRenderer) {
     }
 
     log::info!(
-        "wgpu-mc: rebuilding the render graph for a pipeline-state switch (no-cull {}, greater depth \
-         {})",
+        "wgpu-mc: rebuilding the render graph (no-cull {}, greater depth {}, game block atlas {})",
         terrain_no_cull(),
-        terrain_greater_depth()
+        terrain_greater_depth(),
+        if wgpu_mc::render::graph::game_atlas_bound() {
+            "bound"
+        } else {
+            "not bound yet"
+        }
     );
 
     crate::application::load_shaders(wm);

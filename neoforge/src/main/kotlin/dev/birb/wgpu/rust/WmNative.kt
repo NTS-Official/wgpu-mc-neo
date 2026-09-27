@@ -686,6 +686,31 @@ object WmNative {
     @JvmField val dropSampler: MethodHandle =
         handle("drop_sampler", FunctionDescriptor.ofVoid(PTR))
 
+    /**
+     * Hands the terrain pass the game's own block atlas: `(renderer, texture) -> ()`.
+     *
+     * The texture is one the *game* owns - `TextureAtlas#getTexture` - and the native side keeps a
+     * view of it, which is what lets a face whose sprite the game animates be drawn from the atlas the
+     * game is already animating, instead of from the frozen copy this renderer packed at startup. It
+     * is called beside the sprite registration, on the same stitcher's atlas, because the rectangles
+     * and the texture have to be from the same stitch. See `bind_game_block_atlas`.
+     */
+    @JvmField val bindGameBlockAtlas: MethodHandle =
+        handle("bind_game_block_atlas", FunctionDescriptor.ofVoid(PTR, PTR))
+
+    /**
+     * Hands the terrain pass the game's **lightmap**: `(renderer, texture) -> ()`.
+     *
+     * The 16x16 texture Minecraft builds its lighting into, and the one thing the game's own terrain
+     * shader samples for it (`sample_lightmap(Sampler2, UV2)`). Handing it over is what makes the
+     * terrain's lighting *the game's* - the gamma and brightness options, the time of day, night vision,
+     * the darkness effect - rather than a curve written on this side. The game writes into one texture
+     * rather than building a new one, so this is called once per texture and not once per frame. See
+     * `bind_game_lightmap`.
+     */
+    @JvmField val bindGameLightmap: MethodHandle =
+        handle("bind_game_lightmap", FunctionDescriptor.ofVoid(PTR, PTR))
+
     @JvmField val compileRenderPipeline: MethodHandle =
         handle("compile_render_pipeline", FunctionDescriptor.of(PTR, PTR, PTR))
 

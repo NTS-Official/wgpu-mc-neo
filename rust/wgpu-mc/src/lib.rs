@@ -48,9 +48,10 @@ See the [render::entity] module for an example of rendering an example entity.
 use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
-use glam::IVec3;
+use glam::{IVec3, ivec2};
 use mc::Scene;
 use mc::chunk::BakedLayer;
 pub use minecraft_assets;
@@ -63,6 +64,17 @@ use crate::mc::resource::ResourceProvider;
 use crate::render::atlas::Atlas;
 use crate::render::pipeline::{BLOCK_ATLAS, ENTITY_ATLAS, create_bind_group_layouts};
 use crate::util::BindableBuffer;
+
+/// Sprite uploads that happened after the first one, and the second the last line about them was
+/// written. See `WmRenderer::upload_late_sprites`.
+static LATE_SPRITE_UPLOADS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static LATE_SPRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static LATE_SPRITES_REPORTED_AT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How long a burst of late sprites is allowed to be one line. One second is the interval the terrain
+/// line uses, and for the same reason: long enough that a steady state is one line a second, short
+/// enough that a burst is not a minute of silence.
+const LATE_SPRITES_REPORT_SECONDS: u64 = 1;
 
 pub mod mc;
 pub mod render;
@@ -249,14 +261,21 @@ impl WmRenderer {
 
         {
             let mut last = scene.trimmed_section_pos.write();
-            if *last == camera {
+            // The trim is horizontal: see `Scene::camera_section_pos` for why the camera's section
+            // carries a height this does not use.
+            let horizontal = ivec2(camera.x, camera.z);
+
+            if *last == horizontal {
                 return;
             }
 
-            *last = camera;
+            *last = horizontal;
         }
 
-        scene.section_storage.write().trim(camera);
+        scene
+            .section_storage
+            .write()
+            .trim(ivec2(camera.x, camera.z));
     }
 
     /// Uploads any sprite the atlas has gained since its texture was last written.
@@ -267,6 +286,12 @@ impl WmRenderer {
     /// once, on the frame after it was allocated, before the frame is recorded. The check is one atomic
     /// load per frame and the upload is a few milliseconds when it happens, which is the trade against
     /// a block that is not on screen at all. See `Atlas::upload_if_dirty`.
+    ///
+    /// **At most one line a second**, because a sprite arriving per frame is a legitimate state - the
+    /// title screen allocates them while it settles, and a resource reload allocates hundreds - and one
+    /// warning per upload is a console with nothing else in it. The line carries the total since the
+    /// last one, so the reader still sees how much arrived and how many uploads it took; the first
+    /// upload after each line is reported immediately, so nothing is swallowed either.
     fn upload_late_sprites(&self) {
         let atlases = self.mc.texture_manager.atlases.read();
 
@@ -279,9 +304,25 @@ impl WmRenderer {
 
             atlas.upload_if_dirty(self);
 
+            let uploads = LATE_SPRITE_UPLOADS.fetch_add(1, Ordering::Relaxed) + 1;
+            let sprites = LATE_SPRITES.fetch_add(pending, Ordering::Relaxed) + pending;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|since| since.as_secs())
+                .unwrap_or(0);
+            let reported_at = LATE_SPRITES_REPORTED_AT.load(Ordering::Relaxed);
+
+            if reported_at != 0 && now.saturating_sub(reported_at) < LATE_SPRITES_REPORT_SECONDS {
+                continue;
+            }
+
+            LATE_SPRITES_REPORTED_AT.store(now, Ordering::Relaxed);
+            LATE_SPRITES.store(0, Ordering::Relaxed);
+            LATE_SPRITE_UPLOADS.store(0, Ordering::Relaxed);
+
             log::warn!(
-                "wgpu-mc: {name} was uploaded again after the frame: {pending} sprite(s) had been added \
-                 to it since the last upload"
+                "wgpu-mc: {name} was uploaded again after the frame: {sprites} sprite(s) over \
+                 {uploads} upload(s) since the last line, the last one adding {pending}"
             );
         }
     }

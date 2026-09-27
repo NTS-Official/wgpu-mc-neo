@@ -39,6 +39,28 @@ pub struct Settings {
     /// file used to be, a file name a player had to know and a restart to change.
     #[serde(default)]
     pub terrain: BoolSetting,
+    /// Whether the game's animated block textures move, drawn on the options screen's Quality page.
+    ///
+    /// The two values are the quality convention the graphics preset uses - `Fancy` is the animation
+    /// on, `Fast` is off - and what it decides is which atlas a face samples when the sprite behind it
+    /// is one the game animates: the game animates its block atlas by rendering each due frame into it,
+    /// so a face drawn from *that* atlas moves for free, and a face drawn from the copy this side packs
+    /// holds whatever frame it was copied at. See `UV_GAME_ATLAS`.
+    ///
+    /// Not a performance switch in disguise, and the schema says so rather than implying otherwise: the
+    /// game renders those frames whether or not this side samples them, and the difference at the
+    /// sampler is one binding. `Fast` is the picture this renderer drew before any of it existed.
+    ///
+    /// Applied by baking the block models again, because the answer is *in* the vertices: a face is
+    /// baked with one atlas's coordinates and a flag saying which. See `debug::apply`, which asks the
+    /// JVM for the re-bake, and `BlockCache.blockTexturesChanged`.
+    ///
+    /// The default is named rather than left to `#[serde(default)]`, which would take
+    /// `EnumSetting::default()` - the *first* variant, `Fast`, i.e. the animation off. That is the trap
+    /// this field shares with [`Settings::frames_in_flight`]: a serde default and the type's own default
+    /// are two different things, and only one of them is the behaviour this setting is replacing.
+    #[serde(default = "animated_textures_default")]
+    pub animated_textures: EnumSetting,
     /// How many frames the CPU may record ahead of the GPU.
     ///
     /// One is a full stall on every frame; two hides the recording behind the GPU's own work, which
@@ -143,11 +165,21 @@ fn two_frames_in_flight() -> IntSetting {
     IntSetting::of(1, 3, 1, 2)
 }
 
+/// The default of `animated_textures`: the animation on, which is the game's own behaviour.
+///
+/// See the note on that field: `EnumSetting`'s own default is its first variant, which is `Fast`.
+fn animated_textures_default() -> EnumSetting {
+    EnumSetting::from_variant(AnimatedTextures::default())
+}
+
 #[derive(Serialize)]
 pub struct SettingsInfo {
     backend: EnumSettingInfo<GraphicsBackend>,
     vsync: SettingInfo,
     terrain: SettingInfo,
+    /// On the Quality page rather than on the renderer's own, which is why the page skips it: one row
+    /// in one place. See `OptionPages`' `DRAWN_ELSEWHERE`.
+    animated_textures: EnumSettingInfo<AnimatedTextures>,
     frames_in_flight: SettingInfo,
     /// The two switches that change *how* the frame is rendered rather than what is reported about
     /// it. **This order has to match [`Settings`]'s**, because the two halves of a row come from the
@@ -214,6 +246,18 @@ lazy_static! {
             needs_restart: false,
             section: None,
         },
+        animated_textures: EnumSettingInfo::new(
+            "Whether the block textures Minecraft animates - fire, lava, the campfire, the sea lantern, \
+            every sprite with an `.mcmeta` that says so - move on the terrain this renderer draws. \
+            Minecraft animates its block atlas by rendering each due frame into it, and `Quality` draws \
+            those faces from that atlas, so they move exactly as they do in vanilla and nothing is \
+            copied per frame. `Fast` bakes them against this renderer's own copy of the sprite instead, \
+            which is a single frame: the picture this renderer drew before any of this existed. The two \
+            are a fidelity choice rather than a speed one - the game renders those frames either way - \
+            and switching takes effect after the block models are baked again, which is a second or two \
+            and re-meshes the loaded sections.",
+            false,
+        ),
         frames_in_flight: SettingInfo {
             desc: "How many frames the CPU may record ahead of the GPU. One is a full stall on \
             every frame and two hides the recording behind the GPU's own work; three adds a frame \
@@ -514,6 +558,14 @@ impl Settings {
     pub fn graphics_backend(&self) -> GraphicsBackend {
         self.backend.get_variant()
     }
+
+    /// Whether faces whose sprite the game animates are drawn from the game's own atlas.
+    ///
+    /// See [`Settings::animated_textures`]: `Fancy` (the default) is yes, `Fast` is the frozen picture
+    /// this renderer drew before the animated-texture path existed.
+    pub fn animated_textures(&self) -> bool {
+        self.animated_textures.get_variant::<AnimatedTextures>().is_on()
+    }
 }
 
 impl Default for Settings {
@@ -524,6 +576,9 @@ impl Default for Settings {
             // `BoolSetting::default()` is `true`, which is the right default for the terrain path: it is
             // what the renderer is being built towards, and the switch is here to turn it *off*.
             terrain: BoolSetting::default(),
+            // `Fancy`: the animated textures move, which is what the game does and what a player who has
+            // not been told about this row expects to see.
+            animated_textures: EnumSetting::from_variant(AnimatedTextures::default()),
             frames_in_flight: two_frames_in_flight(),
             // The debug switches default to the behaviour the renderer had before they existed:
             // logging and tracing off, the bind group cache and dynamic offsets on, and GPU-based
@@ -687,6 +742,40 @@ impl LanguageKey for GraphicsBackend {
     }
 }
 
+/// Whether the block textures the game animates move on the terrain this renderer draws.
+///
+/// The values are spelled the way the graphics preset spells its own - `Fast` and `Fancy` - because
+/// this is a row on the same page and answers the same kind of question. `Fancy` is the animation:
+/// see [`Settings::animated_textures`] for what the two actually do.
+#[derive(EnumIter, IntoStaticStr, Eq, PartialEq, Clone, Copy, Debug, Default)]
+pub enum AnimatedTextures {
+    /// The animation is off. A face whose sprite the game animates is baked against this side's copy
+    /// of that sprite, which is one frame of it, and holds that frame.
+    #[strum(serialize = "Fast")]
+    Fast,
+    /// The animation is on, for the price of one more binding: such a face is baked with the game's own
+    /// coordinates and drawn from the atlas the game is animating.
+    #[default]
+    #[strum(serialize = "Fancy")]
+    Fancy,
+}
+
+impl AnimatedTextures {
+    /// Whether the animation is the one this variant asks for.
+    pub fn is_on(self) -> bool {
+        matches!(self, AnimatedTextures::Fancy)
+    }
+}
+
+impl LanguageKey for AnimatedTextures {
+    fn lang_key(&self) -> &'static str {
+        match self {
+            AnimatedTextures::Fast => "wgpu_mc.option.animated_textures.fast",
+            AnimatedTextures::Fancy => "wgpu_mc.option.animated_textures.fancy",
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(tag = "type", rename = "bool")]
 pub struct BoolSetting {
@@ -821,6 +910,37 @@ mod tests {
     const LEGACY_CONFIG: &str = r#"{
         "vsync": { "type": "bool", "value": false }
     }"#;
+
+    /// The animated-texture switch: `Fancy` is the animation, `Fast` is the frozen picture.
+    ///
+    /// Worth its lines because the two names are borrowed from the graphics preset, where "Fast" is the
+    /// *cheaper* option - and here the cheaper-sounding one draws a single frame, which is only cheaper
+    /// in the sense that it is what the renderer did before the animated-texture path existed. Reversed,
+    /// this row would turn the animation on for the player who asked for less of it.
+    #[test]
+    fn fast_is_the_frozen_picture_and_fancy_is_the_animation() {
+        let mut settings = Settings::default();
+
+        assert!(
+            settings.animated_textures(),
+            "the default is the game's own behaviour: the textures the game animates move"
+        );
+
+        settings.animated_textures = EnumSetting::from_variant(AnimatedTextures::Fast);
+        assert!(!settings.animated_textures());
+
+        settings.animated_textures = EnumSetting::from_variant(AnimatedTextures::Fancy);
+        assert!(settings.animated_textures());
+    }
+
+    /// A config written before this setting existed draws the animation, because that is what its
+    /// default says - and `#[serde(default)]` is what makes an older file keep every other value too.
+    #[test]
+    fn a_config_without_the_animated_texture_key_animates() {
+        let settings: Settings = serde_json::from_str(LEGACY_CONFIG).expect("legacy config");
+
+        assert!(settings.animated_textures());
+    }
 
     #[test]
     fn a_config_without_a_backend_key_still_loads() {
@@ -1009,10 +1129,11 @@ mod tests {
 
     /// Every setting's name, which is the same in both documents. Kept as a list because the two
     /// documents' own key order is not readable through `serde_json::Value` - see the test above.
-    const NAME_LIST: [&str; 19] = [
+    const NAME_LIST: [&str; 20] = [
         "backend",
         "vsync",
         "terrain",
+        "animated_textures",
         "frames_in_flight",
         "bind_group_cache",
         "dynamic_offsets",

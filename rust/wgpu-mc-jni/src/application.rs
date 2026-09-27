@@ -37,6 +37,15 @@ pub struct TerrainMatrices {
     pub projection: Arc<wgpu::Buffer>,
 }
 
+/// The fog buffer the terrain shader reads, alongside the matrices and for the same reason: the graph
+/// is rebuilt on every shader reload and the values keep arriving per frame.
+pub static TERRAIN_FOG: Lazy<parking_lot::Mutex<Option<Arc<wgpu::Buffer>>>> =
+    Lazy::new(|| parking_lot::Mutex::new(None));
+
+/// How many bytes the shader's `FogEnvironment` struct takes: a `vec4` colour, four floats, and a `vec3`
+/// with the padding uniform layout gives it.
+const FOG_BYTES: u64 = 48;
+
 pub fn load_shaders(wm: &WmRenderer) {
     let shader_pack: ShaderPackConfig =
         serde_yaml::from_str(include_str!("../graph.yaml")).unwrap();
@@ -46,6 +55,22 @@ pub fn load_shaders(wm: &WmRenderer) {
     let mat4_projection = create_matrix_buffer(wm);
     let mat4_view = create_matrix_buffer(wm);
     let mat4_model = create_matrix_buffer(wm);
+
+    // Zeroed, and written for this frame before the pass reads it: a fog colour of zero is a fog that
+    // blends nothing, so the frames before the first upload are the unfogged picture rather than a black
+    // one. See `renderer::FOG`.
+    let fog = Arc::new(wm.gpu.device.create_buffer_init(&BufferInitDescriptor {
+        label: Some("wgpu-mc: terrain fog"),
+        contents: &[0u8; FOG_BYTES as usize],
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::UNIFORM,
+    }));
+
+    *TERRAIN_FOG.lock() = Some(fog.clone());
+
+    render_resources.insert(
+        "@fog_environment".into(),
+        ResourceBacking::Buffer(fog, BufferBindingType::Uniform),
+    );
 
     *TERRAIN_MATRICES.lock() = Some(TerrainMatrices {
         model: mat4_model.clone(),
@@ -152,6 +177,15 @@ pub fn upload_terrain_matrices(wm: &WmRenderer) {
     wm.gpu
         .queue
         .write_buffer(&buffers.projection, 0, bytemuck::cast_slice(&matrices.2));
+
+    // And the fog, which the JVM read out of the same frame's camera render state as those matrices.
+    let fog = *crate::renderer::FOG.lock();
+
+    if let Some(buffer) = TERRAIN_FOG.lock().as_ref() {
+        wm.gpu
+            .queue
+            .write_buffer(buffer, 0, bytemuck::cast_slice(&fog));
+    }
 }
 
 fn create_matrix_buffer(wm: &WmRenderer) -> Arc<wgpu::Buffer> {
@@ -210,14 +244,75 @@ mod tests {
                 "@mat4_view",
                 "@mat4_perspective",
                 "@texture_block_atlas",
-                "@sampler"
+                "@sampler",
+                "@texture_mc_block_atlas",
+                "@sampler_mc_block_atlas",
+                "@texture_game_lightmap",
+                "@sampler_game_lightmap",
+                "@fog_environment"
             ],
-            "the shader's own binding numbers are the keys of this map"
+            "the shader's own binding numbers are the keys of this map: the two atlases with their \
+             samplers, the game's lightmap - which is the whole of the terrain's lighting - and the fog \
+             block the game's fog is written into"
         );
 
         assert!(
             matches!(terrain.bind_groups.get(&1), Some(BindGroupDef::Resource(name)) if name == "@bg_ssbo_chunks"),
             "group 1 is the arena the sections were baked into"
         );
+    }
+
+    /// The shader the shipped graph draws the terrain with compiles.
+    ///
+    /// The graph is built at startup and the shader is read out of the mod's own resources - this is
+    /// the file `wgpu_mc:shaders/terrain.wgsl` resolves to - and a WGSL mistake in it is not a shader
+    /// that draws something wrong: the module fails to validate while the pipeline is being created,
+    /// wgpu answers with a validation error, this crate's error handler panics on it, and the process
+    /// ends. Nothing between writing the file and running the game says so otherwise, and the file is
+    /// edited by hand.
+    ///
+    /// Validation is naga's, which is the same front end wgpu compiles WGSL with, so what passes here
+    /// is what the pipeline creation will accept. `IMMEDIATES` is part of `Capabilities::all()`, which
+    /// is what the pass needs for its `var<immediate>` section position.
+    #[test]
+    fn the_shipped_terrain_shader_compiles() {
+        use wgpu_mc::wgpu::naga;
+
+        let source = include_str!(
+            "../../../neoforge/src/main/resources/assets/wgpu_mc/shaders/terrain.wgsl"
+        );
+
+        let module = match naga::front::wgsl::parse_str(source) {
+            Ok(module) => module,
+            Err(error) => panic!(
+                "naga will not parse the terrain shader: {}",
+                error.emit_to_string(source)
+            ),
+        };
+
+        let mut validator = naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        );
+
+        if let Err(error) = validator.validate(&module) {
+            panic!("the terrain shader does not validate: {error:?}");
+        }
+
+        // The two textures the fragment stage chooses between and their samplers, by the name each is
+        // declared under: a shader that lost one of them would still compile, still validate, and
+        // silently sample whatever the graph binds in the slot it kept.
+        let declared = module
+            .global_variables
+            .iter()
+            .filter_map(|(_, global)| global.name.clone())
+            .collect::<Vec<String>>();
+
+        for wanted in ["t_texture", "t_game_atlas", "t_sampler", "t_game_sampler"] {
+            assert!(
+                declared.iter().any(|name| name == wanted),
+                "the terrain shader no longer declares {wanted}; it declares {declared:?}"
+            );
+        }
     }
 }
