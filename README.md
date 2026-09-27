@@ -1,5 +1,7 @@
 # "wgpu-mc" — Minecraft Rendering Engine Built in Rust
 <img  src="assets/logo.png" width="280" alt="Logo">
+
+**English** | [简体中文](README_zh.md)
 <p>
 <img alt="Static Badge" src="https://img.shields.io/badge/Powered_by-WebGPU-orange?logo=webgpu&logoSize=auto&link=https%3A%2F%2Fwebgpu.org%2F">
 <img alt="Static Badge" src="https://img.shields.io/badge/Discord_-5865F2?style=flat-square&logo=discord&logoColor=fff&link=https%3A%2F%2Fdiscord.gg%2FNTuK8bQ2hn">
