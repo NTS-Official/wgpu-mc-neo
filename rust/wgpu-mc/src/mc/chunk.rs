@@ -216,6 +216,19 @@ pub struct SectionStorage {
     pool: u32,
     /// Whether the last [`SectionStorage::allocate_ranges`] ran out of pool.
     refused: bool,
+    /// **Whether a growth request has been clamped by the device's buffer limit**, which is the state
+    /// the JVM has to know about.
+    ///
+    /// A refusal on its own is recoverable: `pending_arena_growth` doubles the pool and the section is
+    /// re-offered. This is what says the doubling has nowhere to go - the arena is at
+    /// `Scene::arena_cap_slots`, the device's own `max_buffer_size`, and from there every further
+    /// refusal is permanent for as long as the world needs more room than the device will make.
+    ///
+    /// It exists because the JVM decides whether to drop Minecraft's mesh *before* the bake is queued,
+    /// on a chunk-build thread that cannot see any of this. A section this side has no room for is a
+    /// section the game should draw, and there was nothing to tell it so. See
+    /// [`SectionStorage::at_capacity`] and `RustChunkBake`.
+    at_capacity: bool,
     /// The sections an allocation was refused for since the JVM last asked, as their positions.
     ///
     /// The boolean above says "this allocation failed"; this says *which* ones, because the two sides
@@ -244,6 +257,7 @@ impl SectionStorage {
             deferred_depth: 1,
             pool: range,
             refused: false,
+            at_capacity: false,
             refused_pending: std::collections::HashSet::new(),
         }
     }
@@ -307,6 +321,21 @@ impl SectionStorage {
         self.pool = slots;
 
         true
+    }
+
+    /// **Says that the arena is at the device's buffer limit**, so a refusal is not one that growth can
+    /// answer. See [`SectionStorage::at_capacity`].
+    ///
+    /// Set by `WmRenderer::grow_arena` when the request it was handed had to be clamped to
+    /// `Scene::arena_cap_slots` - the only place that knows the request has nowhere to go. Cleared when
+    /// a pool is set afresh for a world, because a new world may need less than the device will make.
+    pub fn set_at_capacity(&mut self, at: bool) {
+        self.at_capacity = at;
+    }
+
+    /// Whether a refusal is one growth cannot answer. See [`SectionStorage::at_capacity`].
+    pub fn at_capacity(&self) -> bool {
+        self.at_capacity
     }
 
     /// Drops every stored section, for a world the renderer is no longer drawing.

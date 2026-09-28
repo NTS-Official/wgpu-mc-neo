@@ -4838,6 +4838,23 @@ pub extern "C" fn terrain_arena_can_grow() -> bool {
         .is_some_and(|scene| scene.section_storage.read().pool_slots() < scene.arena_cap_slots)
 }
 
+/// **Whether the arena is at the device's buffer limit**, so a refused section is one this side will
+/// never be able to draw.
+///
+/// The JVM asks this to decide whether to keep Minecraft's own mesh for the sections being refused. It
+/// is the difference between a refusal that growth will answer and one that will not, and the JVM cannot
+/// work it out from the outside: it decides to drop the mesh on a chunk-build thread, before the bake is
+/// even queued, and by the time the refusal comes back the geometry is already gone. See
+/// `SectionStorage::at_capacity`, which is where the answer is recorded, and `RustChunkBake`, which is
+/// what acts on it.
+#[jni_fn("dev.birb.wgpu.rust.WgpuNative")]
+pub fn terrainArenaAtCapacity(_env: JNIEnv, _class: JClass) -> crate::jboolean {
+    RENDERER
+        .get()
+        .and_then(|wm| wm.scene())
+        .is_some_and(|scene| scene.section_storage.read().at_capacity()) as crate::jboolean
+}
+
 /// Whether the graph has a terrain pipeline, building it if it does not.
 ///
 /// The graph is built by a shader reload, and a shader reload is gated on the renderer being up *and*

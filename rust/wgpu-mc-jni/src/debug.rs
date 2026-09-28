@@ -245,6 +245,8 @@ pub fn apply(settings: &Settings) {
         logging,
         terrain_no_cull,
         terrain_greater_depth,
+        terrain_occlusion,
+        atlas_base_mip_only,
     } = settings.debug();
 
     set(&LOGGING, logging);
@@ -274,6 +276,17 @@ pub fn apply(settings: &Settings) {
     if wgpu_mc::render::graph::set_pipeline_diagnostics(no_cull, greater_depth) {
         // Not rebuilt here: this runs when the settings are handed over, which is not a point a frame
         // is known to be between. The frame's own end is - see [`rebuild_pipelines_if_stale`].
+        PIPELINES_STALE.store(true, Ordering::Relaxed);
+    }
+
+    // The occlusion switch is not one of those: it decides an `if` inside the gather, so it takes
+    // effect on the next frame and nothing has to be rebuilt for it.
+    wgpu_mc::render::graph::set_terrain_occlusion(terrain_occlusion);
+
+    // The atlas mip clamp *is* built into the samplers, which are created with the graph - so moving it
+    // invalidates the same thing `terrain_no_cull` does, and for the same reason.
+    if wgpu_mc::render::graph::atlas_base_mip_only() != atlas_base_mip_only {
+        wgpu_mc::render::graph::set_atlas_base_mip_only(atlas_base_mip_only);
         PIPELINES_STALE.store(true, Ordering::Relaxed);
     }
 

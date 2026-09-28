@@ -39,6 +39,10 @@ public class RustChunkBakeMixin {
 
     @Inject(method = "doTask", at = @At("HEAD"))
     private void wgpuMc$bakeInRust(SectionBufferBuilderPack pack, CallbackInfoReturnable<Object> cir) {
-        RustChunkBake.noteTookSection(RustChunkBake.bake(this.region));
+        // **No second `noteTookSection` here.** `bake` records the answer itself, where the tables it
+        // depends on are; this used to pass `bake(region)`'s return value in, and that value was "did it
+        // not throw" - true for every refusal inside, so a section Rust had refused was still dropped
+        // from Minecraft's mesh and drawn by neither side.
+        RustChunkBake.bake(this.region);
     }
 }

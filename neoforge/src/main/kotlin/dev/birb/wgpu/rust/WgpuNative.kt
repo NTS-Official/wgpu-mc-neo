@@ -289,6 +289,12 @@ object WgpuNative {
 
 	external fun maxQueuedBakes(): Int
 
+	/** How many sections the arena is actually drawing. See the note on the native side. */
+	external fun arenaSections(): Int
+
+	/** Whether the arena is at the device's buffer limit, so a refusal is permanent. */
+	external fun terrainArenaAtCapacity(): Boolean
+
 	external fun registerBlockStateFaceFlags(
 		key: Int,
 		occlusion: Int,

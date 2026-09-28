@@ -191,6 +191,10 @@ object RustChunkBake {
 		// bridge apart from a full arena. See `checkRefusalChannel`.
 		checkRefusalChannel()
 
+		// And the claim against the fact, on the same clock and for the same reason - see the note on
+		// `reportClaimAgainstArena`, which is the measurement a hole needs to be attributable at all.
+		reportClaimAgainstArena()
+
 		if (enabled == previous && reportedState) {
 			return
 		}
@@ -276,17 +280,24 @@ object RustChunkBake {
 			return
 		}
 
-		// A refusal whose section cannot have room made for it is not queued for a rebuild, because the
-		// rebuild would be refused again: the arena doubles on a refusal and stops at the device's own
-		// buffer limit, and past that point a rebuild per refusal, once a tick, is a spin rather than a
-		// convergence. So the drain checks it once, here, rather than per pending entry in `redirtyDue`.
-		val canGrow = try {
-			WmNative.terrainArenaCanGrow.invokeExact() as Boolean
-		} catch (error: Throwable) {
-			// No renderer to ask: nothing was baked, so nothing can be waiting on a rebuild.
-			return
-		}
-
+		// **The rebuild is asked for whether or not the arena can grow, and that is the fix for a hole
+		// that stayed after the queue was added.** This used to read `if (canGrow && ...)`, on the
+		// argument that a rebuild for a section the arena cannot hold is a spin: the arena doubles on a
+		// refusal and stops at the device's buffer limit, so past that point a rebuild per refusal is
+		// work that cannot converge.
+		//
+		// That argument is right about the spin and wrong about the alternative. A key dropped here has
+		// already been removed from [rustHas] a line above, so Minecraft's mesh for that section is no
+		// longer suppressed - but *nothing asks for it to be rebuilt either*, and a mesh that is not
+		// suppressed and not rebuilt is the same 16x16x16 hole by a different route. It is the bug the
+		// queue was added to fix, reintroduced by the gate that was meant to keep the queue cheap.
+		//
+		// Asking for the rebuild converges even when the arena is full, because of what the rebuild
+		// does: it bakes, the bake fails to allocate, the refusal clears `rustHas` again, and the
+		// **bake answers "not taken"** - so `noteTookSection(false)` leaves Minecraft's own mesh in
+		// place. The section ends up drawn by the game, which is the correct answer for a section this
+		// side has no room for. The cost is one rebuild per refused section, and the rate is [budget]'s
+		// in [redirtyDue], which is where a rate belongs.
 		var queued = 0
 
 		for (key in refused) {
@@ -295,7 +306,7 @@ object RustChunkBake {
 			// the fallback for it. The rebuild `redirtyDue` asks for is what puts it back.
 			rustHas.remove(key)
 
-			if (canGrow && pendingRedirty.size < PENDING_REDIRTY_LIMIT) {
+			if (pendingRedirty.size < PENDING_REDIRTY_LIMIT) {
 				pendingRedirty.add(key)
 				queued++
 			}
@@ -303,11 +314,21 @@ object RustChunkBake {
 
 		refusedDrained += refused.size
 
+		// Whether the arena can still grow is no longer a gate here, but it is the number that says
+		// whether this run is at the device's buffer limit - which is the state where the sections
+		// being refused will end up drawn by Minecraft instead of by this side.
+		val canGrow = try {
+			WmNative.terrainArenaCanGrow.invokeExact() as Boolean
+		} catch (error: Throwable) {
+			true
+		}
+
 		WgpuMcMod.LOGGER.warn(
-			"wgpu: the section arena refused {} section(s); forgetting them, so the next rebuild " +
-				"of each carries its blocks again, and queueing {} of those rebuild(s) ({} drained so " +
-				"far, {} waiting)",
+			"wgpu: the section arena refused {} section(s) (it {} grow); forgetting them, so the next " +
+				"rebuild of each carries its blocks again, and queueing {} of those rebuild(s) ({} " +
+				"drained so far, {} waiting)",
 			refused.size,
+			if (canGrow) "can" else "cannot",
 			queued,
 			refusedDrained,
 			pendingRedirty.size,
@@ -346,6 +367,59 @@ object RustChunkBake {
 	/** How many refusals are waiting for a rebuild. For the report. */
 	@JvmStatic
 	fun pendingRedirtyCount(): Int = pendingRedirty.size
+
+	/**
+	 * Reports what this side claims Rust has against what Rust is actually drawing, once a second.
+	 *
+	 * **This is the measurement three rounds of reasoning went without.** [rustHas] means "this side has
+	 * told Rust about the section", and the mixin that drops Minecraft's mesh reads that same claim - so a
+	 * section that was told and never *published* is drawn by neither renderer, and it is a 16x16x16 hole
+	 * with nothing in the logs to say so. Nothing compared the claim with the fact until this line.
+	 *
+	 * The two numbers are not expected to be equal, and that is not a broken invariant: [rustHas] also
+	 * holds sections the arena has legitimately trimmed, because this side's bookkeeping is the game's
+	 * whole view while the arena is only what is being drawn. What matters is whether the gap moves - a
+	 * gap that grows while the player stands still is sections being claimed and not published, and that
+	 * is the hole.
+	 *
+	 * Called with the settings poll, once a second, and only while the logging switch is on.
+	 */
+	@JvmStatic
+	fun reportClaimAgainstArena() {
+		if (!Diagnostics.loggingEnabled()) {
+			return
+		}
+
+		val now = System.nanoTime()
+
+		if (now - claimReportedAt < 1_000_000_000L) {
+			return
+		}
+
+		claimReportedAt = now
+
+		val arena = try {
+			WgpuNative.arenaSections()
+		} catch (error: Throwable) {
+			return
+		}
+
+		WgpuMcMod.LOGGER.info(
+			"wgpu: this side claims Rust has {} section(s); the arena is drawing {}, with {} awaiting a " +
+				"rebuild and {} bake(s) queued",
+			rustHas.size,
+			arena,
+			pendingRedirty.size,
+			try {
+				WgpuNative.queuedBakes()
+			} catch (error: Throwable) {
+				-1
+			},
+		)
+	}
+
+	/** When [reportClaimAgainstArena] last wrote. */
+	private var claimReportedAt = 0L
 
 	/**
 	 * Asks the game to rebuild a few of the sections the arena refused, one frame at a time.
@@ -622,9 +696,16 @@ object RustChunkBake {
 		// then would find no registry and no "air", and the whole copy would be wasted.
 		if (!WgpuNative.blocksCached()) return false
 
+		// **Not "did it not throw" - "did Rust take it".** This used to answer `true` for every call
+		// that returned normally, which is every call: the early returns inside `bakeNow` are refusals
+		// (the bake queue is full, the payload was rejected, the arena is at its limit) and each of them
+		// is a plain return. The mixin passes this answer to `noteTookSection`, and *that* is what
+		// decides whether Minecraft's mesh is dropped - so a section Rust refused was drawn by neither
+		// side, which is the hole. The decision is recorded inside `bakeNow`, beside the tables it
+		// depends on; this reads it back rather than inventing a second answer.
 		return try {
 			bakeNow(region)
-			true
+			tookThisSection.get()
 		} catch (throwable: Throwable) {
 			WgpuMcMod.LOGGER.error("wgpu: the Rust terrain bake failed", throwable)
 			false
@@ -645,6 +726,25 @@ object RustChunkBake {
 	/** For the mixin that drops Minecraft's mesh. See [tookThisSection]. */
 	@JvmStatic
 	fun meshesInRust(): Boolean = tookThisSection.get()
+
+	/**
+	 * Whether the arena is at the device's buffer limit, so a section this side cannot draw is one the
+	 * game has to.
+	 *
+	 * Read on the chunk-build thread, once per rebuild, as a plain native call: the answer changes only
+	 * when the arena grows or a world is loaded, and a frame of staleness costs one section's mesh.
+	 *
+	 * A native call that cannot be made reads as `false` - "not at capacity" - because that is the
+	 * answer that drops Minecraft's mesh, and the failure it would otherwise cause is a section drawn
+	 * twice rather than a section drawn by neither. The safe direction is the other one, so this is
+	 * deliberately the opposite of what a cautious default would be: with no renderer there is no Rust
+	 * terrain either, so `bake` has already answered false and this is never consulted.
+	 */
+	private fun atCapacity(): Boolean = try {
+		WgpuNative.terrainArenaAtCapacity()
+	} catch (error: Throwable) {
+		false
+	}
 
 	/** Records the answer of the bake that just ran on this thread. See [tookThisSection]. */
 	@JvmStatic
@@ -747,7 +847,15 @@ object RustChunkBake {
 		// The answer for this section: `true` only when every one of the 27 was already Rust's. It is
 		// read *after* the commit above, which is what makes the second rebuild of a section the one
 		// that stops meshing it.
-		noteTookSection(!firstLook[0])
+		//
+		// **Unless the arena is full, in which case the answer is `false` whatever the tables say.** This
+		// is the hole that survived every other fix: `noteTookSection(true)` drops Minecraft's mesh for
+		// the section, and it is asked *before* the bake runs - the bake is queued here and allocates on
+		// a later frame, so a refusal arrives after the geometry is already gone and nothing puts it
+		// back. At the device's buffer limit those refusals are permanent, so every section that does not
+		// fit is drawn by neither renderer. The game has to keep its mesh for them, and this is the only
+		// place that can decide it.
+		noteTookSection(!firstLook[0] && !atCapacity())
 
 		bakes++
 		if (Diagnostics.loggingEnabled() || bakes - reported >= REPORT_EVERY) {

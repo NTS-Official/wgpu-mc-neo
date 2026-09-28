@@ -145,6 +145,17 @@ pub struct Settings {
     /// rather than nothing.
     #[serde(default = "off")]
     pub terrain_no_cull: BoolSetting,
+    /// Whether the terrain pass honours the game's occlusion graph. See [Settings::terrain_occlusion].
+    ///
+    /// Defaulted rather than `off`: the behaviour it names is the behaviour the renderer already had, so
+    /// a config written before this switch existed is not asking for anything different. `BoolSetting`'s
+    /// own default is `true`, which is exactly what that needs.
+    #[serde(default)]
+    pub terrain_occlusion: BoolSetting,
+    /// Whether the game's block atlas is sampled from its base mip level only. See
+    /// [`Settings::atlas_base_mip_only`].
+    #[serde(default = "off")]
+    pub atlas_base_mip_only: BoolSetting,
     #[serde(default = "off")]
     pub terrain_greater_depth: BoolSetting,
 }
@@ -199,6 +210,8 @@ pub struct SettingsInfo {
     upload_report: SettingInfo,
     dump_frames: SettingInfo,
     terrain_no_cull: SettingInfo,
+    terrain_occlusion: SettingInfo,
+    atlas_base_mip_only: SettingInfo,
     terrain_greater_depth: SettingInfo,
 }
 
@@ -427,6 +440,34 @@ lazy_static! {
             pipeline rather than something a draw can change.",
             false,
         ),
+        terrain_occlusion: SettingInfo::debug(
+            "Honour the game's own occlusion graph - the list of sections `LevelRenderer` worked out \
+            are on screen - and skip the ones it did not name. On is the faster and, while the list is \
+            right, the correct answer; off draws every section the frustum contains.\n\n\
+            This is a switch because that list is a **snapshot**, and how stale it is decides whether \
+            trusting it costs a hole. `LevelRenderer.applyFrustum` is the only thing that refills it, \
+            and it runs only when the camera has turned by more than two degrees or the occlusion \
+            graph says something changed - so between those moments the list is whatever the last \
+            refill produced. A section this side has baked and the game's list has not caught up with \
+            is skipped by the terrain pass while the game's own mesh for it stays suppressed, and a \
+            section neither side draws is a 16x16x16 hole. With this off there are no holes to \
+            attribute and the difference says whether that is the mechanism.",
+            true,
+        ),
+        atlas_base_mip_only: SettingInfo::debug(
+            "Sample the game's own block atlas from its base mip level only, so a distant animated \
+            sprite resolves to a single texel of it rather than a blend of mip levels.\n\n\
+            Off, because the game animates the whole chain rather than one level of it: \
+            `TextureAtlas#uploadAnimationFrames` walks every level and renders the current frame of \
+            each animated sprite into each of them, through that level's own view and that level's own \
+            uniform buffer. No level is staler than any other, so there is no stale level for a clamp \
+            to avoid - and clamping to 0.0 does not make the animated textures fresher, it makes them \
+            alias: one texel of a 16x16 sprite per pixel is the temporal noise a mip chain exists to \
+            remove. It is a switch because the case for it is a picture rather than an argument, and a \
+            run with it on against a run with it off is what settles it. Applying it rebuilds the \
+            graph, because a sampler is built with the pipelines rather than per draw.",
+            false,
+        ),
         terrain_greater_depth: SettingInfo::debug(
             "Draw every pipeline the render graph builds with the depth test the opposite way round, \
             so the faces *behind* are the ones kept. The other half of the pair above: it is what \
@@ -568,6 +609,14 @@ impl Settings {
             .get_variant::<AnimatedTextures>()
             .is_on()
     }
+
+    /// Whether the game's block atlas is sampled from its base mip level only.
+    ///
+    /// See `wgpu_mc::render::graph::set_atlas_base_mip_only`, which is what applies it - and which
+    /// carries the argument for why the default is off.
+    pub fn atlas_base_mip_only(&self) -> bool {
+        self.atlas_base_mip_only.value
+    }
 }
 
 impl Default for Settings {
@@ -602,6 +651,8 @@ impl Default for Settings {
             // The renderer culled back faces and used the ordinary depth test before these existed,
             // and both of them are diagnostics: the switch is here to turn one *on*.
             terrain_no_cull: BoolSetting::of(false),
+            terrain_occlusion: BoolSetting::of(true),
+            atlas_base_mip_only: BoolSetting::of(false),
             terrain_greater_depth: BoolSetting::of(false),
         }
     }
@@ -628,6 +679,12 @@ pub struct DebugSettings {
     pub pix_capture: bool,
     /// Whether the section feed is timed - see [`Settings::section_timing`].
     pub section_timing: bool,
+    /// Whether the terrain pass honours the game's occlusion graph rather than drawing every section
+    /// the frustum contains. See [Settings::terrain_occlusion], which is the switch.
+    pub terrain_occlusion: bool,
+    /// Whether the game's block atlas is sampled from its base mip level only. See
+    /// [`Settings::atlas_base_mip_only`].
+    pub atlas_base_mip_only: bool,
     /// Whether every pipeline the graph builds keeps its back faces. See
     /// [`Settings::terrain_no_cull`], which is the switch - and
     /// `wgpu_mc::render::graph::set_pipeline_diagnostics`, which is what applies it to a pipeline.
@@ -652,6 +709,8 @@ impl Settings {
             pix_capture: self.pix_capture.value,
             section_timing: self.section_timing.value,
             terrain_no_cull: self.terrain_no_cull.value,
+            terrain_occlusion: self.terrain_occlusion.value,
+            atlas_base_mip_only: self.atlas_base_mip_only.value,
             terrain_greater_depth: self.terrain_greater_depth.value,
         }
     }
@@ -1064,6 +1123,8 @@ mod tests {
             "gpu_timestamps",
             "pix_capture",
             "terrain_no_cull",
+            "terrain_occlusion",
+            "atlas_base_mip_only",
             "terrain_greater_depth",
         ];
 
@@ -1131,7 +1192,7 @@ mod tests {
 
     /// Every setting's name, which is the same in both documents. Kept as a list because the two
     /// documents' own key order is not readable through `serde_json::Value` - see the test above.
-    const NAME_LIST: [&str; 20] = [
+    const NAME_LIST: [&str; 22] = [
         "backend",
         "vsync",
         "terrain",
@@ -1151,6 +1212,8 @@ mod tests {
         "upload_report",
         "dump_frames",
         "terrain_no_cull",
+        "terrain_occlusion",
+        "atlas_base_mip_only",
         "terrain_greater_depth",
     ];
 
@@ -1213,6 +1276,12 @@ mod tests {
     /// The section feed, pulled in for the one invariant in it that is a hole in the world when broken.
     const RUST_CHUNK_BAKE: &str =
         include_str!("../../../neoforge/src/main/kotlin/dev/birb/wgpu/chunk/RustChunkBake.kt");
+
+    /// The hook that starts a bake, pulled in because *what it records* is the same invariant from the
+    /// other side: it must not write the answer a second time. See the assertions that use it.
+    const RUST_CHUNK_BAKE_MIXIN: &str = include_str!(
+        "../../../neoforge/src/main/java/dev/birb/wgpu/mixin/chunk/RustChunkBakeMixin.java"
+    );
 
     /// **Every place this side forgets what it told Rust, it forgets that Rust is drawing it too.**
     ///
@@ -1354,6 +1423,64 @@ mod tests {
         assert!(
             source.contains("REDIRTY_PER_FRAME"),
             "the requests are budgeted per frame"
+        );
+
+        // **A refusal is queued whatever the arena's state**, which is the gate that produced a hole
+        // after everything else had been fixed.
+        assert!(
+            source.contains("if (pendingRedirty.size < PENDING_REDIRTY_LIMIT) {"),
+            "the refusal drain must queue the rebuild without asking whether the arena can grow. It used \
+             to read `if (canGrow && ...)`, and a key dropped there had already been removed from \
+             `rustHas` - so Minecraft's mesh was no longer suppressed *and* nothing asked for that \
+             section to be rebuilt: the same 16x16x16 hole by another route. The rebuild converges even \
+             with a full arena, because the next bake is refused too and answers \"not taken\", which \
+             leaves Minecraft's own mesh in place."
+        );
+
+        let forget = source
+            .split("fun forgetRefused()")
+            .nth(1)
+            .expect("`forgetRefused` is still there");
+        let before_queue = forget
+            .split("pendingRedirty.add(key)")
+            .next()
+            .expect("the refusal still queues a rebuild");
+
+        assert!(
+            !before_queue.contains("canGrow &&"),
+            "`canGrow` is gating the queue again - see the note above for what that cost"
+        );
+
+        // **`bake`'s answer has to be the decision, not "it did not throw".**
+        //
+        // The mixin that drops Minecraft's mesh is handed this answer, and every refusal inside
+        // `bakeNow` is a plain return: a full bake queue, a rejected payload, an arena at its limit.
+        // While the answer was `true` for all of them, a section Rust refused was dropped from
+        // Minecraft's mesh too - drawn by neither side, which is the hole.
+        assert!(
+            source.contains("tookThisSection.get()"),
+            "`bake` must read back the decision recorded inside `bakeNow`, not report that the call \
+             returned normally"
+        );
+
+        // And the capacity check itself, which is the part only the native side can answer.
+        assert!(
+            source.contains("noteTookSection(!firstLook[0] && !atCapacity())"),
+            "the decision to drop Minecraft's mesh has to account for an arena that cannot grow: at the \
+             device's buffer limit a refusal is permanent, so the game keeps its mesh for those sections"
+        );
+
+        assert!(
+            source.contains("fun atCapacity()"),
+            "and that decision needs the capacity answer from the native side, which is `atCapacity`"
+        );
+
+        // The mixin must not write the answer a second time - a coarser one would overwrite it.
+        let mixin = code_of(RUST_CHUNK_BAKE_MIXIN);
+        assert!(
+            !mixin.contains("noteTookSection"),
+            "the mixin writes `tookThisSection` as well, which overwrites the capacity check with \
+             `bake`'s coarser answer. `bake` records it; the mixin only calls `bake`."
         );
     }
 

@@ -59,16 +59,27 @@ struct FogEnvironment {
 struct VertexResult {
     @builtin(position) pos: vec4<f32>,
     @location(0) tex_coords: vec2<f32>,
-    @location(1) tex_coords2: vec2<f32>,
-    @location(2) blend: f32,
-    @location(3) normal: vec3<f32>,
-    @location(4) world_pos: vec3<f32>,
-    // Nothing assigns or reads this one; the two integer varyings below carry what the fragment stage
-    // needs. It still has to be `flat`: an integer varying is not interpolated, and naga 30 stopped
-    // assuming that on the shader's behalf, so a bare one fails validation - and a shader that fails
-    // validation is the cut-out layer of the world not drawn.
-    @interpolate(flat) @location(6) section: u32,
-    @location(7) ao: f32,
+    // **There is no `location(1)` or `location(2)` here, and that is the answer to "fill in
+    // `tex_coords2` and `blend`" rather than a gap.** This struct used to declare both and the vertex
+    // stage used to write `vec2(0.0, 0.0)` and `0.0` into them, which is a varying that is written and
+    // never read - so the compiler removes it and the value never means anything. What they came from is
+    // the reason they could not be filled in: they are leftovers from the GLSL renderer this one
+    // replaced, where `texCoord2` was a second UV set and `blend` chose between the two, and they have
+    // no source in the vertex format this side bakes.
+    //
+    // `Vertex` is `position`, one `uv` pair, a colour, ten animated-texture bits and a lightmap byte -
+    // see `render::pipeline`, which is where the thirteen bytes are packed. There is no
+    // second UV pair for `tex_coords2` to carry, and no blend weight for `blend` to be. The game's own
+    // terrain shader is the same shape and has neither:
+    //
+    //     in vec3 Position; in vec4 Color; in vec2 UV0; in ivec2 UV2;
+    //
+    // - and its fragment stage reads `texCoord0` and `vertexColor` and nothing else. The lightmap that
+    // `blend` would have selected against is fetched in the vertex stage here, into `light_color` below.
+    //
+    // So the two are gone rather than kept at zero: a varying that is always zero reads as "something
+    // should be filling this in", and the next person to look at it has to do this same search to find
+    // out that nothing should.
     @interpolate(flat) @location(12) ao1: f32,
     @interpolate(flat) @location(13) ao2: f32,
     @interpolate(flat) @location(14) ao3: f32,
@@ -81,7 +92,6 @@ struct VertexResult {
     // How far this vertex is from the camera, the two ways the game measures it for fog. Interpolated,
     // as the game's own varyings are: the fog is applied per pixel from a per-vertex distance.
     @location(20) fog_distances: vec2<f32>,
-    @interpolate(flat) @location(17) int: u32,
     @location(18) color: vec4<f32>,
     // Which atlas `tex_coords` is in: bit 0 of the ten the vertex format reserves for an animated
     // texture. Flat, because it is a property of the face and not of the corner: every vertex of a
@@ -154,7 +164,6 @@ fn vert(
     var light_uv = uv[vi & 3];
 
     var vr: VertexResult;
-    vr.int = vi & 3;
     vr.ao1 = v1_ao;
     vr.ao2 = v2_ao;
     vr.ao3 = v3_ao;
@@ -177,10 +186,11 @@ fn vert(
 
     vr.color = vec4(f32(r) * 0.003921568627451, f32(g) * 0.003921568627451, f32(b) * 0.003921568627451, 1.0);
 
-    // This vertex's own occlusion count, unblended. The fragment stage uses the four corner counts
-    // instead (`ao1..ao4`, blended by where in the quad the pixel is) - this one is the single value
-    // the quad's first vertex carries, kept because the varying exists, not because anything reads it.
-    var ao: f32 = f32((v4 >> 8u) & 0xff);
+    // The quad's first vertex carries a single occlusion count in the same byte the four corners come
+    // from, and **it is not read**: the fragment stage blends the four corner counts instead
+    // (`ao1..ao4`, by where in the quad the pixel is), which is the whole of the ambient occlusion.
+    // There was a varying for it, and the varying was written and never read, so both are gone - see
+    // the note on `VertexResult` for why an unused varying is worth removing rather than zeroing.
 
     // Which atlas these coordinates are in, and therefore what one step of the sixteen bits the
     // vertex holds them in is worth.
@@ -228,10 +238,7 @@ fn vert(
     vr.pos.y = -vr.pos.y;
 
     vr.tex_coords = vec2<f32>(u, v);
-    vr.tex_coords2 = vec2(0.0, 0.0);
     vr.game_atlas = game_atlas;
-    vr.world_pos = world_pos;
-    vr.ao = ao;
 
     // The lighting, fetched the way the game's own terrain shader fetches it: one lightmap texel per
     // vertex, and the rasterizer interpolates the *colour*, which is what `vertexColor = Color *
@@ -271,8 +278,6 @@ fn vert(
     var spherical = length(camera_relative);
     var cylindrical = max(length(camera_relative.xz), abs(camera_relative.y));
     vr.fog_distances = vec2<f32>(spherical, cylindrical);
-
-    vr.blend = 0.0;
 
     return vr;
 }

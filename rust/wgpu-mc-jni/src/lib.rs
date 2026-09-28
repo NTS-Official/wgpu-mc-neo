@@ -1035,6 +1035,27 @@ pub fn queuedBakes(_env: JNIEnv, _class: JClass) -> jint {
     QUEUED_BAKES.load(Ordering::Relaxed) as jint
 }
 
+/// **How many sections the arena is actually drawing**, which is the number the JVM's `rustHas` is a
+/// claim about.
+///
+/// This exists to close a hole that three rounds of reasoning failed to close: `rustHas` means "this
+/// side told Rust about the section", and the JVM uses it to suppress Minecraft's own mesh - but a
+/// section can be told *and* never published, and then neither renderer draws it. Nothing compared the
+/// claim with the fact, so nothing could say whether a hole was one.
+///
+/// The comparison is a count rather than a list because it is read once a second: `rustHas` also holds
+/// sections the arena has legitimately trimmed (the game's bookkeeping is wider than this side's view),
+/// so the two are not expected to be equal - what matters is whether the gap *moves*, and a report line
+/// with both numbers on it says that.
+#[jni_fn("dev.birb.wgpu.rust.WgpuNative")]
+pub fn arenaSections(_env: JNIEnv, _class: JClass) -> jint {
+    RENDERER
+        .get()
+        .and_then(|wm| wm.scene())
+        .map(|scene| scene.section_storage.read().len() as jint)
+        .unwrap_or(0)
+}
+
 /// The ceiling [`queuedBakes`] is measured against - [`MAX_QUEUED_BAKES`], so the two sides agree about
 /// what "backed up" means without either writing the other's number down.
 #[jni_fn("dev.birb.wgpu.rust.WgpuNative")]

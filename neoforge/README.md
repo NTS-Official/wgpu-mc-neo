@@ -3839,6 +3839,274 @@ mirror) and the same fluid under a solid roof bakes six (no mirror, because ther
 spoil). A back face that is always drawn is two draws and two blends for every lake in the world, and one
 that is never drawn is the report above.
 
+### `tex_coords2` and `blend` were hardcoded to zero because nothing was ever going to fill them
+
+The vertex stage wrote `vec2(0.0, 0.0)` and `0.0` into two varyings the fragment stage never mentioned.
+Read as source that is a gap - "these are stubbed out, something should be filling them in" - and the
+search for what is short, because there is nothing:
+
+**They are leftovers from the GLSL renderer this one replaced**, where `texCoord2` was a second UV set and
+`blend` chose between the two. The vertex format this side bakes has no source for either. `Vertex` is
+`position`, one `uv` pair, a colour, ten animated-texture bits and a lightmap byte - thirteen bytes, packed
+in `render::pipeline` - and the game's own terrain shader is the same shape:
+
+```glsl
+in vec3 Position; in vec4 Color; in vec2 UV0; in ivec2 UV2;
+```
+
+with a fragment stage that reads `texCoord0` and `vertexColor` and nothing else. So they are removed
+rather than filled in: a varying that is always zero reads as "something should be filling this in", and
+the next person has to do this same search to find out that nothing should.
+
+**The same search found four more**, which is why it is worth doing as a test rather than by eye:
+`world_pos`, `section`, `ao` and `int` were all declared as varyings and never read by the fragment stage
+either - `section` was not even *assigned* - and the local `ao` the quad's first vertex carried existed
+only to feed the varying that nothing read. All gone. `world_pos` stays as a local, because the vertex
+stage uses it for the position and the fog distances.
+
+**And the class is now checked.** `dead_varying_tests` parses the shader, walks the fragment entry point's
+argument, and reports every location-bearing struct member the function never touches - a read of `in.ao3`
+is an `AccessIndex` off the argument handle, so the set of fields reached that way is the set that mean
+something. It is not a blanket "every varying is read": a member may be unread *on purpose*, and the test
+accepts that only when the comment directly above the declaration says so, in the words "unused", "never
+read", "nothing reads", "not read" or "does not read". Satisfying it that way means somebody wrote down
+why, which is the whole point.
+
+Two rounds of getting that check wrong are worth recording, because both are the shape this kind of test
+fails in. The first version searched for the member's **name** and looked a fixed distance back - which
+finds the name inside the comment explaining some *other* member, and then a window wide enough to cover
+anything says "yes" to everything. The second anchored on the declaration correctly but still measured a
+fixed window, so it picked up prose from before the comment it wanted. It is line-based now: the anchor is
+the `@location(N) name:` line, and the window is the contiguous comment block directly above it. The
+detector also has a fixture test - the branching shape is fed to it and must be reported - because a test
+that asserts "nothing was found" cannot be told from one whose detector never finds anything.
+
+### The game animates every mip level of its atlas, so there is no moving level to clamp to
+
+The idea was to clamp `lod_max_clamp` on `@sampler_mc_block_atlas` down to the mip level the game is
+actually animating - the reasoning being that only level 0 moves and the levels above it are stale
+pictures of an old frame. **The reasoning does not hold, and the source says so plainly:**
+
+```java
+private void uploadAnimationFrames() {
+    if (this.animatedTexturesStates.stream().anyMatch(SpriteContents.AnimationState::needsToDraw)) {
+        for (int level = 0; level <= this.maxMipLevel; level++) {
+            try (RenderPass renderPass = RenderSystem.getDevice()
+                    .createCommandEncoder()
+                    .createRenderPass(() -> "Animate " + this.location, this.mipViews[level], OptionalInt.empty())) {
+                for (SpriteContents.AnimationState animationState : this.animatedTexturesStates) {
+                    if (animationState.needsToDraw()) {
+                        animationState.drawToAtlas(renderPass, animationState.getDrawUbo(level));
+```
+
+The loop walks **the whole chain**, one render pass per level into that level's own view, and
+`getDrawUbo(level)` is `spriteUbosByMip[level]` - one uniform buffer per entry of `byMipLevel`. Every
+level gets the current frame in the same call. No level is staler than any other, so a clamp to "the
+level that moves" would clamp to all of them, which is no clamp at all.
+
+The chain reaches us intact, which is why the question was worth checking rather than assuming: a sprite
+uploads each level through `writeToTexture(..., mip_level, ...)`, our native side passes that
+`mip_level` to `Queue::write_texture`, the animate pass targets `mipViews[level]`, and
+`createTextureView` resolves `base_mip_level`. Any one of those dropping the level would have made the
+premise true and produced exactly this symptom - they do not.
+
+What a clamp to 0.0 *would* do is throw the chain away for this atlas: a distant lump of lava would
+resolve one texel of a 16x16 sprite per pixel, which is the aliasing the chain exists to remove. That is
+more temporal noise at distance, not less, so the clamp is off by default.
+
+It exists anyway, as **`Atlas sampled from its base mip only`**, because the case for it is a picture
+rather than an argument and the two runs are cheap to compare. Applying it rebuilds the graph, since a
+sampler is built with the pipelines.
+
+### `bake` answered "did it not throw", and that answer dropped Minecraft's mesh
+
+The hook that starts a bake records whether Rust took the section, and that record is what
+`SectionCompilerMixin` reads to decide whether Minecraft's mesh for the same section is geometry nobody
+will read. The hook was:
+
+```java
+RustChunkBake.noteTookSection(RustChunkBake.bake(this.region));
+```
+
+and `bake` ended in:
+
+```kotlin
+return try {
+    bakeNow(region)
+    true                      // <- "it returned normally"
+} catch (throwable: Throwable) {
+    false
+}
+```
+
+**Every refusal inside `bakeNow` is a plain return**, so every one of them answered `true`: the bake
+queue was full and the task dropped, the payload rejected, the arena out of room. The section was then
+recorded as Rust's, `SectionCompilerMixin` dropped Minecraft's mesh for it, and Rust had not taken it -
+**drawn by neither side, which is the 16x16x16 hole.** It is the failure the mixin's own doc comment warns
+about, produced by the value it was being handed.
+
+Two things were wrong and both are fixed:
+
+- **`bake` reads back the decision** instead of inventing one: `bakeNow` records it where the tables it
+  depends on are, and `bake` returns `tookThisSection.get()`.
+- **The mixin no longer writes it a second time.** It was calling `noteTookSection(bake(region))`, which
+  *overwrote* the finer answer `bakeNow` had already recorded - so the capacity check below was being
+  clobbered by the coarser one on every rebuild.
+
+**And the decision now accounts for an arena that cannot grow**: `noteTookSection(!firstLook[0] &&
+!atCapacity())`. At the device's `max_buffer_size` a refusal is permanent, and a section this side will
+never be able to draw is one the game has to. `atCapacity` is a new native query, set in
+`grow_arena_if_asked` at the only place that knows the request was clamped - and it is a fact the JVM
+cannot work out from the outside, because the mesh is dropped on a chunk-build thread *before* the bake is
+queued, so the refusal arrives after the geometry is already gone.
+
+This is also the answer to "the arena only holds sections Minecraft re-meshed, so freshly explored terrain
+has holes": the arena is fed by the rebuild, the rebuild is what suppresses the mesh, and the two were
+joined by an answer that was true for refusals - so any section whose bake was refused was suppressed and
+never drawn.
+
+### What the hole is *not*, measured
+
+Three fixes went in for this and all three were wrong, so the negative results are worth more than the
+patches were. Each was a plausible mechanism rather than a measurement, and each was reported as the
+answer.
+
+**Not the occlusion list.** `LevelRenderer.visibleSections` is a snapshot - it is refilled by
+`applyFrustum`, which runs only when the camera has turned by more than two degrees or the occlusion graph
+reports a change - and the terrain gather treated it as a whitelist. That is a real defect and it was
+changed, but turning occlusion culling off does not fill the holes, which settles it.
+
+**Not the refusal list's cap.** The list of refused positions was capped at 4096 and dropped what it could
+not hold, which is a section never re-offered and therefore a permanent hole. Also real, also fixed, and
+also not this.
+
+**Not the refusal queue's gate.** A refusal whose section the arena could not grow for was dropped rather
+than queued, after `rustHas` had already been cleared - the same hole by another route. Real, fixed, and
+not this.
+
+**What the measurement says instead**, from a run with the logging switch on:
+
+```text
+wgpu: this side claims Rust has 9619 section(s); the arena is drawing 2593, with 0 awaiting a rebuild
+      and 0 bake(s) queued
+```
+
+**Zero refusals, zero pending rebuilds, zero empty bakes** out of 2,800 bake lines. The arena is not full,
+nothing is waiting, and every bake that ran produced geometry. So the hole is not in the refusal path, not
+in the arena's capacity, and not in the mesher - and the three fixes above, while each a real bug, were
+answers to questions nobody had asked.
+
+The report line is new, and it exists because nothing compared the two halves of the claim before it:
+`rustHas` is this side saying "Rust has this section", and the mixin that drops Minecraft's mesh reads that
+same claim. A section that was told and never published is drawn by neither renderer, and the only way to
+see it is to put the claim and the fact on one line. `arenaSections` is the native side of it.
+
+**Where the evidence points now, and why it is not yet a fix.** The one reproduction detail that
+discriminates: a hole that never fills while the player stands still, and fills the moment anything dirties
+it or a neighbour. That is a section which is *in* the arena and *not drawn* - the gather skips a section
+whose layers are all empty (`if !any { continue }`), and Rust's own mesh is suppressed for it, so the two
+conditions together are a hole with nothing in the log to mark it. What is not known is which of the two
+clauses is true for the sections in question: whether the arena holds no layer, or the gather is not
+reaching it. Answering that needs the position of a hole, which is what the next diagnostic has to carry.
+
+### The fix for the hole had the hole in it, behind a different gate
+
+The refusal queue was added because a refusal dropped past the per-tick budget was a 16x16x16 hole
+nothing would fill. It worked, and the holes stayed - and the reason is a single `&&` in the drain that
+feeds it:
+
+```kotlin
+if (canGrow && pendingRedirty.size < PENDING_REDIRTY_LIMIT) {
+    pendingRedirty.add(key)
+```
+
+`canGrow` is `terrainArenaCanGrow`: false once the arena is at the device's own buffer limit. The
+argument for it was that a rebuild for a section the arena cannot hold is a spin - the arena doubles on a
+refusal and stops, so past that point a rebuild per refusal is work that cannot converge.
+
+**That argument is right about the spin and wrong about the alternative**, and the two lines above the
+`if` are what make it wrong:
+
+```kotlin
+sent.remove(key)
+rustHas.remove(key)
+```
+
+The key has already been taken out of `rustHas`, so Minecraft's mesh for that section stops being
+suppressed - but nothing asks for it to be *rebuilt* either. A mesh that is neither drawn by Rust nor
+rebuilt by the game is the same hole by another route, and it is permanent, because the only thing that
+would have re-offered the section was the rebuild that was never requested. It is the exact bug the queue
+was written to fix, reintroduced by the gate that was meant to keep the queue cheap.
+
+The rebuild is asked for now, whatever the arena's state - and it **converges with a full arena**, because
+of what the rebuild does. It bakes, the bake fails to allocate, the refusal clears `rustHas` again, and the
+bake answers *not taken*: `noteTookSection(false)` leaves Minecraft's own mesh in place, so the section
+ends up drawn by the game, which is the correct answer for a section this side has no room for. The cost
+is one rebuild per refused section, and the rate is the budget's in `redirtyDue`, which is where a rate
+belongs.
+
+`canGrow` still gets read, for the log line rather than for a decision:
+
+```
+the section arena refused N section(s) (it can/cannot grow); forgetting them, ... queueing M of those
+```
+
+**What this cost to find is worth recording.** Two earlier attempts fixed real bugs that were not this
+one - a capped refusal list, and a backoff that could livelock - on the strength of a plausible mechanism
+rather than a measurement, and each was reported as the answer. The measurement that settled it came from
+two questions instead: whether the same holes appear in vanilla (`no - turning the terrain takeover off
+fills them in`), and whether the game's own mesh covers them when the takeover is off (`yes`). That pair
+says the section is in neither renderer, which points at the publish path and not at culling - and the
+occlusion-culling change, which looked like the obvious suspect, was innocent.
+
+### The occlusion list is a snapshot, and the terrain pass treated it as a fact
+
+`LevelRenderer` fills `visibleSections` in exactly one place:
+
+```java
+private void applyFrustum(Frustum frustum) {
+    this.clearVisibleSections();
+    this.sectionOcclusionGraph.addSectionsInFrustum(frustum, this.visibleSections, this.nearbyVisibleSections);
+}
+```
+
+and `applyFrustum` is called from one place, behind a condition:
+
+```java
+if (this.sectionOcclusionGraph.consumeFrustumUpdate() || camRotX != this.prevCamRotX || camRotY != this.prevCamRotY) {
+    this.applyFrustum(offsetFrustum(frustum));
+}
+```
+
+`camRotX` and `camRotY` are `floor(xRot / 2)` - **two degrees**. So the list is refilled when the camera
+has turned by more than two degrees, or when the occlusion graph says something changed, and **between
+those moments it is a snapshot of whenever the last refill happened**. That is fine for the game, which
+uses it to decide what to draw *this* frame from meshes that already exist. It is not fine as a whitelist
+for a renderer that owns sections the list has not caught up with.
+
+The terrain pass used it as one. `SectionVisibility::OutOfSight` skipped the section outright, and the
+section it skipped is one the game's own mesh has been suppressed for - `rustHas` marks a section as Rust's
+the moment the bake is committed, and `SectionCompilerMixin` drops Minecraft's mesh for it. So:
+
+- Rust has baked the section and skipped it, because the stale list did not name it;
+- Minecraft is not drawing it, because Rust was told about it;
+- and a section neither side draws is a 16x16x16 hole, in the shape of the section and nothing else.
+
+It matches the report exactly, which is why this is the answer rather than another candidate: the holes
+appear while **unrendered terrain is streaming in** - new sections are exactly the ones the list has not
+caught up with - and "any deliberate rebuild fills them", because a rebuild is the camera turning or the
+graph updating, which is the refill.
+
+**The switch is `Terrain occlusion culling`, on by default, under the terrain heading.** It is not a
+marker file and not a hard-coded decision, because which answer is right depends on the measurement: with
+it on, the frame does less work but every section the list is late for is a hole; with it off, every
+section the frustum contains is drawn and there is nothing to attribute. Turning it off and flying the same
+route is the experiment - if the holes go with it, this is the mechanism, and the fix is to stop treating a
+snapshot as an authority rather than to remove the culling.
+
+With it off, the report's `not named by the game's occlusion graph` count still appears - the gather still
+counts what the list left out - so the two runs are comparable rather than the number simply vanishing.
+
 ### Two ways a refused section became a 16x16x16 hole, and one of them was the fix for the other
 
 The symptom: selecting a large render distance loads a lot of unrendered terrain, and single sections come

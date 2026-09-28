@@ -439,6 +439,20 @@ impl WmRenderer {
         }
 
         let wanted = asked.min(scene.arena_cap_slots);
+
+        // **Whether the request had to be clamped, which is the one place that knows.** A growth that
+        // came back smaller than it asked for is a growth that has run into the device's `max_buffer_size`
+        // - and from there every refusal is permanent, because there is no more arena to be had. The JVM
+        // needs that fact to stop dropping Minecraft's mesh for sections this side cannot draw; see
+        // `SectionStorage::at_capacity`.
+        //
+        // Cleared rather than only ever set: a request that fits means there is room again, which happens
+        // when a smaller world is loaded or the render distance comes down.
+        scene
+            .section_storage
+            .write()
+            .set_at_capacity(wanted < asked);
+
         let old = scene.chunk_buffer.load_full();
 
         // The pool first: it is the thing that decides whether this helped, and a buffer without the

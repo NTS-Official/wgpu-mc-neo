@@ -152,6 +152,49 @@ pub fn terrain_sections_drawn() -> u64 {
 /// change leaves the pipelines already in the graph stale: [`set_pipeline_diagnostics`] reports
 /// that, and the caller rebuilds them.
 static TERRAIN_NO_CULL: AtomicBool = AtomicBool::new(false);
+
+/// Whether the terrain pass honours the game's occlusion list or draws every section the frustum holds.
+///
+/// Read per gather rather than baked into a pipeline, because it decides an `if` and not a pipeline
+/// state - so unlike [`TERRAIN_NO_CULL`] this one takes effect on the next frame, with nothing rebuilt.
+///
+/// **On is the faster answer and, while the list is right, the correct one.** It is a switch because the
+/// list is a *snapshot*: `LevelRenderer.applyFrustum` is the only thing that refills it, and it runs only
+/// when the camera has turned more than two degrees or the occlusion graph reports a change. A section
+/// this side has baked and the game's list has not caught up with is skipped here while the game's own
+/// mesh for it stays suppressed - and a section neither side draws is a 16x16x16 hole. See
+/// `Settings::terrain_occlusion`.
+static TERRAIN_OCCLUSION: AtomicBool = AtomicBool::new(true);
+
+/// Sets whether the gather honours the game's occlusion list. See [`TERRAIN_OCCLUSION`].
+pub fn set_terrain_occlusion(honour: bool) {
+    TERRAIN_OCCLUSION.store(honour, Ordering::Relaxed);
+}
+
+/// Whether the game's block atlas is sampled from its base mip level only.
+///
+/// **Off, and the argument for leaving it off is in the sampler's own comment** - the game animates
+/// every level of that chain, so there is no stale level for a clamp to avoid, and clamping to 0.0 gives
+/// up the mip chain instead: a distant lump of lava samples one texel of a 16x16 sprite, which is the
+/// aliasing the chain exists to prevent. It is a switch rather than a decision because the case for it
+/// is a picture nobody has measured yet - if the distant animated textures shimmer, this is the one-line
+/// answer to try, and a run with it on against a run with it off says whether it helped.
+///
+/// Read when the sampler is built, so it is applied by rebuilding the graph - see
+/// `wgpu_mc_jni::debug::rebuild_pipelines_if_stale`, which is the same path the occlusion switch's
+/// neighbour takes.
+static ATLAS_BASE_MIP_ONLY: AtomicBool = AtomicBool::new(false);
+
+/// Sets whether the game's block atlas is sampled from its base mip level only. See
+/// [`ATLAS_BASE_MIP_ONLY`].
+pub fn set_atlas_base_mip_only(base_only: bool) {
+    ATLAS_BASE_MIP_ONLY.store(base_only, Ordering::Relaxed);
+}
+
+/// Whether the game's block atlas is sampled from its base mip level only. See [`ATLAS_BASE_MIP_ONLY`].
+pub fn atlas_base_mip_only() -> bool {
+    ATLAS_BASE_MIP_ONLY.load(Ordering::Relaxed)
+}
 static TERRAIN_GREATER_DEPTH: AtomicBool = AtomicBool::new(false);
 
 /// Sets both pipeline-state diagnostics, and says whether either of them changed.
@@ -1039,6 +1082,39 @@ impl RenderGraph {
                     crate::render::atlas::block_atlas_sampler(wgpu::AddressMode::ClampToEdge);
                 descriptor.label = Some("wgpu-mc: the game's block atlas");
 
+                // **No `lod_max_clamp`, and the reason is worth writing down because "clamp it to the
+                // level the game is animating" is the obvious thing to try.**
+                //
+                // The game does not animate one level. `TextureAtlas#uploadAnimationFrames` walks the
+                // whole chain and renders the current frame of every animated sprite into each level in
+                // turn, through that level's own view and that level's own UBO:
+                //
+                //     for (int level = 0; level <= this.maxMipLevel; level++) {
+                //         try (RenderPass pass = ...createRenderPass(() -> "Animate " + this.location,
+                //                                          this.mipViews[level], OptionalInt.empty())) {
+                //             ...
+                //             animationState.drawToAtlas(pass, animationState.getDrawUbo(level));
+                //
+                // `getDrawUbo(level)` is `spriteUbosByMip[level]`, and there is one UBO per entry of
+                // `byMipLevel` - so every level receives the frame, in the same call, and no level is
+                // staler than any other. Clamping to the level that moves would therefore clamp to
+                // *every* level, which is no clamp at all.
+                //
+                // What a clamp to 0.0 would actually do is throw the mip chain away for this atlas:
+                // a distant lump of lava would sample one texel of a 16x16 sprite, which is the
+                // aliasing the chain exists to prevent - more temporal noise at distance, not less.
+                // The two block atlases take the same filters for the same reason; see
+                // `render::atlas::block_atlas_sampler`, which is where that agreement is enforced.
+                //
+                // It is nevertheless reachable, as the `atlas_base_mip_only` switch, because the case
+                // for it is a picture rather than an argument: with the clamp in place the sampler can
+                // only return level 0, so a run comparing the two says whether the shimmer was the
+                // chain or something else.
+                if ATLAS_BASE_MIP_ONLY.load(Ordering::Relaxed) {
+                    descriptor.lod_min_clamp = 0.0;
+                    descriptor.lod_max_clamp = 0.0;
+                }
+
                 descriptor
             }))),
         );
@@ -1593,9 +1669,12 @@ impl RenderGraph {
                     let out = &mut *scratch;
 
                     out.clear();
+                    let honour_occlusion = TERRAIN_OCCLUSION.load(Ordering::Relaxed);
+
                     for (pos, section) in sections_source.iter() {
-                        if Self::section_visibility(visible.as_ref(), pos)
-                            == SectionVisibility::OutOfSight
+                        if honour_occlusion
+                            && Self::section_visibility(visible.as_ref(), pos)
+                                == SectionVisibility::OutOfSight
                         {
                             out_of_sight += 1;
                             continue;
@@ -2987,6 +3066,230 @@ fn frag(in: V) -> @location(0) vec4<f32> {
         assert!(
             detector::samples_inside_branches(&hoisted).is_empty(),
             "hoisting the samples out of the branch is the fix, and it has to read as one"
+        );
+    }
+}
+
+/// **A varying the fragment stage declares and never reads is a varying nobody filled in.**
+///
+/// This is the test for the class of bug that `tex_coords2` and `blend` were: the vertex stage wrote
+/// `vec2(0.0, 0.0)` and `0.0` into them, the fragment stage never mentioned them, and the two facts
+/// together look like a gap - "these are hardcoded, something should be filling them in" - when they are
+/// in fact dead. The compiler removes a varying nothing reads, so the value never reached the GPU and no
+/// picture ever depended on it, but the source reads as though one should.
+///
+/// **It is a detector and not a blanket assertion**, which is the part worth explaining. The terrain
+/// shaders do have other unused varyings on purpose - `normal`, `section`, `ao`, `light_uv` - and they
+/// are documented as unused where they are declared, because the *vertex format* carries them and
+/// dropping them is a different change from dropping these two. A blanket "every declared varying is
+/// read" would fail on those today and be deleted by whoever hit it.
+///
+/// What it asserts instead is that **no varying is silently dead**: every struct member with a location
+/// that the fragment stage never reads must be named in the shader as deliberately unread. The check for
+/// that is `intentionally_unread` below, and it is deliberately dumb - it looks for the member's own
+/// name next to the word, in the text above the struct - so satisfying it means a person wrote down why,
+/// which is the whole point.
+#[cfg(test)]
+mod dead_varying_tests {
+    use crate::wgpu::naga;
+
+    /// Whether the source says, next to this member's declaration, that it is not read.
+    ///
+    /// **Line-based, anchored on the declaration.** Both halves matter:
+    ///
+    ///  - the anchor is the line that declares the member, `@location(N) name:`, and not the first
+    ///    place the member's *name* appears - because a name also appears inside the comment that
+    ///    explains some other member, and a search from there finds a window that happens to cover the
+    ///    wrong declaration;
+    ///  - the window is the comment block directly above that line, and not a fixed number of characters
+    ///    back - because a fixed window runs past the comment it was looking for and picks up whatever
+    ///    prose came before it, which is how the first version of this said "yes" to everything.
+    ///
+    /// It is still not parsing prose: the phrase has to be there, and the person who wrote the member
+    /// has to have written it.
+    fn intentionally_unread(source: &str, member: &str) -> bool {
+        let lines: Vec<&str> = source.lines().collect();
+
+        // The declaration's own line, found by the attribute that opens it.
+        let Some(at) = lines.iter().position(|line| {
+            let trimmed = line.trim_start();
+            (trimmed.starts_with("@location(") || trimmed.starts_with("@builtin("))
+                && trimmed.contains(&format!(") {member}:"))
+        }) else {
+            return false;
+        };
+
+        // And the contiguous comment block directly above it, which is where a reason would be written.
+        let above = lines[..at]
+            .iter()
+            .rev()
+            .take_while(|line| {
+                let trimmed = line.trim_start();
+                trimmed.starts_with("//")
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n")
+            .to_lowercase();
+
+        [
+            "unused",
+            "never read",
+            "nothing reads",
+            "not read",
+            "does not read",
+        ]
+        .iter()
+        .any(|phrase| above.contains(phrase))
+    }
+
+    /// The location-bearing struct members the fragment entry point never reads.
+    fn unread_varyings(source: &str) -> Vec<String> {
+        let module = naga::front::wgsl::parse_str(source).expect("the terrain shader parses");
+
+        let mut unread = Vec::new();
+
+        for entry in &module.entry_points {
+            if entry.stage != naga::ShaderStage::Fragment {
+                continue;
+            }
+
+            for (which_arg, argument) in entry.function.arguments.iter().enumerate() {
+                let naga::TypeInner::Struct { members, .. } = &module.types[argument.ty].inner
+                else {
+                    continue;
+                };
+
+                // Every field of this argument the function touches. A read of `in.ao3` is an
+                // `AccessIndex` off *this* argument handle - the probe this was written from shows
+                // `AccessIndex(base=FunctionArgument(0), idx=field)` for each one - so the set of
+                // indices reached that way is the set of fields that mean something.
+                let mut touched: Vec<usize> = Vec::new();
+
+                for (_, expression) in entry.function.expressions.iter() {
+                    if let naga::Expression::AccessIndex { base, index } = expression
+                        && let Ok(naga::Expression::FunctionArgument(the_arg)) =
+                            entry.function.expressions.try_get(*base)
+                        && *the_arg as usize == which_arg
+                    {
+                        touched.push(*index as usize);
+                    }
+                }
+
+                for (field, member) in members.iter().enumerate() {
+                    if !matches!(member.binding, Some(naga::Binding::Location { .. })) {
+                        // A `@builtin(position)` is not a varying between stages in the same sense.
+                        continue;
+                    }
+
+                    if touched.contains(&field) {
+                        continue;
+                    }
+
+                    unread.push(
+                        member
+                            .name
+                            .clone()
+                            .unwrap_or_else(|| format!("field {field}")),
+                    );
+                }
+            }
+        }
+
+        unread
+    }
+
+    #[test]
+    fn the_terrain_shaders_do_not_carry_a_silently_dead_varying() {
+        for name in ["terrain", "terrain_solid"] {
+            let path = format!(
+                "{}/../../neoforge/src/main/resources/assets/wgpu_mc/shaders/{name}.wgsl",
+                env!("CARGO_MANIFEST_DIR")
+            );
+
+            let source = std::fs::read_to_string(&path)
+                .unwrap_or_else(|err| panic!("{path} is unreadable: {err}"));
+
+            let unexplained: Vec<String> = unread_varyings(&source)
+                .into_iter()
+                .filter(|member| !intentionally_unread(&source, member))
+                .collect();
+
+            assert!(
+                unexplained.is_empty(),
+                "{name}.wgsl declares {} varying(s) its fragment stage never reads and does not say so: \
+                 {unexplained:?}.\n\n\
+                 A varying that is written and never read is one the compiler removes, so nothing depends \
+                 on its value - but the write reads as though something should be filling it in, and the \
+                 next person to look has to search the whole vertex format to find out that nothing \
+                 should. Either drop the varying, or say beside it that it is unread and why.",
+                unexplained.len()
+            );
+        }
+    }
+
+    /// **The detector fires.** A test that asserts "nothing was found" cannot be told from one whose
+    /// detector never finds anything, and this one walks an expression arena looking for accesses to a
+    /// particular argument - exactly the shape that can silently look at the wrong handle.
+    ///
+    /// The fixture is the shape `terrain.wgsl` had: a varying the vertex stage writes and the fragment
+    /// stage never mentions.
+    #[test]
+    fn a_varying_that_is_written_and_never_read_is_reported() {
+        let dead = r#"
+struct VertexResult {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) tex_coords: vec2<f32>,
+    @location(1) tex_coords2: vec2<f32>,
+    @location(2) blend: f32,
+};
+
+@vertex
+fn vert(@builtin(vertex_index) vi: u32) -> VertexResult {
+    var out: VertexResult;
+    out.pos = vec4<f32>(0.0, 0.0, 0.0, 1.0);
+    out.tex_coords = vec2<f32>(1.0, 0.5);
+    out.tex_coords2 = vec2<f32>(0.0, 0.0);
+    out.blend = 0.0;
+    return out;
+}
+
+@fragment
+fn frag(in: VertexResult) -> @location(0) vec4<f32> {
+    return vec4<f32>(in.tex_coords, 0.0, 1.0);
+}
+"#;
+
+        let mut unread = unread_varyings(dead);
+        unread.sort();
+
+        assert_eq!(
+            unread,
+            ["blend", "tex_coords2"],
+            "both are written by the vertex stage and never read by the fragment stage, and the one that \
+             *is* read must not be reported"
+        );
+
+        // And the other half of the detector: naming the reason is what makes it acceptable, which is
+        // what the escape hatch is for and therefore what has to work. The comment has to be *directly*
+        // above the declaration - that is the window - and one member at a time, so `blend` is still
+        // reported while `tex_coords2` is not.
+        let explained = dead.replace(
+            "    @location(1) tex_coords2: vec2<f32>,",
+            "    // Unused: the format reserves the slot and nothing reads it.\n    @location(1) tex_coords2: vec2<f32>,",
+        );
+
+        assert_ne!(explained, dead, "the fixture did not change");
+
+        let unexplained: Vec<String> = unread_varyings(&explained)
+            .into_iter()
+            .filter(|member| !intentionally_unread(&explained, member))
+            .collect();
+
+        assert_eq!(
+            unexplained,
+            ["blend"],
+            "`tex_coords2` now says it is unused and `blend` still does not, so exactly one is left"
         );
     }
 }
