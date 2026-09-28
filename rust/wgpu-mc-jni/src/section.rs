@@ -647,6 +647,77 @@ impl BlockStateProvider for CachedBlockstateProvider {
 }
 
 #[cfg(test)]
+mod queue_footprint_tests {
+    use super::*;
+    use crate::MAX_QUEUED_BAKES;
+
+    /// **What one queued bake actually holds**, which is the number `MAX_QUEUED_BAKES` is a bound on.
+    ///
+    /// The comment beside that constant said "each queued bake owns 27 sections' worth of palettes,
+    /// storages and light layers, which is a few hundred kilobytes" - and that is not what the type
+    /// does. A bake is handed `Arc`s from the section cache (`SectionWorld::blocks`, which is
+    /// `get(..).cloned()`, a refcount bump), so what it *owns* is 27 pointers for the blocks and 27 for
+    /// the light. The palettes and storages are shared with the cache and with every other bake that
+    /// wants the same neighbour, and they are freed when the last of those lets go.
+    ///
+    /// This test is the arithmetic written down rather than estimated: the size of the struct, and what
+    /// a full queue of them costs. It is here so that the next person to think about this constant has
+    /// the measurement instead of a plausible sentence.
+    #[test]
+    fn a_queued_bake_holds_pointers_and_not_sections() {
+        let unit = size_of::<CachedBlockstateProvider>();
+
+        // 27 `Option<Arc<..>>` for the blocks, 27 for the light, and the air key. Each `Option<Arc>` is
+        // one pointer: `Arc` is non-null, so the niche makes the `Option` free.
+        let pointers = 2 * SECTIONS * size_of::<Option<Arc<SectionBlocks>>>();
+        assert_eq!(
+            size_of::<Option<Arc<SectionLight>>>(),
+            size_of::<Option<Arc<SectionBlocks>>>(),
+            "the two arrays are the same shape"
+        );
+
+        assert!(
+            unit >= pointers && unit <= pointers + 32,
+            "the provider is {unit} bytes, and {pointers} of those are the two pointer arrays plus at \
+             most a few bytes of padding and the air key"
+        );
+
+        // The light of one section is the thing that would dominate if it were owned: two 2048-byte
+        // nibble arrays. It is not owned, and this is the size that says so.
+        assert_eq!(
+            size_of::<SectionLight>(),
+            2 * size_of::<Box<[u8]>>(),
+            "a light layer is two boxed slices, so a `SectionLight` is two fat pointers"
+        );
+
+        println!(
+            "one queued bake is {unit} bytes; a full queue of {MAX_QUEUED_BAKES} is {} bytes",
+            unit * MAX_QUEUED_BAKES
+        );
+
+        // **And what one of those pointers points at**, which is the other half of the question: the
+        // flattening idea is to replace the pointers with a per-bake copy of the neighbourhood's cells,
+        // and this is what it would be copying. A section is 4096 cells; at four bytes a cell - a key
+        // and a light nibble pair, before any of the flags a mesher also asks for - one neighbour is
+        // twice what all 54 pointers cost, and there are 26 of them.
+        let section_cells = 16 * 16 * 16;
+        let flattened_neighbourhood = 26 * section_cells * 4;
+
+        assert!(
+            flattened_neighbourhood > 26 * unit,
+            "a flattened neighbourhood of {flattened_neighbourhood} bytes is not cheaper than the 26 \
+             shared pointers it would replace ({unit} bytes for the whole provider)"
+        );
+
+        println!(
+            "flattening 26 neighbours at 4 bytes a cell would be {flattened_neighbourhood} bytes per \
+             bake, {} times the pointers it replaces",
+            flattened_neighbourhood / unit
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

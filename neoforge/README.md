@@ -3839,6 +3839,116 @@ mirror) and the same fluid under a solid roof bakes six (no mirror, because ther
 spoil). A back face that is always drawn is two draws and two blends for every lake in the world, and one
 that is never drawn is the report above.
 
+### Two ways a refused section became a 16x16x16 hole, and one of them was the fix for the other
+
+The symptom: selecting a large render distance loads a lot of unrendered terrain, and single sections come
+out completely missing - a square hole you can see the ground through, which any deliberate rebuild fills.
+That last part is the diagnosis: the section is not lost, it is *not being offered*, and the offer only
+happens when something else dirties it.
+
+A refusal is the one thing that leaves a section undrawn, because it is the one thing that happens after
+both sides have agreed Rust owns it. `sent` records the section, `rustHas` suppresses Minecraft's own mesh
+for it, the bake happens, and then the arena has no room - so nothing draws it. The refusal channel exists
+to undo that, and it lost entries in two separate places.
+
+**One: the list of refused positions had a cap and dropped what it could not hold.**
+
+```rust
+if self.refused_positions.len() < REFUSED_LIMIT {   // 4096
+    self.refused_positions.push(pos);
+} else {
+    REFUSED_DROPPED.fetch_add(1, Relaxed);          // counted, then forgotten
+}
+```
+
+Past 4096 refusals between two ticks the position was gone: never handed to the JVM, so the JVM kept its
+`sent` record, so nothing offered the section again, and `rustHas` kept Minecraft's mesh suppressed. A
+large render distance is exactly the state that produces thousands of refusals at once, which is why this
+is the test that found it.
+
+The cap is not raised - it is **gone, because there was nothing to cap**. A refusal leaves its section in
+the storage (that is the documented point of `allocate` returning `None`), so the storage is already the
+set of sections waiting for room. The positions live in a `HashSet` alongside it now, bounded by the arena
+itself, and `insert` clears the mark because that is the call that publishes. The only way a refusal is
+still lost is a level change, which clears the arena it described - and that is not a hole, because the
+world it belonged to is gone.
+
+**Two: the backoff added to stop a rebuild storm could livelock.**
+
+The refusal drain asks the game to rebuild, and the rebuild becomes an offer, which reserves a bake slot.
+So it backs off while the bake queue is deep. The first version of that backoff was:
+
+```kotlin
+if (backedUp()) { return 0 }
+```
+
+and the queue it protects is fed by **nothing else** - so "the pool is full, therefore ask for nothing" and
+"nothing finishes, therefore the pool stays full" is a livelock, and the sections in that queue are holes
+for the session. It is the exact failure the queue was added to fix, reintroduced one function below it.
+
+The backoff shrinks the budget instead of stopping the drain:
+
+```kotlin
+val budget = if (backedUp()) 1 else REDIRTY_PER_FRAME
+```
+
+One a frame is a trickle rather than a stop: sixty asks a second against a pool of a few hundred slots,
+slow enough that it cannot be the storm the backoff exists for, and non-zero, so the pool is always being
+given work that can finish and make room. The test pins the shape, not just the string - it splits
+`redirtyDue` and fails if `backedUp()` is consulted anywhere before the budget is computed, because that
+is the early return waiting to happen again.
+
+### A refused section was dropped by the drain that was supposed to rescue it
+
+A refusal is the one thing that leaves a section permanently undrawn, and the path that handles it had a
+hole in the middle. When the arena has no room for a baked section, the native side reports the position
+(`SectionStorage::refused`, a `mem::take` - **handed over exactly once**), and this side has to do two
+things: drop the section's record from `sent`, so the next rebuild of it carries its blocks again, and
+then *ask the game for that rebuild*, because a rebuild only carries what changed and the rebuild is the
+thing that never comes on its own.
+
+The second half was already there and was throttled three ways - but it marked at most
+`REDIRTY_PER_TICK` of a batch dirty and **dropped the rest**. And a dropped one was not merely delayed:
+its `sent` record had already been removed and the refusal had already been consumed, so nothing would
+ever offer that section again. It stayed a hole for the session, with no log line and nothing to look at.
+
+So the drain remembers instead of discarding. Refused keys go into a `LinkedHashSet` (`RustChunkBake`),
+which is the de-duplication as well as the queue - a section refused twice before it was retried is one
+rebuild and not two - and `redirtyDue` spends a small budget of them **per frame**:
+
+- **`REDIRTY_PER_FRAME` a frame**, because a burst of rebuilds for sections whose blocks have not changed
+  is frame time the player pays for. What is skipped is still in the queue;
+- **`setSectionDirty`, never `setSectionDirtyWithNeighbors`.** The refusal was for one section; the
+  neighbours variant drags its 26 neighbours into the rebuild queue, which turns one refusal into 27
+  rebuilds - and none of those neighbours was refused, so each of their rebuilds offers a payload and
+  reserves a bake slot for nothing;
+- **and `backedUp()`: no requests while the bake pool is behind.** This is the one that matters when the
+  arena is small, and it is the storm the design has to avoid - marking sections dirty makes Minecraft
+  offer them, every offer applies a 27-section payload and reserves a bake slot, and a full queue drops
+  the offer. Without the backoff that loop runs at whatever rate the frames do: *queue full, mark dirty,
+  offer again, still full*. `queuedBakes` and `maxQueuedBakes` come from the native side so the two sides
+  agree about what "backed up" means rather than one writing down the other's constant, and the threshold
+  is two thirds - below that the pool is working and there is room to feed it.
+
+**Per frame, not per tick**, for the two things that throttle it: the budget it spends and the pool it
+backs off from are both drained by frames. A tick is 50 ms, and fifty milliseconds of rebuild requests
+arriving in one lump is the spike the per-frame budget exists to avoid. The hook is
+`GameRenderer#render` at `HEAD` (`GameRendererMixin`), which is the frame - and at `HEAD` rather than
+`TAIL` because `setSectionDirty` starts a task on Minecraft's chunk-build threads, so asking at the top
+gives those threads the frame to work in.
+
+The queue is bounded at the native side's own refusal cap, past which it has already forgotten refusals
+of its own; and the drain only queues at all while `terrainArenaCanGrow`, because a refusal whose section
+cannot have room made for it would be refused again - the arena doubles on a refusal and stops at the
+device's buffer limit, and past that a rebuild per refusal is a spin rather than a convergence.
+
+Checked in a run, on the line the drain prints:
+
+```
+the section arena refused 2 section(s); forgetting them, so the next rebuild of each carries its
+blocks again, and queueing 2 of those rebuild(s) (2 drained so far, 2 waiting)
+```
+
 ### The terrain pass was allocating a HashMap per section, and drawing water in hash order
 
 Four things were wrong with one loop, and the last is the one that was a picture difference.
@@ -3876,6 +3986,55 @@ Two notes on what the diagnostics now mean. `culled` and `out of sight` are deci
 once per section, before a layer is chosen - so a two-layer pass reports about half what it used to; the
 ratio between them, which is what the line is read for, is unchanged. And `drawn` and `empty` are still
 per layer, because they are decided where the layer is drawn.
+
+### `textureSample` under an `if` is undefined behaviour, however uniform the condition looks
+
+The terrain fragment stage picked which atlas to read like this:
+
+```wgsl
+var texel: vec4<f32>;
+if (in.game_atlas == 1u) {
+    texel = textureSample(t_game_atlas, t_game_sampler, in.tex_coords);
+} else {
+    texel = textureSample(t_texture, t_sampler, in.tex_coords);
+}
+```
+
+`textureSample` takes its level of detail from the derivatives of the coordinates, and WGSL defines those
+only in **uniform control flow**. A `textureSample` inside a branch is undefined behaviour - not "slow",
+not "discouraged", undefined - whether or not the condition happens to hold for every fragment.
+
+The argument for the branch was real and is worth writing down, because it is the argument that will be
+made again: `game_atlas` is `@interpolate(flat)`, so every fragment of one primitive takes the same
+branch and the derivative is the one it would have had. That is an argument about the *picture coming out
+right on the hardware it was tried on*. It is not an argument about the program being defined, and the
+gap between the two is a driver that decides to execute both sides of a uniform branch, or one that
+vectorises a quad across a primitive boundary - and this shader runs on whatever driver the player has.
+
+The samples are hoisted and the choice is a `select` between the values:
+
+```wgsl
+let texel_from_game = textureSample(t_game_atlas, t_game_sampler, in.tex_coords);
+let texel_from_ours = textureSample(t_texture, t_sampler, in.tex_coords);
+let texel = select(texel_from_ours, texel_from_game, in.game_atlas == 1u);
+```
+
+Both fetch the same coordinates with the same sampler *shape*, and both atlases are the same size, so the
+two mip chains are indexed identically and the pair costs what the branch cost whenever both sides were
+live. `select` rather than `mix`: this is a choice and not a blend, and a half-way value would be one
+atlas bleeding into the other at every sprite edge.
+
+Both `terrain.wgsl` and `terrain_solid.wgsl` had it, and both are fixed - the vertex stage's lightmap
+fetch is a `textureSampleLevel` with an explicit level, which is legal anywhere and has to be, because a
+vertex stage has no derivatives to take a level from.
+
+**The test is structural, and that is the whole point of it.** The offending code is now quoted in the
+comment above the fix, so a test that looked for the string `textureSample` under an `if` would fail on
+the explanation of why it must not be there. Instead the shader is parsed with naga and walked: a
+`textureSample` whose level is `Auto` and which sits one or more branches deep is a failure. Two
+supporting tests keep the detector honest, because "found nothing" is also what a detector that finds
+nothing at all reports - the branching shape is fed to it as a fixture and must produce two findings one
+branch deep, and the hoisted shape must produce none.
 
 ### The block atlases are point-sampled, and the game never point-samples them
 

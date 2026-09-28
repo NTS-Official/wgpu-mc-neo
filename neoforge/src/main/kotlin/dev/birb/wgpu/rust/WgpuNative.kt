@@ -284,6 +284,11 @@ object WgpuNative {
 
 	external fun setVisibleSections(keys: LongArray)
 
+	/** How many section bakes are queued or running, and the ceiling they are measured against. */
+	external fun queuedBakes(): Int
+
+	external fun maxQueuedBakes(): Int
+
 	external fun registerBlockStateFaceFlags(
 		key: Int,
 		occlusion: Int,

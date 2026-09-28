@@ -223,16 +223,16 @@ pub struct SectionStorage {
     /// room for, is a hole nothing will ever fill - its rebuild has already happened, and a rebuild
     /// only carries what changed. So the positions are kept until [`SectionStorage::refused`] hands
     /// them over, and the JVM forgets what it had recorded for them.
-    refused_positions: Vec<IVec3>,
+    ///
+    /// A set with no cap. It was a `Vec` capped at 4096 that dropped what it could not hold, and that
+    /// cap was the hole: a section refused while the pool was exhausted, past the cap, was counted and
+    /// forgotten - never handed over, never re-offered, and drawn by neither side. A refusal leaves its
+    /// section in `storage`, so there is nothing to cap: these are positions that are already in the
+    /// map, and the set cannot outgrow it.
+    refused_pending: std::collections::HashSet<IVec3>,
     width: i32,
 }
 
-/// How many refused positions are kept before the oldest are dropped.
-///
-/// The JVM drains them every client tick, so this is only reached when the arena is refusing
-/// everything - in which case the positions it cannot remember are sections it will be told about
-/// again by the next refusal, and the count is in the log either way.
-const REFUSED_LIMIT: usize = 4096;
 impl SectionStorage {
     pub fn new(range: u32) -> Self {
         SectionStorage {
@@ -244,7 +244,7 @@ impl SectionStorage {
             deferred_depth: 1,
             pool: range,
             refused: false,
-            refused_positions: Vec::new(),
+            refused_pending: std::collections::HashSet::new(),
         }
     }
     /// Narrows or widens the pool to a render distance, which is only possible while it is empty.
@@ -323,7 +323,7 @@ impl SectionStorage {
     /// What the difference buys is the whole pool, immediately. The new world's sections are baked
     /// over the next seconds and the pool has to hold them; ranges parked for `frames_in_flight`
     /// frames would have the first of them refused, and a refusal now costs a section the JVM has to
-    /// be told about and re-bake (see `refused_positions`) - for a frame that is already gone.
+    /// be told about and re-bake (see `refused_pending`) - for a frame that is already gone.
     pub fn forget(&mut self) {
         for section in self.storage.values() {
             for ranges in section.layers.iter().flatten() {
@@ -338,11 +338,14 @@ impl SectionStorage {
         // clearing its own record of them at the same moment (`forgetAll`), and handing them over
         // afterwards would have it forget sections of the *new* world that share a coordinate. They
         // are counted as dropped rather than forgotten, so the sum the diagnostic checks still closes.
+        //
+        // This is the one way a refusal is still lost, and it is not a hole: the world it belonged to
+        // is gone, and the new world's sections are offered from scratch.
         REFUSED_DROPPED.fetch_add(
-            self.refused_positions.len() as u64,
+            self.refused_pending.len() as u64,
             std::sync::atomic::Ordering::Relaxed,
         );
-        self.refused_positions.clear();
+        self.refused_pending.clear();
     }
     /// How far the arena reaches from the camera, in chunks.
     pub fn width(&self) -> i32 {
@@ -410,19 +413,22 @@ impl SectionStorage {
         let section = self.allocate_ranges(baked_layers);
 
         if self.refused {
-            // Remembered, not just counted: the JVM has to be told which section it may not record
-            // as sent, or nothing will offer it again. See `refused_positions`.
-            if self.refused_positions.len() < REFUSED_LIMIT {
-                self.refused_positions.push(pos);
-            } else {
-                // Past the cap the position is lost rather than kept: it is counted here so that
-                // `refused == handed_over + dropped` still closes, which is what makes a mismatch
-                // mean a broken channel rather than a full list.
-                REFUSED_DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
+            // **Marked, not listed.** The section is left in the storage exactly as it was (see the
+            // note below), so the storage is already the set of sections that need re-offering - and a
+            // list beside it is a list that can disagree with it. It did: past `REFUSED_LIMIT`
+            // positions were counted and thrown away, so a section refused while the pool was
+            // exhausted was never reported, never re-offered, and stayed a 16x16x16 hole until the
+            // player happened to dirty it. There is no cap now because there is nothing to cap: the
+            // flag is a field on a section that is already in the map.
+            self.refused_pending.insert(pos);
 
             return None;
         }
+
+        // Published, so it is no longer waiting for one. `insert` clears the flag as well - this is
+        // for the case below, where the section was refused on one frame and accepted on the next
+        // without the map ever being touched in between.
+        self.refused_pending.remove(&pos);
 
         Some((section, freed))
     }
@@ -431,10 +437,15 @@ impl SectionStorage {
     ///
     /// Called from the JVM once a tick: what it does with them is drop the record of having sent
     /// them, so the next rebuild of each carries its blocks again and the section gets another
-    /// chance at the pool. The count handed over is kept in [`REFUSED_REPORTED`], because it is the
-    /// number the JVM's own running total has to match.
+    /// chance at the pool.
+    ///
+    /// **A drain of the pending set rather than of a list that could overflow.** These are sections
+    /// already in the storage - a refusal leaves its section exactly as it was - so the set of them is
+    /// bounded by the arena's own size and cannot lose an entry the way the capped list this replaced
+    /// could. See [`Self::allocate`] for what that cost: a refusal past the old cap was counted and
+    /// dropped, which is a section nothing would ever offer again.
     pub fn refused(&mut self) -> Vec<IVec3> {
-        let refused = std::mem::take(&mut self.refused_positions);
+        let refused: Vec<IVec3> = self.refused_pending.drain().collect();
 
         REFUSED_REPORTED.fetch_add(refused.len() as u64, std::sync::atomic::Ordering::Relaxed);
 
@@ -495,8 +506,14 @@ impl SectionStorage {
     }
 
     /// Publishes an allocated section, which is what makes the next frame draw it.
+    ///
+    /// Clears the pending-refusal mark, which is the other half of "a refusal leaves the section as it
+    /// was": a section refused on one frame and accepted on the next is in the arena, so it must not be
+    /// handed to the JVM as refused any more - that would drop its `sent` record and rebuild a section
+    /// that is already drawn.
     pub fn insert(&mut self, pos: IVec3, section: Section) {
         self.storage.insert(pos, section);
+        self.refused_pending.remove(&pos);
     }
 
     fn allocate_ranges(&mut self, baked_layers: &[BakedLayer]) -> Section {
@@ -632,9 +649,12 @@ static REFUSED_REPORTED: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 
 /// How many refusals were never handed over, so that the sum above closes.
 ///
-/// Two ways to lose one, and both are by design: the list has a cap ([`REFUSED_LIMIT`], reached only
-/// when the arena is refusing everything), and a level change clears the list along with the arena it
-/// describes. What is *not* by design is a refusal that neither reaches the JVM nor appears here.
+/// **One way to lose one now, and it is by design: a level change** clears the pending set along with
+/// the arena it describes, and that is not a hole - the world it belonged to is gone. There used to be
+/// a second, a cap on the list, and it *was* a hole: a refusal past it was counted here and forgotten
+/// by both sides. The pending set is unbounded because its members are sections that are already in
+/// the storage, so there is nothing left to cap. What is still not by design is a refusal that neither
+/// reaches the JVM nor appears here.
 static REFUSED_DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// sections refused for the JVM side. See [REFUSED].
@@ -4714,5 +4734,148 @@ mod arena_tests {
             "the solid layer's range came back with the refusal"
         );
         assert_eq!(storage.used_slots(), 0);
+    }
+
+    /// **A refusal is reported however many of them there are**, which is the hole this closed.
+    ///
+    /// The list of refused positions used to have a cap of 4096 and dropped what it could not hold -
+    /// counted in `REFUSED_DROPPED` and forgotten by both sides. A section refused past that cap was
+    /// never handed to the JVM, so the JVM kept its record of having sent it, so nothing offered it
+    /// again, and Minecraft's own mesh for it stayed suppressed because Rust had been told about it.
+    /// Neither side drew it: a 16x16x16 hole that only an unrelated rebuild would ever fill.
+    ///
+    /// The cap is gone because there is nothing to cap. A refusal leaves its section in the storage, and
+    /// the pending set holds positions that are in that map - so the set cannot outgrow the arena.
+    #[test]
+    fn every_refused_section_is_reported_however_many_there_are() {
+        // Enough pool for exactly one quad, so everything that needs a second is refused.
+        let mut storage = SectionStorage::new(pool_for(1));
+        let layers = [layer(1)];
+
+        // Well past the old cap of 4096.
+        let attempts = 6000;
+        let mut refused_here = Vec::new();
+
+        for index in 0..attempts {
+            let pos = IVec3::new(index % 100, 0, index / 100);
+
+            if storage.allocate(pos, &layers).is_none() {
+                refused_here.push(pos);
+            }
+        }
+
+        assert!(
+            refused_here.len() > 4096,
+            "the test is only meaningful past the cap this replaced: {} refusals",
+            refused_here.len()
+        );
+
+        // Sorted as tuples, because `IVec3` has no `Ord` - and sorted rather than compared as sets
+        // because a set comparison would not say *how many* were missing, and the count is the whole
+        // point of this test.
+        let as_tuples = |positions: &mut Vec<IVec3>| {
+            let mut tuples: Vec<(i32, i32, i32)> =
+                positions.iter().map(|pos| (pos.x, pos.y, pos.z)).collect();
+
+            tuples.sort_unstable();
+
+            tuples
+        };
+
+        let reported = as_tuples(&mut storage.refused());
+        let refused_here = as_tuples(&mut refused_here);
+
+        assert_eq!(
+            reported.len(),
+            refused_here.len(),
+            "every refusal has to be reported. One the JVM is not told about is a hole nothing will \
+             fill: it keeps its record of having sent the section, so nothing offers it again, and \
+             Minecraft's own mesh for it stays suppressed."
+        );
+
+        assert_eq!(reported, refused_here, "and they are the right sections");
+
+        assert!(
+            storage.refused().is_empty(),
+            "and the drain is a drain - a second call has nothing left to hand over"
+        );
+    }
+
+    /// A section that is refused and then accepted stops being reported.
+    ///
+    /// The other half of the pending set being derived from the storage: a section refused on one frame
+    /// and published on the next is in the arena, so handing it to the JVM as refused would drop its
+    /// `sent` record and rebuild a section that is already drawn.
+    #[test]
+    fn a_section_that_fits_on_a_later_frame_stops_being_refused() {
+        let mut storage = SectionStorage::new(pool_for(1));
+        let layers = [layer(1)];
+
+        // The one quad of pool, taken by a section that keeps it.
+        let occupier = IVec3::new(0, 0, 0);
+        let (occupier_section, _) = storage
+            .allocate(occupier, &layers)
+            .expect("the pool starts empty, so the first section fits");
+
+        let held = occupier_section.layers[0]
+            .clone()
+            .expect("it has a layer, which is what took the pool");
+
+        storage.insert(occupier, occupier_section);
+
+        let pos = IVec3::new(3, 0, 7);
+
+        assert!(
+            storage.allocate(pos, &layers).is_none(),
+            "and the next one has nowhere to go"
+        );
+        assert_eq!(storage.refused(), vec![pos], "so it is reported");
+
+        // Room made the way the game makes it: the occupier is walked away from.
+        storage.allocator.free_range(held.vertex_range);
+        storage.allocator.free_range(held.index_range);
+        storage.storage.remove(&occupier);
+
+        assert!(
+            storage.allocate(pos, &layers).is_some(),
+            "the same section, with room this time"
+        );
+
+        assert!(
+            storage.refused().is_empty(),
+            "a section that is in the arena is not waiting for one - reporting it here would rebuild \
+             geometry that is already drawn"
+        );
+    }
+
+    /// And the same, for the case where it never went through `allocate` a second time: `insert`
+    /// clears the mark, because that is the call that publishes.
+    #[test]
+    fn publishing_a_section_clears_its_refusal_mark() {
+        let mut storage = SectionStorage::new(pool_for(1));
+        let layers = [layer(1)];
+
+        let occupier = IVec3::new(0, 0, 0);
+        let (occupier_section, _) = storage
+            .allocate(occupier, &layers)
+            .expect("the pool starts empty");
+        storage.insert(occupier, occupier_section);
+
+        let pos = IVec3::new(1, 0, 0);
+        assert!(storage.allocate(pos, &layers).is_none());
+        assert_eq!(storage.refused(), vec![pos]);
+
+        // Now it is refused and reported, and the section is published directly - which is what
+        // `submit_chunk_updates` does once `allocate` has handed it a section.
+        let section = Section {
+            layers: vec![None, None, None],
+        };
+
+        storage.insert(pos, section);
+
+        assert!(
+            storage.refused().is_empty(),
+            "`insert` is what publishes, so it is what says the section is no longer waiting"
+        );
     }
 }

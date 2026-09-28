@@ -882,9 +882,21 @@ static THREAD_POOL: Lazy<ThreadPool> = Lazy::new(|| {
 /// How many bakes may be waiting before further sections are dropped on the floor.
 ///
 /// A section rebuild is offered every time Minecraft decides one is out of date, so a dropped offer
-/// is not lost work - it comes back. What it buys is a bound on the memory waiting in this queue:
-/// each queued bake owns 27 sections' worth of palettes, storages and light layers, which is a few
-/// hundred kilobytes, and a player moving quickly can offer thousands of sections in a second.
+/// is not lost work - it comes back.
+///
+/// **This is not a memory bound, and the comment here used to say it was.** It said each queued bake
+/// "owns 27 sections' worth of palettes, storages and light layers, which is a few hundred kilobytes" -
+/// and a bake owns no such thing. It is handed `Arc`s out of the section cache
+/// (`SectionWorld::blocks`, which is `get(..).cloned()`, a refcount bump), so what it holds is 54
+/// pointers: 27 for the blocks and 27 for the light. `a_queued_bake_holds_pointers_and_not_sections`
+/// in `section.rs` measures it, because the arithmetic is the only thing that settles a sentence like
+/// that one - **440 bytes per queued bake, so a full queue of this many is 110 KB**, and the payload
+/// that arrived over JNI is dropped at the end of the call that built the task.
+///
+/// What the number is actually for is **latency**, and that is why it is a few hundred rather than a
+/// few thousand: a bake that waits behind a thousand others has been overtaken by the player twice, and
+/// the section is rebuilt and offered again before it is ever drawn. Dropping it and letting the next
+/// offer queue nearer the front is the better answer, and it costs nothing because the offer comes back.
 const MAX_QUEUED_BAKES: usize = 256;
 
 /// How many bakes are queued or running, against [MAX_QUEUED_BAKES].
@@ -1006,6 +1018,28 @@ pub fn refusedSections(env: JNIEnv, _class: JClass) -> jlongArray {
     }
 
     array.into_raw()
+}
+
+/// How many bakes are queued or running right now, against [`MAX_QUEUED_BAKES`].
+///
+/// The JVM's refusal drain reads this to decide whether to ask for a rebuild at all: a refused section
+/// is one the arena had no room for, and asking the game to rebuild it is worth doing only when there
+/// is room in the pool for the result. With the queue backed up the rebuild would wait behind everything
+/// already in it and arrive at a section the player has left, so the drain backs off until the pool has
+/// caught up - which is what stops "full queue, mark dirty, offer again, still full" from being a
+/// rebuild storm.
+///
+/// See `RustChunkBake.redirtyDue`.
+#[jni_fn("dev.birb.wgpu.rust.WgpuNative")]
+pub fn queuedBakes(_env: JNIEnv, _class: JClass) -> jint {
+    QUEUED_BAKES.load(Ordering::Relaxed) as jint
+}
+
+/// The ceiling [`queuedBakes`] is measured against - [`MAX_QUEUED_BAKES`], so the two sides agree about
+/// what "backed up" means without either writing the other's number down.
+#[jni_fn("dev.birb.wgpu.rust.WgpuNative")]
+pub fn maxQueuedBakes(_env: JNIEnv, _class: JClass) -> jint {
+    MAX_QUEUED_BAKES as jint
 }
 
 /// Forgets every section of the world the bake was built against, and answers the new generation.

@@ -276,82 +276,171 @@ object RustChunkBake {
 			return
 		}
 
-		for (key in refused) {
-			sent.remove(key)
-			// And a refused section is one Rust is not drawing, so Minecraft's mesh goes back to being
-			// the fallback for it. `redirty` below is what asks for the rebuild that will use it.
-			rustHas.remove(key)
-		}
-
-		refusedDrained += refused.size
-
-		val redirtied = redirty(refused)
-
-		WgpuMcMod.LOGGER.warn(
-			"wgpu: the section arena refused {} section(s); forgetting them, so the next rebuild " +
-				"of each carries its blocks again, and asking the game for {} of those rebuild(s) " +
-				"({} drained so far)",
-			refused.size,
-			redirtied,
-			refusedDrained,
-		)
-	}
-
-	/**
-	 * Marks the refused sections dirty, which is what makes Minecraft rebuild them.
-	 *
-	 * Only while the arena can still grow: the native side doubles the pool on a refusal, so the
-	 * rebuild asked for here has somewhere to land - and once the pool is at the device's own buffer
-	 * limit it never will, which is exactly the case where a rebuild per refusal, once a tick, is a
-	 * spin rather than a convergence.
-	 *
-	 * Bounded per tick as well, for the same reason: sixty-four rebuilds of a section whose blocks have
-	 * not changed is a burst of work the player pays for in frame time, and what is skipped is not lost
-	 * - the next refusal of the same section arrives with the next drain.
-	 */
-	private fun redirty(refused: LongArray): Int {
-		val client = Minecraft.getInstance()
-
-		// Only with a world loaded: `setSectionDirty` walks the view area, which is not there on the
-		// title screen - and after leaving a world the drain can still find refusals from the one before.
-		if (client.level == null) {
-			return 0
-		}
-
+		// A refusal whose section cannot have room made for it is not queued for a rebuild, because the
+		// rebuild would be refused again: the arena doubles on a refusal and stops at the device's own
+		// buffer limit, and past that point a rebuild per refusal, once a tick, is a spin rather than a
+		// convergence. So the drain checks it once, here, rather than per pending entry in `redirtyDue`.
 		val canGrow = try {
 			WmNative.terrainArenaCanGrow.invokeExact() as Boolean
 		} catch (error: Throwable) {
 			// No renderer to ask: nothing was baked, so nothing can be waiting on a rebuild.
-			return 0
+			return
 		}
 
-		if (!canGrow) {
-			return 0
-		}
-
-		val renderer = client.levelRenderer
-		var count = 0
+		var queued = 0
 
 		for (key in refused) {
-			if (count >= REDIRTY_PER_TICK) {
-				break
+			sent.remove(key)
+			// And a refused section is one Rust is not drawing, so Minecraft's mesh goes back to being
+			// the fallback for it. The rebuild `redirtyDue` asks for is what puts it back.
+			rustHas.remove(key)
+
+			if (canGrow && pendingRedirty.size < PENDING_REDIRTY_LIMIT) {
+				pendingRedirty.add(key)
+				queued++
 			}
+		}
+
+		refusedDrained += refused.size
+
+		WgpuMcMod.LOGGER.warn(
+			"wgpu: the section arena refused {} section(s); forgetting them, so the next rebuild " +
+				"of each carries its blocks again, and queueing {} of those rebuild(s) ({} drained so " +
+				"far, {} waiting)",
+			refused.size,
+			queued,
+			refusedDrained,
+			pendingRedirty.size,
+		)
+	}
+
+	/**
+	 * The sections waiting for a rebuild, as `SectionPos.asLong` keys.
+	 *
+	 * **A queue rather than a burst, and this is the half that used to lose sections.** The drain used to
+	 * mark at most [REDIRTY_PER_TICK] of a refusal batch dirty and drop the rest - and a dropped one was
+	 * not merely delayed: its [sent] record had already been removed and nothing would offer that section
+	 * again, so it stayed a hole until the player broke a block in it. The native side hands each refusal
+	 * over exactly once (`SectionStorage::refused` is a `mem::take`), so there is no second copy coming.
+	 *
+	 * A `LinkedHashSet` because a section refused twice before it was retried is one rebuild and not two:
+	 * the insert is the de-duplication, and its order is the order the refusals arrived in.
+	 *
+	 * Bounded, and the bound is the native side's own refusal cap: past that it has already forgotten
+	 * refusals of its own, so a queue that kept growing would hold entries for sections that were never
+	 * coming back.
+	 */
+	private val pendingRedirty = java.util.LinkedHashSet<Long>()
+
+	/**
+	 * How many refusals may wait for a rebuild at once.
+	 *
+	 * The native side drops refused positions past its own cap (4096) before this side ever sees them, so
+	 * a queue that grew without limit would be holding entries whose sections were already forgotten
+	 * there. The budget is [REDIRTY_PER_FRAME] a frame, so even this many is drained in seconds - and the
+	 * number is only reached when the arena is refusing faster than the game can rebuild, which is the
+	 * case the cap turns into "stop queueing" rather than "grow without bound".
+	 */
+	private const val PENDING_REDIRTY_LIMIT = 4096
+
+	/** How many refusals are waiting for a rebuild. For the report. */
+	@JvmStatic
+	fun pendingRedirtyCount(): Int = pendingRedirty.size
+
+	/**
+	 * Asks the game to rebuild a few of the sections the arena refused, one frame at a time.
+	 *
+	 * Called every frame rather than every tick, because the two things it is throttled by are both
+	 * per-frame: the work it asks for is Minecraft's chunk builds, and the pressure it backs off from is
+	 * the bake pool the results go to. A tick is 50 ms of that same work arriving in one lump.
+	 *
+	 * Three things bound it, and each answers a different way of making this a storm:
+	 *
+	 *  - **the queue has to be drained**, so a section refused twice is one rebuild;
+	 *  - **at most [REDIRTY_PER_FRAME] a frame**, because sixty-four rebuilds of sections whose blocks
+	 *    have not changed is a burst the player pays for in frame time. What is skipped is not lost - it
+	 *    is still in the queue, and the next frame takes it;
+	 *  - **and the bake pool has to have room**, which is the one that matters when the arena is small:
+	 *    marking sections dirty makes Minecraft offer them, every offer applies a 27-section payload and
+	 *    reserves a bake slot, and a full queue drops the offer - so without this the loop is "queue full,
+	 *    mark dirty, offer again, still full" at whatever rate the frames run at. It shrinks the budget
+	 *    to one rather than stopping, and [backedUp] says why that difference is load-bearing.
+	 *
+	 * Returns how many it asked for, for the caller's report.
+	 */
+	@JvmStatic
+	fun redirtyDue(): Int {
+		if (pendingRedirty.isEmpty()) {
+			return 0
+		}
+
+		val client = Minecraft.getInstance()
+
+		// Only with a world loaded: `setSectionDirty` walks the view area, which is not there on the
+		// title screen - and after leaving a world the queue can still hold refusals from the one before.
+		val renderer = client.levelRenderer ?: return 0
+
+		// **The budget shrinks under backoff, and it never reaches zero.** That distinction is the whole
+		// of this function's safety: the queue being fed here is also fed by nothing else, so a backoff
+		// that stopped the drain outright would be a livelock - the pool stays full because no rebuild
+		// completes, and no rebuild is asked for because the pool is full. Sections would sit in
+		// [pendingRedirty] for the session, which is the hole this queue exists to close.
+		//
+		// One a frame is a trickle rather than a stop: at sixty frames a second it is sixty asks a
+		// second against a pool of a few hundred slots, which is slow enough that it cannot be the
+		// storm the backoff is for, and it is non-zero, so the pool is always being given work that can
+		// finish and make room. See [backedUp] for what "full" means here.
+		val budget = if (backedUp()) 1 else REDIRTY_PER_FRAME
+
+		var count = 0
+		val iterator = pendingRedirty.iterator()
+
+		while (iterator.hasNext() && count < budget) {
+			val key = iterator.next()
+			iterator.remove()
 
 			try {
 				renderer.setSectionDirty(SectionPos.x(key), SectionPos.y(key), SectionPos.z(key))
-				count++
 			} catch (error: Throwable) {
-				// A nudge that does not land is not worth taking the game down for: the section keeps
-				// the geometry it had, which is where this path started.
+				// A nudge that does not land is not worth taking the game down for: the section keeps the
+				// geometry it had, which is where this path started. Put back, so the next frame tries it
+				// again rather than losing it the way the drain used to.
+				pendingRedirty.add(key)
 				return count
 			}
+
+			count++
 		}
 
 		return count
 	}
 
-	/** How many refused sections one tick may ask the game to rebuild. See [redirty]. */
-	private const val REDIRTY_PER_TICK = 32
+	/**
+	 * Whether the bake pool is behind enough that asking for a lot more work would only make it later.
+	 *
+	 * A rebuild asked for now arrives at a pool that is already holding [QUEUED_BAKES] bakes, and the
+	 * section it belongs to is one the player may have walked away from by the time it is reached. So the
+	 * drain slows down: the queue is drained by bakes finishing, and finishing is what makes room. Two
+	 * thirds of the pool is the threshold, because below that the pool is working and there is room to
+	 * feed it.
+	 *
+	 * **It slows the drain and does not stop it**, which is the part that matters: this queue is fed by
+	 * nothing else, so a backoff that stopped the drain would be a livelock - no rebuild asked for
+	 * because the pool is full, and the pool full because no rebuild finishes. Whoever reads this next
+	 * and is tempted to make it `return 0`: the sections it would strand are 16x16x16 holes with nothing
+	 * drawing them.
+	 *
+	 * A native call that cannot be made - no renderer yet - reads as "not backed up": a refusal cannot
+	 * exist before there is a renderer, so the question is moot rather than dangerous.
+	 */
+	private fun backedUp(): Boolean = try {
+		WgpuNative.queuedBakes() * 3 >= WgpuNative.maxQueuedBakes() * 2
+	} catch (error: Throwable) {
+		false
+	}
+
+	/** How many refused sections one frame may ask the game to rebuild. See [redirtyDue]. */
+	private const val REDIRTY_PER_FRAME = 16
 
 	/**
 	 * Checks the arena's return channel against this side's own count.

@@ -1263,6 +1263,100 @@ mod tests {
         );
     }
 
+    /// **A refused section is queued for a rebuild rather than dropped**, and the requests are throttled
+    /// three ways.
+    ///
+    /// A refusal is the one thing that leaves a section permanently undrawn. The arena had no room, so
+    /// nothing was baked; `sent` forgets the section so the *next* rebuild carries its blocks - and a
+    /// rebuild only carries what changed, so the next rebuild is the thing that never comes. The native
+    /// side hands each refusal over exactly once (`SectionStorage::refused` is a `mem::take`), so a
+    /// refusal this side drops is a hole for the session, with no log line and nothing to look at.
+    ///
+    /// The drain used to drop them: it marked at most its budget dirty and forgot the rest. That is the
+    /// shape this test exists to keep out, and it is why the assertions are about the *queue* rather than
+    /// about the budget: what has to survive is the refusals, not the rate.
+    ///
+    /// Checked on the source because the logic is Kotlin and this is the crate that can see it - the same
+    /// arrangement as the `sent`/`rustHas` test above, and for the same reason: the failure is a missing
+    /// line, and a missing line is what a test can see.
+    #[test]
+    fn a_refused_section_is_queued_for_a_rebuild_and_not_dropped() {
+        let source = code_of(RUST_CHUNK_BAKE);
+
+        // A queue, and the drain adds to it rather than acting on the batch directly.
+        assert!(
+            source.contains("pendingRedirty.add(key)"),
+            "the refusal drain has to remember the sections it could not act on; without this a refusal \
+             past the per-frame budget is a section nothing will ever rebuild"
+        );
+
+        assert!(
+            source.contains("private val pendingRedirty = java.util.LinkedHashSet<Long>()"),
+            "a set, because a section refused twice before it was retried is one rebuild and not two"
+        );
+
+        // **Single-section dirty, never the neighbours variant.** `setSectionDirtyWithNeighbors` dirties
+        // the 26 around it as well, which turns one refusal into 27 rebuilds - and those neighbours were
+        // not refused, so each of their rebuilds offers a payload and reserves a bake slot for nothing.
+        assert!(
+            source.contains("renderer.setSectionDirty("),
+            "a refusal is one section, so it is marked dirty one section at a time"
+        );
+
+        assert!(
+            !source.contains("setSectionDirtyWithNeighbors"),
+            "marking a refused section dirty must not drag its 26 neighbours into the rebuild queue: \
+             they were not refused, and one refusal would become 27 rebuilds"
+        );
+
+        // The backoff, which is what stops "queue full, mark dirty, offer again, still full" from being
+        // a storm: less work while the bake pool is behind.
+        assert!(
+            source.contains("private fun backedUp()"),
+            "the drain has to ask how deep the bake queue is before asking for more work"
+        );
+
+        assert!(
+            source.contains("val budget = if (backedUp()) 1 else REDIRTY_PER_FRAME"),
+            "**and the backoff has to shrink the budget rather than stop the drain.** This queue is fed \
+             by nothing else, so a backoff that returned early would be a livelock: no rebuild is asked \
+             for because the pool is full, and the pool stays full because no rebuild finishes. The \
+             sections stranded that way are 16x16x16 holes with nothing drawing them - which is what the \
+             first version of this backoff did."
+        );
+
+        // The other half of the same property, checked structurally rather than by the string above:
+        // nothing may consult `backedUp` before the budget is computed, because that is the shape that
+        // stops the drain instead of slowing it.
+        let drain = source
+            .split("fun redirtyDue()")
+            .nth(1)
+            .expect("`redirtyDue` is still there");
+        let before_budget = drain
+            .split("val budget")
+            .next()
+            .expect("the budget is still computed in it");
+
+        assert!(
+            !before_budget.contains("backedUp()"),
+            "`backedUp()` is consulted before the budget is computed, which makes it an early return \
+             waiting to happen - it must only choose the size of the budget"
+        );
+
+        assert!(
+            source.contains("WgpuNative.queuedBakes()")
+                && source.contains("WgpuNative.maxQueuedBakes()"),
+            "the depth of the bake queue is read from the native side rather than guessed at, and so is \
+             the ceiling it is a fraction of"
+        );
+
+        // And the budget, which is the third throttle.
+        assert!(
+            source.contains("REDIRTY_PER_FRAME"),
+            "the requests are budgeted per frame"
+        );
+    }
+
     /// The language files, pulled in so that editing one of them re-runs these tests.
     ///
     /// The options screen builds every key it asks for out of a setting's name - `wgpu_mc.option.`
