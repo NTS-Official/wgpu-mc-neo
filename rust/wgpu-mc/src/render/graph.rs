@@ -37,6 +37,30 @@ static TERRAIN_CULLED: AtomicU64 = AtomicU64::new(0);
 static TERRAIN_EMPTY: AtomicU64 = AtomicU64::new(0);
 static TERRAIN_REPORTED: AtomicU64 = AtomicU64::new(0);
 
+/// The same three counts, per layer.
+///
+/// A layer that is not on screen has two very different explanations - the arena has nothing in it for
+/// those sections, or it has and the pass is not drawing it - and the total above cannot tell them
+/// apart. Indexed by `RenderLayer as usize`.
+static LAYER_DRAWN: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+static LAYER_EMPTY: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+
+/// Drains those six counters, for a caller outside this module.
+///
+/// Drained rather than read, so the numbers a caller prints are the ones since its last call - which
+/// is what makes them readable beside a per-second report.
+pub fn take_layer_counts() -> ([u64; 3], [u64; 3]) {
+    let mut drawn = [0u64; 3];
+    let mut empty = [0u64; 3];
+
+    for layer in 0..3 {
+        drawn[layer] = LAYER_DRAWN[layer].swap(0, Ordering::Relaxed);
+        empty[layer] = LAYER_EMPTY[layer].swap(0, Ordering::Relaxed);
+    }
+
+    (drawn, empty)
+}
+
 /// Sections drawn by the terrain pass, in total rather than since the last report.
 ///
 /// The counter above is drained by the report; this one is not, because it is what a caller outside
@@ -104,9 +128,31 @@ fn report_terrain_pass() {
         return;
     }
 
+    // Per layer as well as in total, and the three numbers answer three different questions about a
+    // layer that is not on screen: "drawn" is geometry that reached the GPU, "empty" is a layer the
+    // arena has nothing in for that section, and "culled" is a section the frustum rejected. A layer
+    // whose drawn count is zero while the arena holds it is a pipeline problem; a layer whose empty
+    // count is every section is a bake that never landed. Lumped together they say nothing.
+    let per_layer: Vec<String> = [
+        RenderLayer::Solid,
+        RenderLayer::Cutout,
+        RenderLayer::Transparent,
+    ]
+    .iter()
+    .map(|layer| {
+        let index = *layer as usize;
+        format!(
+            "{layer:?} {} drawn {} empty",
+            LAYER_DRAWN[index].swap(0, Ordering::Relaxed),
+            LAYER_EMPTY[index].swap(0, Ordering::Relaxed)
+        )
+    })
+    .collect();
+
     log::info!(
-        "wgpu-mc: terrain pass: {drawn} section draw(s) - the solid and cutout layers of one pass - \
-         {culled} culled by the frustum, {empty} with neither layer"
+        "wgpu-mc: terrain pass: {drawn} section draw(s) - solid and cutout of one pass, transparent of \
+         the other -, {culled} culled by the frustum, {empty} with no layer at all; per layer: {}",
+        per_layer.join(", ")
     );
 }
 
@@ -598,7 +644,12 @@ impl RenderGraph {
             // JVM - and a graph missing one pipeline still draws the rest of the frame. `init` has no
             // error to report (it is a `None` for "no such resource" and for "not UTF-8"), so the line
             // names the resource it wanted, which is what the reader needs either way.
-            let shader_resource = ResourcePath(format!("wgpu_mc:shaders/{}.wgsl", pipeline_name));
+            //
+            // The name is the pipeline's own unless the config names another, because two pipelines can
+            // be one shader with two sets of pipeline state: the two terrain passes are, and a pipeline
+            // that was left to look for a shader named after itself was skipped in silence.
+            let shader_name = pipeline_config.shader.as_deref().unwrap_or(pipeline_name);
+            let shader_resource = ResourcePath(format!("wgpu_mc:shaders/{shader_name}.wgsl"));
             let Some(shader) = WgslShader::init(
                 &shader_resource,
                 &*wm.mc.resource_provider,
@@ -615,7 +666,7 @@ impl RenderGraph {
             };
 
             let vertex_buffer = match &pipeline_config.geometry[..] {
-                "@geo_terrain" => vec![],
+                "@geo_terrain" | "@geo_terrain_translucent" => vec![],
                 "@geo_entities" => vec![EntityVertex::desc(), InstanceVertex::desc()],
                 "@geo_quad" => vec![QuadVertex::desc()],
                 "@geo_sun_moon" => vec![SunMoonVertex::desc()],
@@ -667,7 +718,7 @@ impl RenderGraph {
                         depth_stencil: pipeline_config.depth.as_ref().map(|_| {
                             wgpu::DepthStencilState {
                                 format: wgpu::TextureFormat::Depth32Float,
-                                depth_write_enabled: Some(true),
+                                depth_write_enabled: Some(pipeline_config.depth_write),
                                 // The other half of that diagnostic - see `TERRAIN_GREATER_DEPTH`. It
                                 // asks the depth test the opposite question, which is what "the faces
                                 // behind are the ones drawn" would mean if the depth values were the
@@ -1018,6 +1069,37 @@ impl RenderGraph {
         graph
     }
 
+    /// The layers each terrain pass draws, in the order it draws them - keyed by the geometry name a
+    /// pipeline in `graph.yaml` asks for.
+    ///
+    /// **Two passes, because Minecraft has two.** Its own terrain is drawn as two *groups*
+    /// (`ChunkSectionLayerGroup`): `OPAQUE` is the solid layer and then the cutout one inside a single
+    /// render pass, and `TRANSLUCENT` is the translucent layer in a pass of its own - which is where
+    /// water and every other blending block model ends up, because a face that blends cannot be drawn in
+    /// the pass that writes opaque depth. So the two are split the same way here, and each name below
+    /// stands in for one group.
+    ///
+    /// The two need different *pipeline state* and not just different ranges: the opaque two neither
+    /// blend nor are drawn back to front and both write depth, while the translucent one blends, must not
+    /// write depth, and is drawn far-to-near. That is `graph.yaml`'s job - the two pipelines there differ
+    /// in `blending` and in `depth_write` - which is why this split is along the pipeline and not along
+    /// the layer.
+    ///
+    /// Each entry is `(layer, the alpha cutoff that layer's own Minecraft pipeline declares)`. The
+    /// cutoffs are Minecraft's own numbers: `SOLID_TERRAIN` declares no `ALPHA_CUTOUT` at all (which is a
+    /// cutoff of zero, a test no alpha fails), `CUTOUT_TERRAIN` declares 0.5, and `TRANSLUCENT_TERRAIN`
+    /// declares **0.01** - small, and not zero: a translucent texture with a *nearly* empty texel has to
+    /// leave a hole, and a mip level of one has a small non-zero alpha everywhere, so a cutoff of zero
+    /// would paint the holes in.
+    fn terrain_layers(geometry: &str) -> &'static [(RenderLayer, f32)] {
+        match geometry {
+            "@geo_terrain_translucent" => &[(RenderLayer::Transparent, 0.01)],
+            // Solid and cutout, which is every other name that reaches this: `@geo_terrain` is the only
+            // other terrain pipeline there is.
+            _ => &[(RenderLayer::Solid, 0.0), (RenderLayer::Cutout, 0.5)],
+        }
+    }
+
     /// Records the graph's passes into `encoder`, one pass per pipeline, in the order the config lists
     /// them.
     ///
@@ -1049,6 +1131,44 @@ impl RenderGraph {
         view_projection: [[f32; 4]; 4],
         model_translation: [f32; 3],
     ) {
+        self.render_with_mvp_only(
+            wm,
+            encoder,
+            scene,
+            render_target,
+            depth_override,
+            clear_color,
+            view_projection,
+            model_translation,
+            None,
+        );
+    }
+
+    /// The same, recording **one named pipeline and nothing else**.
+    ///
+    /// The two terrain groups are one graph but two moments in a frame, and the moment is not cosmetic.
+    /// Minecraft draws its opaque terrain, then its entities and features, then its translucent terrain
+    /// (`LevelRenderer#addMainPass`: `renderGroup(OPAQUE)`, `submitEntities`,
+    /// `renderTranslucentFeatures`, `renderGroup(TRANSLUCENT)`), and water that is blended into the
+    /// frame **before** the entities is water the entities are then drawn on top of - which is exactly
+    /// what "a mob in a lake looks like it never entered the water" is.
+    ///
+    /// So each group is recorded when the game reaches that group's own pass, and each one opens its own
+    /// render pass over the frame's colour and depth. `only` is the pipeline name, or `None` for the
+    /// whole graph - which is what a caller drawing a frame of its own wants.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_with_mvp_only(
+        &self,
+        wm: &WmRenderer,
+        encoder: &mut wgpu::CommandEncoder,
+        scene: &Scene,
+        render_target: &wgpu::TextureView,
+        depth_override: Option<&wgpu::TextureView>,
+        clear_color: [f32; 3],
+        view_projection: [[f32; 4]; 4],
+        model_translation: [f32; 3],
+        only: Option<&str>,
+    ) {
         let frustum = Frustum::from_modelview_projection(with_gl_depth_range(view_projection));
         let mut geometry = HashMap::new();
 
@@ -1062,6 +1182,7 @@ impl RenderGraph {
             &mut geometry,
             &frustum,
             model_translation,
+            only,
         );
     }
 
@@ -1077,12 +1198,19 @@ impl RenderGraph {
         geometry: &mut HashMap<String, Box<dyn Geometry>>,
         frustum: &Frustum<f32>,
         model_translation: [f32; 3],
+        only: Option<&str>,
     ) {
         let arena = WmArena::new(4096);
 
         let mut should_clear_depth = true;
 
         for (pipeline_name, bound_pipeline) in &self.pipelines {
+            if let Some(only) = only {
+                if pipeline_name != only {
+                    continue;
+                }
+            }
+
             let pipeline_config = self.config.pipelines.pipelines.get(pipeline_name).unwrap();
 
             let mut render_pass = encoder.begin_render_pass(&RenderPassDescriptor {
@@ -1126,7 +1254,24 @@ impl RenderGraph {
                         None
                     };
 
-                    let will_clear_depth = should_clear_depth && overridden.is_none();
+                    // Whether this pass clears the caller's depth buffer, which is a decision about the
+                    // *frame* and not about the pass: the frame's depth belongs to whoever wrote it
+                    // first, and every pass after that has to load it. `should_clear_depth` says one has
+                    // already claimed it - and `only` is the other half, because the two terrain groups
+                    // are recorded at two different moments in one frame and each call starts with
+                    // `should_clear_depth` true again. Clearing there would erase the whole opaque
+                    // world's depth under the water, and every face drawn after it would be tested
+                    // against a bare buffer.
+                    //
+                    // Which pass claims it is asked of the **layers**, not of a name: the opaque group is
+                    // the one that draws solid geometry, and the translucent one draws none.
+                    let opaque_group = Self::terrain_layers(&pipeline_config.geometry)
+                        .iter()
+                        .any(|(layer, _)| *layer == RenderLayer::Solid);
+
+                    let will_clear_depth = should_clear_depth
+                        && overridden.is_none()
+                        && only.is_none_or(|_| opaque_group);
                     should_clear_depth = false;
 
                     let depth_view = match overridden {
@@ -1169,7 +1314,10 @@ impl RenderGraph {
             });
 
             match &pipeline_config.geometry[..] {
-                "@geo_terrain" => {
+                // The two terrain passes: the opaque one draws the solid and cutout layers, the
+                // translucent one draws the transparent layer. See `terrain_layers` for which, and for
+                // why there are two passes rather than one.
+                "@geo_terrain" | "@geo_terrain_translucent" => {
                     render_pass.set_pipeline(&bound_pipeline.pipeline);
 
                     // The arena's buffer, loaded once for this pass and held for all of it: it is
@@ -1237,31 +1385,25 @@ impl RenderGraph {
                         );
                     }
 
-                    // The layers this pass draws, in the order the pass it stands in for draws them.
+                    // The layers this pass draws, in the order the pass it stands in for draws them - see
+                    // `terrain_layers`, which is the whole of which pass draws which.
                     //
-                    // That pass is the game's OPAQUE group, and it is *one* render pass with two
-                    // pipelines inside it - `ChunkSectionsToRender#renderGroup` walks the group's
-                    // layers, calling `setPipeline` for each, and opens nothing in between. A group
-                    // whose first pipeline is the solid layer is therefore taken over whole: drawing
-                    // only the solid layer here dropped every cutout face in the world from the frame,
-                    // and there is no other pass for them - every leaf, plant and grass overlay simply
-                    // disappeared, because Minecraft's own cutout draws would have happened further
-                    // down the pass this one replaced.
+                    // The pass being stood in for is the game's OPAQUE group, which is *one* render pass
+                    // with two pipelines inside it - `ChunkSectionsToRender#renderGroup` walks the
+                    // group's layers, calling `setPipeline` for each, and opens nothing in between. A
+                    // group whose first pipeline is the solid layer is therefore taken over whole:
+                    // drawing only the solid layer here dropped every cutout face in the world from the
+                    // frame, and there is no other pass for them - every leaf, plant and grass overlay
+                    // simply disappeared, because Minecraft's own cutout draws would have happened
+                    // further down the pass this one replaced.
                     //
-                    // The two need no different pipeline state - neither blends, both write depth, and
-                    // the shader discards the texels a cutout texture leaves empty - so what separates
-                    // them here is only which range of the arena is drawn.
-                    for layer_index in [RenderLayer::Solid as usize, RenderLayer::Cutout as usize] {
-                        // The alpha test the layer's own pipeline asks for: Minecraft's cutout terrain
-                        // pipeline defines `ALPHA_CUTOUT` as 0.5, and its solid one defines nothing -
-                        // which is a cutoff of zero here, a test no alpha fails, and the reason a
-                        // solid texture is never erased by its own alpha.
-                        let alpha_cutout: f32 = if layer_index == RenderLayer::Cutout as usize {
-                            0.5
-                        } else {
-                            0.0
-                        };
-
+                    // The second entry of `terrain_layers` is the same arrangement for the game's
+                    // TRANSLUCENT group, which is where water is.
+                    for (layer_index, alpha_cutout) in
+                        Self::terrain_layers(&pipeline_config.geometry)
+                    {
+                        let layer_index = *layer_index as usize;
+                        let alpha_cutout = *alpha_cutout;
                         for (pos, section) in sections.iter() {
                             // The section's position *relative to the camera's section*: the view matrix
                             // carries the camera's offset within its own section and nothing else, so a
@@ -1291,6 +1433,7 @@ impl RenderGraph {
 
                             let Some(layer) = &section.layers[layer_index] else {
                                 TERRAIN_EMPTY.fetch_add(1, Ordering::Relaxed);
+                                LAYER_EMPTY[layer_index].fetch_add(1, Ordering::Relaxed);
                                 continue;
                             };
 
@@ -1318,6 +1461,7 @@ impl RenderGraph {
 
                             TERRAIN_DRAWN.fetch_add(1, Ordering::Relaxed);
                             TERRAIN_DRAWN_TOTAL.fetch_add(1, Ordering::Relaxed);
+                            LAYER_DRAWN[layer_index].fetch_add(1, Ordering::Relaxed);
                         }
                     }
 
@@ -1586,6 +1730,56 @@ fn with_gl_depth_range(mvp: [[f32; 4]; 4]) -> [[f32; 4]; 4] {
     }
 
     converted
+}
+
+/// Which layer each of the two terrain passes draws. See [`RenderGraph::terrain_layers`].
+#[cfg(test)]
+mod terrain_layer_tests {
+    use super::*;
+
+    /// The split, and the three cutoffs that go with it.
+    ///
+    /// All four numbers are Minecraft's own, and every one of them is a picture difference rather than
+    /// an error if it is wrong: the wrong layer is water drawn opaque, and a cutoff of zero paints in the
+    /// holes a translucent mip level leaves nearly empty.
+    ///
+    /// The values are `RenderPipelines.SOLID_TERRAIN` (no `ALPHA_CUTOUT` at all), `CUTOUT_TERRAIN`
+    /// (`0.5`) and `TRANSLUCENT_TERRAIN` (`0.01`), and the layers are `ChunkSectionLayerGroup.OPAQUE`
+    /// and `TRANSLUCENT`.
+    #[test]
+    fn the_two_terrain_passes_draw_one_layer_each_and_neither_draws_the_other_s() {
+        let opaque = RenderGraph::terrain_layers("@geo_terrain");
+        let translucent = RenderGraph::terrain_layers("@geo_terrain_translucent");
+
+        assert_eq!(
+            opaque,
+            [(RenderLayer::Solid, 0.0), (RenderLayer::Cutout, 0.5)],
+            "the opaque group is the solid layer and then the cutout one, at the cutoffs the game's \
+             two pipelines declare"
+        );
+
+        assert_eq!(
+            translucent,
+            [(RenderLayer::Transparent, 0.01)],
+            "the translucent group is one layer, and its cutoff is Minecraft's 0.01 rather than zero"
+        );
+
+        // The two together are every layer there is, once each: a layer both drew would be drawn twice
+        // and a layer neither drew would be baked and invisible, which is the state water was in.
+        let mut drawn: Vec<usize> = opaque
+            .iter()
+            .chain(translucent)
+            .map(|(layer, _)| *layer as usize)
+            .collect();
+        drawn.sort_unstable();
+
+        assert_eq!(
+            drawn,
+            [0, 1, 2],
+            "the two passes between them have to draw the solid, cutout and transparent layers exactly \
+             once each"
+        );
+    }
 }
 
 #[cfg(test)]

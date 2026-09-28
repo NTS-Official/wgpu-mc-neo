@@ -13,6 +13,7 @@ import net.minecraft.client.renderer.state.level.CameraRenderState
 import net.minecraft.core.SectionPos
 import org.joml.Matrix4f
 import java.lang.foreign.MemorySegment
+import java.lang.foreign.ValueLayout
 
 /**
  * The Rust terrain pass, from this side: which of Minecraft's passes it stands in for, and the camera
@@ -32,20 +33,47 @@ object TerrainPass {
 	 * This is where the takeover fires, and it takes the *whole* pass with it - which in 26.1 is the
 	 * game's `OPAQUE` section-layer group: `ChunkSectionsToRender#renderGroup` opens one render pass
 	 * and walks the group's layers inside it, calling `setPipeline` first for the solid layer and then
-	 * for the cutout one. So the graph pass draws both of those layers out of the arena, and the
-	 * translucent layer is the one that stays Minecraft's - it is a group of its own, drawn in a pass
-	 * of its own, into a target of its own.
+	 * for the cutout one. So the graph pass draws both of those layers out of the arena.
 	 */
 	private const val SOLID_TERRAIN = "minecraft:pipeline/solid_terrain"
+
+	/**
+	 * The other pass the graph draws: the game's `TRANSLUCENT` group, which is one layer - water, ice,
+	 * stained glass and every other block model whose sprite blends.
+	 *
+	 * It is a second takeover rather than a third layer of the first one because Minecraft draws it as a
+	 * group of its own: `LevelRenderer` submits the transparent features, copies the main target's depth
+	 * into whichever target the group draws into, and only then calls `renderGroup` for it. The two are
+	 * also not interchangeable at the pipeline level - this one blends, does not write depth, and is
+	 * drawn far-to-near - which the graph has as two pipelines (`terrain` and `translucent_terrain`).
+	 *
+	 * What makes it takeable here is that the group's own target usually **does not exist**:
+	 * `ChunkSectionLayerGroup#outputTarget` falls back to the main target, and the translucent target is
+	 * only created when a transparency post chain is loaded - the Fabulous preset, or a resource pack
+	 * that ships one. See [usesOwnTarget], which is what refuses the takeover in that case rather than
+	 * drawing water into the wrong texture.
+	 */
+	private const val TRANSLUCENT_TERRAIN = "minecraft:pipeline/translucent_terrain"
 
 	/** Whether the path is switched on at all. See [RustChunkBake.MARKER]. */
 	fun isOn(): Boolean = RustChunkBake.isOn()
 
 	/** Whether the graph draws the pass a pipeline belongs to. */
+	fun replaces(location: String?): Boolean =
+		location == SOLID_TERRAIN || location == TRANSLUCENT_TERRAIN
+
+	/** Whether a pipeline is the translucent group's, which is the second of the two takeovers. */
+	fun isTranslucent(location: String?): Boolean = location == TRANSLUCENT_TERRAIN
+
+	/** Whether the message about the translucent layer being taken over has been written. */
+	private val reportedTranslucent = java.util.concurrent.atomic.AtomicBoolean()
+
+	fun noteTranslucentTakenOver(): Boolean = reportedTranslucent.compareAndSet(false, true)
+
 	/**
 	 * Whether the arena has anything to draw.
 	 *
-	 * That pass stays Minecraft's until it does: the graph draws the arena's contents, so a pass taken
+	 * A pass stays Minecraft's until it does: the graph draws the arena's contents, so a pass taken
 	 * over while the arena is empty is a frame with no ground in it - the same trade [ready] makes
 	 * about the pipeline, for the same reason. Asked per frame, because the answer changes as the world
 	 * is meshed; the call is one lock and a length.
@@ -53,7 +81,40 @@ object TerrainPass {
 	fun hasGeometry(renderer: MemorySegment): Boolean =
 		(WmNative.terrainArenaSections.invokeExact(renderer) as Int) > 0
 
-	fun replaces(location: String?): Boolean = location == SOLID_TERRAIN
+	/**
+	 * Whether the pass a pipeline belongs to draws into a target of its own, which this pass cannot be
+	 * handed.
+	 *
+	 * Only the translucent group ever has one, and only under a transparency post chain: `Fabulous` or a
+	 * resource pack's own chain, which `Minecraft.useShaderTransparency` is the switch for. The
+	 * takeover is handed the colour and depth views Minecraft opened *this* pass with, so drawing the
+	 * translucent layer into an opaque pass's target would put it in the wrong texture - and, because
+	 * the copy of the depth belongs to that other target, at the wrong depth.
+	 *
+	 * A resource pack can turn this on at any time, so it is asked per frame rather than cached.
+	 */
+	fun usesOwnTarget(location: String?): Boolean {
+		if (location != TRANSLUCENT_TERRAIN) {
+			return false
+		}
+
+		val renderer = Minecraft.getInstance().levelRenderer
+		return renderer.getTranslucentTarget() != null
+	}
+
+	/** Whether the message about a refused translucent takeover has been written. See [usesOwnTarget]. */
+	private val reportedOwnTarget = java.util.concurrent.atomic.AtomicBoolean()
+
+	/** Says once that the translucent layer is still Minecraft's, and why. */
+	fun reportOwnTarget() {
+		if (reportedOwnTarget.compareAndSet(false, true)) {
+			WgpuMcMod.LOGGER.info(
+				"wgpu: the translucent terrain is still Minecraft's - improved transparency (the " +
+					"Fabulous preset, or a resource pack's transparency chain) draws it into a target " +
+					"of its own, which this pass cannot be handed. Water and glass are the game's again."
+			)
+		}
+	}
 
 	/**
 	 * Whether the graph can draw it yet.
@@ -72,8 +133,8 @@ object TerrainPass {
 		canDraw = WmNative.terrainPassReady.invokeExact(renderer) as Boolean
 		if (canDraw) {
 			WgpuMcMod.LOGGER.info(
-				"wgpu: the render graph is drawing the solid and cutout terrain; Minecraft's own " +
-					"meshes for those two layers are skipped"
+				"wgpu: the render graph is drawing the solid, cutout and translucent terrain; " +
+					"Minecraft's own meshes for those three layers are skipped"
 			)
 		}
 		return canDraw
@@ -425,6 +486,7 @@ object TerrainPass {
 		val used = WmNative.terrainArenaUsed.invokeExact() as Int
 		val largest = WmNative.terrainArenaLargestSection.invokeExact() as Int
 		val watched = WgpuNative.watchedBlockFaces()
+		val layers = layerCounts()
 
 		// A *moving* watched count is worth the full line - under a second apart, so the loop while the
 		// world is meshed says what the watched blocks did and then stops: once they hold still, the
@@ -438,16 +500,24 @@ object TerrainPass {
 		val arena = "arena %,d of %,d slot(s) handed out (%d%%, %d MB), the largest section %,d slot(s)"
 			.format(used, slots, share, megabytes, largest)
 
+		// The six numbers, named for the three layers in the order the arena holds them. A layer whose
+		// `drawn` is zero while the arena has geometry is a pass that is not drawing it; a layer whose
+		// `empty` is every section is a bake that never landed. See `terrain_layer_counts`.
+		val perLayer = "solid %d+%d, cutout %d+%d, transparent %d+%d (drawn+empty)"
+			.format(layers[0], layers[1], layers[2], layers[3], layers[4], layers[5])
+
 		when (due) {
 			null -> null
-			false -> "; %,d section draw(s), %s, %,d refused".format(sections, arena, refused)
+			false ->
+				"; %,d section draw(s), %s, %,d refused; %s".format(sections, arena, refused, perLayer)
 			true ->
-				"; %,d section draw(s) - the solid and cutout layers of one pass -, ".format(sections) +
+				"; %,d section draw(s) - the three layers of two passes -, ".format(sections) +
 					"%,d fluid block(s) in the bakes, ".format(fluidBlocks) +
 					"%,d fluid face(s), %,d section(s) refused by the arena, ".format(fluidQuads, refused) +
 					arena +
 					", bob (%.2f, %.2f)".format(lastBobX, lastBobY) +
 					", bobView=$lastBobView player=$lastIsPlayer walk=%.2f".format(lastWalk) +
+					"; $perLayer" +
 					"; ${RustChunkBake.fluidDiagnostics}" +
 					"; ${RustChunkBake.refusedDiagnostics}" +
 					(watched.takeIf { it.isNotEmpty() }?.let { "; watched $it" } ?: "") +
@@ -456,6 +526,36 @@ object TerrainPass {
 	} catch (error: Throwable) {
 		if (reportDue(drawn, -1, -1, false) == null) null else "; the native counters could not be read: $error"
 	}
+
+	/**
+	 * The per-layer counts, read from the two packed words, or six zeroes with one warning.
+	 *
+	 * The native side *drains* the counters, so this is what the pass drew since the last report - and it
+	 * is read once here rather than in each branch of [describeFrame], because a second read would return
+	 * an empty second.
+	 *
+	 * A failure is said out loud once rather than swallowed into six zeroes: zeroes are a *plausible
+	 * answer* to the question this asks, so a silent failure here reads as "the pass drew nothing" and
+	 * sends whoever is looking in the wrong direction. That is not hypothetical - it is what this did
+	 * first, and the six zeroes were believed.
+	 */
+	private fun layerCounts(): LongArray = try {
+		val drawn = WmNative.terrainLayerCounts.invokeExact(0) as Long
+		val empty = WmNative.terrainLayerCounts.invokeExact(1) as Long
+
+		LongArray(6) { index ->
+			val word = if (index % 2 == 0) drawn else empty
+			(word ushr (21 * (index / 2))) and 0x1F_FFFF
+		}
+	} catch (error: Throwable) {
+		if (layerCountsReported.compareAndSet(false, true)) {
+			WgpuMcMod.LOGGER.warn("wgpu: the per-layer terrain counts could not be read", error)
+		}
+
+		LongArray(6)
+	}
+
+	private val layerCountsReported = java.util.concurrent.atomic.AtomicBoolean()
 
 	/** When the pass last said what it drew, and the numbers that line carried. See [describeFrame]. */
 	private var reportedAt = 0L

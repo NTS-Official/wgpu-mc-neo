@@ -1210,6 +1210,59 @@ mod tests {
             .join("\n")
     }
 
+    /// The section feed, pulled in for the one invariant in it that is a hole in the world when broken.
+    const RUST_CHUNK_BAKE: &str =
+        include_str!("../../../neoforge/src/main/kotlin/dev/birb/wgpu/chunk/RustChunkBake.kt");
+
+    /// **Every place this side forgets what it told Rust, it forgets that Rust is drawing it too.**
+    ///
+    /// Minecraft's own mesh for a section is dropped once Rust has been handed that section
+    /// (`SectionCompilerMixin`, gated on the `rustHas` set), which is what stops the game meshing the
+    /// whole world for a pass that has been taken over. The cost of getting it wrong is asymmetric and
+    /// that is why this is a test rather than a review: a `rustHas` entry that outlives its `sent` entry
+    /// is a section this side believes Rust is drawing while Rust has been told to forget it - and a
+    /// section nothing draws has nothing to look at. There is no log line for it, because from both
+    /// sides the section looks handled.
+    ///
+    /// So the two tables are checked against each other by *counting*: the source has to clear them the
+    /// same number of times, and no `sent` entry may be removed without its `rustHas` twin. A new
+    /// `sent.clear()` that nobody thought about fails here rather than in a world.
+    #[test]
+    fn forgetting_what_rust_was_told_forgets_that_rust_is_drawing_it() {
+        let source = code_of(RUST_CHUNK_BAKE);
+
+        let clears = |name: &str| source.matches(&format!("{name}.clear()")).count();
+
+        assert_eq!(
+            clears("sent"),
+            clears("rustHas"),
+            "`sent` is cleared {} time(s) and `rustHas` {} - the two are one fact: what Rust has been \
+             told, and what of that it is drawing",
+            clears("sent"),
+            clears("rustHas"),
+        );
+
+        assert!(
+            clears("sent") > 0,
+            "the test is looking for the clears by name; if they were renamed it is checking nothing"
+        );
+
+        // The removals, which are the refusals: one section at a time, and the two go together here
+        // rather than in blocks of their own.
+        assert_eq!(
+            source.matches("sent.remove(key)").count(),
+            source.matches("rustHas.remove(key)").count(),
+            "a section removed from `sent` is a section Rust may have refused, so it is one \
+             Minecraft's mesh has to be the fallback for again",
+        );
+
+        assert!(
+            source.contains("rustHas.remove(key)"),
+            "and the refusal path is where that matters: the arena refusing a section is the one case \
+             where Rust was told and is still not drawing",
+        );
+    }
+
     /// The language files, pulled in so that editing one of them re-runs these tests.
     ///
     /// The options screen builds every key it asks for out of a setting's name - `wgpu_mc.option.`

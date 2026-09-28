@@ -4493,6 +4493,7 @@ pub extern "C" fn render_terrain_pass(
     wm: &WmRenderer,
     color: &wgpu::TextureView,
     depth: &wgpu::TextureView,
+    translucent: bool,
 ) -> bool {
     // The graph opens a pass of its own, and wgpu allows one at a time: recording it inside one of
     // Minecraft's would leave the frame's recording in a state neither side can describe.
@@ -4549,7 +4550,16 @@ pub extern "C" fn render_terrain_pass(
     report_terrain_transform(scene, &view_projection, model_translation);
 
     with_shared_encoder(|encoder| {
-        graph.render_with_mvp(
+        // One group at a time, because the two are one frame apart in the game's own order: the opaque
+        // terrain, then the entities and features, then the translucent terrain. See
+        // `RenderGraph::render_with_mvp_only`.
+        let only = if translucent {
+            "translucent_terrain"
+        } else {
+            "terrain"
+        };
+
+        graph.render_with_mvp_only(
             wm,
             encoder,
             scene,
@@ -4558,6 +4568,7 @@ pub extern "C" fn render_terrain_pass(
             [0.0, 0.0, 0.0],
             view_projection,
             model_translation,
+            Some(only),
         );
     });
 
@@ -4659,6 +4670,43 @@ pub extern "C" fn terrain_sections_drawn() -> u32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn terrain_fluid_blocks() -> u32 {
     wgpu_mc::mc::chunk::fluid_totals().0.min(u32::MAX as u64) as u32
+}
+
+/// What the terrain pass drew since the last call, per layer, packed three to a word.
+///
+/// Six counts would be six calls, so each of these returns three - solid, cutout and transparent in the
+/// low, middle and high thirds of a `jlong`, 21 bits each. A second of drawing is thousands, not
+/// millions, so the ceiling is not a number anything reaches; the counts are clamped to it rather than
+/// allowed to wrap.
+///
+/// `which` is 0 for the sections each layer **drew** and 1 for the sections whose layer was **empty**.
+/// A drained pair, like the report the native side keeps for its own log - so the JVM asks once a second
+/// and gets that second's numbers.
+///
+/// It exists because a layer that is not on screen has two very different explanations that the total
+/// number of section draws cannot tell apart: the arena has nothing in that layer for those sections, or
+/// it has and the pass is not drawing it. A transparent count that is zero while the arena holds water
+/// is a pipeline or a pipeline-state problem; an *empty* count that is every section is a bake that
+/// never landed. Written into the JVM's report as six numbers, because that is the line a run always
+/// has.
+///
+/// **An out-parameter was tried first and does not work.** `&mut [u32; 6]` is not a signature this
+/// crate's `jni` macro supports, and the failure is not a signature error at the call - it is an
+/// exception inside the downcall, which the JVM side caught and reported as six zeroes. Zeroes are a
+/// *plausible answer* here, which is what made it worth writing down.
+#[unsafe(no_mangle)]
+pub extern "C" fn terrain_layer_counts(which: i32) -> i64 {
+    let (drawn, empty) = wgpu_mc::render::graph::take_layer_counts();
+    let counts = if which == 0 { drawn } else { empty };
+
+    /// Three per word, 21 bits each: `(1 << 21) - 1`.
+    const FIELD: u64 = (1 << 21) - 1;
+
+    let packed = (0..3).fold(0u64, |word, layer| {
+        word | (counts[layer].min(FIELD) << (21 * layer))
+    });
+
+    packed as i64
 }
 
 /// How many sections the arena has refused to hold, over the whole run. See [terrain_fluid_blocks].

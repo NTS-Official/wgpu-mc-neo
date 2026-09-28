@@ -143,6 +143,12 @@ fn blend_default() -> String {
     "alpha_blending".into()
 }
 
+/// The default of [`PipelineConfig::depth_write`]: every pipeline writes depth unless it says otherwise,
+/// which is what every pipeline but the translucent terrain one does.
+fn depth_write_default() -> bool {
+    true
+}
+
 fn output_format_default() -> String {
     "bgra8unorm".into()
 }
@@ -158,6 +164,17 @@ pub enum BindGroupDef {
 pub struct PipelineConfig {
     pub geometry: String,
 
+    /// The shader this pipeline draws with, as a resource path without the extension.
+    ///
+    /// **`None` means the pipeline's own name**, which is how every pipeline but one works: a config that
+    /// writes `terrain:` gets `wgpu_mc:shaders/terrain.wgsl`. It is spelled out here when two pipelines
+    /// are the same shader with two sets of pipeline state - the two terrain passes are exactly that, and
+    /// a pipeline that named `translucent_terrain` was looking for a shader that does not exist and being
+    /// **skipped in silence**: `WgslShader::init` answers `None` for "no such resource", the graph logs it
+    /// at a level the game's log file may not carry, and the frame goes on without that pass.
+    #[serde(default)]
+    pub shader: Option<String>,
+
     #[serde(default)]
     pub output: Vec<String>,
 
@@ -171,6 +188,16 @@ pub struct PipelineConfig {
     pub output_format: String,
 
     pub depth: Option<String>,
+
+    /// Whether this pipeline writes the depth it tests against.
+    ///
+    /// True for everything that draws a surface, and **false for the one pass that blends**: a
+    /// translucent face has to be tested against the depth of what is behind it and must not become
+    /// what the next translucent face is tested against, or the nearest pane of glass in a window hides
+    /// all the others. Minecraft's own translucent terrain draws with the depth test on and the depth
+    /// write off, which is what this says.
+    #[serde(default = "depth_write_default")]
+    pub depth_write: bool,
 
     #[serde(default)]
     pub clear: bool,

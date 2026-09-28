@@ -203,9 +203,21 @@ object RustChunkBake {
 			SETTING,
 		)
 
-		if (enabled && enabled != previous) {
-			Minecraft.getInstance().execute { Minecraft.getInstance().levelRenderer.allChanged() }
-		}
+		// **Both directions rebuild the world, and they have to.** Turning the path *on* is the obvious
+		// half: the graph can only draw what the baker has baked, so every section has to be offered to
+		// it. Turning it *off* is the half that was missing while Minecraft's meshes were being built
+		// anyway - they were the fallback, so nothing had to be done to get them back.
+		//
+		// And they are not being built any more: with the path on, a section Rust took is a section whose
+		// Minecraft mesh was dropped before it was uploaded (`SectionCompilerMixin`). So the sections in
+		// the view are holding empty meshes, and turning the switch off without this leaves the world
+		// drawn by nobody - the graph is off and Minecraft has nothing to draw.
+		//
+		// `allChanged` is what marks every section dirty and rebuilds it, and it is the same call a
+		// resource reload makes. The sections are meshed over the next second or two, which is the same
+		// window the `on` direction already had. Only a real *change* reaches here - see the early return
+		// above - so a session that never touches the switch never pays for it.
+		Minecraft.getInstance().execute { Minecraft.getInstance().levelRenderer.allChanged() }
 	}
 
 	private var bakes = 0L
@@ -266,6 +278,9 @@ object RustChunkBake {
 
 		for (key in refused) {
 			sent.remove(key)
+			// And a refused section is one Rust is not drawing, so Minecraft's mesh goes back to being
+			// the fallback for it. `redirty` below is what asks for the rebuild that will use it.
+			rustHas.remove(key)
 		}
 
 		refusedDrained += refused.size
@@ -435,6 +450,10 @@ object RustChunkBake {
 	@JvmStatic
 	fun forgetAll(generation: Int) {
 		sent.clear()
+		// A world change is every section Rust knew about gone, so nothing it was drawing is known
+		// either - and Minecraft meshes sections again until Rust has been told about them. See
+		// [rustHas].
+		rustHas.clear()
 		this.generation = generation
 
 		WgpuMcMod.LOGGER.info(
@@ -467,6 +486,13 @@ object RustChunkBake {
 		val forgotten = sent.size
 		sent.clear()
 
+		// The sections themselves have not changed, but what they bake *to* has - a new pack, or a
+		// setting that decides how a face is baked - so the arena is holding geometry of the last bake
+		// and Minecraft's own mesh is the only correct thing to draw until the re-offers land. So this
+		// forgets that Rust is drawing them too, and the re-mesh the caller asks for is one Minecraft
+		// takes part in. See [rustHas].
+		rustHas.clear()
+
 		WgpuMcMod.LOGGER.info(
 			"wgpu: {} section(s) will be offered to the Rust baker with their blocks again",
 			forgotten,
@@ -486,21 +512,78 @@ object RustChunkBake {
 	 * Minecraft's mesh, and taking the world down over an optimisation that is not drawing anything
 	 * yet would be the wrong trade.
 	 */
+	/**
+	 * Offers one section rebuild to the Rust baker, and answers whether Rust took it.
+	 *
+	 * The answer is what decides whether Minecraft meshes the same section at all - see [meshesInRust],
+	 * which the rebuild task asks before it starts building geometry. So the two halves have to be one
+	 * answer: a section Rust did **not** take has to be meshed by Minecraft, or it is a section nothing
+	 * draws.
+	 *
+	 * A failure is logged and answered `false`: the world falls back to Minecraft's mesh for that
+	 * section, which is the picture this renderer drew before the path existed, and taking the world
+	 * down over an optimisation would be the wrong trade.
+	 */
 	@JvmStatic
-	fun bake(region: RenderSectionRegion) {
-		if (!isOn()) return
+	fun bake(region: RenderSectionRegion): Boolean {
+		if (!isOn()) return false
 
 		// A rebuild can arrive before the native side has cached block states - the cache is built on
 		// the title screen, and a quickplay launch is loading chunks well before that finishes. A bake
 		// then would find no registry and no "air", and the whole copy would be wasted.
-		if (!WgpuNative.blocksCached()) return
+		if (!WgpuNative.blocksCached()) return false
 
-		try {
+		return try {
 			bakeNow(region)
+			true
 		} catch (throwable: Throwable) {
 			WgpuMcMod.LOGGER.error("wgpu: the Rust terrain bake failed", throwable)
+			false
 		}
 	}
+
+	/**
+	 * Whether the rebuild being run on this thread has been **taken** by Rust, so Minecraft's own mesh
+	 * for the same section is geometry nothing will ever read. See [rustHas] for what "taken" means.
+	 *
+	 * **Per thread, and that is the whole reason it is not a field beside the others.** Section rebuilds
+	 * run on a pool of chunk-build workers, the bake is called at the head of the task and this is read a
+	 * moment later inside the same task, and a single shared flag would be a race the moment two workers
+	 * ran two sections at once: one section's bake would answer for the other's read.
+	 */
+	private val tookThisSection = ThreadLocal.withInitial { false }
+
+	/** For the mixin that drops Minecraft's mesh. See [tookThisSection]. */
+	@JvmStatic
+	fun meshesInRust(): Boolean = tookThisSection.get()
+
+	/** Records the answer of the bake that just ran on this thread. See [tookThisSection]. */
+	@JvmStatic
+	fun noteTookSection(took: Boolean) {
+		tookThisSection.set(took)
+	}
+
+	/**
+	 * The sections Rust has been handed at least once - which is what "Rust has this section" means
+	 * here, and the only claim this side is entitled to make.
+	 *
+	 * **A payload leaving is not the same as a mesh existing**, and the difference is a hole in the
+	 * world. Rust bakes on its own thread off a queue: `bakeSections` returns as soon as the payload is
+	 * copied, and what comes out the other end lands in the arena some frames later, if it lands at all
+	 * - the arena refuses sections it has no room for. So a section offered for the first time is a
+	 * section Rust may not be drawing yet, and Minecraft's mesh is dropped for such a section is a
+	 * section **nothing** draws until something dirties it again, which for a section that is not
+	 * changing is never.
+	 *
+	 * Being handed once closes that: the payload has landed by the next rebuild of the same section by
+	 * definition - a rebuild of it is what carries it. So the first rebuild of a section lets Minecraft
+	 * mesh it as it always did while Rust catches up, and every rebuild after that drops the mesh.
+	 *
+	 * The keys are `SectionPos.asLong`, the same key [sent] uses, and the two are cleared together
+	 * everywhere: a section this side has forgotten is one Rust may have refused, so it is one
+	 * Minecraft's mesh goes back to being the fallback for.
+	 */
+	private val rustHas: MutableSet<Long> = java.util.concurrent.ConcurrentHashMap.newKeySet()
 
 	/**
 	 * The block states of one of the 27 sections, from the rebuild's own snapshot.
@@ -549,17 +632,33 @@ object RustChunkBake {
 		// player, so a section this side counts as sent can be gone there. It says so instead of baking
 		// against holes, and the answer is to forget what was sent and hand the whole neighbourhood
 		// over again - once, because the second call carries everything the first one was missing.
-		if (send(region, minX, minY, minZ, targetX, targetY, targetZ, force = false)) {
+		//
+		// `firstLook` is the other answer the call gives, and the two are separate questions: this one
+		// says Rust had to be told everything again, that one says it was being told about a section for
+		// the first time. See [rustHas].
+		val firstLook = BooleanArray(1)
+
+		if (send(region, minX, minY, minZ, targetX, targetY, targetZ, force = false, firstLook)) {
 			resyncs++
+			// Both tables go together: this side's bookkeeping is everything it has told Rust, and
+			// [rustHas] is the part of that Rust is drawing. A resync means Rust kept less than it was
+			// told, so what it is drawing is not known either.
 			sent.clear()
-			send(region, minX, minY, minZ, targetX, targetY, targetZ, force = true)
+			rustHas.clear()
+			send(region, minX, minY, minZ, targetX, targetY, targetZ, force = true, firstLook)
 		}
 
 		if (sent.size > SENT_LIMIT) {
 			// Rust keeps what it has; dropping this side's bookkeeping only means the next payloads
-			// carry more than they had to.
+			// carry more than they had to. Both tables go together - see [rustHas].
 			sent.clear()
+			rustHas.clear()
 		}
+
+		// The answer for this section: `true` only when every one of the 27 was already Rust's. It is
+		// read *after* the commit above, which is what makes the second rebuild of a section the one
+		// that stops meshing it.
+		noteTookSection(!firstLook[0])
 
 		bakes++
 		if (Diagnostics.loggingEnabled() || bakes - reported >= REPORT_EVERY) {
@@ -615,6 +714,7 @@ object RustChunkBake {
 		targetY: Int,
 		targetZ: Int,
 		force: Boolean,
+		firstLook: BooleanArray,
 	): Boolean {
 		val lightEngine = region.lightEngine
 		val blockLayers = lightEngine.getLayerListener(LightLayer.BLOCK)
@@ -662,6 +762,10 @@ object RustChunkBake {
 			val states = statesOf(region, copies, index, x, y, z)
 			val blocks = if (states == null) null else describe(states)
 			val entry = sent[key]
+
+			if (!rustHas.contains(key)) {
+				firstLook[0] = true
+			}
 
 			if (blocks != null) {
 				present++
@@ -754,6 +858,11 @@ object RustChunkBake {
 				}
 
 				sent[update.key] = update.entry
+
+				// And Rust has been told about this one, which is what Minecraft's own meshing is gated
+				// on. A refusal leaves it unmarked, so the next rebuild of that section still has
+				// Minecraft's mesh to fall back on. See [rustHas].
+				rustHas.add(update.key)
 			}
 		}
 

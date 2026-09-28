@@ -43,3 +43,45 @@ pipelines:
       1: "@bg_ssbo_chunks"
     immediates:
       0: "@pc_section_position"
+
+  # The translucent terrain pass: the transparent layer of the same arena, which is water, ice, stained
+  # glass and every other block model whose sprite blends.
+  #
+  # It is a pipeline of its own rather than a third layer of the one above because Minecraft's own
+  # terrain is two *groups* and not one pass - `ChunkSectionLayerGroup.TRANSLUCENT` is opened after the
+  # transparent features have been submitted, and its layer needs different pipeline state: it blends,
+  # it does not write depth, and it is drawn far-to-near. See `terrain_layers` in `graph.rs` for which
+  # layers each of the two draws, and `PipelineConfig::depth_write` for the depth half.
+  #
+  # `alpha_blending` is the game's own `BlendFunction.TRANSLUCENT`, and `rgba8unorm` is the same target
+  # as the opaque pass because the translucent target - which Minecraft only creates for the Fabulous
+  # preset and for a resource pack with a transparency post chain - does not exist here; see
+  # `TerrainPass` on the JVM side for what handles that case.
+  translucent_terrain:
+    geometry: "@geo_terrain_translucent"
+    # The same shader as `terrain`, which is the whole point: the two are one vertex and one fragment
+    # program with two sets of pipeline state. Without this the graph would look for
+    # `wgpu_mc:shaders/translucent_terrain.wgsl`, not find it, and skip the pipeline - which is a pass
+    # that never opens, a transparent layer nothing draws, and no error anywhere loud enough to notice.
+    shader: terrain
+    depth: "@texture_depth"
+    output: [ "@framebuffer_texture" ]
+    output_format: rgba8unorm
+    blending: alpha_blending
+    depth_write: false
+    bind_groups:
+      0:
+        0: "@mat4_model"
+        1: "@mat4_view"
+        2: "@mat4_perspective"
+        3: "@texture_block_atlas"
+        4: "@sampler"
+        5: "@texture_mc_block_atlas"
+        6: "@sampler_mc_block_atlas"
+        7: "@texture_game_lightmap"
+        8: "@sampler_game_lightmap"
+        9: "@fog_environment"
+      1: "@bg_ssbo_chunks"
+    immediates:
+      0: "@pc_section_position"
+

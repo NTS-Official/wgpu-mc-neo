@@ -382,9 +382,23 @@ public class WgpuRenderPass implements RenderPassBackend {
         }
         reportPlanOnce(slots);
 
-        // The Rust terrain path: the pass Minecraft has opened for the solid layer is the one the
-        // render graph draws, so this is where it is handed over - the pipeline is what says which pass
-        // this is, and it is bound before anything is drawn into it.
+        // The Rust terrain path: a pass Minecraft has opened for one of the two terrain groups is the
+        // one the render graph draws, so this is where it is handed over - the pipeline is what says
+        // which pass this is, and it is bound before anything is drawn into it.
+        //
+        // **Each group is recorded at its own pass, and that is not an optimization.** Minecraft draws
+        // its opaque terrain, then its entities and features, then its translucent terrain
+        // (`LevelRenderer#addMainPass`); the graph is asked for one group at a time
+        // (`render_terrain_pass`'s `translucent` flag) so that the water lands where the game's own water
+        // lands. Recording both groups at the *opaque* pass - which is what this did first - draws the
+        // water before the entities, and the entities are then drawn on top of it: a mob standing in a
+        // lake with no water in front of it at all.
+        //
+        // Each group's own pipeline is where that group's *meshes* are dropped: the opaque pass now, and
+        // the translucent pass when Minecraft opens it. `graphDrawnThisFrame` tells the second visit that
+        // the frame is already being drawn by the graph, which is what stops Minecraft's own translucent
+        // meshes from being recorded on top of the graph's. `usesOwnTarget` is the one case that refuses
+        // the second outright - see `TerrainPass.TRANSLUCENT_TERRAIN`.
         //
         // The last two conditions are the same trade twice: a pass taken away from Minecraft before the
         // graph can draw it, or before the arena holds anything to draw, is a frame with no ground in it
@@ -396,7 +410,26 @@ public class WgpuRenderPass implements RenderPassBackend {
                 && !depthView.equals(MemorySegment.NULL)
                 && TerrainPass.INSTANCE.ready(device.renderer())
                 && TerrainPass.INSTANCE.hasGeometry(device.renderer())) {
-            takeOverTerrainPass();
+            if (TerrainPass.INSTANCE.usesOwnTarget(activePipelineName)) {
+                // Asked here rather than in the guard, so that it is only said once the graph could have
+                // drawn this pass at all: a player who has not taken the terrain over does not need a
+                // line about water.
+                TerrainPass.INSTANCE.reportOwnTarget();
+            } else if (TerrainPass.INSTANCE.isTranslucent(activePipelineName)) {
+                // The translucent group's own pass, and it is recorded here - after the entities the game
+                // has already drawn into this target, which is the whole reason it is a separate call.
+                graphTerrain = true;
+                takeOverTerrainPass(true);
+
+                if (TerrainPass.INSTANCE.noteTranslucentTakenOver()) {
+                    dev.birb.wgpu.WgpuMcMod.LOGGER.info(
+                            "wgpu: the render graph is drawing the translucent terrain too, so water "
+                                    + "and glass come out of the arena; Minecraft's own meshes for "
+                                    + "that layer are skipped");
+                }
+            } else {
+                takeOverTerrainPass(false);
+            }
         }
     }
 
@@ -413,15 +446,21 @@ public class WgpuRenderPass implements RenderPassBackend {
      * else Minecraft draws afterwards test against the depth this pass fills. The pass being replaced
      * is the game's opaque group, which draws the solid layer and then the cutout one inside one
      * render pass, so both of those come out of the arena here - see {@code @geo_terrain}.
+     *
+     * <p>{@code translucent} picks which of the two groups the graph is asked for. It is the group this
+     * pass stands in for, and the two are one frame apart: the opaque group is drawn before the game's
+     * entities and the translucent group after them, so asking for the wrong one puts water either in
+     * front of or behind everything the game draws between them.
      */
-    private void takeOverTerrainPass() {
+    private void takeOverTerrainPass(boolean translucent) {
         invoke(WmNative.dropRenderPass, nativePass);
         nativePass = MemorySegment.NULL;
         graphTerrain = true;
 
         TerrainPass.INSTANCE.sendCameraMatrices();
 
-        boolean drawn = (boolean) invoke(WmNative.renderTerrainPass, device.renderer(), colorView, depthView);
+        boolean drawn = (boolean) invoke(
+                WmNative.renderTerrainPass, device.renderer(), colorView, depthView, translucent);
 
         // Null on most frames: the pass is taken over every frame of a world, and a line per frame is
         // half a megabyte of log in thirty seconds. It answers when there is something to say - the

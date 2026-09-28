@@ -132,8 +132,22 @@ pub const fn arena_slots(render_distance: u32) -> u32 {
     const RING: u32 = 2;
     /// How many sections deep a column of an ordinary world is meshed.
     const SECTIONS_PER_COLUMN: u32 = 3;
-    /// One section's vertices and indices, in u32 slots: about 64 KB, or 727 quads.
-    const SLOTS_PER_SECTION: u32 = 16_000;
+    /// One section's vertices and indices, in u32 slots: about 80 KB, or 909 quads.
+    ///
+    /// It was **16 000**, and the water is why it is not any more. The measurement above is the pool at
+    /// **79%** with only the solid and cutout layers in it, and the transparent layer is a whole layer
+    /// more: an ocean section is a surface, a floor and however many risers the shoreline has, and the
+    /// fluid mesher has already culled the faces inside the water (it skips a side towards the same
+    /// fluid and a top with the same fluid above it), so what is added is bounded by the *surface* of
+    /// the water rather than by its volume. Vanilla sizes the same thing from the other end - its
+    /// translucent section buffer is 786 432 bytes against 4 194 304 for each of the two opaque ones, a
+    /// fifth - and the water is most of what that layer holds.
+    ///
+    /// A fifth on top of 16 000 is 19 200, and 20 000 is that rounded up: the danger is not the average
+    /// section but a *column* that is all water from the surface to the floor, where the average is the
+    /// only thing this constant can describe. What it does not cover is `WmRenderer::grow_arena`, which
+    /// doubles the pool the moment a section does not fit - see `REFUSED`.
+    const SLOTS_PER_SECTION: u32 = 20_000;
 
     let capped = if render_distance > 64 {
         64
@@ -2523,21 +2537,24 @@ mod fluid_geometry_tests {
     use super::*;
 
     /// The fluid sprites, at rectangles that do not matter here: this is about where the vertices are.
+    ///
+    /// Both fluids are present and they are in **different layers** - water blends and lava does not,
+    /// which is the one thing about a fluid this side of the sprite lookup decides - because which layer
+    /// a fluid lands in is what says which pass draws it. See `the_water_lands_in_the_transparent_layer`.
     fn sprites() -> [Option<(RenderLayer, FluidSprites)>; 2] {
         let sprite = FluidSprite {
             atlas: ((0, 0), (16, 16)),
             game: None,
         };
 
+        let both = || FluidSprites {
+            still: sprite,
+            flow: sprite,
+        };
+
         [
-            None,
-            Some((
-                RenderLayer::Solid,
-                FluidSprites {
-                    still: sprite,
-                    flow: sprite,
-                },
-            )),
+            Some((RenderLayer::Transparent, both())),
+            Some((RenderLayer::Solid, both())),
         ]
     }
 
@@ -2589,13 +2606,87 @@ mod fluid_geometry_tests {
         )
     }
 
-    /// Bakes the fluids of one section-sized world and answers the quads of the solid layer.
-    fn bake(world: &FluidWorld) -> Vec<[[f32; 3]; 4]> {
+    /// Bakes the fluids of one section-sized world and answers the quads of one layer.
+    ///
+    /// The layer is named rather than assumed because the two fluids go in different ones - see
+    /// `the_water_lands_in_the_transparent_layer` - and most of what is below is about lava's shape.
+    fn bake_layer(world: &FluidWorld, layer: RenderLayer) -> Vec<[[f32; 3]; 4]> {
         let mut layers = vec![BakedLayer::default(); 3];
 
         bake_fluid_faces_with(&manager(), world, &sprites(), &mut layers);
 
-        quads(&layers[RenderLayer::Solid as usize])
+        quads(&layers[layer as usize])
+    }
+
+    /// The same, for the lava layer, which is what every shape test below is about.
+    fn bake(world: &FluidWorld) -> Vec<[[f32; 3]; 4]> {
+        bake_layer(world, RenderLayer::Solid)
+    }
+
+    /// **Where the water goes, which is what makes it drawable at all.**
+    ///
+    /// Water and lava are the same mesher and the same shapes; the whole of what separates them is the
+    /// layer they are baked into, and that is decided by [`fluid_sprites`] from the fluid's kind. Lava
+    /// is opaque and goes in the solid layer, which is one of the two the graph's *opaque* pass draws.
+    /// Water blends, so it goes in the transparent layer - and a transparent layer that nothing draws is
+    /// water that is baked and invisible, which is exactly the state this was in for as long as water was
+    /// skipped here.
+    ///
+    /// So this asserts both halves: the water is in the transparent layer, and it is **not** in the solid
+    /// one. The second half is the one that catches a mesher that ignored the layer it was handed: a
+    /// water block drawn in the opaque pass is water with no blending, which is an ocean you cannot see
+    /// the bottom of rather than an error.
+    #[test]
+    fn the_water_lands_in_the_transparent_layer() {
+        // A source of water, with solid ground under it so that it has a floor and its sides are walls.
+        let world = FluidWorld::with(
+            1,
+            &[],
+            &[
+                (IVec3::new(0, -1, 0), SOLID),
+                (IVec3::new(1, 0, 0), SOLID),
+                (IVec3::new(-1, 0, 0), SOLID),
+                (IVec3::new(0, 0, 1), SOLID),
+                (IVec3::new(0, 0, -1), SOLID),
+            ],
+        );
+
+        let transparent = bake_layer(&world, RenderLayer::Transparent);
+        let solid = bake_layer(&world, RenderLayer::Solid);
+
+        assert!(
+            !transparent.is_empty(),
+            "a water source with a floor and four walls has five faces to draw and none were baked \
+             into the layer water belongs in"
+        );
+
+        assert!(
+            solid.is_empty(),
+            "and none of them belong in the solid layer, which cannot blend: {} quad(s) of water were \
+             baked there",
+            solid.len()
+        );
+
+        // The same world with lava in it is the other way round, which is what says the split is the
+        // fluid's and not the world's.
+        let lava = FluidWorld::with(
+            2,
+            &[],
+            &[
+                (IVec3::new(0, -1, 0), SOLID),
+                (IVec3::new(1, 0, 0), SOLID),
+                (IVec3::new(-1, 0, 0), SOLID),
+                (IVec3::new(0, 0, 1), SOLID),
+                (IVec3::new(0, 0, -1), SOLID),
+            ],
+        );
+
+        assert!(
+            bake_layer(&lava, RenderLayer::Solid).len() == transparent.len(),
+            "the two fluids have the same shape, so with the same neighbours they bake the same number \
+             of faces - in their own layers"
+        );
+        assert!(bake_layer(&lava, RenderLayer::Transparent).is_empty());
     }
 
     /// The wall of one block in one direction, as the quad that was baked for it - the plane it lies
@@ -3028,6 +3119,11 @@ fn fluid_sprites(atlas: &Atlas, kind: u8, name: &str) -> Option<(RenderLayer, Fl
 /// so the pass above walks straight past it, and the Rust terrain came out with the lava and the
 /// water simply missing, which in a superflat world is the lava lakes and the water.
 ///
+/// The two go into different layers, which is the whole of what separates them here: lava is opaque and
+/// goes in the solid layer, water blends and goes in the transparent one. See [`fluid_sprites`], which
+/// is where that is decided, and `@geo_terrain_translucent` on the render graph's side, which is what
+/// draws the transparent layer.
+///
 /// The shape: a top face at the height the fluid settled at and only where the block above holds a
 /// different fluid, side faces only towards blocks that do not hold the same fluid, clipped to the
 /// corners' heights so a sloping surface comes out sloping, a bottom face where the fluid does not
@@ -3042,10 +3138,8 @@ fn bake_fluid_faces<Provider: BlockStateProvider>(
     atlas: &Atlas,
     layers: &mut [BakedLayer],
 ) {
-    // Lava is the only fluid with a layer to draw into yet (see the `match` below). The water sprites
-    // are still looked up, so that a pack missing them says so once now rather than on the day water is
-    // drawn. Indexed by kind - 1, so the geometry below does not have to know a `FluidSprites` from an
-    // atlas; see [`bake_fluid_faces_with`], which is what a test calls.
+    // Indexed by kind - 1, so the geometry below does not have to know a `FluidSprites` from an atlas;
+    // see [`bake_fluid_faces_with`], which is what a test calls.
     let sprites = [
         fluid_sprites(atlas, 1, "water"),
         fluid_sprites(atlas, 2, "lava"),
@@ -3072,9 +3166,21 @@ fn bake_fluid_faces_with<Provider: BlockStateProvider>(
     // in the order that comes back out wound counter-clockwise.
     const INDICES: [u32; 6] = [0, 3, 1, 1, 3, 2];
 
-    // Water is tinted by the biome it is in, which nothing on this path knows. This is the colour
-    // the game uses where no biome says otherwise, packed the way the terrain shader reads the
-    // vertex colour back: red in the low byte.
+    // Water is tinted by the biome it is in, which nothing on this path knows. This is the colour the
+    // game uses where no biome says otherwise, packed the way the terrain shader reads the vertex
+    // colour back: red in the low byte.
+    //
+    // **An approximation, and a visible one.** A face is tinted by `BiomeColors.getAverageWaterColor` in
+    // the game, which is a function of the biome's temperature and downfall - so an ocean, a swamp and a
+    // cold river are three different colours there and one here. Sending the tint with the payload is
+    // what closes it: the JVM has the biome at every position it meshes, and the fluid mesher would take
+    // a colour per block instead of this constant.
+    //
+    // The alpha byte is not part of that. The shader builds the vertex colour as `vec4(red, green, blue,
+    // 1.0)` and the alpha that reaches the blend is the *texture's*, so this byte goes nowhere - it is
+    // `ff` only because it is unused rather than because it means anything. **The two halves are not
+    // interchangeable and were briefly confused**: `0x00e4763f` is a colour, `0x00ffffff` is white, and
+    // white water is what this line looks like when the colour half is mistaken for the alpha half.
     const WATER_TINT: u32 = 0x00e4_763f;
 
     let mut add_quad = |layer: RenderLayer,
@@ -3134,11 +3240,7 @@ fn bake_fluid_faces_with<Provider: BlockStateProvider>(
         }
 
         let sprites = match kind {
-            // Lava only, for now: water belongs in the translucent layer and no pass of ours draws that
-            // layer yet - Minecraft still draws its own water - so baking it would be a second copy of
-            // every ocean in the arena, in space the sections that *are* drawn have to share. It comes
-            // back the day the translucent pass is taken over.
-            1 => continue,
+            1 => &sprites[0],
             2 => &sprites[1],
             // 3 is "a fluid this mesher does not know": a modded one, or the empty fluid of a block
             // that has none, which is 0.

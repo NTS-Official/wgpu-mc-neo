@@ -262,6 +262,111 @@ mod tests {
         );
     }
 
+    /// The graph the mod ships also carries the translucent terrain pipeline, and it is the *only*
+    /// pipeline that blends without writing depth.
+    ///
+    /// This is the water. It is checked here rather than left to the run because every way of getting it
+    /// wrong is silent: a pipeline whose geometry name does not match what `graph.rs` matches on is a
+    /// pass that opens and draws nothing, one with `depth_write` left at its default turns every pane of
+    /// glass into a curtain - the nearest one writes depth and hides the rest - and one with `replace`
+    /// instead of `alpha_blending` draws water opaque, which looks almost right until the first pane of
+    /// glass behind it disappears.
+    #[test]
+    fn the_shipped_graph_has_the_translucent_terrain_pipeline() {
+        let config: ShaderPackConfig =
+            serde_yaml::from_str(include_str!("../graph.yaml")).expect("graph.yaml parses");
+
+        let opaque = config
+            .pipelines
+            .pipelines
+            .get("terrain")
+            .expect("the graph has the terrain pipeline");
+
+        let translucent = config
+            .pipelines
+            .pipelines
+            .get("translucent_terrain")
+            .expect("the graph has the translucent terrain pipeline");
+
+        assert_eq!(translucent.geometry, "@geo_terrain_translucent");
+        assert_eq!(translucent.blending, "alpha_blending");
+        assert!(
+            !translucent.depth_write,
+            "a translucent face is tested against the depth behind it and must not become what the \
+             next one is tested against"
+        );
+        assert!(
+            opaque.depth_write,
+            "and the opaque terrain still writes the depth the translucent pass tests against"
+        );
+
+        // Everything else the two passes need is the same, because they draw the same arena out of the
+        // same bindings - a field copied wrong between them is a pass that draws into the wrong texture
+        // or samples the wrong atlas, and neither fails until the frame is on screen.
+        assert_eq!(translucent.depth, opaque.depth);
+        assert_eq!(translucent.output, opaque.output);
+        assert_eq!(translucent.output_format, opaque.output_format);
+        assert_eq!(
+            translucent.immediates, opaque.immediates,
+            "the section position is what tells the shader which section it is drawing"
+        );
+        assert_eq!(
+            translucent.bind_groups, opaque.bind_groups,
+            "the same arena, the same two atlases and the same lightmap"
+        );
+    }
+
+    /// **Every pipeline in the shipped graph has a shader file behind it.**
+    ///
+    /// This is the check for a failure that is completely silent: the graph resolves a pipeline's shader
+    /// as `wgpu_mc:shaders/<name>.wgsl`, where `<name>` is the pipeline's own name *unless it names
+    /// another*, and a pipeline whose shader is not found is **skipped** - on purpose, because a shader
+    /// can legitimately be missing while the atlas is still being stitched, and a panic there would end
+    /// the process. What that costs when the name is simply wrong is a pass that never opens and a layer
+    /// nothing draws: the second terrain pass - the one that draws water - was written with
+    /// `translucent_terrain:` and no `shader:`, so it looked for a `translucent_terrain.wgsl` that does
+    /// not exist and was skipped every time. The frame looked fine, the exit code was zero, and the only
+    /// sign was a transparent layer that was not on screen.
+    ///
+    /// The files are checked by name against this crate's own list, because the shaders live in the
+    /// mod's resources rather than beside the Rust: `SHADERS` below is every `.wgsl` there is.
+    #[test]
+    fn every_pipeline_in_the_shipped_graph_has_its_shader() {
+        let config: ShaderPackConfig =
+            serde_yaml::from_str(include_str!("../graph.yaml")).expect("graph.yaml parses");
+
+        /// Every shader the mod ships, by the name a pipeline would resolve.
+        ///
+        /// Transcribed from `neoforge/src/main/resources/assets/wgpu_mc/shaders/` rather than globbed:
+        /// a build script that read that directory would be the only way to glob it, and this list is
+        /// the thing that has to be *kept* in step with it - a shader added there without being added
+        /// here fails this test, which is the right direction for the warning to point.
+        const SHADERS: &[&str] = &[
+            "clear",
+            "debug_lines",
+            "electrum_gui",
+            "entity",
+            "grass",
+            "sky_fog",
+            "sky_scatter",
+            "stars",
+            "sun_moon_cycle",
+            "terrain",
+            "transparent",
+        ];
+
+        for (name, pipeline) in &config.pipelines.pipelines {
+            let shader = pipeline.shader.as_deref().unwrap_or(name);
+
+            assert!(
+                SHADERS.contains(&shader),
+                "the '{name}' pipeline draws with '{shader}.wgsl', which the mod does not ship; the \
+                 graph would skip the pipeline in silence and the layer it draws would never appear. \
+                 Shipping shaders: {SHADERS:?}"
+            );
+        }
+    }
+
     /// The shader the shipped graph draws the terrain with compiles.
     ///
     /// The graph is built at startup and the shader is read out of the mod's own resources - this is

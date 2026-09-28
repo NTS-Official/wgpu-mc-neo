@@ -882,16 +882,26 @@ fn default_face_uv(bounds: ElementBounds, declared: Direction) -> [f32; 4] {
     let [fx, fy, fz] = bounds.from;
     let [tx, ty, tz] = bounds.to;
 
-    // The sprite's four corners, built from the two axes each face samples and the direction each runs.
-    // The six lines of the game's `defaultFaceUV` are the comment above, one per arm, and each arm here
-    // is that line with both axes turned - see the note there for why the turn is not optional.
+    // The game's six lines, transcribed with **neither axis turned**.
+    //
+    // An earlier version of this turned both axes, on the argument that this side's vertices are the
+    // game's read backwards (`face_vertices`) and reversing a quad flips both of its texture axes. The
+    // argument is wrong, and it produced upside-down textures on every side face of every model that
+    // writes no `uv` - the whole of `defaultFaceUV` - which is slabs, stairs, panes and plants. What the
+    // argument got wrong is *where* the turn belongs: `face_vertices` is a table of which corner of the
+    // box samples which corner of the rectangle, and it is written against the rectangle **as the game
+    // defines it**. Turning the rectangle as well turns the face twice, and a face turned twice is a face
+    // turned once.
+    //
+    // It is not a second opinion about those six lines either: they are quoted in the doc comment above
+    // and this is them, with `from` and `to` substituted. Nothing here sorts or clamps.
     match declared {
-        Direction::Down => [fx, fz, tx, tz],
-        Direction::Up => [fx, 16.0 - fz, tx, 16.0 - tz],
-        Direction::North => [tx, ty, fx, fy],
-        Direction::South => [fx, fy, tx, ty],
-        Direction::West => [fz, fy, tz, ty],
-        Direction::East => [16.0 - fz, fy, 16.0 - tz, ty],
+        Direction::Down => [fx, 16.0 - tz, tx, 16.0 - fz],
+        Direction::Up => [fx, fz, tx, tz],
+        Direction::North => [16.0 - tx, 16.0 - ty, 16.0 - fx, 16.0 - fy],
+        Direction::South => [fx, 16.0 - ty, tx, 16.0 - fy],
+        Direction::West => [fz, 16.0 - ty, tz, 16.0 - fy],
+        Direction::East => [16.0 - tz, 16.0 - ty, 16.0 - fz, 16.0 - fy],
     }
 }
 
@@ -1002,32 +1012,31 @@ type SpriteCorner = (bool, bool);
 ///
 /// > some blocks' faces are rotated against the game's - 90, 180 or 270 degrees
 ///
-/// The corners are the game's `FaceInfo` row for the face, and the sprite corners are
-/// `CuboidFace.UVs#getVertexU`/`#getVertexV` for the same index - which is two lines rather than four
+/// The corners are the game's `FaceInfo` row for the face **in its own order**, and the sprite corners
+/// are `CuboidFace.UVs#getVertexU`/`#getVertexV` for the same index - which is two lines rather than four
 /// cases, so the four corners of the sprite they name are always the same four in the same walking order,
 /// and what changes from face to face is where the box's corners sit in it.
 ///
-/// **What is not the game's is the direction the list runs in.** `FaceInfo` is written for
-/// `calculateFacing`, which only asks which direction a quad is *about*, so a face comes out of it wound
-/// against this renderer's `Ccw` - and the game turns it round afterwards, in `recalculateWinding`, by
-/// reading the quad from its other end. That is the order below, and it is not cosmetic here: this
-/// renderer culls back faces, so a face wound the wrong way is a face that is never drawn.
+/// **The game's order is the renderer's winding, and this file spent a while believing otherwise.**
+/// `FaceInfo` is written for `calculateFacing`, which only asks which direction a quad is *about* - and
+/// the conclusion drawn from that was that its quads wind against this renderer's `Ccw`, so the order was
+/// reversed here. It is not true: the cross product of the first three corners of every one of the game's
+/// six rows points *out* of the block, which is what `Ccw` front faces want, and
+/// `every_face_turns_the_way_the_renderer_draws_it` checks it on every run. Turning a quad over is also a
+/// symmetry that nothing here can see - a reversed quad is still a quad, and its winding is still a
+/// winding - so the wrong belief cost nothing until it was combined with the table below, and then every
+/// side face of every model that writes no `uv` came out **upside down**: `default_face_uv` was turned as
+/// well, on the same argument, and a face turned twice is a face turned once.
 ///
-/// Three versions of this table were tried before it, and each of the first two was turned against the
-/// game on four of the six faces while every test of the day passed. What found the third is
-/// [`default_face_uv`] - the *same* six lines of the game, read as a statement about which corner of the
-/// box samples which corner of the sprite - because that is one fact per face rather than a pairing.
-/// `a_face_pairs_its_corners_the_way_the_games_own_uv_lines_do` runs that comparison, and
-/// `every_face_turns_the_way_the_renderer_draws_it` checks the winding, on every test run.
+/// What found the table was not another hand-written one. It was asking the two game tables together -
+/// `FaceInfo`'s corners and `default_face_uv`'s rectangle - which corner of the sprite each corner of the
+/// box samples, and writing down what they said. `a_face_pairs_its_corners_the_way_the_games_own_uv_lines_do`
+/// runs that comparison, and `every_face_turns_the_way_the_renderer_draws_it` checks the winding, on every
+/// test run.
 fn face_vertices(dir: Direction) -> [(Corner, SpriteCorner); 4] {
-    // The four corners of the face, in the order this renderer winds its quads, each paired with the
-    // corner of the sprite the game's own `defaultFaceUV` line for the face puts it at.
-    //
-    // Each row is that line's two axes read against the four corners the face is on, and the *order* is
-    // the game's `FaceInfo` row read backwards: `FaceInfo` is written for `calculateFacing`, which only
-    // asks which direction a quad is *about*, so its quads wind against this renderer's `Ccw` and the
-    // game turns them round after baking. Winding them the other way here is the same four corners in the
-    // other order, which is why the sprite corners below run against the corner list and not with it.
+    // The four corners of the face in the game's own `FaceInfo` order, each paired with the corner of the
+    // sprite `default_face_uv` puts it at. Both columns were derived from those two tables rather than
+    // argued about; see the note above for how long arguing about them took.
     //
     // Three tables got this wrong before, and both of the first two passed every test of the day. What
     // found the working one is the two checks that run on every test now:
@@ -1036,44 +1045,45 @@ fn face_vertices(dir: Direction) -> [(Corner, SpriteCorner); 4] {
     let pairs: [(Corner, SpriteCorner); 4] = match dir {
         // from.x, 16 - to.z -> `u` runs with `x`, `v` against `z`.
         Direction::Down => [
-            (4, (true, false)),
-            (5, (true, true)),
-            (1, (false, true)),
-            (0, (false, false)),
+            (1, (false, false)),
+            (0, (false, true)),
+            (4, (true, true)),
+            (5, (true, false)),
         ],
         // from.x, from.z -> `u` with `x`, `v` against `z`.
         Direction::Up => [
-            (7, (true, false)),
-            (6, (true, true)),
-            (2, (false, true)),
-            (3, (false, false)),
-        ], // 16 - to.x, 16 - to.y -> `u` against `x`, `v` against `y`.
+            (2, (false, false)),
+            (3, (false, true)),
+            (7, (true, true)),
+            (6, (true, false)),
+        ],
+        // 16 - to.x, 16 - to.y -> `u` against `x`, `v` against `y`.
         Direction::North => [
-            (0, (false, false)),
-            (2, (false, true)),
-            (6, (true, true)),
-            (4, (true, false)),
+            (6, (false, false)),
+            (4, (false, true)),
+            (0, (true, true)),
+            (2, (true, false)),
         ],
         // from.x, 16 - to.y -> `u` with `x`, `v` against `y`.
         Direction::South => [
-            (5, (true, false)),
-            (7, (true, true)),
-            (3, (false, true)),
-            (1, (false, false)),
+            (3, (false, false)),
+            (1, (false, true)),
+            (5, (true, true)),
+            (7, (true, false)),
         ],
         // from.z, 16 - to.y -> `u` with `z`, `v` against `y`.
         Direction::West => [
-            (1, (true, false)),
-            (3, (true, true)),
-            (2, (false, true)),
-            (0, (false, false)),
+            (2, (false, false)),
+            (0, (false, true)),
+            (1, (true, true)),
+            (3, (true, false)),
         ],
         // 16 - to.z, 16 - to.y -> `u` against `z`, `v` against `y`.
         Direction::East => [
-            (4, (true, false)),
-            (6, (true, true)),
-            (7, (false, true)),
-            (5, (false, false)),
+            (7, (false, false)),
+            (5, (false, true)),
+            (4, (true, true)),
+            (6, (true, false)),
         ],
     };
 
@@ -1736,12 +1746,17 @@ mod default_uv_tests {
     /// pane and every plant are all *part* of a block sampling the sprite the game cut out for them.
     ///
     /// The numbers are `FaceBakery#defaultFaceUV`'s six lines for a bottom slab - `from [0, 0, 0]`,
-    /// `to [16, 8, 16]` - evaluated in this side's terms. Every one of the six is different, so nothing
-    /// here can pass by the axes being right and the signs being wrong, or the other way round.
+    /// `to [16, 8, 16]` - quoted above and transcribed with **neither axis turned**. Every one of the six
+    /// is different, so nothing here can pass by the axes being right and the signs being wrong, or the
+    /// other way round.
     ///
-    /// Up and Down keep the `v` axis the game does not turn on them; the four sides are the game's lines
-    /// with `16 - y` read as `y`, which is what a box corner *is* on this side's winding - see
-    /// [`default_face_uv`].
+    /// **A turned version of these was here first and it was wrong.** It read `16 - y` as `y` on the four
+    /// sides and turned `Up`/`Down` as well, on the argument that this side's vertices are the game's read
+    /// backwards and reversing a quad flips both texture axes. It is a regression that shipped: every side
+    /// face of every model that writes no `uv` - slabs, stairs, panes, plants - came out upside down.
+    /// `face_vertices` is already the answer to "which corner of the box samples which corner of the
+    /// rectangle", written against the rectangle the game defines, so turning the rectangle as well turns
+    /// the face twice.
     #[test]
     fn a_face_without_a_uv_covers_the_element_and_not_the_sprite() {
         let bottom_slab = ElementBounds {
@@ -1750,12 +1765,12 @@ mod default_uv_tests {
         };
 
         for (dir, expected) in [
-            (Direction::Up, [0.0, 16.0, 16.0, 0.0]),
+            (Direction::Up, [0.0, 0.0, 16.0, 16.0]),
             (Direction::Down, [0.0, 0.0, 16.0, 16.0]),
-            (Direction::North, [16.0, 8.0, 0.0, 0.0]),
-            (Direction::South, [0.0, 0.0, 16.0, 8.0]),
-            (Direction::West, [0.0, 0.0, 16.0, 8.0]),
-            (Direction::East, [16.0, 0.0, 0.0, 8.0]),
+            (Direction::North, [0.0, 8.0, 16.0, 16.0]),
+            (Direction::South, [0.0, 8.0, 16.0, 16.0]),
+            (Direction::West, [0.0, 8.0, 16.0, 16.0]),
+            (Direction::East, [0.0, 8.0, 16.0, 16.0]),
         ] {
             assert_eq!(
                 default_face_uv(bottom_slab, dir),
@@ -1772,12 +1787,12 @@ mod default_uv_tests {
         };
 
         for (dir, expected) in [
-            (Direction::Up, [4.0, 12.0, 12.0, 4.0]),
+            (Direction::Up, [4.0, 4.0, 12.0, 12.0]),
             (Direction::Down, [4.0, 4.0, 12.0, 12.0]),
-            (Direction::North, [12.0, 16.0, 4.0, 0.0]),
+            (Direction::North, [4.0, 0.0, 12.0, 16.0]),
             (Direction::South, [4.0, 0.0, 12.0, 16.0]),
             (Direction::West, [4.0, 0.0, 12.0, 16.0]),
-            (Direction::East, [12.0, 0.0, 4.0, 16.0]),
+            (Direction::East, [4.0, 0.0, 12.0, 16.0]),
         ] {
             assert_eq!(default_face_uv(post, dir), expected, "{dir:?} of a post");
         }
@@ -1814,9 +1829,13 @@ mod default_uv_tests {
 
         let span = *vs.iter().max().expect("four") as i32 - *vs.iter().min().expect("four") as i32;
 
-        assert_eq!(
-            span,
-            game_bits(0.5) as i32,
+        // Within one bit rather than exact, and that is the sixteen-bit encoding and not the geometry:
+        // `game_bits` puts a fraction into `0..65535`, so the *middle* of the sprite is `0.5 * 65535` -
+        // 32767.5, which a `f32` lands either side of depending on how the two halves were computed.
+        // The question this test asks is whether the side covers half the sprite or all of it, and one
+        // bit in sixteen is four orders of magnitude away from that.
+        assert!(
+            (span - game_bits(0.5) as i32).abs() <= 1,
             "a bottom slab's side sampled {vs:?}, which is not half the sprite - a slab is half a block \
              tall and its sprite is not, so this is the texture drawn at the wrong scale",
         );

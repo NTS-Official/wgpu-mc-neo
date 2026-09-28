@@ -2346,7 +2346,9 @@ Three things were wrong behind that, and one of them made it permanent:
 - **The estimate was four times too small.** See above; `SLOTS_PER_SECTION` is 16 000 with the
   arithmetic written next to it, and the placeholder the arena is created with (`ARENA_SLOTS`) is now
   the *small* one on purpose - the game reports its render distance before anything is baked, and that
-  report is what sizes the pool.
+  report is what sizes the pool. It is **20 000** since the water was taken over, which is a fifth more
+  and the same ratio vanilla gives its translucent section buffer; see "The water was baked and never
+  drawn" for why.
 - **Nothing grew the arena, and nothing retried the section.** A fixed pool and a render distance that
   is a slider do not have to agree, and the two ends of that disagreement were both missing. The arena
   now grows: `RangeAllocator::grow_to` extends the pool at the *end*, so every range already handed out
@@ -2706,53 +2708,79 @@ order "says nothing about" this side's - and it is what the next report was abou
 > there is a new problem: one or some of a block's faces are rotated against the game's - for example some
 > stones' top faces, by 90, 180 or 270 degrees
 
-Three separate mistakes were stacked in that arrangement, and each one hid the next.
+**`FaceInfo`'s winding is this renderer's after all, and saying otherwise is a regression that shipped.**
+The claim was that `FaceInfo` is written for `calculateFacing`, which only asks which direction a quad is
+*about*, so a face comes out of it wound against `Ccw` and vanilla turns it round afterwards. That is
+false, and it can be checked against the game's own data without running anything: take the first three
+corners of `FaceInfo`'s row for a face, and their cross product points **out** of the block. Checked for
+all six:
 
-**One: `FaceInfo`'s winding is not this renderer's.** `FaceInfo` is written for `calculateFacing`, which
-only asks which direction a quad is *about* - so a face comes out of it wound against `Ccw`, and vanilla
-turns it round afterwards. This renderer culls back faces, so every face in the old table that was wound
-the game's way was a face that was **never drawn**: the DOWN face's normal came out `(0, 1, 0)` where the
-face points `(0, -1, 0)`. That is the one mistake here with a test that catches it without any reference
-to the game - take the normal of the first three vertices and compare it with the direction the face is
-supposed to point (`every_face_turns_the_way_the_renderer_draws_it`).
-
-**Two: the bit order of a corner is `z`, `y`, `x` - not `x`, `y`, `z`.** The baker writes its eight
-corners out as `p000`..`p111` and puts them in one array, so the bit a name carries is `x` in 4, `y` in 2,
-`z` in 1 - the reverse of the order the axes are usually spoken in. A test that reads the bits as
-`(x, y, z)` gets a **mirrored box**, and a mirrored box is a symmetry of all six faces: every fact about
-a full cube still holds, every "which corner is which" check still passes, and nothing shows up until a
-pairing is asked about an axis by name. `corner_position` is that array written out by name now, shared by
-the bake and the tests, so there is one reading of the bits rather than one per caller.
-
-**Three: `16 - y` is a statement about the box's axes, and only `u` is mirrored between the two sides.**
-`defaultFaceUV` writes each of a face's lines out of two of the box's axes, and which two - and which way
-round - is the whole of the pairing:
-
-| face | `u` runs | `v` runs |
+| face | first three `FaceInfo` corners | cross |
 | --- | --- | --- |
-| DOWN | with `x` | with `z` |
-| UP | with `x` | against `z` |
-| NORTH | against `x` | against `y` |
-| SOUTH | with `x` | against `y` |
-| WEST | with `z` | against `y` |
-| EAST | against `z` | against `y` |
+| DOWN | `(minX,minY,maxZ) (minX,minY,minZ) (maxX,minY,minZ)` | `(0,-1,0)` |
+| UP | `(minX,maxY,minZ) (minX,maxY,maxZ) (maxX,maxY,maxZ)` | `(0,+1,0)` |
+| NORTH | `(maxX,maxY,minZ) (maxX,minY,minZ) (minX,minY,minZ)` | `(0,0,-1)` |
+| SOUTH | `(minX,maxY,maxZ) (minX,minY,maxZ) (maxX,minY,maxZ)` | `(0,0,+1)` |
+| WEST | `(minX,maxY,minZ) (minX,minY,minZ) (minX,minY,maxZ)` | `(-1,0,0)` |
+| EAST | `(maxX,maxY,maxZ) (maxX,minY,maxZ) (maxX,minY,minZ)` | `(+1,0,0)` |
 
-Getting that table right by hand is what took three attempts, so nothing here is a hand-derivation any
-more. The test **derives** it, from `default_face_uv` itself: each of the game's six lines writes each of
-its coordinates out of one axis only, so the axis a coordinate runs along is the one that moves it - move
-that axis, and *that* coordinate changes and the other does not. The test asks the function, for a slab
-(where all three axes have different extents, so no two are confusable), and then asks `face_vertices`
-whether the corner of the box it names really samples what the line says. It is the one statement of the
-pairing that is not the table, and it is what found the third version.
+So the game's order is the renderer's winding, and reversing it here was wrong. What made the wrong
+version hard to see is that **reversing a quad changes nothing any test in this file can observe**: it is
+still four corners, still a closed walk, and still a winding - a winding that now faces the other way, but
+the sprite corners had been turned to match, so `a_face_pairs_its_corners_the_way_the_games_own_uv_lines_do`
+was told what to expect by the same turned `default_face_uv`. Two consistent wrongs.
 
-The table itself is now one row per face and looks like the game's own: the four corners of `FaceInfo`'s
-row, read backwards, each with the corner of the sprite the game's line puts there.
+That is exactly how the *next* report came in:
 
-**The lesson worth keeping** is about which tests can see what. Two of the three mistakes are invisible to
-any test that only asks *which corner of the box is this* or *does the walk go round*: a mirrored box
-satisfies all of them, and a pairing turned as a whole satisfies the first two tests in this file - which
-is exactly why they passed for two rounds while four of the six faces were wrong. What sees a mirror is a
-question about a **named axis**; what sees a turn is a question about a **specific corner of the sprite**.
+> 似乎是修uv那一轮让方块侧面的贴图都反了（倒过来了），草也反了，火焰也反了
+
+which is the shape of the failure: `default_face_uv` had been turned as well, on the same "the quad is
+reversed" argument, and a face turned twice is a face turned once. Every side face of every model that
+writes no `uv` - which is the whole of `defaultFaceUV`: slabs, stairs, panes, plants - came out upside
+down. `default_face_uv` is now the game's six lines **verbatim**, with neither axis turned:
+
+```rust
+match declared {
+    Direction::Down => [fx, 16.0 - tz, tx, 16.0 - fz],
+    Direction::Up => [fx, fz, tx, tz],
+    Direction::North => [16.0 - tx, 16.0 - ty, 16.0 - fx, 16.0 - fy],
+    Direction::South => [fx, 16.0 - ty, tx, 16.0 - fy],
+    Direction::West => [fz, 16.0 - ty, tz, 16.0 - fy],
+    Direction::East => [16.0 - tz, 16.0 - ty, 16.0 - fz, 16.0 - fy],
+}
+```
+
+**Two more things were wrong in the arrangement, and one of them is still the reason to be careful.**
+
+**The bit order of a corner is `z`, `y`, `x` - not `x`, `y`, `z`.** The baker writes its eight corners
+out as `p000`..`p111` and puts them in one array, so the bit a name carries is `x` in 4, `y` in 2, `z` in
+1 - the reverse of the order the axes are usually spoken in. A test that reads the bits as `(x, y, z)`
+gets a **mirrored box**, and a mirrored box is a symmetry of all six faces: every fact about a full cube
+still holds, every "which corner is which" check still passes, and nothing shows up until a pairing is
+asked about an axis by name. `corner_position` is that array written out by name now, shared by the bake
+and the tests, so there is one reading of the bits rather than one per caller. This one is real and stands.
+
+**Three: the pairing itself.** `defaultFaceUV` writes each of a face's lines out of two of the box's axes,
+and which two - and which way round - is the whole of the pairing. Nothing here is a hand-derivation any
+more. The test **derives** it from the two game tables together: for a slab (where all three axes have
+different extents, so no two are confusable) it asks `default_face_uv` which axis each coordinate follows
+and which way it runs, then asks that corner of the sprite each corner of the box samples should be, then
+asks `face_vertices` whether that is what it says. It is the one statement of the pairing that is not the
+table.
+
+**How the table was actually found, after two hand-written ones failed.** By printing it. A throwaway test
+walked `FaceInfo`'s rows and `default_face_uv`'s rectangle together and printed the pairs they imply, and
+the table was written from that output - and the printed rows and the test's independent derivation agreed
+on all six faces. That is the method worth keeping: when two hand-derivations have disagreed with the
+screen, **derive it from the game's data and print it** rather than reasoning about it a third time.
+
+**The lesson worth keeping** is about which tests can see what. A mirrored box satisfies every "which
+corner is this" question; a pairing turned as a whole satisfies every "does the walk go round" question.
+So does a *reversed* quad, which is the one that cost the most here: it is invisible to every test in this
+file and it silently re-defined what the neighbouring function was expected to say. What sees a mirror is
+a question about a **named axis**; what sees a turn is a question about a **specific corner of the
+sprite** - and neither of them sees a test whose expectations were written from the same wrong premise.
+For that, the expectations have to come from data the code does not own.
 
 ### The title screen wrote a warning per frame
 
@@ -3199,20 +3227,47 @@ the two fire sprites while the switch is off, and all three places stop at once:
 private void wgpu_mc$tickUnlessFrozen(SpriteContents.AnimationState state) { … }
 ```
 
-**Which state is fire is the fiddly part.** `AnimationState` does not say which sprite it belongs to, so it
-is traced back three links - the state to its `AnimatedTexture`, that to the outer `SpriteContents`, and
-that to the sprite's name - and the name is compared against the identifiers `ModelBakery` builds its
-`FIRE_0`/`FIRE_1` sprite ids from, rather than against the paths spelled out again. Two notes from writing
-that:
+**Which state is fire is the fiddly part, and the first two ways of answering it both took the game down.**
+`AnimationState` does not say which sprite it belongs to.
 
-- **`AnimatedTexture` is package-private, so the accessors answer `Object`.** An `@Accessor` whose return
-  type is that class cannot be named from a mod's own package. The JVM widens a reference to `Object` for
-  free, and only the last link (`SpriteContents`) has to be named. The chain was checked against the real
-  classes before shipping, because an accessor is looked up by name the *first time it is called* - which
-  is in the middle of a running client, not at build time. A `@Shadow` field added to an accessor interface
-  does not get that check either; it built fine with a deliberately wrong name.
-- **If the trace ever fails, fire animates and one warning is logged.** It does not fall back to freezing
-  the whole atlas: an atlas that quietly stops moving would be a stranger bug than the one being fixed.
+The obvious route is to follow the objects the tick loop already holds: the state to its `AnimatedTexture`,
+that to the outer `SpriteContents`, and that to the sprite's name - compared against the identifiers
+`ModelBakery` builds its `FIRE_0`/`FIRE_1` sprite ids from, rather than against the paths spelled out
+again. That is what this did first, with two `@Accessor`s, and it cannot be done:
+
+- **A field accessor is matched by name *and type*, not by name.** The type is the accessor method's own
+  return type, so an accessor answering `Object` is not a wider version of one answering
+  `AnimatedTexture` - it is a member that does not exist. The session died on the title screen with
+  `InvalidAccessorException: No candidates were found matching this$0:Ljava/lang/Object;`. This is worth
+  stating plainly because the intuition runs the other way: widening a reference to `Object` is free
+  inside a method body, and the descriptor is a different thing.
+- **And the type cannot be spelled out instead.** `SpriteContents$AnimatedTexture` is package-private, so
+  a mod's own package cannot name it in a signature - and a type parameter erases to `Object`, which is
+  the same member that does not exist. (A `@Shadow` field with a deliberately wrong name also builds
+  fine; nothing about an accessor is checked at build time, which is why the client run below is the real
+  test.)
+
+So the association is recorded where the sprite is already a **parameter** instead:
+`SpriteContents.createAnimationState` is a public method of a public class, it is handed the
+`SpriteContents` it is making the state for, and it returns the state - both halves are in the signature,
+and nothing private is named. That is `SpriteContentsMixin` writing and `TextureAtlasMixin` reading, and
+the two cannot see each other's fields, so the association lives in a class of its own.
+
+**That class is in the mod's package and not beside the mixins, which was the second crash.** Mixin
+refuses to load a plain class out of a package it owns: every class under a configured mixin package is
+treated as a mixin, and one that is not fails its *class load* with
+
+```
+IllegalClassLoadError: dev.birb.wgpu.mixin.render.AnimationSprites is in a defined mixin
+package dev.birb.wgpu.mixin.* owned by wgpu_mc
+```
+
+which is not a warning at load time - it landed inside a resource reload, took the whole reload down with
+it, and left the title screen **black and unclickable** with no crash report. `AnimationSprites` lives in
+`dev.birb.wgpu.render` for that reason, and it is the only place the association could go.
+
+**If the trace ever fails, fire animates and one warning is logged.** It does not fall back to freezing
+the whole atlas: an atlas that quietly stops moving would be a stranger bug than the one being fixed.
 
 The frame it stops on is a real one. Both strips are 32 frames - `fire_1` in order, `fire_0` starting at
 the back half of its sheet - and holding whatever frame is in the atlas is the same thing the terrain does
@@ -3584,8 +3639,221 @@ Still the game's and not ours, in the fluid path:
   The two agree for everything a fluid meets - air, stone, and a fluid itself, which is not solid - and
   differ for a cobweb and a bamboo sapling, which this then counts as a `0.0` sample where the game drops
   them;
-- **water**, which is not taken over at all: it belongs in the translucent layer, no pass of ours draws
-  that layer yet, and Minecraft still draws its own.
+- water's **colour**, which is one constant here and a function of the biome in the game:
+  `BiomeColors.getAverageWaterColor` is the biome's temperature and downfall, so an ocean, a swamp and a
+  cold river are three colours in vanilla and one here. It was invisible while water was not drawn at all,
+  and it is the next thing to close - see "The water was baked and never drawn" below, and the note on
+  `WATER_TINT`;
+- the **order** the translucent layer is drawn in. The game sorts translucent geometry back to front,
+  because that is what blending needs when two surfaces overlap; this side draws the layer far-to-near by
+  section and in bake order within one, which is right for the water surface and can be wrong where two
+  translucent blocks overlap inside the same section. It is a picture difference, not a hole.
+
+### Minecraft kept meshing the world for a pass it was no longer drawing
+
+Taking the terrain pass over stopped Minecraft *drawing* its sections, and did nothing about it *building*
+them. `RustChunkBakeMixin` injects at the head of `RebuildTask#doTask`, calls the Rust bake, and lets the
+task carry on: the game then looked up a model for every block in the section, built the vertices, packed
+them into the scratch buffers, ran the sort-key pass and uploaded the result into its own uber buffers -
+for a pass that had been taken over. On a populated world that is the whole cost of the terrain pipeline,
+paid for geometry nothing reads.
+
+**What made it survivable was stopping it, and what made stopping it delicate is that the rebuild does
+three jobs and only one of them is the mesh.** `SectionCompiler#compile` also collects the section's
+**renderable block entities** and computes its **visibility set**, and both are read by things that are
+not the terrain:
+
+```java
+// LevelRenderer
+for (SectionRenderDispatcher.RenderSection section : this.visibleSections) {
+    List<BlockEntity> renderableBlockEntities = section.getSectionMesh().getRenderableBlockEntities();
+```
+
+That list is how a chest is found at all - it is the *only* source of block entities to render - so
+throwing the whole compile away is every chest, sign and banner in the world disappearing. And
+`SectionOcclusionGraph` walks `facesCanSeeEachother` to decide which sections are even worth visiting, so
+an empty mesh turns the culling off for everything behind it. The picture would look almost right.
+
+So the compile still runs and the hook is on the last thing it produces: `new CompiledSectionMesh(pointOfView, results)`, the one call in `doTask` handed both the results and the layers. Emptying
+`renderedLayers` there leaves the caller taking its `results.renderedLayers.isEmpty()` path, which is the
+path an **all-air section** takes - the one state in this dispatcher that is known to be safe:
+
+```java
+if (results.renderedLayers.isEmpty()) {
+    SectionMesh oldMesh = RenderSection.this.setSectionMesh(compiledSectionMesh);
+    ...
+    return SectionTaskResult.SUCCESSFUL;   // what an empty chunk already does every frame
+}
+```
+
+`MeshData` is `AutoCloseable` and its `close` is what returns the scratch buffers to a **fixed pool**, so
+the layers are closed one at a time before the map is emptied - `EnumMap.clear()` does not close what was
+in it, and a bare `clear()` there leaks the whole section's staging buffers out of that pool.
+
+**And the gate is not the setting.** `meshesInRust()` asks whether Rust has *this* section, not whether
+the path is on, because a payload leaving is not the same as a mesh existing: `bakeSections` returns as
+soon as the payload is copied, the bake happens on the Rust side's own thread off a queue, the result
+lands in the arena some frames later, and the arena refuses sections it has no room for. Dropping
+Minecraft's mesh for a section Rust is not drawing yet is a section **nothing** draws - and for a section
+whose blocks are not changing there is no second rebuild to notice. So the answer is a set of the
+sections Rust has been handed **at least once**, which the next rebuild of the same section closes by
+definition. A section offered for the first time keeps Minecraft's mesh one rebuild longer, and every
+rebuild after that drops it.
+
+The two tables are cleared together everywhere, and that is a hole-in-the-world invariant rather than
+tidiness: a stale "Rust has it" entry is a section this side believes is drawn while Rust has been told to
+forget it. `forgetRefused` is the one that is not bookkeeping - the arena refusing a section is the one
+case where Rust was told and is still not drawing - so the refusal path drops the mark and `redirty` asks
+the game for the rebuild that will use Minecraft's mesh again. The rule is a test rather than a review,
+because there is no log line for getting it wrong: from both sides the section looks handled.
+
+### Turning the switch off has to give the world back
+
+While Minecraft's meshes were being built anyway, turning `rust terrain` off needed nothing: they were the
+fallback all along, and the switch only said who drew them. That is no longer true - with the path on, the
+sections in view are holding **empty** meshes - so `RustChunkBake.refresh()` now calls `allChanged()` on
+**both** transitions rather than only on the way on:
+
+```kotlin
+if (enabled == previous && reportedState) {
+    return
+}
+// ... both directions rebuild the world ...
+Minecraft.getInstance().execute { Minecraft.getInstance().levelRenderer.allChanged() }
+```
+
+A switch-off without that is the graph off and Minecraft with nothing to draw, which is the whole world
+gone. `allChanged` is the same call a resource reload makes, and the sections come back over the next
+second or two - the window the `on` direction already had. Only a real change reaches it, so a session
+that never touches the switch never pays for it.
+
+### A pipeline is skipped in silence when its shader is not found, and the shader is named after the pipeline
+
+The second terrain pass - the one that draws water and glass - was written as a pipeline called
+`translucent_terrain`, and it never drew a single section. Not slowly, not wrongly: **zero**. The
+diagnostic that settled it was per-layer rather than total, because the total could not tell the two
+explanations apart:
+
+```
+; solid 826+0, cutout 704+0, transparent 0+0 (drawn+empty)
+```
+
+The second number of each pair is the sections whose layer the arena had **nothing** in. Solid and cutout
+were drawing hundreds of sections a second; the transparent layer was not drawing anything *and* was not
+reporting empty layers either - so the loop was never entered, which means the pass did not exist. A layer
+whose geometry is missing from the arena reports `empty` for every section; a layer nothing iterates
+reports nothing at all. That difference is the whole reason those six numbers are in the report.
+
+The cause is one line in `graph.rs`:
+
+```rust
+let shader_resource = ResourcePath(format!("wgpu_mc:shaders/{}.wgsl", pipeline_name));
+```
+
+A pipeline's shader is looked up **by the pipeline's own name**. `terrain` finds `terrain.wgsl`;
+`translucent_terrain` went looking for `translucent_terrain.wgsl`, which does not exist - and a pipeline
+whose shader cannot be read is skipped on purpose, because the block atlas is registered by a resource
+reload and a pipeline built before it has a legitimately missing shader. A panic there would end the JVM.
+So the graph logged a line at a level the game's log file may not carry, drew the rest of the frame, and
+exited zero.
+
+Two pipelines with the same shader and different pipeline state is the normal case, so a pipeline can now
+say which shader it wants:
+
+```yaml
+  translucent_terrain:
+    geometry: "@geo_terrain_translucent"
+    shader: terrain          # the same program; the difference is the pipeline state below it
+    blending: alpha_blending
+    depth_write: false
+```
+
+**And the silence is what the test is for.** A skipped pipeline is indistinguishable from a pipeline that
+draws nothing, so `every_pipeline_in_the_shipped_graph_has_its_shader` walks the graph and asserts that
+each pipeline's resolved shader is one the mod ships - checked by removing the `shader:` line above and
+watching it fail with the pipeline's name in the message, because a test that has never failed is a test
+nobody has seen work.
+
+### The water was baked and never drawn, and Minecraft's terrain is two passes and not one
+
+The fluid mesher has handled water since it was written: `fluid_sprites` gives water the translucent
+layer and lava the solid one, the corners, the flow, the risers and the underside are the same code, and
+the sprites are looked up for both. What kept water off the screen was one line:
+
+```rust
+let sprites = match kind {
+    // Lava only, for now: water belongs in the translucent layer and no pass of ours draws that
+    // layer yet - Minecraft still draws its own water ...
+    1 => continue,
+    2 => &sprites[1],
+```
+
+which was the right call while it was written, because **no pass of ours drew the transparent layer at
+all**. The graph's terrain pass walked `[Solid, Cutout]` and stopped: the transparent layer had been
+baked into the arena since the arena had a third layer, holding ice, stained glass and every other block
+model whose sprite blends, and nothing had ever drawn it. So "take over water like lava" is not a copy of
+the lava path - lava is *drawable* because it lands in the solid layer, which the opaque pass already
+draws.
+
+**And the layer cannot simply be added to that pass.** Minecraft's own terrain is two *groups*, not one
+pass with three pipelines:
+
+```java
+public enum ChunkSectionLayerGroup {
+    OPAQUE(ChunkSectionLayer.SOLID, ChunkSectionLayer.CUTOUT),
+    TRANSLUCENT(ChunkSectionLayer.TRANSLUCENT);
+}
+```
+
+and the two differ in pipeline *state* as well as in when they run: `TRANSLUCENT_TERRAIN` is built with
+`BlendFunction.TRANSLUCENT`, an `ALPHA_CUTOUT` of `0.01` rather than the cutout layer's `0.5`, and - the
+half that is easy to miss - it does not write depth, because a translucent face has to be tested against
+what is behind it and must not become what the next one is tested against. Drawing water in the opaque
+pass would be water with no blending at all, which reads as an ocean you cannot see the bottom of rather
+than as an error.
+
+So the graph has a second terrain pipeline, `translucent_terrain`, and `PipelineConfig` grew a
+`depth_write` flag for it - the one field of a pipeline that is about what it does to the frame rather
+than about what it draws:
+
+```yaml
+  translucent_terrain:
+    geometry: "@geo_terrain_translucent"
+    blending: alpha_blending
+    depth_write: false
+```
+
+`terrain_layers` in `graph.rs` is what decides which layer each pass draws, and it is keyed on the
+geometry name so the yaml is the one place the two are told apart.
+
+**Three things about the takeover are worth keeping.**
+
+*The graph is recorded once and both groups are suppressed.* `render_terrain_pass` runs the **whole**
+graph, so one call draws the opaque pass and the translucent one in the order they are listed. Recording
+it at both pipelines - which is what "take over the second pass too" sounds like - would draw the water
+twice, once blended against the frame and then again on top of itself. So the opaque group is where it is
+recorded, and each group's own pipeline is where that group's *meshes* are dropped: the opaque pass when
+it opens, and the translucent pass later in the same frame, on the strength of `TerrainPass.graphDrawn`.
+The flag is cleared at `presentTexture`, which is the one point in a frame that is known to happen
+exactly once and after everything else.
+
+*The translucent target usually does not exist, and that is what makes this takeable.*
+`ChunkSectionLayerGroup#outputTarget` falls back to the main target, and the target of its own is only
+created when a transparency post chain is loaded - `Minecraft.useShaderTransparency()`, which is the
+Fabulous preset or a resource pack that ships a chain, and Fabulous is deliberately not offered here. So
+on the presets this build offers, the translucent group is a second pass into the **main** target, which
+is exactly the pass this takeover is handed. When a pack does turn it on, `TerrainPass.usesOwnTarget`
+refuses the takeover and says so once rather than drawing water into a texture whose depth belongs to
+another target.
+
+*Water is not free, and the arena had to be resized for it.* The last measured session ran the pool at
+**79%** with only the two opaque layers in it, and water is a whole layer more - so `SLOTS_PER_SECTION`
+in `arena_slots` went from 16 000 to 20 000, which is a fifth, which is vanilla's own ratio: its
+translucent section buffer is 786 432 bytes against 4 194 304 for each of the two opaque ones. The faces
+inside the water are already culled by the fluid mesher (a side towards the same fluid is skipped, and so
+is a top with the same fluid above it), so what is added is bounded by the water's *surface* and not by
+its volume - but `grow_arena` is the backstop, and a session that refuses sections is the diagnostic to
+read.
 
 ### The lighting was a straight line through a curve the game had already built
 
@@ -3803,11 +4071,12 @@ file writes them in, because that is the space the game's six lines are written 
 ### Known gaps
 
 - **Fluids animate, stand at the right height, and turn their surface with the flow; it is still not the
-  game's surface.** See "The fluid faces" above: lava's faces sample the game's atlas like everything else,
-  the offsets are the game's own, a source block is `8/9` of a block rather than a full cube, and a moving
-  surface is a quarter of the flowing sprite turned by `getFlow`. What is still different is the weighted
-  corner average, the hidden faces vanilla culls, and water - which belongs to a translucent pass this
-  renderer does not have yet.
+  game's surface.** See "The fluid faces" above: a fluid's faces sample the game's atlas like everything
+  else, the offsets are the game's own, a source block is `8/9` of a block rather than a full cube, and a
+  moving surface is a quarter of the flowing sprite turned by `getFlow`. What is still different is the
+  weighted corner average, the hidden faces vanilla culls, and water's **colour** - one constant here
+  against a biome function in the game. See "The water was baked and never drawn" for the layer and the
+  pass, and the three bullets above it for what is left.
 
 - **A resource reload is followed now, with one caveat.** See "A resource reload reloads now" above: the
   atlas, the models and the arena are all rebuilt against the new pack, and the sections are re-meshed

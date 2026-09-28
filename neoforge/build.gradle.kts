@@ -2,10 +2,12 @@ import org.gradle.api.publish.maven.MavenPublication
 import org.gradle.api.tasks.Copy
 import org.gradle.api.tasks.Delete
 import org.gradle.api.tasks.compile.JavaCompile
+import org.gradle.internal.jvm.Jvm
 import org.gradle.jvm.tasks.Jar
 import org.gradle.language.jvm.tasks.ProcessResources
 import org.gradle.process.CommandLineArgumentProvider
 import org.gradle.process.JavaForkOptions
+import java.io.File
 
 plugins {
 	`java-library`
@@ -289,6 +291,100 @@ tasks.withType<Jar>().configureEach {
 tasks.withType<JavaCompile>().configureEach {
 	options.encoding = "UTF-8"
 	options.release.set(25)
+}
+
+/**
+ * Fails the build if a mixin's **class initialiser** reads a Minecraft class.
+ *
+ * This is a crash rather than a style rule, and a crash on the title screen. A mixin is applied to a
+ * Minecraft class and its own `<clinit>` runs at whatever moment that class is first initialised - which
+ * for `TextureAtlas` is reached from `Sheets`' own initialiser, before `Sheets` has published its
+ * fields. Reading a Minecraft class from there starts *its* initialiser, and if that one reads a field
+ * of the class that is still initialising, the field is `null`:
+ *
+ * ```
+ * java.lang.NullPointerException: Cannot invoke
+ *   "net.minecraft.client.renderer.SpriteMapper.defaultNamespaceApply(String)"
+ *   because "net.minecraft.client.resources.Sheets.BLOCKS_MAPPER" is null
+ *     at ModelBakery.<clinit>
+ *     at TextureAtlas.<clinit>          <- our mixin's static field was being built here
+ *     at RenderTypes.createMovingBlockSetup
+ *     at Sheets.<clinit>                <- still initialising
+ * ```
+ *
+ * The fix in that case was to move the read into a nested class, so it happens on first *use* rather
+ * than at class load. This task is what stops the next one: anything a mixin needs from the game at
+ * class-load time has to be deferred the same way.
+ *
+ * Only the class initialiser is read, and by constant-pool reference rather than by compiling against
+ * it - a mixin method body may call Minecraft as freely as it likes, because by then the class is in use
+ * and every initialiser involved has long finished.
+ */
+val checkMixinClassInitialisers by tasks.registering {
+	description = "Fails if a mixin's static initialiser reads a Minecraft class."
+	group = "verification"
+
+	val classesDir = layout.buildDirectory.dir("classes/java/main")
+	val mixinsDir = classesDir.map { it.dir("dev/birb/wgpu/mixin") }
+	val classpath = sourceSets["main"].runtimeClasspath
+
+	inputs.dir(mixinsDir).withPropertyName("mixinClasses")
+	inputs.files(classpath).withPropertyName("classpath")
+
+	doLast {
+		val root = mixinsDir.get().asFile
+		if (!root.exists()) {
+			logger.warn("wgpu-mc: no compiled mixins at {}; run compileJava first", root)
+			return@doLast
+		}
+
+		// `Jvm.current()` and not `System.getProperty("java.home")`: this task has to disassemble with
+		// the same JDK Gradle is running on, or `javap` reads a class file it does not understand.
+		val javap = Jvm.current().javaExecutable.absolutePath
+		val classes = classesDir.get().asFile
+		val offenders = mutableListOf<String>()
+
+		root.walkTopDown().filter { it.extension == "class" }.forEach { file ->
+			val binaryName = file.relativeTo(classes).path
+				.removeSuffix(".class")
+				.replace(File.separatorChar, '.')
+
+			val disassembly = providers.exec {
+				commandLine(javap, "-classpath", classes.absolutePath, "-c", "-p", binaryName)
+				isIgnoreExitValue = true
+			}.standardOutput.asText.get()
+
+			// Only the `static {};` block, which runs when the class is *initialised* - the thing that
+			// happens at whatever moment Minecraft first touches the class this mixin is applied to.
+			// Everything inside a method is a different question, and is not this task's business.
+			val lines = disassembly.lines()
+			val start = lines.indexOfFirst { it.trim() == "static {};" }
+			if (start < 0) {
+				return@forEach
+			}
+
+			// The block runs until the next member, which javap indents less than the instructions in
+			// it: every instruction of ours is indented, and the closing brace is not.
+			val initialiser = lines.drop(start + 1).takeWhile { it.isBlank() || it.startsWith(" ") }
+
+			initialiser.filter { it.contains("net/minecraft/") }.forEach { line ->
+				offenders.add("$binaryName: ${line.trim()}")
+			}
+		}
+
+		if (offenders.isNotEmpty()) {
+			throw GradleException(
+				"wgpu-mc: a mixin's class initialiser reads a Minecraft class, which can run before " +
+					"that class has finished initialising and take the game down on the title screen " +
+					"with a `null` field. Move the read into a nested holder class so it happens on " +
+					"first use:\n" + offenders.joinToString("\n") { "  $it" }
+			)
+		}
+	}
+}
+
+tasks.named("check") {
+	dependsOn(checkMixinClassInitialisers)
 }
 
 publishing {

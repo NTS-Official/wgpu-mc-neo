@@ -473,11 +473,17 @@ object WmNative {
      * have used, because a terrain pass with a depth buffer of its own is terrain nothing else in the
      * frame can occlude. Answers whether anything was drawn: false means no scene, no graph, or no
      * terrain pipeline in it, and the caller is left with a world that has no ground in it.
+     *
+     * [translucent] picks **which of the two groups** to record, and it has to be false at the opaque
+     * pass and true at the translucent one. The two are one frame apart in the game's own order -
+     * opaque terrain, then entities and features, then translucent terrain - and water recorded at the
+     * first of those is water the entities are then drawn on top of: a mob in a lake with no water in
+     * front of it.
      */
     @JvmField val renderTerrainPass: MethodHandle =
         handle(
             "render_terrain_pass",
-            FunctionDescriptor.of(ValueLayout.JAVA_BOOLEAN, PTR, PTR, PTR),
+            FunctionDescriptor.of(ValueLayout.JAVA_BOOLEAN, PTR, PTR, PTR, ValueLayout.JAVA_BOOLEAN),
         )
 
     /**
@@ -521,6 +527,19 @@ object WmNative {
     /** How many fluid faces the mesher has drawn, over every bake so far. See [terrainFluidBlocks]. */
     @JvmField val terrainFluidQuads: MethodHandle =
         handle("terrain_fluid_quads", FunctionDescriptor.of(INT))
+
+    /**
+     * What the terrain pass drew since the last call, per layer, packed three to a word.
+     *
+     * `terrainLayerCounts(0)` is the sections each layer **drew** and `terrainLayerCounts(1)` the
+     * sections whose layer was **empty**, with solid, cutout and transparent in the low, middle and high
+     * 21-bit fields. **Drained**, so this is the second since the last ask.
+     *
+     * It is what tells a layer the arena holds from a layer the pass is drawing - the two look identical
+     * in the total number of section draws, and "the water is not there" is one or the other.
+     */
+    @JvmField val terrainLayerCounts: MethodHandle =
+        handle("terrain_layer_counts", FunctionDescriptor.of(LONG, INT))
 
     /**
      * How many sections the section arena has refused to hold, over the whole run.
