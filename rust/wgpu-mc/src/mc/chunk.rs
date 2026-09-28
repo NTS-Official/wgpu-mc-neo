@@ -7,7 +7,7 @@
 //! Minecraft splits chunks into 16-block tall pieces called chunk sections, for
 //! rendering purposes.
 use arrayvec::ArrayVec;
-use glam::{IVec2, IVec3, Vec3Swizzles, ivec3, vec3};
+use glam::{IVec2, IVec3, Vec3, Vec3Swizzles, ivec3, vec3};
 use range_alloc::RangeAllocator;
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -1256,6 +1256,29 @@ fn bake_layers<Provider: BlockStateProvider>(
 
         let block_state: ChunkBlockState = state_provider.get_state(pos);
 
+        // Where this block actually stands, which for a plant is not where it was placed: the game
+        // gives every one of them a random nudge derived from its own coordinates, so that a field is a
+        // field and not a grid. See [`FaceFlags::block_offset`], which is `BlockBehaviour#getOffset`.
+        //
+        // The hash takes the **world** coordinates - a section knows its own origin and not the
+        // block's, so the section offset is added back here, and the `y` it is hashed with is zero
+        // whatever the block's height is. See [`block_seed`].
+        let offset = {
+            let flags = face_flags(block_manager, block_state);
+
+            if flags.has_offset() {
+                let world = ivec3(
+                    section_offset.x + pos.x,
+                    section_offset.y + pos.y,
+                    section_offset.z + pos.z,
+                );
+
+                flags.block_offset(world.x, world.z)
+            } else {
+                Vec3::ZERO
+            }
+        };
+
         // Which watched block this is, if any: counted per block rather than per face, so the cost is
         // one short scan and three atomics for the handful of blocks in the list. See
         // [`WATCHED_BLOCKS`] for what the three numbers are for.
@@ -1371,9 +1394,9 @@ fn bake_layers<Provider: BlockStateProvider>(
 
                             Vertex {
                                 position: [
-                                    fpos.x + model_vertex.position[0],
-                                    fpos.y + model_vertex.position[1],
-                                    fpos.z + model_vertex.position[2],
+                                    fpos.x + model_vertex.position[0] + offset.x,
+                                    fpos.y + model_vertex.position[1] + offset.y,
+                                    fpos.z + model_vertex.position[2] + offset.z,
                                 ],
                                 uv: model_vertex.tex_coords,
                                 normal: face.normal.to_array(),
@@ -2304,6 +2327,8 @@ mod fluid_fixtures {
                     self_hide: 0,
                     shades: blocks_motion,
                     blocks_motion,
+                    offset_max_y: 0.0,
+                    offset_xz: false,
                 },
             );
         }
@@ -2687,6 +2712,137 @@ mod fluid_geometry_tests {
              of faces - in their own layers"
         );
         assert!(bake_layer(&lava, RenderLayer::Transparent).is_empty());
+    }
+
+    /// **A flat pool has no faces between its own blocks, and that is what says a camera inside it sees
+    /// through to whatever is beyond.**
+    ///
+    /// Vanilla draws a side face between two blocks of one fluid only where one of them stands above the
+    /// other - the *riser* of a step. Two blocks at one level leave no band, and the face is not drawn, so
+    /// from inside a pool the water beyond it is invisible: there is nothing there to look through. This
+    /// measures that on a five-by-five pool one block deep with a wall around it: five faces under it,
+    /// eight wall-facing sides, and **nothing else** - no face between any two of the pool's own blocks.
+    ///
+    /// A pool that comes out with faces between its own blocks is a pool a player inside can see out of,
+    /// which is what "the waterfall shows through the water surface" is.
+    #[test]
+    fn a_flat_pool_has_no_faces_between_its_own_blocks() {
+        let mut fluids = Vec::new();
+        let mut blocks = Vec::new();
+
+        // A five-by-five pool of source water, **three blocks deep**, with a solid floor under it. Depth is
+        // the part that matters: a block with water above it is a whole block tall rather than 8/9, so a
+        // one-deep pool is a different set of heights from a real one.
+        //
+        // And **one column is one block shorter** - a step, which is what a waterfall's foot is. That is the
+        // case the riser logic exists for, and the case a flat pool says nothing about.
+        for x in -2i32..=2 {
+            for z in -2i32..=2 {
+                let top = if x == 2 && z == 2 { 2 } else { 3 };
+
+                for y in 0i32..top {
+                    fluids.push((IVec3::new(x, y, z), fluid(1, SOURCE)));
+                }
+
+                blocks.push((IVec3::new(x, -1, z), SOLID));
+            }
+        }
+
+        let world = FluidWorld::new(&fluids, &blocks);
+        let quads = bake_layer(&world, RenderLayer::Transparent);
+
+        // `sampled_height` is 8/9 for a source, so the surface sits a sixteenth below the block top.
+        let surface = 8.0 / 9.0;
+        let leak = |a: f32, b: f32| (a - b).abs() < 1.0e-4;
+
+        // **No quad may lie in a plane between two of the pool's own blocks.** Those are the four inner
+        // planes of x and of z, and the count of faces on them is the count of ways a camera inside the
+        // pool can see out of it. A rim face is a different thing entirely and is not asked about.
+        let mut interior = Vec::new();
+
+        for quad in &quads {
+            let planes = [
+                (0, IVec3::new(-1, 0, 0), IVec3::new(0, 0, 0)),
+                (1, IVec3::new(0, -1, 0), IVec3::new(0, 0, 0)),
+                (2, IVec3::new(0, 0, -1), IVec3::new(0, 0, 0)),
+            ];
+
+            for (axis, _a, _b) in planes {
+                for at in -1i32..=0 {
+                    let on = quad
+                        .iter()
+                        .all(|corner| (corner[axis] - at as f32).abs() < 1.0e-4);
+
+                    // A *side* face on that plane, and not the surface or the floor: its two heights are
+                    // not all the same.
+                    let is_side = quad.iter().any(|corner| !leak(corner[1], quad[0][1]));
+
+                    if on && is_side {
+                        interior.push((axis, at, quad[0]));
+                    }
+                }
+            }
+
+            let _ = surface;
+        }
+
+        assert!(
+            interior.is_empty(),
+            "a flat pool drew {} face(s) between its own blocks, which a camera inside it sees straight \
+             through - the first is {:#?}",
+            interior.len(),
+            interior.first()
+        );
+    }
+
+    /// **The surface of a lake is visible from inside it, and that is a second face.**
+    ///
+    /// A fluid's top face is baked pointing *up*, and this renderer culls back faces - so a player under
+    /// water looking at the surface is looking at the back of it and sees nothing at all. Vanilla draws
+    /// that surface twice (`FluidRenderer`'s `addBackFace`, fed by
+    /// `FluidState#shouldRenderBackwardUpFace`), and the condition is a three-by-three one block up: if
+    /// any of those nine is neither this fluid nor a solid block, the surface gets a copy wound the other
+    /// way. This is the report it is here for:
+    ///
+    /// > 在水里向上看看不见水面的纹理
+    ///
+    /// Both halves are asserted, because either one alone is a picture that is wrong in a different way:
+    /// a back face that is always drawn is a doubled surface (which is invisible, since a quad and its
+    /// mirror occupy the same pixels, but it is two draws and two blends for every lake in the world),
+    /// and one that is never drawn is the report above.
+    #[test]
+    fn a_fluid_surface_is_drawn_from_below_when_it_can_be_seen_from_below() {
+        // A single source with air around it: the block above and all eight of its neighbours are air,
+        // which is neither this fluid nor solid, so the surface is drawn both ways. One bottom face, four
+        // sides, a top face and its mirror - seven quads rather than six.
+        let open = FluidWorld::new(&[(IVec3::ZERO, fluid(1, SOURCE))], &[]);
+
+        let quads = bake_layer(&open, RenderLayer::Transparent).len();
+
+        assert_eq!(
+            quads, 7,
+            "a fluid surface in the open is drawn from above and from below - the block above it is air, \
+             so a player inside the fluid can see it; {quads} quad(s) were baked"
+        );
+
+        // The same fluid with all nine of the cells above it made solid: there is no view from above to
+        // be had - a player under it is under a roof - so the second copy is not baked. One bottom, four
+        // sides, one top.
+        let mut blocks = vec![(IVec3::new(0, -1, 0), SOLID)];
+        for dx in -1..=1 {
+            for dz in -1..=1 {
+                blocks.push((IVec3::new(dx, 1, dz), SOLID));
+            }
+        }
+
+        let roofed = FluidWorld::new(&[(IVec3::ZERO, fluid(1, SOURCE))], &blocks);
+        let quads = bake_layer(&roofed, RenderLayer::Transparent).len();
+
+        assert_eq!(
+            quads, 6,
+            "a fluid under a solid roof still has its four sides and its surface - and the surface there \
+             is the one face, because the nine cells above it are all solid; {quads} quad(s) were baked"
+        );
     }
 
     /// The wall of one block in one direction, as the quad that was baked for it - the plane it lies
@@ -3129,9 +3285,10 @@ fn fluid_sprites(atlas: &Atlas, kind: u8, name: &str) -> Option<(RenderLayer, Fl
 /// corners' heights so a sloping surface comes out sloping, a bottom face where the fluid does not
 /// continue downwards, and no face at all between two blocks of the same fluid.
 ///
-/// The block manager is here for one thing: the top face's direction. The game turns a flowing surface
-/// to face along its flow, which is [`fluid_flow`], and that function's one non-height step is the
-/// `blocksMotion` of a neighbour state - see [`FaceFlags::blocks_motion`].
+/// The block manager is here for two things: the top face's direction, and whether the nine cells above
+/// a fluid are solid enough to hide its surface. The game turns a flowing surface to face along its flow,
+/// which is [`fluid_flow`], and that function's one non-height step is the `blocksMotion` of a neighbour
+/// state - see [`FaceFlags::blocks_motion`].
 fn bake_fluid_faces<Provider: BlockStateProvider>(
     block_manager: &BlockManager,
     state_provider: &Provider,
@@ -3146,6 +3303,75 @@ fn bake_fluid_faces<Provider: BlockStateProvider>(
     ];
 
     bake_fluid_faces_with(block_manager, state_provider, &sprites, layers);
+}
+
+/// Whether a fluid's **top face** is also drawn facing the other way - the one thing that makes the
+/// surface of a lake visible from inside it.
+///
+/// This is the game's `FluidState#shouldRenderBackwardUpFace`, and the shape of it is what says what it
+/// is for:
+///
+/// ```java
+/// for (int ox = -1; ox <= 1; ox++) {
+///     for (int oz = -1; oz <= 1; oz++) {
+///         BlockPos offset = above.offset(ox, 0, oz);
+///         FluidState fluidState = level.getFluidState(offset);
+///         if (!fluidState.getType().isSame(this.getType()) && !level.getBlockState(offset).isSolidRender()) {
+///             return true;
+///         }
+///     }
+/// }
+/// ```
+///
+/// Three by three, one block **up**: if any of those nine is neither this fluid nor a solid block, the
+/// surface gets a second copy of itself wound the other way. The case that answer is for is a player
+/// under water looking up - the top face as baked points *up*, this renderer culls back faces, so from
+/// below it is the back of a surface and nothing is drawn at all. A lake you cannot see the surface of
+/// from inside is the report this was written for.
+///
+/// The condition is what keeps it from being unconditional: a fluid with a solid roof over it - one that
+/// is entirely enclosed - has no view from above to spoil, and the check skips the work there.
+fn fluid_wants_back_face<Provider: BlockStateProvider>(
+    state_provider: &Provider,
+    block_manager: &BlockManager,
+    pos: IVec3,
+    kind: u8,
+    flowing: bool,
+) -> bool {
+    let mut wants = false;
+
+    // `pos.above()` and then the nine around it, so the block that decided the top face has one at all
+    // (`!same_above`) is one of the nine asked about here.
+    for (dx, dz) in [
+        (-1, -1),
+        (-1, 0),
+        (-1, 1),
+        (0, -1),
+        (0, 0),
+        (0, 1),
+        (1, -1),
+        (1, 0),
+        (1, 1),
+    ] {
+        let at = pos + IVec3::new(dx, 1, dz);
+        let (other_kind, _, other_flowing) = fluid_of(state_provider.get_fluid(at));
+
+        if same_fluid(kind, flowing, other_kind, other_flowing) {
+            continue;
+        }
+
+        // "Solid render" is the game's `BlockState#isSolidRender` - a full block that hides what is
+        // behind it - which this side carries as the face flags' occlusion mask rather than as a
+        // separate flag: a block that occludes all six of its neighbours is exactly one that renders
+        // solid. See [`FaceFlags::occlusion`].
+        let flags = face_flags(block_manager, state_provider.get_state(at));
+
+        if flags.occlusion != 0b0011_1111 {
+            wants = true;
+        }
+    }
+
+    wants
 }
 
 /// The fluid mesher's geometry, for a caller that already has the sprites.
@@ -3188,7 +3414,8 @@ fn bake_fluid_faces_with<Provider: BlockStateProvider>(
                         light: u8,
                         color: u32,
                         uv_flags: u32,
-                        corners: [(glam::Vec3, [u16; 2]); 4]| {
+                        corners: [(glam::Vec3, [u16; 2]); 4],
+                        back_face: bool| {
         FLUID_QUADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         // A fluid face is shaded by its direction exactly as a block face is - the game's `FluidRenderer`
@@ -3200,33 +3427,56 @@ fn bake_fluid_faces_with<Provider: BlockStateProvider>(
         let first = baked_layer.vertices.len() / Vertex::VERTEX_LENGTH;
         let normal = dir.to_vec().as_vec3().to_array();
 
-        baked_layer.vertices.extend(
-            wind_quad(corners, glam::Vec3::from_array(normal))
-                .iter()
-                .flat_map(|(position, uv)| {
-                    Vertex {
-                        position: position.to_array(),
-                        uv: *uv,
-                        normal,
-                        color,
-                        // Whichever atlas this fluid's sprite was baked for: the game's, when it animates
-                        // it and the pass has that atlas - which is what makes a lava fall move - and this
-                        // side's copy of the frame otherwise. See `FluidSprite`.
-                        uv_flags,
-                        lightmap_coords: light,
-                        // Fluids are not shaded per corner in the game either: a fluid face is
-                        // one flat surface, lit by the block it is seen from - so no corner of it is
-                        // darkened, which is a count of zero.
-                        ao: 0,
-                    }
-                    .compressed()
-                }),
-        );
-        baked_layer.indices.extend(
-            INDICES
-                .iter()
-                .flat_map(|index| (index + (first as u32)).to_ne_bytes()),
-        );
+        // The face, wound the way this renderer culls it.
+        let wound = wind_quad(corners, glam::Vec3::from_array(normal));
+
+        // And, when it is asked for, **its mirror as well** - the same four points the other way round,
+        // which is the same surface facing the other way, sent as a second quad of its own. Reversed
+        // *after* the winding and appended rather than replacing it, because both sides are drawn: the
+        // front for everyone above the surface, the back for a player inside it. See
+        // [`fluid_wants_back_face`].
+        //
+        // Two quads and not one turned inside out, which is the mistake this was written as first: a
+        // `reverse()` of the four corners in place rearranges one quad's vertices and appends nothing, so
+        // the surface was still drawn from one side only and the quad count did not move.
+        let mut quads: Vec<(glam::Vec3, [u16; 2])> = wound.to_vec();
+
+        if back_face {
+            quads.extend(wound.iter().rev().copied());
+        }
+
+        baked_layer
+            .vertices
+            .extend(quads.iter().flat_map(|(position, uv)| {
+                Vertex {
+                    position: position.to_array(),
+                    uv: *uv,
+                    normal,
+                    color,
+                    // Whichever atlas this fluid's sprite was baked for: the game's, when it animates
+                    // it and the pass has that atlas - which is what makes a lava fall move - and this
+                    // side's copy of the frame otherwise. See `FluidSprite`.
+                    uv_flags,
+                    lightmap_coords: light,
+                    // Fluids are not shaded per corner in the game either: a fluid face is
+                    // one flat surface, lit by the block it is seen from - so no corner of it is
+                    // darkened, which is a count of zero.
+                    ao: 0,
+                }
+                .compressed()
+            }));
+        // One set of six indices per quad that was written, so the back face's four vertices at `first +
+        // 4` are indexed as well as the front's at `first`. A vertex buffer with eight vertices and six
+        // indices draws one quad and leaves the other in the arena unread.
+        for quad in 0..quads.len() / 4 {
+            let base = first as u32 + (quad as u32) * 4;
+
+            baked_layer.indices.extend(
+                INDICES
+                    .iter()
+                    .flat_map(|index| (index + base).to_ne_bytes()),
+            );
+        }
     };
 
     for block_index in 0..16 * 16 * 16 {
@@ -3418,6 +3668,7 @@ fn bake_fluid_faces_with<Provider: BlockStateProvider>(
                         sprite.at(offsets[3].0, offsets[3].1),
                     ),
                 ],
+                fluid_wants_back_face(state_provider, block_manager, pos, kind, flowing),
             );
         }
 
@@ -3540,6 +3791,9 @@ fn bake_fluid_faces_with<Provider: BlockStateProvider>(
                         sprites.flow.at(0.0, v_surface(low)),
                     ),
                 ],
+                // A side face is drawn once: the game adds no back face to one, because a fluid's sides
+                // are only ever seen from outside it.
+                false,
             );
         }
 
@@ -3563,6 +3817,7 @@ fn bake_fluid_faces_with<Provider: BlockStateProvider>(
                     (vec3(fx + 1.0, fy, fz + 1.0), sprites.still.at(1.0, 1.0)),
                     (vec3(fx + 1.0, fy, fz), sprites.still.at(1.0, 0.0)),
                 ],
+                false,
             );
         }
     }
@@ -3769,6 +4024,68 @@ mod winding_tests {
         );
     }
 
+    /// **Reversing a wound quad turns it over, and that is the whole of what the back face relies on.**
+    ///
+    /// The back face of a fluid surface - the one that makes a lake visible from inside it, see
+    /// [`fluid_wants_back_face`] - is the front face's four points written the other way round. If that
+    /// did *not* turn the triangle over, the second quad would be culled with the first and the fix would
+    /// do nothing at all.
+    ///
+    /// Winding is a sign, so this asks the two quads for the sign their first triangle has about the
+    /// surface's axis. The subtlety it is here for is **which** four points are reversed: [`wind_quad`]
+    /// normalises whatever it is handed - it swaps two corners if the first triangle comes out facing away
+    /// from the normal - so reversing its *input* is a question it answers by undoing. What has to be
+    /// reversed is its *output*. This asserts exactly that, and the first version of this test asserted
+    /// the opposite and was wrong.
+    #[test]
+    fn a_reversed_quad_is_turned_over_and_winds_the_other_way() {
+        let top = [
+            [0.0, 1.0, 0.0],
+            [0.0, 1.0, 1.0],
+            [1.0, 1.0, 1.0],
+            [1.0, 1.0, 0.0],
+        ];
+
+        let signed_area = |corners: [[f32; 3]; 4]| {
+            let a = glam::Vec3::from_array(corners[0]);
+            let b = glam::Vec3::from_array(corners[1]);
+            let c = glam::Vec3::from_array(corners[2]);
+
+            (b - a).cross(c - a).y
+        };
+
+        let wound = wind_quad(
+            top.map(|corner| (glam::Vec3::from_array(corner), [0u16, 0u16])),
+            glam::Vec3::Y,
+        );
+
+        let as_corners = |quad: [(glam::Vec3, [u16; 2]); 4]| {
+            [
+                quad[0].0.to_array(),
+                quad[1].0.to_array(),
+                quad[2].0.to_array(),
+                quad[3].0.to_array(),
+            ]
+        };
+
+        let front = signed_area(as_corners(wound));
+        let back = signed_area(as_corners([wound[3], wound[2], wound[1], wound[0]]));
+
+        assert!(
+            front > 0.0,
+            "the front face has to come out of `wind_quad` facing its own normal, which for an upward \
+             surface is a positive area about `y`: got {front}"
+        );
+
+        assert!(
+            back < 0.0,
+            "the back face is the front face's four points reversed, so it has to wind the other way - \
+             that is the only thing that makes it a back face rather than a second copy of the front one, \
+             which would be culled with it and leave the surface invisible from below. front {front}, \
+             back {back}"
+        );
+    }
+
     /// A fluid face is put in its drawing order by its corners rather than by a table, and this is
     /// the property that has to hold: whichever way round the four corners arrive, the quad has to
     /// come out one the diagnostic counts as outward.
@@ -3944,6 +4261,9 @@ mod face_culling_tests {
             // A full cube stops a fluid: `blocksMotion()` is `isSolid()` for everything that is not
             // cobweb or a bamboo sapling, and a collision shape that fills the block is solid.
             blocks_motion: true,
+            // A block stands where it was placed unless it asked not to.
+            offset_max_y: 0.0,
+            offset_xz: false,
         }
     }
 
@@ -3959,6 +4279,8 @@ mod face_culling_tests {
             // `noOcclusion` is about light, not collision, and glass is walked on like any other
             // block: a fluid cannot flow past it either.
             blocks_motion: true,
+            offset_max_y: 0.0,
+            offset_xz: false,
         }
     }
 
@@ -4048,6 +4370,8 @@ mod face_culling_tests {
             // A slab is solid - it stops a fluid - and it occludes nothing. The two answers are
             // independent, which is why they are two fields.
             blocks_motion: true,
+            offset_max_y: 0.0,
+            offset_xz: false,
         };
 
         let manager = registry(&[(0, FULL_CUBE), (1, FULL_CUBE)], &[(1, partial)]);

@@ -102,12 +102,19 @@ object BlockFaceFlags {
 		var selfHide = 0
 		var shades = 0
 		var motion = 0
+		var offsetMaxY = 0.0f
+		var offsetXz = 0
 
 		try {
 			occlusion = occlusion(state)
 			selfHide = selfHide(state)
 			shades = shadeBrightness(state)
 			motion = blocksMotion(state)
+			offsetMaxY = offsetMaxY(state)
+			// Whether the state is offset *at all*, which the limit cannot say: a flower's offset is
+			// horizontal only, so its vertical limit is exactly zero - the same value a block that is
+			// not offset at all sends. Without this bit every flower would stand dead centre.
+			offsetXz = if (state.hasOffsetFunction()) 1 else 0
 		} catch (error: Throwable) {
 			if (unreadable == 0) {
 				WgpuMcMod.LOGGER.warn(
@@ -126,6 +133,8 @@ object BlockFaceFlags {
 			selfHide,
 			shades,
 			motion,
+			offsetMaxY,
+			offsetXz,
 		)
 		described++
 	}
@@ -166,6 +175,83 @@ object BlockFaceFlags {
 		val brightness = state.getShadeBrightness(EmptyBlockGetter.INSTANCE, BlockPos.ZERO)
 
 		return if (brightness >= 1.0f) 0 else 1
+	}
+
+	/**
+	 * How far up the block's own random placement may move it, or zero for a block that stands where it
+	 * was placed - which is almost every block.
+	 *
+	 * `short_grass`, `fern`, `bush`, `sugar_cane` and every flower ask for one
+	 * (`BlockBehaviour.Properties#offsetType`), and what it does is nudge each of them somewhere else in
+	 * its block from a hash of its own coordinates: a field of grass is a field and not a grid. Without
+	 * it they all stand dead centre, which is the one thing a field of them never looks like.
+	 *
+	 * **Only the vertical limit is read here, and the horizontal one deliberately is not.** The formula
+	 * is
+	 *
+	 * ```java
+	 * double y = ((float)(seed >> 4 & 15L) / 15.0F - 1.0) * getMaxVerticalOffset();
+	 * double x = clamp(((float)(seed & 15L) / 15.0F - 0.5) * 0.5, -maxH, maxH);
+	 * ```
+	 *
+	 * and the clamp's argument spans `-0.25 .. 0.25` exactly - both ends occur - while the game's
+	 * default limit is `0.25`: it never actually clamps a plant, and the one block that raises it is
+	 * pointed dripstone, which is not a plant. So `maxY` is the whole of what has to travel, and the
+	 * native side carries it and computes the rest. See
+	 * `wgpu_mc::mc::block::FaceFlags::block_offset`.
+	 *
+	 * `getMaxVerticalOffset` is **protected**, so it cannot be read directly and is instead recovered by
+	 * asking the game's own `getOffset` at sixteen positions - the ones whose `x` hash bits are all
+	 * sixteen values - and keeping the candidate limit that reproduces the vertical offsets it gave.
+	 * Asking the state rather than the number is also what makes this immune to a block that overrides
+	 * the method: the answer is whatever the game actually does. A state whose offsets do not fit any
+	 * candidate is sent as zero, which is the block standing where it was placed - a plant in the middle
+	 * of its block rather than a plant in the block beside it.
+	 */
+	@JvmStatic
+	fun offsetMaxY(state: BlockState): Float {
+		if (!state.hasOffsetFunction()) {
+			return 0.0f
+		}
+
+		// The limits worth trying: the game's defaults for `XYZ` and for `XZ`, then the two others a
+		// block in the game could mean.
+		for (candidate in floatArrayOf(0.2f, 0.0f, 0.25f, 0.1f)) {
+			if (offsetFits(state, candidate)) {
+				return candidate
+			}
+		}
+
+		return 0.0f
+	}
+
+	/** Whether one candidate vertical limit reproduces what the state's own `getOffset` returns. */
+	private fun offsetFits(state: BlockState, maxY: Float): Boolean {
+		val pos = BlockPos.MutableBlockPos()
+
+		for (x in 0 until 16) {
+			val seed = seed(x, 0, 0)
+			val offset = state.getOffset(pos.set(x, 0, 0))
+
+			// The vertical term, which is what this candidate is being tested against. It is the
+			// *only* one of the three that can tell the two types apart, because `x` and `z` do not
+			// depend on the limit for any value a plant can produce.
+			val y = ((seed shr 4 and 15L).toFloat() / 15.0f - 1.0f) * maxY
+
+			if (kotlin.math.abs(offset.y - y) > 1.0e-4) {
+				return false
+			}
+		}
+
+		return true
+	}
+
+	/** `Mth.getSeed`, the hash every block's random offset is derived from. */
+	private fun seed(x: Int, y: Int, z: Int): Long {
+		var value = x.toLong() * 3129871L xor (z.toLong() * 116129781L) xor y.toLong()
+		value = value * value * 42317861L + value * 11L
+
+		return value shr 16
 	}
 
 	/**

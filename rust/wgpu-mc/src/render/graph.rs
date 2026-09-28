@@ -1205,10 +1205,8 @@ impl RenderGraph {
         let mut should_clear_depth = true;
 
         for (pipeline_name, bound_pipeline) in &self.pipelines {
-            if let Some(only) = only {
-                if pipeline_name != only {
-                    continue;
-                }
+            if only.is_some_and(|only| pipeline_name != only) {
+                continue;
             }
 
             let pipeline_config = self.config.pipelines.pipelines.get(pipeline_name).unwrap();

@@ -288,6 +288,8 @@ object WgpuNative {
 		selfHide: Int,
 		shades: Int,
 		blocksMotion: Int,
+		offsetMaxY: Float,
+		offsetXz: Int,
 	)
 
 	@JvmStatic

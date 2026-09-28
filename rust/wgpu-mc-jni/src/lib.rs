@@ -621,6 +621,8 @@ pub fn registerBlockStateFaceFlags(
     self_hide: jint,
     shades: jint,
     blocks_motion: jint,
+    offset_max_y: jfloat,
+    offset_xz: jint,
 ) {
     BLOCK_STATE_FACE_FLAGS.lock().push((
         key as u32,
@@ -635,6 +637,12 @@ pub fn registerBlockStateFaceFlags(
             // And whether it blocks motion, which is what a fluid looks past when it decides where it
             // is flowing (`FlowingFluid#getFlow`). See `FaceFlags::blocks_motion`.
             blocks_motion: blocks_motion != 0,
+            // How far up the block's own random placement may move it, or zero for the common case of
+            // a block that stands where it was put. See `FaceFlags::block_offset`.
+            offset_max_y,
+            // And whether it is offset at all, which is *not* the same question: a flower's offset is
+            // horizontal only, so its vertical limit is exactly zero.
+            offset_xz: offset_xz != 0,
         },
     ));
 }

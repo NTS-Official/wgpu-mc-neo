@@ -118,15 +118,45 @@ pub struct BlockModelFace {
 ///   does not block motion, which is how a stream's surface learns to point at the drop it is about to
 ///   fall down. The three things this side has that look similar are all wrong for it - a plant does not
 ///   occlude, a slab is not a full cube, and neither of those is "blocks motion" - so it is read.
+/// - `offset_max_y`: the **maximum vertical offset** of the block's own random placement, or zero either
+///   for a block that stands where it was placed or for one whose offset is horizontal only. See
+///   [`FaceFlags::block_offset`] for what it is used for and why the horizontal limit does not travel.
+/// - `offset_xz`: whether the block is offset **at all**. Not the same question as the limit above, and
+///   the difference is a whole class of blocks: a flower's offset type is `XZ`, whose vertical limit is
+///   exactly zero, so a block that only carried the limit would be indistinguishable from a block with
+///   no offset and every flower would stand dead centre - which is the bug this pair exists to avoid.
 ///
 /// The bits are in Java's `Direction.ordinal()` order, because that is the side that computes them;
 /// read them with [`crate::mc::direction::java_mask_has`].
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct FaceFlags {
     pub occlusion: u8,
     pub self_hide: u8,
     pub shades: bool,
     pub blocks_motion: bool,
+    pub offset_max_y: f32,
+    pub offset_xz: bool,
+}
+
+/// `Mth.getSeed`, the hash every block's random offset is derived from.
+///
+/// ```java
+/// public static long getSeed(int x, int y, int z) {
+///     long seed = x * 3129871 ^ z * 116129781L ^ y;
+///     seed = seed * seed * 42317861L + seed * 11L;
+///     return seed >> 16;
+/// }
+/// ```
+///
+/// Wrapping arithmetic throughout, because that is what Java's `long` does and the whole point is to
+/// agree with it bit for bit: the square in the middle overflows for any coordinate worth placing.
+pub fn block_seed(x: i32, y: i32, z: i32) -> i64 {
+    let seed = (x as i64).wrapping_mul(3_129_871) ^ (z as i64).wrapping_mul(116_129_781) ^ y as i64;
+
+    seed.wrapping_mul(seed)
+        .wrapping_mul(42_317_861)
+        .wrapping_add(seed.wrapping_mul(11))
+        >> 16
 }
 
 impl FaceFlags {
@@ -143,13 +173,30 @@ impl FaceFlags {
     /// shadow than vanilla rather than shadow where vanilla has none. `blocks_motion` is the same
     /// trade again: a neighbour that two states disagree about is one a fluid does not look past,
     /// which is the flow it would have had without the flag at all.
+    ///
+    /// `offset_max_y` is the odd one out and follows the strictest rule: it survives only where the two
+    /// agree *exactly*, and a disagreement clears it rather than picking one. An offset placed wrong is
+    /// a plant standing inside the block beside it, so a key whose states cannot agree on how far up
+    /// they float is a key whose plants do not float - the smaller error. `offset_xz` is the same trade
+    /// and for the same reason, so a key is offset only when every state wearing it is.
     pub fn and(self, other: FaceFlags) -> FaceFlags {
         FaceFlags {
             occlusion: self.occlusion & other.occlusion,
             self_hide: self.self_hide & other.self_hide,
             shades: self.shades && other.shades,
             blocks_motion: self.blocks_motion && other.blocks_motion,
+            offset_max_y: if self.offset_max_y == other.offset_max_y {
+                self.offset_max_y
+            } else {
+                0.0
+            },
+            offset_xz: self.offset_xz && other.offset_xz,
         }
+    }
+
+    /// Whether this state stands somewhere other than where it was placed.
+    pub fn has_offset(self) -> bool {
+        self.offset_xz
     }
 
     /// Whether the state's shape covers the whole face in this direction.
@@ -160,6 +207,52 @@ impl FaceFlags {
     /// Whether the state hides its own face toward a neighbour of the same kind in this direction.
     pub fn hides_same_state(self, dir: Direction) -> bool {
         java_mask_has(self.self_hide, dir)
+    }
+
+    /// Where this block actually stands, which for a plant is **not** where it was placed.
+    ///
+    /// Minecraft gives `short_grass`, `fern`, `bush`, `sugar_cane` and every flower a random offset
+    /// derived from the block's own coordinates, so that a field of them is a field and not a grid
+    /// (`BlockBehaviour.Properties#offsetType`). This is that function, verbatim, for the `XZ` and `XYZ`
+    /// types the game uses - `NONE` is the zero this returns when [`FaceFlags::has_offset`] is false:
+    ///
+    /// ```java
+    /// long seed = Mth.getSeed(pos.getX(), 0, pos.getZ());
+    /// double y = ((float)(seed >>  4 & 15L) / 15.0F - 1.0) * block.getMaxVerticalOffset();
+    /// double x = Mth.clamp(((float)(seed       & 15L) / 15.0F - 0.5) * 0.5, -maxH, maxH);
+    /// double z = Mth.clamp(((float)(seed >>  8 & 15L) / 15.0F - 0.5) * 0.5, -maxH, maxH);
+    /// ```
+    ///
+    /// Three things about it are worth knowing because each is a way to get it almost right:
+    ///
+    ///  - the **hash takes `y = 0`**, not the block's own `y`. A plant at the top of a hill and one at
+    ///    the bottom of the same column get the same offset, which is part of what makes a field look
+    ///    planted rather than shaken;
+    ///  - `x` and `z` are **clamped** but `y` is not, and the vertical term is `bits / 15 - 1`, so it
+    ///    runs `-maxY .. 0` - a plant may sink into the ground and may not float above it;
+    ///  - that clamp's argument is `(bits/15 - 0.5) * 0.5`, which spans `-0.25 .. 0.25` **exactly** - the
+    ///    two ends are reached at `bits = 0` and `bits = 15`, which do occur - so the game's default
+    ///    limit of `0.25` is reproduced here and is enough for every block the game offsets except
+    ///    pointed dripstone, which raises it and is not a plant. That is why only `maxY` crosses the
+    ///    bridge and why the horizontal limit is a constant here rather than another field.
+    pub fn block_offset(self, x: i32, z: i32) -> Vec3 {
+        if !self.has_offset() {
+            return Vec3::ZERO;
+        }
+
+        let seed = block_seed(x, 0, z);
+
+        // `getMaxHorizontalOffset` is `0.25` for everything the game offsets except pointed dripstone,
+        // which is not a plant and which this side does not bake.
+        const MAX_HORIZONTAL: f32 = 0.25;
+
+        let horizontal = |shift: u32| {
+            (((seed >> shift & 15) as f32 / 15.0 - 0.5) * 0.5)
+                .clamp(-MAX_HORIZONTAL, MAX_HORIZONTAL)
+        };
+        let vertical = ((seed >> 4 & 15) as f32 / 15.0 - 1.0) * self.offset_max_y;
+
+        vec3(horizontal(0), vertical, horizontal(8))
     }
 }
 
@@ -1114,6 +1207,46 @@ pub enum MeshBakeError {
     JsonError(serde_json::Error),
 }
 
+/// The per-axis factor an element's `rescale` asks for, or one on every axis when it asks for none.
+///
+/// A turned element is a *narrower* element: a 14.4-wide cuboid turned 45 degrees about `y` covers
+/// `14.4 * cos(45) = 10.18` of the block, so a plant drawn as a cross is 29% smaller than the one the
+/// game draws. `rescale` is the model saying "and now stretch it back", and this is Minecraft's own
+/// answer to by how much - `CuboidRotation#computeRescale`, which for each axis takes the unit vector,
+/// turns it with the same matrix, and returns the reciprocal of its largest component:
+///
+/// ```java
+/// private static float scaleFactorForAxis(Matrix4fc rotation, Direction.Axis axis, Vector3f scratch) {
+///     Vector3f transformedAxisUnit = rotation.transformDirection(scratch.set(axis.getPositive().getUnitVec3f()));
+///     return 1.0F / Math.max(Math.max(abs(x), abs(y)), abs(z));
+/// }
+/// ```
+///
+/// For the 45 degree `y` turn every cross model uses, the turned `x` unit is `(cos45, 0, -sin45)` and
+/// its largest component is `cos45`, so the factor is `1.4142` on `x` and `z` and `1` on `y` - which is
+/// exactly the `1/cos` that undoes the narrowing. A 90 degree turn comes out at `1` on every axis
+/// because a quarter turn preserves lengths, and so does the identity a zero angle gives.
+///
+/// `Minecraft` composes this as `transform.scale(...)` on a JOML matrix, which multiplies the
+/// *columns* - `R * S`, rotation first and scale second. The order is not a detail: `S * R` would
+/// stretch along the block's axes and then turn the stretched shape, which is a different block.
+pub fn element_rescale(rotation: &schemas::models::ElementRotation, matrix: &Mat3) -> Vec3 {
+    let apply = |axis_vec: Vec3| {
+        let turned = *matrix * axis_vec;
+
+        1.0 / turned.x.abs().max(turned.y.abs()).max(turned.z.abs())
+    };
+
+    // Minecraft skips the rescale entirely for a rotation that is the identity, which matters because
+    // the identity has no largest component to divide by in any meaningful sense - the guard is what
+    // keeps a zero-angle element from being stretched by whatever `1/1` rounds to.
+    if !rotation.rescale || *matrix == Mat3::IDENTITY {
+        return Vec3::ONE;
+    }
+
+    Vec3::new(apply(Vec3::X), apply(Vec3::Y), apply(Vec3::Z))
+}
+
 /// A block model which has been baked into a mesh and is ready for rendering
 #[derive(Debug)]
 pub struct ModelMesh {
@@ -1317,12 +1450,22 @@ impl ModelMesh {
                         };
                         let vec_origin = Vec3::from_array(rot.origin) / 16.0;
 
+                        // The element's `rescale`, when it asks for one. See [`element_rescale`]: a
+                        // turned element is a *narrower* element, and this is the factor that turns it
+                        // back. Without it a cross model's plants - which are all `rescale: true` and
+                        // all 45 degrees - come out 29% small, which is what they did.
+                        let rescale = element_rescale(rot, &matrix);
+
                         let vertex_transform = |v: Vec3| {
-                            // The element's own rotation first, then the variant's - which is the
-                            // order Minecraft applies them in, and the reason the variant's rotation
-                            // is per model property rather than per model: the same model file baked
-                            // under two variants is two different meshes.
-                            let v = matrix * (v - vec_origin) + vec_origin;
+                            // The element's own rotation first, then its rescale, then the variant's -
+                            // which is the order Minecraft applies them in, and the reason the
+                            // variant's rotation is per model property rather than per model: the same
+                            // model file baked under two variants is two different meshes.
+                            //
+                            // The rescale is about the same origin the rotation is, because
+                            // `CuboidRotation` composes it as `R * S` and the whole thing is applied
+                            // as `origin + R * S * (v - origin)`.
+                            let v = matrix * (v - vec_origin) * rescale + vec_origin;
 
                             rotation.position(v)
                         };
@@ -1436,6 +1579,335 @@ fn corner_position(corner: Corner, from: Vec3, to: Vec3) -> Vec3 {
         3 => vec3(from.x, to.y, to.z),     // p011
         7 => vec3(to.x, to.y, to.z),       // p111
         _ => unreachable!("a corner is one of the box's eight"),
+    }
+}
+
+#[cfg(test)]
+mod element_rescale_tests {
+    use super::*;
+
+    /// The factor for the turn every cross model in the game writes: 45 degrees about `y`.
+    ///
+    /// The turned `x` unit is `(cos45, 0, -sin45)`, so the largest component of *both* the turned `x`
+    /// and the turned `z` is `cos45` and the factor is `1/cos45 = sqrt(2)`; `y` is the axis and does not
+    /// move. This is the whole of what makes a plant the size the game draws it.
+    #[test]
+    fn the_cross_models_turn_is_scaled_back_to_full_size() {
+        let rot = schemas::models::ElementRotation {
+            origin: [8.0, 8.0, 8.0],
+            axis: schemas::models::Axis::Y,
+            angle: 45.0,
+            rescale: true,
+        };
+        let matrix = Mat3::from_rotation_y(45f32.to_radians());
+
+        let s = element_rescale(&rot, &matrix);
+
+        let expected = 1.0 / (45f32.to_radians()).cos();
+        assert!(
+            (s.x - expected).abs() < 1e-5,
+            "x should be 1/cos45 = {expected}, got {}",
+            s.x
+        );
+        assert!(
+            (s.z - expected).abs() < 1e-5,
+            "z should be 1/cos45 = {expected}, got {}",
+            s.z
+        );
+        assert!(
+            (s.y - 1.0).abs() < 1e-5,
+            "the axis of the turn does not shrink, so y is 1, got {}",
+            s.y
+        );
+    }
+
+    /// **The plant is a block wide after the turn, and 71% of one without it.**
+    ///
+    /// The first element of the real `minecraft:block/tinted_cross` - the parent of `short_grass`, and
+    /// of every other plant the game draws as a cross - turned exactly the way the bake turns it. This
+    /// is the model the game ships, so the numbers are the game's own: `from` 0.8 to `to` 15.2 is 14.4
+    /// units of block, and a 45 degree turn takes that to `14.4 * cos45 = 10.18`, which is the 29% that
+    /// plants were missing.
+    #[test]
+    fn a_turned_cross_keeps_its_width_and_loses_it_without_the_rescale() {
+        let origin = Vec3::new(8.0, 8.0, 8.0) / 16.0;
+        let from = Vec3::new(0.8, 0.0, 8.0) / 16.0;
+        let to = Vec3::new(15.2, 16.0, 8.0) / 16.0;
+        let matrix = Mat3::from_rotation_y(45f32.to_radians());
+
+        // The `rescale` the model asks for, and what the flat `1.0` of ignoring it comes to.
+        let with = element_rescale(
+            &schemas::models::ElementRotation {
+                origin: [8.0, 8.0, 8.0],
+                axis: schemas::models::Axis::Y,
+                angle: 45.0,
+                rescale: true,
+            },
+            &matrix,
+        );
+
+        let transform = |scale: Vec3, corner: usize| {
+            let v = corner_position(corner as Corner, from, to);
+            matrix * (v - origin) * scale + origin
+        };
+
+        // Corner 0 is `from`, corner 4 is `to` - the two ends of the element's 14.4 units of `x`.
+        let width = |scale: Vec3| {
+            let a = transform(scale, 0);
+            let b = transform(scale, 4);
+
+            (b.x - a.x).abs()
+        };
+
+        let full = 14.4 / 16.0;
+        let turned = full * 45f32.to_radians().cos();
+
+        assert!(
+            (width(with) - full).abs() < 1e-5,
+            "with the rescale the element is {full} of a block wide, got {}",
+            width(with)
+        );
+        assert!(
+            (width(Vec3::ONE) - turned).abs() < 1e-5,
+            "without it the element is {turned} of a block wide, got {}",
+            width(Vec3::ONE)
+        );
+    }
+
+    /// A turned element is stretched back along its own axes, not along the block's.
+    ///
+    /// `S * R` and `R * S` differ, and only one of them is what `CuboidRotation` builds. The visible
+    /// difference for a 45 degree `y` turn is where the element's ends land: stretched about the
+    /// element's own axes the element grows along the diagonal it was turned onto, so a corner that was
+    /// at the `x` end stays at the same `z` as the other end; stretched about the block's it would also
+    /// move in `z`. Checked by the fact that the end-to-end delta is parallel to the turned `x` axis.
+    #[test]
+    fn the_rescale_is_applied_before_the_rotation_not_after() {
+        let origin = Vec3::new(8.0, 8.0, 8.0) / 16.0;
+        let from = Vec3::new(0.8, 0.0, 8.0) / 16.0;
+        let to = Vec3::new(15.2, 16.0, 8.0) / 16.0;
+        let matrix = Mat3::from_rotation_y(45f32.to_radians());
+
+        let s = element_rescale(
+            &schemas::models::ElementRotation {
+                origin: [8.0, 8.0, 8.0],
+                axis: schemas::models::Axis::Y,
+                angle: 45.0,
+                rescale: true,
+            },
+            &matrix,
+        );
+
+        let a = matrix * (corner_position(0, from, to) - origin) * s + origin;
+        let b = matrix * (corner_position(4, from, to) - origin) * s + origin;
+
+        // The direction the element runs in, and the turned `x` axis it should be parallel to.
+        let delta = (b - a).normalize();
+        let turned_x = (matrix * Vec3::X).normalize();
+
+        assert!(
+            delta.dot(turned_x) > 1.0 - 1e-5,
+            "the ends should lie along the turned x axis, got {delta:?} against {turned_x:?}"
+        );
+    }
+
+    /// The guard: nothing is scaled when the model did not ask, and nothing is scaled when there is no
+    /// turn to undo - a quarter turn and a zero turn both preserve lengths, so both come out at one.
+    #[test]
+    fn a_rescale_is_one_without_a_turn_and_absent_without_the_flag() {
+        let asked = |axis, angle, rescale| schemas::models::ElementRotation {
+            origin: [8.0, 8.0, 8.0],
+            axis,
+            angle,
+            rescale,
+        };
+        let turned = |axis, angle| match axis {
+            schemas::models::Axis::X => Mat3::from_rotation_x(f32::to_radians(angle)),
+            schemas::models::Axis::Y => Mat3::from_rotation_y(f32::to_radians(angle)),
+            schemas::models::Axis::Z => Mat3::from_rotation_z(f32::to_radians(angle)),
+        };
+
+        // `rescale` absent: every axis one, whatever the angle.
+        let matrix = turned(schemas::models::Axis::Y, 45.0);
+        assert_eq!(
+            element_rescale(&asked(schemas::models::Axis::Y, 45.0, false), &matrix),
+            Vec3::ONE,
+            "a model that did not ask for a rescale does not get one"
+        );
+
+        // A quarter turn preserves lengths, so there is nothing to undo.
+        let matrix = turned(schemas::models::Axis::Y, 90.0);
+        let s = element_rescale(&asked(schemas::models::Axis::Y, 90.0, true), &matrix);
+        for axis in [s.x, s.y, s.z] {
+            assert!((axis - 1.0).abs() < 1e-5, "a quarter turn is 1, got {axis}");
+        }
+
+        // And so does no turn at all - the identity is where `1/max` would divide by itself.
+        let s = element_rescale(&asked(schemas::models::Axis::X, 0.0, true), &Mat3::IDENTITY);
+        assert_eq!(s, Vec3::ONE, "no turn, nothing to rescale");
+    }
+}
+
+#[cfg(test)]
+mod block_offset_tests {
+    use super::*;
+
+    fn offsetting(max_y: f32) -> FaceFlags {
+        FaceFlags {
+            offset_max_y: max_y,
+            offset_xz: true,
+            ..FaceFlags::default()
+        }
+    }
+
+    /// **The hash is Java's, bit for bit**, which is the one thing here that cannot be checked by
+    /// reading the Rust: `Mth.getSeed` is a chain of multiplications that overflow a `long` on
+    /// purpose, and an ordinary `*` panics in debug and wraps silently in release.
+    ///
+    /// The expected values are Java's own, evaluated from
+    ///
+    /// ```java
+    /// long seed = x * 3129871 ^ z * 116129781L ^ y;
+    /// seed = seed * seed * 42317861L + seed * 11L;
+    /// return seed >> 16;
+    /// ```
+    ///
+    /// at the coordinates written down here. One of them is negative in both coordinates, which is the
+    /// case a sign extension would get wrong.
+    #[test]
+    fn the_seed_is_javas_hash() {
+        for (x, y, z, expected) in [
+            (0, 0, 0, 0i64),
+            (1, 0, 0, 133_076_631_897_947),
+            (0, 0, 1, -20_769_809_646_864),
+            (-7, 0, 13, 125_444_078_969_910),
+            (10, 0, 10, -20_383_890_839_690),
+        ] {
+            assert_eq!(
+                block_seed(x, y, z),
+                expected,
+                "the hash of ({x}, {y}, {z}) is not Java's"
+            );
+        }
+    }
+
+    /// The game's own `getOffset` for one plant, to nine places.
+    ///
+    /// `short_grass` at `(10, 0, 10)` with the default vertical limit of `0.2`. Java evaluates
+    ///
+    /// ```java
+    /// double y = ((float)(seed >> 4 & 15L) / 15.0F - 1.0) * 0.2;
+    /// double x = clamp(((float)(seed & 15L) / 15.0F - 0.5) * 0.5, -0.25, 0.25);
+    /// double z = clamp(((float)(seed >> 8 & 15L) / 15.0F - 0.5) * 0.5, -0.25, 0.25);
+    /// ```
+    ///
+    /// and this side has to land on the same numbers or a field of grass is subtly the wrong field.
+    #[test]
+    fn the_offset_is_the_games_own_numbers() {
+        let plant = offsetting(0.2);
+        let offset = plant.block_offset(10, 10);
+
+        assert!(
+            (offset.x - -0.049_999_997).abs() < 1e-6,
+            "x was {}",
+            offset.x
+        );
+        assert!(
+            (offset.y - -0.106_666_67).abs() < 1e-6,
+            "y was {}",
+            offset.y
+        );
+        assert!(
+            (offset.z - -0.016_666_666).abs() < 1e-6,
+            "z was {}",
+            offset.z
+        );
+    }
+
+    /// A plant is nudged, twice over: the offset depends on the coordinates and on nothing else.
+    ///
+    /// The three properties that matter and that a wrong implementation loses: the offset is **not**
+    /// zero (which is the bug this exists for - every plant dead centre), it **differs between
+    /// neighbours** (so a field is a field), and it is the **same for the same column** - the hash is
+    /// taken with `y = 0`, so a plant at the top of a hill and one at the bottom agree. The last is the
+    /// one a plausible-looking implementation that hashes the block's own `y` gets wrong.
+    #[test]
+    fn a_plant_is_nudged_by_the_block_it_is_in_and_not_by_its_height() {
+        let plant = offsetting(0.2);
+
+        let origin = plant.block_offset(10, 10);
+        assert_ne!(origin, Vec3::ZERO, "a plant with an offset is not centred");
+
+        // Every axis is inside the block, and the vertical one is the game's `-maxY .. 0`: a plant may
+        // sink and may not float.
+        for x in -30..30 {
+            for z in -30..30 {
+                let offset = plant.block_offset(x, z);
+
+                assert!(
+                    offset.x >= -0.25 && offset.x <= 0.25,
+                    "x {} is outside the clamp at ({x}, {z})",
+                    offset.x
+                );
+                assert!(
+                    offset.z >= -0.25 && offset.z <= 0.25,
+                    "z {} is outside the clamp at ({x}, {z})",
+                    offset.z
+                );
+                assert!(
+                    offset.y <= 0.0 && offset.y >= -0.2 - 1e-6,
+                    "y {} is outside -0.2 .. 0 at ({x}, {z})",
+                    offset.y
+                );
+            }
+        }
+
+        // Neighbours disagree - that is the whole point of the nudge.
+        assert_ne!(
+            plant.block_offset(10, 10),
+            plant.block_offset(11, 10),
+            "two neighbouring plants were given the same offset"
+        );
+
+        // `XZ` is the same function with the vertical term held at zero - which is a *different* thing
+        // from a block with no offset, and the one the test above is named for. A flower is nudged
+        // horizontally and not vertically, so its limit is zero and the bit is what says so.
+        let flower = offsetting(0.0);
+        assert!(flower.has_offset(), "a flower is offset, just not upwards");
+        assert_eq!(flower.block_offset(10, 10).y, 0.0);
+        assert_eq!(
+            flower.block_offset(10, 10).x,
+            plant.block_offset(10, 10).x,
+            "the horizontal nudge does not depend on the vertical limit"
+        );
+    }
+
+    /// A block that did not ask to be offset does not move, whatever the coordinates.
+    ///
+    /// The default is the whole reason the limit travels instead of a type: `Default` is `0.0`, and a
+    /// bridge that forgot to send it leaves every block in the world where it was placed rather than
+    /// scattering the terrain.
+    #[test]
+    fn a_block_without_an_offset_stays_where_it_was_placed() {
+        let stone = FaceFlags::default();
+
+        assert!(!stone.has_offset());
+        assert_eq!(stone.block_offset(0, 0), Vec3::ZERO);
+        assert_eq!(stone.block_offset(-1234, 5678), Vec3::ZERO);
+    }
+
+    /// Two states of one key keep the offset only if they agree on it exactly.
+    ///
+    /// A packed key can be worn by more than one state, and the offset is per position - so two states
+    /// that disagree about how far up they float cannot both be right, and the smaller error is neither
+    /// of them floating. This is the one flag here that is dropped on disagreement rather than
+    /// intersected, because its values are not bits.
+    #[test]
+    fn a_key_whose_states_disagree_about_the_height_does_not_offset() {
+        assert_eq!(offsetting(0.2).and(offsetting(0.2)).offset_max_y, 0.2);
+        assert_eq!(offsetting(0.2).and(offsetting(0.0)).offset_max_y, 0.0);
+        assert_eq!(offsetting(0.0).and(offsetting(0.2)).offset_max_y, 0.0);
+        assert_eq!(offsetting(0.0).and(offsetting(0.0)).offset_max_y, 0.0);
     }
 }
 

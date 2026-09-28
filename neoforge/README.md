@@ -3727,6 +3727,162 @@ gone. `allChanged` is the same call a resource reload makes, and the sections co
 second or two - the window the `on` direction already had. Only a real change reaches it, so a session
 that never touches the switch never pays for it.
 
+### The water was drawn before the entities, so a mob in a lake looked dry
+
+The second terrain group's takeover recorded **both** groups in one call:
+
+```java
+// the opaque group's pass - and, at the time, the translucent one's too
+graph.render_with_mvp(...);   // draws `terrain` and then `translucent_terrain`
+```
+
+which reads as an optimization - one call, both groups, in the order `graph.yaml` lists them - and is
+the wrong moment in the frame for the second one. Minecraft's own order is
+`LevelRenderer#addMainPass`:
+
+```java
+684:  chunkSectionsToRender.renderGroup(ChunkSectionLayerGroup.OPAQUE, ...);   // solid + cutout
+699:  this.submitEntities(poseStack, levelRenderState, this.submitNodeStorage);
+725:  this.featureRenderDispatcher.renderTranslucentFeatures();
+742:  chunkSectionsToRender.renderGroup(ChunkSectionLayerGroup.TRANSLUCENT, ...); // water, glass
+```
+
+Water is drawn **after** the entities, and it has to be: it is blended into a frame that already has them
+in it, so a mob standing in a lake has the water blended over the half of it that is under the surface,
+and nothing over the half above. With both groups recorded at the opaque pass, the entities are drawn
+*after* the water - so the water is behind them, and the report was
+
+> rust接管地形后，进入水里的生物就像没有入水一样，没有被水遮挡，无论是在水面还是水下
+
+`render_terrain_pass` now takes a flag naming **which group** to record, and each takeover records its
+own: the opaque pass at the opaque group's pipeline, the translucent pass at the translucent group's. Each
+one opens its own pass over the frame's colour and depth, which is what the game does too.
+
+**The depth clear moved with them, and it had to.** `should_clear_depth` is a local of one `render` call,
+so two calls in one frame each start believing they are first - and the second one clearing the frame's
+depth would erase the entire opaque world's depth from under the water, after which every face drawn would
+be tested against a bare buffer. Which pass claims the clear is now asked of the **layers** rather than of
+a name, because that is what actually distinguishes them: the opaque group draw the solid layer, and the
+translucent one draws none.
+
+```rust
+let opaque_group = Self::terrain_layers(&pipeline_config.geometry)
+    .iter()
+    .any(|(layer, _)| *layer == RenderLayer::Solid);
+
+let will_clear_depth = should_clear_depth && overridden.is_none() && only.is_none_or(|_| opaque_group);
+```
+
+The `graphDrawn` frame flag that used to coordinate the two takeovers is gone with it: it existed to stop
+the second visit from recording the graph a second time, and now the second visit is *supposed* to record
+its own group. What it also did was refuse the translucent takeover on a frame where the opaque one had
+not happened - which is now impossible to get wrong in that direction, because each group's pass is the
+one that draws it.
+
+### The surface of a lake was invisible from inside it, because it is drawn twice and this drew it once
+
+A fluid's top face is baked with its normal **up**, and this renderer culls back faces - so a player under
+water looking at the surface is looking at the back of a quad and sees nothing at all:
+
+> 在水里向上看看不见水面的纹理
+
+Vanilla draws that surface **twice**, and the flag is right there in `FluidRenderer`:
+
+```java
+fluidState.shouldRenderBackwardUpFace(level, pos.above())   // the top quad's `addBackFace`
+```
+
+`FluidState#shouldRenderBackwardUpFace` is three-by-three, one block up: if any of those nine cells is
+neither the same fluid nor a solid block, the surface gets a second copy of itself wound the other way.
+The "solid" test is `BlockState#isSolidRender`, which this side carries as the face flags' occlusion mask
+rather than as a flag of its own - a block that occludes all six of its neighbours is exactly one that
+renders solid.
+
+**The first version of this fix did nothing at all, and the quad count is what said so.** It wound the
+quad and then called `reverse()` on the four corners:
+
+```rust
+let mut wound = wind_quad(corners, normal);
+if back_face {
+    wound.reverse();      // rearranges four vertices, appends none
+}
+```
+
+which is a *rearrangement* and not a second quad - the surface was still drawn from one side, and the test
+that asked for seven quads got six. The back face has to be appended, and its indices have to be written
+too: a vertex buffer with eight vertices and six indices draws one quad and leaves the other one in the
+arena unread.
+
+```rust
+let mut quads = wound.to_vec();
+if back_face {
+    quads.extend(wound.iter().rev().copied());
+}
+
+for quad in 0..quads.len() / 4 {
+    let base = first as u32 + (quad as u32) * 4;
+    baked_layer.indices.extend(INDICES.iter().flat_map(|index| (index + base).to_ne_bytes()));
+}
+```
+
+The test asserts **both** halves: an open surface bakes seven quads (one bottom, four sides, a top and its
+mirror) and the same fluid under a solid roof bakes six (no mirror, because there is no view from above to
+spoil). A back face that is always drawn is two draws and two blends for every lake in the world, and one
+that is never drawn is the report above.
+
+### A pass's binding stash is shared across its pipelines, and that made the diagnostic lie
+
+`WgpuRenderPass` remembers every name bound into a pass and re-emits them when the game sets a new
+pipeline in it - the same name sits in a different slot under a different pipeline, so what was written
+for the previous one is meaningless and has to be written again in the new one's slots. That is right. What
+was wrong is that it re-emitted **everything**, including names the new pipeline's shader has never heard
+of:
+
+```java
+clearBindings();
+for (Map.Entry<String, Bound> entry : boundBindings.entrySet()) {
+    writeBinding(entry.getKey(), entry.getValue());   // every name, into any plan
+}
+```
+
+`SpriteContents.AnimatedTexture#drawToAtlas` picks one of two pipelines **per sprite**, and the animated
+sprites in one atlas use both, so the two alternate once per sprite per mip level:
+
+```java
+if (this.animationInfo.interpolateFrames) {
+    renderPass.setPipeline(RenderPipelines.ANIMATE_SPRITE_INTERPOLATE);
+    renderPass.bindTexture("CurrentSprite", ...);
+    renderPass.bindTexture("NextSprite", ...);
+} else if (this.isDirty) {
+    renderPass.setPipeline(RenderPipelines.ANIMATE_SPRITE_BLIT);
+    renderPass.bindTexture("Sprite", ...);
+}
+```
+
+so each pipeline was handed the *other's* names on every switch, and the log said:
+
+```
+animate_sprite_blit           bound CurrentSprite          plan: 0:SpriteAnimationInfo, 1:Sprite, 2:Sprite
+animate_sprite_blit           bound NextSprite             plan: ...
+animate_sprite_interpolate    bound Sprite                 plan: 0:SpriteAnimationInfo, 1:CurrentSprite, 2:CurrentSprite, 3:NextSprite, 4:NextSprite
+```
+
+**A complementary pair of warnings that says nothing about either pipeline** - and this is the diagnostic
+that exists for the case where a name *is* requested and the shader spells it differently, which is a
+binding silently left empty. Two spurious warnings per animation pipeline is exactly the noise that buries
+it.
+
+The fix drops a carried-over name the new plan has not got, and does not report it: nothing is being
+requested, the game binds what each pipeline's shader declares after `setPipeline`, and a name that
+survives a pipeline change is one the previous pipeline's draw needed. Only the two real binding entry
+points report now. Checked in a run: the pair is gone from both pipelines, the remaining unplanned-texture
+list is empty, and the atlas still binds `Sprite` to `lava_still` and `lava_flow` at every mip level.
+
+**This did not turn out to be the distant-lava flicker**, which is why the section says so: the lava's
+animation has no `interpolate` in its `.mcmeta`, so it takes the `blit` branch and its `Sprite` binding was
+never the one being dropped. It is a real bug found on the way to a different one, and it is fixed because
+of what it was doing to the diagnostics rather than to the picture.
+
 ### A pipeline is skipped in silence when its shader is not found, and the shader is named after the pipeline
 
 The second terrain pass - the one that draws water and glass - was written as a pipeline called
@@ -4032,6 +4188,106 @@ pipeline is skipped - which is what every other failure on that path already doe
 unreadable shader, a device without `immediates`). A graph missing one pipeline draws the rest of the
 frame, so the next mistake of this kind costs the terrain and a log line rather than the session. It is a
 guard and not a licence: a pipeline that will not build is still a bug, and the message is still an error.
+
+### Every plant stood dead centre, because a field of grass is not a grid
+
+`BlockBehaviour.Properties#offsetType` gives a block a **random offset derived from its own
+coordinates**, and the plants are the blocks that ask for one:
+
+```java
+case XZ -> (state, pos) -> {
+    long seed = Mth.getSeed(pos.getX(), 0, pos.getZ());
+    float maxHorizontalOffset = block.getMaxHorizontalOffset();
+    double x = Mth.clamp(((float)(seed & 15L) / 15.0F - 0.5) * 0.5, -maxHorizontalOffset, maxHorizontalOffset);
+    double z = Mth.clamp(((float)(seed >> 8 & 15L) / 15.0F - 0.5) * 0.5, -maxHorizontalOffset, maxHorizontalOffset);
+    return new Vec3(x, 0.0, z);
+};
+case XYZ -> ... // the same, plus y = ((float)(seed >> 4 & 15L) / 15.0F - 1.0) * getMaxVerticalOffset()
+```
+
+`ModelBlockRenderer` reads it once per block and adds it to every vertex of the model:
+
+```java
+this.random.setSeed(seed);
+model.collectParts(level, pos, blockState, this.random, this.parts);
+Vec3 offset = blockState.getOffset(pos);
+... tesselateAmbientOcclusion(output, x + (float)offset.x, y + (float)offset.y, z + (float)offset.z, ...)
+```
+
+This side placed every block at its own coordinates, so **every plant stood exactly in the middle of
+its block** - and a field of grass that is a perfect grid is the one thing a field of grass never
+looks like. `short_grass`, `fern`, `bush`, `short_dry_grass` and `tall_dry_grass` are `XYZ`;
+`dandelion`, `poppy` and every other flower, plus `tall_seagrass` and `mangrove_propagule`, are `XZ`.
+
+Three details of the formula are each a way to get it nearly right, and all three are in the port:
+
+- **the hash takes `y = 0`**, not the block's own height, so a plant at the top of a hill and one at
+  the bottom of the same column get the *same* offset;
+- **`y` runs `-maxY .. 0`** - `bits / 15 - 1`, not `bits / 15 - 0.5` - so a plant may sink into the
+  ground and may not float above it;
+- **the horizontal clamp never has to travel.** Its argument spans `-0.25 .. 0.25` exactly and the
+  game's default limit is `0.25`, so the limit only matters for pointed dripstone, which raises it and
+  is not a plant. Only `maxY` crosses the bridge.
+
+**`getMaxVerticalOffset` is `protected`**, so it cannot be read - and the JVM side recovers it by
+asking the game's own `getOffset` at the sixteen positions whose `x` hash bits take all sixteen values,
+keeping the candidate limit that reproduces the vertical offsets it returned. Asking the state instead
+of the number is also what makes it immune to an override.
+
+The first design carried only `maxY` and used "is it non-zero" as the flag, which is **wrong for every
+flower**: an `XZ` offset's vertical limit is *exactly zero*, the same value a block with no offset
+sends, so flowers would have stayed dead centre. The bug was caught by a test asserting a flower is
+nudged horizontally, and the fix is the separate `offset_xz` bit - which is why the two travel
+together and why the doc comment on `offset_max_y` says "zero either for a block that stands where it
+was placed *or* for one whose offset is horizontal only".
+
+Five tests hold it: the hash against Java's own values (including a negative coordinate), the exact
+offset of `short_grass` at `(10, 0, 10)` to nine places, the three properties above over a 60×60 span
+of coordinates, a block with no offset staying put, and two states of one key keeping the offset only
+when they agree on it exactly.
+
+### Every plant in the game was 29% too small, because a turned element has to be stretched back
+
+`minecraft:block/tinted_cross` is the parent of `short_grass`, `fern`, `bush`, `tall_grass_bottom`,
+`large_fern_bottom`, `sugar_cane`, `bamboo_sapling` and the rest - every plant the game draws as a cross -
+and its two elements both say the same thing:
+
+```json
+{ "from": [0.8, 0, 8], "to": [15.2, 16, 8],
+  "rotation": { "origin": [8, 8, 8], "axis": "y", "angle": 45, "rescale": true } }
+```
+
+The element is 14.4 units of block wide. A 45 degree turn about `y` puts its **width** on the diagonal, so
+what the block actually covers is `14.4 * cos(45) = 10.18` - **29% narrower** - and `"rescale": true` is the
+model saying "and now stretch it back". This side read the rotation, the axis and the angle, and never read
+the flag: `grep rescale` was zero hits in `rust/`, zero in `neoforge/src`, and the block models that ask for
+one number **39**.
+
+Minecraft's answer is `CuboidRotation#computeRescale`: for each axis, take the unit vector, turn it with the
+same matrix the geometry is turned with, and return the reciprocal of its largest component.
+
+```java
+private static float scaleFactorForAxis(Matrix4fc rotation, Direction.Axis axis, Vector3f scratch) {
+    Vector3f transformedAxisUnit = rotation.transformDirection(scratch.set(axis.getPositive().getUnitVec3f()));
+    return 1.0F / Math.max(Math.max(abs(x), abs(y)), abs(z));
+}
+```
+
+For the 45 degree turn the turned `x` unit is `(cos45, 0, -sin45)`, whose largest component is `cos45`, so the
+factor is `1.4142` on `x` and `z` and `1` on `y` - exactly the `1/cos` that undoes the narrowing. A quarter
+turn comes out at one on every axis, because a quarter turn preserves lengths, and so does the identity.
+
+The order is not a detail. `CuboidRotation` builds it as `transform.scale(scale)` on a JOML matrix, and
+`scaleGeneric` multiplies `m00..m03` by `sx`, `m10..m13` by `sy`, `m20..m23` by `sz` - the **columns** - so
+the composition is `R * S`: rotate first, then stretch along the element's own axes. `S * R` would stretch
+along the block's axes and then turn the stretched shape, which puts the element's ends somewhere else
+again. The whole transform is `origin + R * S * (v - origin)`, which is what `element_rescale` returns a
+factor for and what the bake now applies before the variant's rotation.
+
+Four tests hold it: the factor is `sqrt(2)`/`1`/`sqrt(2)` for the cross's turn, the real `tinted_cross`
+element is 14.4/16 of a block wide with the rescale and 10.18/16 without it, the ends lie along the turned
+`x` axis (which is what separates `R * S` from `S * R`), and the guard - absent flag, quarter turn, identity -
+is one on every axis.
 
 ### A face that writes no `uv` was covering the whole sprite, and that is not what a slab's side is
 

@@ -1,6 +1,7 @@
 package dev.birb.wgpu.render
 
 import dev.birb.wgpu.WgpuMcMod
+import dev.birb.wgpu.backend.Diagnostics
 import dev.birb.wgpu.backend.bindAtlasToTerrainPass
 import dev.birb.wgpu.backend.bindLightmapToTerrainPass
 import dev.birb.wgpu.chunk.RustChunkBake
@@ -252,8 +253,29 @@ object TerrainPass {
 
 		sendFog(cameraState, position.x - originX, position.y - originY, position.z - originZ)
 
+		// Diagnostics: the fog the shader is being handed, once a second.
+		//
+		// This is the one number in the frame that decides what a distance is worth, and it arrives from
+		// the game whole - so a picture that is uniformly too dark or too washed out is either these
+		// values being wrong or the shader doing something else with them. Printing them is what tells
+		// the two apart, and it is the difference between "the fog is too strong" and "the fog is right
+		// and something else is darkening the world".
+		if (Diagnostics.loggingEnabled()) {
+			val now = System.nanoTime()
+			if (now - fogReportedAt >= 1_000_000_000L) {
+				fogReportedAt = now
+				WgpuMcMod.LOGGER.info(
+					"wgpu: fog colour ({}, {}, {}, {}), environmental {}..{}, render distance {}..{}, fogType {}",
+					fog[0], fog[1], fog[2], fog[3], fog[4], fog[5], fog[6], fog[7], cameraState.fogType,
+				)
+			}
+		}
+
 		bindLightmap()
 	}
+
+	/** When the fog line above last went out. See [sendFog]. */
+	private var fogReportedAt = 0L
 
 	/** The fog block the shader reads. See [sendFog] for what goes in it. */
 	private val fog = FloatArray(12)

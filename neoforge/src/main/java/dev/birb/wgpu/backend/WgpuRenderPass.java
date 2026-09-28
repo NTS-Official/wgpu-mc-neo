@@ -374,11 +374,27 @@ public class WgpuRenderPass implements RenderPassBackend {
         this.bindings = slots;
         this.planHasDynamic = slots.dynamicSlotCount() > 0;
         clearBindings();
+        // Only the names the **new** plan has, and only to keep them, not as a fresh request.
+        //
+        // The stash is per pass and shared across every pipeline the game sets in it, so a name bound
+        // under one pipeline is still in it when the next one is set - and re-emitting it blindly is how
+        // `minecraft:pipeline/animate_sprite_interpolate` came to be reported as reading a `Sprite` it
+        // does not declare, and `.../animate_sprite_blit` as reading `CurrentSprite` and `NextSprite` it
+        // does not declare either. The two pipelines are bound alternately, once per animated sprite, so
+        // each reported the other's names: a pair of warnings that says nothing about either, and that
+        // buries the one thing this diagnostic exists for - a *requested* name the shader spells
+        // differently.
+        //
+        // Dropping a name the new plan has not got is right rather than merely quiet: the game binds what
+        // each pipeline's shader declares, and it binds it after `setPipeline`, so a name that survives a
+        // pipeline change is one the previous pipeline's draw needed. `reportUnplanned` is false here
+        // because nothing is being requested - see `reportUnplannedBinding`, which the two binding entry
+        // points call for the names a caller actually asked for.
         for (Map.Entry<String, Bound> entry : boundBindings.entrySet()) {
-            writeBinding(entry.getKey(), entry.getValue());
+            writeBinding(entry.getKey(), entry.getValue(), false);
         }
         for (Map.Entry<String, Sampled> entry : boundSamplers.entrySet()) {
-            writeSampled(entry.getKey(), entry.getValue());
+            writeSampled(entry.getKey(), entry.getValue(), false);
         }
         reportPlanOnce(slots);
 
@@ -594,14 +610,31 @@ public class WgpuRenderPass implements RenderPassBackend {
 
     /** Writes a combined sampler into the two slots its name has in the current plan. */
     private void writeSampled(String name, Sampled pair) {
+        writeSampled(name, pair, true);
+    }
+
+    /**
+     * The same, with the choice of whether a name the plan has not got is worth saying.
+     *
+     * `requested` is false when the name is being carried over a pipeline change rather than asked for -
+     * see {@code setPipeline}, where a name the new plan has not got is dropped in silence because the
+     * game rebinds what each pipeline's shader declares.
+     */
+    private void writeSampled(String name, Sampled pair, boolean requested) {
         int[] slots = bindings == null ? null : bindings.of(name);
         if (slots == null || slots.length == 0) {
-            reportUnplannedBinding("texture + sampler", name);
+            if (requested) {
+                reportUnplannedBinding("texture + sampler", name);
+            }
+
             return;
         }
 
         if (slots.length < 2) {
-            reportUnpairedSampler(name, slots);
+            if (requested) {
+                reportUnpairedSampler(name, slots);
+            }
+
             return;
         }
 
@@ -897,13 +930,21 @@ public class WgpuRenderPass implements RenderPassBackend {
 
     /** Writes a remembered binding into the slot its name has in the current pipeline's plan. */
     private void writeBinding(String name, Bound binding) {
+        writeBinding(name, binding, true);
+    }
+
+    /** The same, with the choice of whether a name the plan has not got is worth saying. See [writeSampled]. */
+    private void writeBinding(String name, Bound binding, boolean requested) {
         if (binding == null) {
             return;
         }
 
         int[] slots = bindings == null ? null : bindings.of(name);
         if (slots == null || slots.length == 0) {
-            reportUnplannedBinding("buffer", name);
+            if (requested) {
+                reportUnplannedBinding("buffer", name);
+            }
+
             return;
         }
 
