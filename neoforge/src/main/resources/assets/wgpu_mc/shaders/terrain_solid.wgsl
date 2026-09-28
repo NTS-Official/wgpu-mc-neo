@@ -63,7 +63,12 @@ struct VertexResult {
     @location(2) blend: f32,
     @location(3) normal: vec3<f32>,
     @location(4) world_pos: vec3<f32>,
-    @location(6) section: u32,
+    // Nothing assigns or reads this one, and the two integer varyings below carry what the fragment
+    // stage actually needs. It still has to be `flat`: an integer varying is not interpolated, and
+    // naga 30 refuses to guess that on its behalf any more - "integer shader I/O no longer defaults
+    // to @interpolate(flat)" - so leaving it bare is a shader that fails to validate, and a pipeline
+    // that fails to validate is the solid layer of the world not drawn.
+    @interpolate(flat) @location(6) section: u32,
     @location(7) ao: f32,
     @interpolate(flat) @location(12) ao1: f32,
     @interpolate(flat) @location(13) ao2: f32,

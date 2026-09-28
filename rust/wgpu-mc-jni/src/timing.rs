@@ -142,7 +142,11 @@ impl GpuTimers {
 
             match outcome {
                 Some(Ok(Ok(()))) => {
-                    let data = slot.readback.slice(0..PAIR_BYTES).get_mapped_range();
+                    let data = slot
+                        .readback
+                        .slice(0..PAIR_BYTES)
+                        .get_mapped_range()
+                        .expect("the mapping reported done");
                     let start = u64::from_le_bytes(data[0..8].try_into().unwrap());
                     let end = u64::from_le_bytes(data[8..16].try_into().unwrap());
                     drop(data);

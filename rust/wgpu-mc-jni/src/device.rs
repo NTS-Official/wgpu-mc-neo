@@ -410,6 +410,12 @@ fn configure_surface_inner(
             desired_maximum_frame_latency: 2,
             alpha_mode,
             view_formats: Vec::new(),
+            // wgpu 30 lets a surface ask for a wider colour space than the format implies, which is
+            // what HDR output is built on. `Auto` is the value that reproduces what this renderer did
+            // before the field existed - sRGB, or extended linear scRGB for `Rgba16Float` where the
+            // backend has it - so the picture is unchanged; naming an HDR space is a switch of its own
+            // rather than something to slip into an upgrade.
+            color_space: wgpu::SurfaceColorSpace::Auto,
         },
     );
 
@@ -582,6 +588,11 @@ fn try_create_renderer(
             wgpu::PowerPreference::from_env().unwrap_or(wgpu::PowerPreference::HighPerformance),
         force_fallback_adapter: false,
         compatible_surface: surface.as_ref(),
+        // wgpu 30 can narrow an adapter's limits and features to one of a few pre-defined buckets,
+        // which is what a WebGPU-conformant build wants. This renderer asks the adapter what it has
+        // and sizes its arena from that answer - `Scene::arena_cap_slots` is `max_buffer_size / 4` -
+        // so the raw limits are what it is written against, and the buckets stay off.
+        apply_limit_buckets: false,
     })) {
         Ok(adapter) => adapter,
         Err(err) => {
@@ -2299,7 +2310,10 @@ pub extern "C" fn dump_texture_rgba(
         }
     }
 
-    let data = slice.get_mapped_range();
+    // The mapping is read here and not checked: the map callback above already said the mapping
+    // succeeded, and a `Result` that says otherwise is one this side has nowhere to put - the ABI
+    // below returns what it read, not an error point.
+    let data = slice.get_mapped_range().expect("the mapping reported done");
     let mut out = Vec::with_capacity(8 + (unpadded * height) as usize);
     out.extend_from_slice(&width.to_le_bytes());
     out.extend_from_slice(&height.to_le_bytes());
@@ -3211,10 +3225,14 @@ impl PipelineRecipe {
         let vertex_buffers = self
             .vertex_buffers
             .iter()
-            .map(|buffer| wgpu::VertexBufferLayout {
-                array_stride: buffer.stride,
-                step_mode: wgpu::VertexStepMode::Vertex,
-                attributes: &buffer.attributes,
+            .map(|buffer| {
+                // `Some` per slot: wgpu 30's `VertexState::buffers` allows holes, and this side names
+                // its buffers in order with none.
+                Some(wgpu::VertexBufferLayout {
+                    array_stride: buffer.stride,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &buffer.attributes,
+                })
             })
             .collect::<Vec<_>>();
 
@@ -4081,7 +4099,7 @@ pub extern "C" fn read_buffer(
     }
 
     {
-        let data = slice.get_mapped_range();
+        let data = slice.get_mapped_range().expect("the mapping reported done");
         // The mapped range starts at the aligned copy, which may begin a few bytes before the range
         // the caller asked for; the padding is this side's and the caller never sees it.
         unsafe {
@@ -4233,7 +4251,9 @@ pub extern "C" fn acquire_next_texture(wm: &WmRenderer) -> *mut SurfaceTexture {
 /// records the next one.
 #[unsafe(no_mangle)]
 pub extern "C" fn present_surface(wm: &WmRenderer, surface_texture: Box<SurfaceTexture>) {
-    surface_texture.present();
+    // wgpu 30 moved this from the surface texture to the queue: presenting is a submission now, which
+    // is what fixed the Vulkan hazard of a screen that presents without being rendered to.
+    wm.gpu.queue.present(*surface_texture);
     PRESENTS.fetch_add(1, Ordering::Relaxed);
 
     // The frame that just presented is the frame this side is finished with, which is the one moment

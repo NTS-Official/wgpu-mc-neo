@@ -501,7 +501,7 @@ impl WmRenderer {
     /// backend name and a version. On the OpenGL backend those four answers are `GL_VENDOR`,
     /// `GL_RENDERER`, "OpenGL" and `GL_VERSION` - the graphics driver, introducing itself - and
     /// wgpu carries the same information in `AdapterInfo`. Handing it over lets that block keep
-    /// looking the way it does on GL instead of reading "wgpu / wgpu-mc / vulkan / wgpu 29".
+    /// looking the way it does on GL instead of reading "wgpu / wgpu-mc / vulkan / wgpu 30".
     ///
     /// Four lines in this order, none of them empty:
     ///

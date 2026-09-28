@@ -784,6 +784,11 @@ impl RenderGraph {
                 }
             }
             .into_iter()
+            // `Some` per slot because wgpu 30's `VertexState::buffers` is a list of *optional* layouts:
+            // the holes it now allows are how a shader reads a buffer it binds by index without every
+            // slot below it having to exist. This side has never had a hole - a geometry names its
+            // layouts in order - so every entry is a layout.
+            .map(Some)
             .collect::<Vec<_>>();
 
             let label = pipeline_name.to_string();
@@ -2263,14 +2268,14 @@ mod terrain_layer_tests {
 /// `textureSample` takes an implicit level of detail from the derivatives of its coordinates, and WGSL
 /// only defines those in *uniform* control flow: a `textureSample` inside a branch is undefined
 /// behaviour, whether or not the condition happens to hold for every fragment of a primitive. The
-/// terrain shader picked which atlas to read with exactly that shape -
+/// terrain shader picked which atlas to read with exactly that shape:
 ///
 /// ```wgsl
 /// if (in.game_atlas == 1u) { texel = textureSample(t_game_atlas, ...); }
 /// else                     { texel = textureSample(t_texture, ...); }
 /// ```
 ///
-/// - and the argument for it was that `game_atlas` is `@interpolate(flat)`, so every fragment of one
+/// The argument for it was that `game_atlas` is `@interpolate(flat)`, so every fragment of one
 /// primitive takes the same branch. That is an argument about the picture, not about the program: it is
 /// true of the hardware it was tried on and it is not what the specification says. The samples are
 /// hoisted out of the branch now and the choice is a `select` on the two values.
@@ -2310,7 +2315,12 @@ mod texture_sample_uniformity_tests {
     }
 
     /// Every auto-level `textureSample` in `source` that is inside a branch, as `(entry point, depth)`.
-    fn samples_inside_branches(source: &str) -> Vec<(String, usize)> {        let module = naga::front::wgsl::parse_str(source).expect("the terrain shader parses");
+    ///
+    /// **A finding is a depth above zero**, and the depth is carried for that reason: zero is a sample
+    /// at the entry point's own top level, which is uniform control flow and is exactly where these
+    /// belong. Reporting at zero would make the test fail on the fixed shader.
+    pub(super) fn samples_inside_branches(source: &str) -> Vec<(String, usize)> {
+        let module = naga::front::wgsl::parse_str(source).expect("the terrain shader parses");
 
         let mut found = Vec::new();
 
@@ -2356,6 +2366,7 @@ mod texture_sample_uniformity_tests {
                 } => {
                     if let Ok(expression) = function.expressions.try_get(*condition)
                         && is_auto_sample(expression)
+                        && branch_depth > 0
                     {
                         found.push((entry.clone(), branch_depth));
                     }
@@ -2366,18 +2377,13 @@ mod texture_sample_uniformity_tests {
                 naga::Statement::Switch { selector, cases } => {
                     if let Ok(expression) = function.expressions.try_get(*selector)
                         && is_auto_sample(expression)
+                        && branch_depth > 0
                     {
                         found.push((entry.clone(), branch_depth));
                     }
 
                     for case in cases {
-                        walk(
-                            function,
-                            &case.body,
-                            branch_depth + 1,
-                            entry.clone(),
-                            found,
-                        );
+                        walk(function, &case.body, branch_depth + 1, entry.clone(), found);
                     }
                 }
                 naga::Statement::Loop {
@@ -2407,7 +2413,7 @@ mod texture_sample_uniformity_tests {
                         .skip(indices.start as usize)
                         .take(length)
                     {
-                        if is_auto_sample(expression) {
+                        if is_auto_sample(expression) && branch_depth > 0 {
                             found.push((entry.clone(), branch_depth));
                         }
                     }
@@ -2903,5 +2909,84 @@ mod culling_tests {
                 "a section behind the camera was kept with a {name} projection"
             );
         }
+    }
+}
+
+/// **The detector fires.** A test that asserts "nothing was found" cannot be told from a test whose
+/// detector never finds anything, and this one is a walk over a parsed module with a branch-depth
+/// counter in it - exactly the shape that can silently look at the wrong arena or the wrong statement.
+///
+/// So the shader this test exists for is fed to it as a string: the branch over `game_atlas`, the two
+/// `textureSample`s inside it, and the expectation that both are found and both are reported as being
+/// in a branch. If the walk ever stops working, this fails before the real test can pass for the wrong
+/// reason.
+#[cfg(test)]
+mod uniformity_detector_tests {
+    use super::texture_sample_uniformity_tests as detector;
+
+    /// The shape `terrain.wgsl` had, kept as a fixture rather than described in a comment.
+    const BRANCHING_TERRAIN: &str = r#"
+@group(0) @binding(0) var t_game_atlas: texture_2d<f32>;
+@group(0) @binding(1) var t_game_sampler: sampler;
+@group(0) @binding(2) var t_texture: texture_2d<f32>;
+@group(0) @binding(3) var t_sampler: sampler;
+
+struct V {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) tex_coords: vec2<f32>,
+    @interpolate(flat) @location(1) game_atlas: u32,
+};
+
+@fragment
+fn frag(in: V) -> @location(0) vec4<f32> {
+    var texel: vec4<f32>;
+    if (in.game_atlas == 1u) {
+        texel = textureSample(t_game_atlas, t_game_sampler, in.tex_coords);
+    } else {
+        texel = textureSample(t_texture, t_sampler, in.tex_coords);
+    }
+
+    return texel;
+}
+"#;
+
+    #[test]
+    fn the_branching_shape_this_was_written_for_is_reported() {
+        let found = detector::samples_inside_branches(BRANCHING_TERRAIN);
+
+        assert_eq!(
+            found.len(),
+            2,
+            "both fetches are inside the branch and both have to be reported: {found:?}"
+        );
+
+        for (entry, depth) in found {
+            assert_eq!(entry, "frag");
+            assert_eq!(
+                depth, 1,
+                "each is one branch deep, which is what makes it a finding"
+            );
+        }
+    }
+
+    /// And the fixed shape is not, which is what the depth is carried for: a sample at the entry
+    /// point's own top level is uniform control flow and is where these belong.
+    #[test]
+    fn the_hoisted_shape_is_not_reported() {
+        let hoisted = BRANCHING_TERRAIN
+            .replace(
+                "    var texel: vec4<f32>;\n    if (in.game_atlas == 1u) {\n        texel = textureSample(t_game_atlas, t_game_sampler, in.tex_coords);\n    } else {\n        texel = textureSample(t_texture, t_sampler, in.tex_coords);\n    }\n",
+                "    let from_game = textureSample(t_game_atlas, t_game_sampler, in.tex_coords);\n    let from_ours = textureSample(t_texture, t_sampler, in.tex_coords);\n    let texel = select(from_ours, from_game, in.game_atlas == 1u);\n",
+            );
+
+        assert_ne!(
+            hoisted, BRANCHING_TERRAIN,
+            "the fixture did not change, so this test is checking the wrong string"
+        );
+
+        assert!(
+            detector::samples_inside_branches(&hoisted).is_empty(),
+            "hoisting the samples out of the branch is the fix, and it has to read as one"
+        );
     }
 }
