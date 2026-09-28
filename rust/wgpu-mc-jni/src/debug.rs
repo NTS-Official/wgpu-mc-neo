@@ -1,11 +1,12 @@
-//! The debug switches, and the marker files they replace.
+//! The debug switches, which are options on the options screen and nothing else.
 //!
 //! Every diagnostic this renderer has grew as a file in the run directory - `wgpu-dump-frames`,
 //! `wgpu-no-bind-group-cache`, `wgpu-trace-dynamic-offsets`, `wgpu-dump-shaders` - because a file
-//! needs no launcher support and no rebuild. They are options on the options screen now, and the
-//! markers keep working: a flag is on when the setting is on *or* the marker exists, so a run that
-//! was started with a marker behaves as it did. The two that are the wrong way round (a marker that
-//! turns something *off*) are handled where they are resolved.
+//! needs no launcher support and no rebuild. They are options now, and **the files are gone**: a run
+//! that still has one in its directory takes the setting's answer, because the setting is the only
+//! source. That is the point of moving them - a file nothing in the game can show you, that has no way
+//! to be turned off from inside it, and that four of the switches were spelled as the *negation* of,
+//! so the file won over the setting and the option could not override it at all.
 //!
 //! The flags live in atomics rather than being read from the settings on use. They are read on the
 //! draw path - once per draw for `diagnostics`, once per pipeline bind for the rest - and the
@@ -22,8 +23,6 @@
 //! They are kept as the complete set, one per switch, so that a new call site reads its flag the way
 //! every existing one does rather than reaching for the atomic itself.
 
-use std::path::Path;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use log::warn;
@@ -223,7 +222,14 @@ pub fn terrain_greater_depth() -> bool {
     TERRAIN_GREATER_DEPTH.load(Ordering::Relaxed)
 }
 
-/// Resolves every flag from the settings and the marker files.
+/// Resolves every flag from the settings.
+///
+/// **The settings are the only source.** A marker file next to the game used to be the other one, and
+/// every switch here resolved as "the setting, or the marker" - which meant the answer a run took
+/// depended on a file that nothing in the game could tell you about, that had no way to be turned off
+/// from inside it, and that four of the switches were even spelled as the *negation* of, so the file
+/// won over the setting and could not be overridden at all. They are on the options screen now, which
+/// is where a switch belongs: it is visible, it is saved, and it is the same place as everything else.
 pub fn apply(settings: &Settings) {
     let DebugSettings {
         gpu_based_validation,
@@ -241,40 +247,26 @@ pub fn apply(settings: &Settings) {
         terrain_greater_depth,
     } = settings.debug();
 
-    set(&LOGGING, logging || marker("wgpu-logging"));
-    set_dynamic_offsets(dynamic_offsets && !marker("wgpu-no-dynamic-offsets"));
-    set(&DIAGNOSTICS, diagnostics || marker("wgpu-dump-frames"));
-    // These two markers are spelled as the *off* switch, so the file wins over the setting.
-    set(
-        &BIND_GROUP_CACHE,
-        bind_group_cache && !marker("wgpu-no-bind-group-cache"),
-    );
-    set(
-        &TRACE_DYNAMIC_OFFSETS,
-        trace_dynamic_offsets || marker("wgpu-trace-dynamic-offsets"),
-    );
-    set(
-        &BINDING_VERBOSITY,
-        binding_verbosity || marker("wgpu-binding-log"),
-    );
-    set(&DUMP_SHADERS, dump_shaders || marker("wgpu-dump-shaders"));
+    set(&LOGGING, logging);
+    set_dynamic_offsets(dynamic_offsets);
+    set(&DIAGNOSTICS, diagnostics);
+    set(&BIND_GROUP_CACHE, bind_group_cache);
+    set(&TRACE_DYNAMIC_OFFSETS, trace_dynamic_offsets);
+    set(&BINDING_VERBOSITY, binding_verbosity);
+    set(&DUMP_SHADERS, dump_shaders);
     set(&GPU_BASED_VALIDATION, gpu_based_validation);
     // These two are not flags to be read somewhere: they *are* the action, so the switch does
-    // something the moment it moves. Both are gated on the setting alone - a marker file has no way
-    // to end a capture, and a capture that never ends is worse than none.
+    // something the moment it moves. See the setting docs for why neither is set here.
     set(&GPU_TIMESTAMPS, gpu_timestamps);
     set(&PIX_CAPTURE, pix_capture);
-    set(
-        &SECTION_TIMING,
-        section_timing || marker("wgpu-section-timing"),
-    );
+    set(&SECTION_TIMING, section_timing);
 
     // The two pipeline-state switches are the odd ones out: they are not flags the draw path reads
     // but state built into every pipeline, which is why they are handed to the crate that builds
     // them instead of being kept here. It answers whether either of them moved, and that is the one
     // thing a change to them invalidates - the pipelines already in the graph carry the old answer.
-    let no_cull = terrain_no_cull || marker("wgpu-terrain-no-cull");
-    let greater_depth = terrain_greater_depth || marker("wgpu-terrain-greater-depth");
+    let no_cull = terrain_no_cull;
+    let greater_depth = terrain_greater_depth;
 
     set(&TERRAIN_NO_CULL, no_cull);
     set(&TERRAIN_GREATER_DEPTH, greater_depth);
@@ -356,53 +348,4 @@ fn name(flag: &AtomicBool) -> &'static str {
         f if std::ptr::eq(f, &TERRAIN_GREATER_DEPTH) => "terrain greater depth",
         _ => "gpu based validation",
     }
-}
-
-/// Whether a marker file exists, asked once per process.
-///
-/// A marker is a file dropped next to the mod, and it used to be read on every draw for the cache
-/// and the offset switches. It cannot appear or disappear meaningfully while the game is running -
-/// the settings are the live switch now - so it is resolved the first time it is asked for, which
-/// is when the settings are applied.
-fn marker(file_name: &'static str) -> bool {
-    static MARKERS: OnceLock<std::collections::HashSet<&'static str>> = OnceLock::new();
-
-    MARKERS
-        .get_or_init(|| {
-            const NAMES: [&str; 10] = [
-                "wgpu-dump-frames",
-                "wgpu-no-bind-group-cache",
-                "wgpu-no-dynamic-offsets",
-                "wgpu-trace-dynamic-offsets",
-                "wgpu-dump-shaders",
-                "wgpu-binding-log",
-                "wgpu-logging",
-                "wgpu-section-timing",
-                "wgpu-terrain-no-cull",
-                "wgpu-terrain-greater-depth",
-            ];
-
-            let mut present = std::collections::HashSet::new();
-
-            for name in NAMES {
-                if Path::new(name).exists() || run_directory_marker(name) {
-                    present.insert(name);
-                }
-            }
-
-            present
-        })
-        .contains(file_name)
-}
-
-/// The same marker, next to the game directory rather than in the process's working directory.
-///
-/// The two are the same directory in a normal launch, and the run directory is the one that is
-/// still right when the game is started from somewhere else. It is only known once the JVM has
-/// sent it, so both are checked.
-fn run_directory_marker(file_name: &str) -> bool {
-    crate::RUN_DIRECTORY
-        .get()
-        .map(|directory| directory.join(file_name).exists())
-        .unwrap_or(false)
 }

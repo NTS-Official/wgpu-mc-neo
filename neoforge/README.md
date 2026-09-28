@@ -585,14 +585,26 @@ wgpu-mc: live resources: 767 textures (74 MB), 786 views, 47 buffers (0 MB, 5 qu
          1 encoders, 0 passes, 0 bind groups, 0 builders
 ```
 
-`-Dwgpu_mc.diagnostics=true` and `WGPU_MC_DIAGNOSTICS=1` do the same thing, but the marker file is
-the one that works whatever the launcher does with JVM arguments.
+`-Dwgpu_mc.diagnostics=true` and `WGPU_MC_DIAGNOSTICS=1` both turn the dumps on, and so does the
+**Diagnostics** option on the Neolectrum page. The option is the one to use: it is visible, it is
+saved with the rest of the settings, and it can be turned off again.
 
-### The debug switches are settings, and the diagnostics cost nothing when they are off
-Every diagnostic in this renderer grew as a marker file, which is the right shape for a switch that
-has to work without a launcher and the wrong one for a player who wants a single frame dumped. They
-are options on the **Neolectrum** page now, under two headings the schema names - **Optimization**
-first, then **Debug** - separated from the backend and vsync by a blank row:
+### The debug switches are settings, and the marker files are gone
+Every diagnostic in this renderer grew as a marker file - a file dropped next to the game - which is
+the right shape for a switch that has to work without a launcher and the wrong one for a player who
+wants a single frame dumped. They are options on the **Neolectrum** page now, under two headings the
+schema names - **Optimization** first, then **Debug** - separated from the backend and vsync by a blank
+row, and **the files no longer do anything**:
+
+> A run that still has `wgpu-logging` or `wgpu-dump-frames` in its directory takes the setting's
+> answer, because the setting is the only source.
+
+That is the point of the move rather than a side effect of it. The files were also a trap: four of the
+switches were spelled as the **negation** of the setting they shadowed (`wgpu-no-bind-group-cache`,
+`wgpu-no-dynamic-offsets`), so the file was resolved as `setting && !marker` - which means a file
+*laying around* overrode the option and the option could not override the file. A file nothing in the
+game can show you, that has no way to be turned off from inside the game, and that wins over the setting
+is not a fallback; it is a second source of truth with no interface.
 
 | Setting | Section | Default | Applies |
 | --- | --- | --- | --- |
@@ -668,14 +680,12 @@ created with it unconditionally, so every launch paid for a driver validation la
 renderer being debugged wants. Host-side `VALIDATION` and `DEBUG` stay on always - they are what
 makes a wgpu error name the call that caused it.
 
-Each of them is also still a marker file (`wgpu-dump-frames`, `wgpu-logging`,
-`wgpu-no-bind-group-cache`, `wgpu-no-dynamic-offsets`, `wgpu-trace-dynamic-offsets`,
-`wgpu-dump-shaders`, `wgpu-binding-log`, `wgpu-terrain-no-cull`, `wgpu-terrain-greater-depth`), and a
-marker wins where the two disagree - including the two that are spelled as the *off* switch, where the
-file turns the feature off regardless of the setting. The schema says which settings belong to which
-heading (`"section": "Optimization"` or `"Debug"`), so the options screen draws both headings without
-knowing what any of them do, and the Rust side resolves them into atomics when the settings are loaded
-or applied: the draw path reads a flag, never a config file or a lock.
+The schema says which settings belong to which heading (`"section": "Optimization"` or `"Debug"`), so
+the options screen draws both headings without knowing what any of them do, and the Rust side resolves
+them into atomics when the settings are loaded or applied: the draw path reads a flag, never a config
+file or a lock. **The marker files those settings used to shadow are gone**, including the two that were
+spelled as the *off* switch - see the section above for why a file that wins over the setting is worse
+than no file at all.
 
 The last two are the exception that proves the rule, because a draw path is not where they are read.
 A cull mode and a depth compare are built *into* a pipeline, so `apply` hands them to the crate that
@@ -1411,7 +1421,7 @@ implemented: the staging buffer was allocated, handed to Blaze3D and freed witho
 from the GPU. `read_buffer` now maps (through a scratch buffer of this side's own, so a buffer
 Minecraft maps itself is left alone), waits for the GPU and fills it.
 
-Two more diagnostics came out of the same dig, both behind the `wgpu-dump-frames` marker:
+Two more diagnostics came out of the same dig, both behind the **Diagnostics** option:
 
 - a file named `wgpu-dump-shaders` in the run directory writes every pipeline's *processed* GLSL to
   `wgpu-shaders/`, which is the only way to see the binding numbers and the operators a shader was
@@ -1663,8 +1673,7 @@ a slot name and no explanation is not a diagnosis either. Three things changed:
 
 All three are the `binding_verbosity` switch on the options screen (`Debug`), default off, and they
 also follow `diagnostics`: the fallback hits and the empty-slot listing are the verbose output, while
-the warning is always printed because it is a binding that went nowhere. The switch is also the
-`wgpu-binding-log` marker.
+the warning is always printed because it is a binding that went nowhere.
 
 It was verified by making every binding in the game take the fallback path for one run - the direct
 lookup commented out - which resolved 26 bindings through their suffixes, reconstructed both halves
@@ -2279,7 +2288,7 @@ them in the world is nine items in the hotbar of the run directory's copy of the
 files are gone, so nothing puts them back.
 
 The two per-draw traces stay, and they are what closed the binding layer as a suspect: `wgpu-trace-plan`
-names a pipeline family (with the `binding_verbosity` setting or the `wgpu-binding-log` marker turning
+names a pipeline family (with the `binding_verbosity` option turning
 them on), and they print the texture every slot of every draw carries on both sides of the ABI, in draw
 order, from the JVM's label registry and from the native side's view registry.
 
@@ -3829,6 +3838,189 @@ The test asserts **both** halves: an open surface bakes seven quads (one bottom,
 mirror) and the same fluid under a solid roof bakes six (no mirror, because there is no view from above to
 spoil). A back face that is always drawn is two draws and two blends for every lake in the world, and one
 that is never drawn is the report above.
+
+### The terrain pass was allocating a HashMap per section, and drawing water in hash order
+
+Four things were wrong with one loop, and the last is the one that was a picture difference.
+
+**The push constants were a `HashMap<String, (Vec<u8>, ShaderStages)>`, built per section per layer.** A
+pass over four hundred sections allocated four hundred `HashMap`s, four hundred `String`s and four
+hundred `Vec`s, to write sixteen bytes each. The layout knows what a draw needs - it was built from the
+config - so the offsets and sizes are resolved **once, when the pipeline is built**
+(`BoundPipeline::immediates`) and a draw hands over a slice parallel to them, built in a fixed-size array
+on its own stack (`set_immediates`). It asserts the length against the layout, which caught nothing in
+testing and is there because a short value is a shader reading whatever follows it in the buffer.
+
+**The counters were relaxed `fetch_add` per section per layer**, for numbers a log line reads once a
+second - and two of them had no reader at all. They are local `u64`s now, added once each at the end of
+the pass.
+
+**The frustum test ran once per layer**, on a box that does not depend on the layer. The gather is now one
+pass over the sections - occlusion list, frustum, and which layers the arena holds - into a list reused
+between passes, and the draw loops walk that list and nothing else. They never touch the arena's
+`HashMap` again.
+
+**And the translucent layer was drawn in `HashMap` iteration order.** That is the picture difference, and
+it is not a subtle one: water blends and does not write depth, so each face mixes with what is already in
+the target and has to be drawn before the face behind it. Hash order is no order at all, and it changed
+as the map grew - so two panes of glass, or a lake and the water behind it, blended in whatever sequence
+the hasher produced. `sort_for_drawing` puts the list far-to-near when one of the layers being drawn
+blends, and **leaves it alone otherwise**: the opaque two write depth and are ordered by the depth test,
+so sorting them would be work for nothing.
+
+The sort is keyed on the section, not on the face. Sorting faces is what the game does for *its*
+translucent mesh, which is rebuilt per section and re-sorted when the camera moves a block; a section is
+the granularity this side has, and it is the granularity the game orders its own translucent sections at.
+
+Two notes on what the diagnostics now mean. `culled` and `out of sight` are decided during the gather -
+once per section, before a layer is chosen - so a two-layer pass reports about half what it used to; the
+ratio between them, which is what the line is read for, is unchanged. And `drawn` and `empty` are still
+per layer, because they are decided where the layer is drawn.
+
+### The block atlases are point-sampled, and the game never point-samples them
+
+**This is a rolled-back change and the note is kept for the evidence, not for the code.** The filters are
+back to `Nearest` on both atlases; what follows is why the game disagrees, and what is still open.
+
+`LevelRenderer` builds one sampler for its terrain and uses it for both groups:
+
+```java
+this.chunkLayerSampler = RenderSystem.getDevice().createSampler(
+    AddressMode.CLAMP_TO_EDGE, AddressMode.CLAMP_TO_EDGE,
+    FilterMode.LINEAR, FilterMode.LINEAR, maxAnisotropy, OptionalDouble.empty());
+...
+chunkSectionsToRender.renderGroup(ChunkSectionLayerGroup.OPAQUE, this.chunkLayerSampler);
+chunkSectionsToRender.renderGroup(ChunkSectionLayerGroup.TRANSLUCENT, this.chunkLayerSampler);
+```
+
+so the game's block atlas is **bilinear**, in both passes, always.
+
+**The video option that sounds like it turns filtering off does not.** `TextureFilteringMethod` is
+`NONE`, `RGSS` or `ANISOTROPIC`; `FilterMode` has no off switch at all - `NEAREST` and `LINEAR` and
+nothing else - and two of the three values resolve to `maxAnisotropy = 1`. Everything the option moves
+is the anisotropy. So there is no setting under which the game's block textures are point-sampled, and
+the default is bilinear.
+
+Both filters matter and they do different jobs: `mag_filter` is what a sixteen-texel texture filling two
+hundred pixels looks like - sixteen squares or a smear - and `min_filter` is the same question at
+distance, where the atlas is minified and point sampling picks one texel out of the four a pixel covers.
+The second is the one that was under suspicion for the distant-lava flicker.
+
+**The change was rolled back rather than kept because it is not a free variable.** The flicker is a
+sample-frequency artifact, and the sampling rate is what a filter decides: carrying a filter change while
+measuring it moves the thing being measured. So the filters went back to where they were, and the
+question of which is right waits until there is a measurement that can tell. The one-line change is
+`mag_filter`/`min_filter` in `render::atlas::block_atlas_sampler`.
+
+**What is *not* rolled back, and is the part that was actually a bug.** The two atlases are both in one
+frame - a face whose sprite the game animates samples the game's `blocks.png`, and the grass, stone and
+leaves beside it sample this side's copy - and there was a revision where only the game's sampler was
+bilinear. A frame holding one of each is a frame with both filters in it, and a player handed that path
+said *"these are all blurry, there is none of the game's crisp pixels left"* about the fire, the lava and
+every other animated sprite, while the blocks around them were clean. The two were made to agree, and
+they still do: both build from one function, `render::atlas::block_atlas_sampler`, and the test asserts
+the **agreement** rather than the filter, so it would hold for either answer and only fires if the two
+drift apart. Rolling back to `Nearest` rolled back both, which is exactly why that is one function.
+
+The one thing that is meant to differ is the address mode: `Repeat` for this side's atlas (its
+coordinates come from its own packing) and `ClampToEdge` for the game's. A descriptor needs no device,
+which is the only reason the test can exist at all - the two samplers are created deep inside
+`RenderGraph::new` and `TextureManager::new`, both of which want a `Gpu`.
+
+**Anisotropy is missing entirely**, in either direction: there is no pipeline field for it the way there
+is one for `depth_write`, so a player on `ANISOTROPIC` does not get it. Kept here because it is the one
+part of the game's sampler that neither answer has.
+
+### The frustum is not occlusion culling, and the game already had the answer
+
+The terrain pass culled its sections against the camera's frustum. That is what Minecraft does *first*
+and what its `SectionOcclusionGraph` then throws most of away: the graph walks outward from the camera
+through the sections it can actually see - a section is reached only through a neighbour whose face
+toward it is not opaque - so the couple of thousand sections inside the frustum of a normal view become
+the few hundred that are not behind a hill. Drawn with the frustum's set, every section of a cave
+system, a ravine or a forest floor is submitted, and the vertex stage transforms geometry the depth test
+then discards.
+
+`LevelRenderer#visibleSections` is that graph's answer and it is rebuilt every frame in `setupRender`,
+which is before the terrain pass runs. It is read rather than recomputed, because recomputing it is what
+the game is already doing and the game's version is the one with the graph in it:
+
+- `VisibleSectionsAccessor` reads the list, `RenderSectionNodeAccessor` reads each section's own
+  `sectionNode` - a `SectionPos.asLong`, the same packing `RustChunkBake` keys its records by and
+  `section_pos` unpacks, so a section cannot be named one way on one side and another way on the other;
+- `TerrainPass#sendVisibleSections` hands the keys over once per frame, and **only when they change** -
+  the list is the same list most frames, and a native call per frame to pass a thousand identical longs
+  is the cost that avoids;
+- the pass obeys it **including when it is empty**. `None` is "nothing has been sent", where a frustum
+  is the best answer there is, and `Some(empty)` is "the game looked and saw nothing", where drawing the
+  arena would be drawing exactly what the game decided not to. Read as "not told", the feature draws the
+  whole world for a frame the game deliberately emptied and looks like it does nothing at all - which is
+  why `section_visibility` is a function with a test rather than three lines inside the draw loop.
+
+The frustum test stays. It is nearly free, and the two disagree in both directions: the graph's answer
+is a frame old and conservative about what a neighbour hides, so a section it left out may be one the
+camera has since turned toward.
+
+**Two things about the accessor were wrong first**, and both are the same trap this project has paid for
+before - an accessor is matched by name and **erased descriptor**:
+
+- the field is `ObjectArrayList<RenderSection>`, not `List<RenderSection>`, so declaring the interface it
+  happens to satisfy is `InvalidAccessorException: No candidates were found matching
+  visibleSections:Ljava/util/List;` at load. The *declared* type is what has to be named;
+- the same shape of mistake as the `this$0:Ljava/lang/Object` one, which is why the doc comment says so.
+
+The report line grew an `N not named by the game's occlusion graph` count beside the frustum's, because
+the two are the interesting pair: out-of-sight much larger than culled is the game culling properly, and
+out-of-sight at zero with the frustum culling hard is the graph's list not arriving at all. Its
+per-layer figures had to become **frame-wide totals** rather than drained counters: the opaque group is
+two pipelines over one geometry, so a report at a pipeline boundary showed whichever of them the graph
+reached last - a solid layer reported as `0 drawn` while it was drawing, which is how that was noticed.
+
+### The solid layer was paying for a `discard` it could never reach
+
+The terrain shader ended its fragment stage with an alpha test at a cutoff that travels in the push
+constant:
+
+```wgsl
+if (col.a < section_pos.alpha_cutout) {
+    discard;
+}
+```
+
+and one pipeline drew **both** opaque layers, with `alpha_cutout` set to `0.5` for the cutout layer and
+`0.0` for the solid one. The solid test can never fire. It cost the whole pipeline early-Z anyway.
+
+That is not a driver quirk to work around, it is the shape of the hardware: a fragment shader that can
+throw a fragment away cannot have run before the depth test, because whether it throws it away is not
+known until it has. So the GPU has to run the fragment stage for every covered pixel and only then ask
+about depth - and hierarchical-Z, which rejects whole tiles before the fragment stage, is gone with it.
+The solid layer is most of the screen, so this was most of the frame's fill rate spent on fragments that
+were about to fail the depth test.
+
+`alpha_cutout` is a `var<immediate>`, which is why nothing could be done about it in one shader: its
+value is not known until the draw call, so the branch cannot be folded away at pipeline creation. wgpu
+has no pipeline-overridable constant here, so the two layers are two shaders and two pipelines -
+`terrain_solid.wgsl` / `terrain_solid` with no test at all, and `terrain.wgsl` / `terrain` with it. That
+is the same split Minecraft makes: its `SOLID_TERRAIN` defines no `ALPHA_CUTOUT` and its `CUTOUT_TERRAIN`
+declares `0.5`.
+
+Three things had to move with it, and each one is a way to get this wrong that the tests now check:
+
+- **`terrain_layers` is keyed on the pipeline name, not the geometry.** The two pipelines share
+  `@geo_terrain`, so the geometry-keyed lookup that was there would have handed *both* of them *both*
+  layers - putting the solid layer straight back through the shader with the test in it, with nothing to
+  see in the picture to say so;
+- **the opaque pass names both pipelines.** `render_with_mvp_only`'s `only` became a slice, because
+  Minecraft's opaque group is two layers: naming one of them is a layer that is baked and never drawn,
+  which is the state the transparent layer was in for a while;
+- **the depth clear follows the solid layer.** It was already asked of the layers rather than of a name,
+  so `terrain_solid` claims the frame's depth and `terrain` loads it, whichever the graph reaches first.
+
+Two tests hold it: the layer split is asserted for all three pipelines (including that the geometry is
+*not* a key any more), and the shipped shader sources are read to assert that `terrain` and
+`terrain_solid` differ by exactly the `discard` - the solid one must not contain the instruction at all.
+A third parses and validates the new file with naga, because a shader that fails to build is a pipeline
+the graph skips **in silence**, and a skipped `terrain_solid` is the solid layer of the world not drawn.
 
 ### A pass's binding stash is shared across its pipelines, and that made the diagnostic lie
 

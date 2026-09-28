@@ -314,6 +314,27 @@ pub fn section_key(pos: IVec3) -> i64 {
         | (pos.y as i64 & 0xF_FFFF)
 }
 
+/// The position a key written by [`section_key`] names: Minecraft's own `SectionPos.x/y/z`.
+///
+/// The inverse of the function above, and written as Minecraft writes it - each field shifted up so its
+/// own sign bit is the top bit of the `i64`, then shifted back down arithmetic, which is what makes a
+/// negative coordinate come out negative rather than as a huge positive one. `y` is **twenty** bits and
+/// the other two are twenty-two: a world is 24 million blocks across and only two million tall, and the
+/// asymmetry is the first thing to get wrong here.
+///
+/// The widths are not `& 0x3F_FFFF` masks, because a mask gives an unsigned answer for a negative
+/// coordinate - the two forms agree only on the values that are not interesting.
+pub fn section_pos(key: i64) -> IVec3 {
+    // The `<< 0` is Minecraft's own `SectionPos.x`: the three decoders are one expression with three
+    // shifts, and writing it out is what keeps them comparable to each other and to the game.
+    #[allow(clippy::identity_op)]
+    IVec3::new(
+        (key << 0 >> 42) as i32,
+        (key << 44 >> 44) as i32,
+        (key << 22 >> 42) as i32,
+    )
+}
+
 /// One parsed call: what arrived with it.
 #[derive(Debug, Default)]
 pub struct Payload {
@@ -1052,6 +1073,16 @@ mod tests {
                 IVec3::new(x(key), y(key), z(key)),
                 pos,
                 "{pos:?} did not survive the round trip the JVM reads it with"
+            );
+
+            // And the **production** decoder is those three expressions, so the occlusion graph's own
+            // keys - which arrive as `SectionPos.asLong` straight off each `RenderSection` - come back
+            // as the positions the arena is keyed by. A hand-written copy of the shifts in the JNI
+            // function is how `y` came to be twenty-one bits wide for one revision of it.
+            assert_eq!(
+                section_pos(key),
+                pos,
+                "{pos:?} did not survive section_pos, which is what setVisibleSections decodes with"
             );
         }
     }

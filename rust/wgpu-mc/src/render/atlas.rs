@@ -544,6 +544,63 @@ mod sprite_layer_tests {
 }
 
 #[cfg(test)]
+mod block_atlas_sampler_tests {
+    use super::*;
+
+    /// **Both block atlases are filtered the same way**, which is the property this function exists for.
+    ///
+    /// A descriptor is built here rather than a sampler, because building one needs no device - which
+    /// is the only reason this can be a test at all: the two sites that create the samplers are deep in
+    /// `RenderGraph::new` and `TextureManager::new`, both of which want a `Gpu`.
+    ///
+    /// What is asserted is the **agreement**, not the filter. `Nearest` is where this stands after the
+    /// bilinear revision was rolled back - see the function's own note, and the distant-lava flicker
+    /// that rollback is waiting on - and the failure this test is here to catch is not "it is nearest"
+    /// but "the two atlases disagree". That is what produced "these are all blurry, there is none of the
+    /// game's crisp pixels left" about the fire, the lava and every other animated sprite, while the
+    /// blocks around them were clean. Written against the function's own answer, so it holds for either
+    /// filter and only fires when the two stop matching.
+    ///
+    /// The address mode is the thing that *does* differ, so both are checked: this side's atlas is
+    /// `Repeat`, because its coordinates come from this side's own packing, and the game's is
+    /// `ClampToEdge`, which is what the game asks for.
+    #[test]
+    fn both_block_atlases_are_filtered_the_same_way() {
+        let repeat = block_atlas_sampler(wgpu::AddressMode::Repeat);
+        let clamp = block_atlas_sampler(wgpu::AddressMode::ClampToEdge);
+
+        assert_eq!(
+            repeat.mag_filter, clamp.mag_filter,
+            "one atlas magnified one way and the other another is two filters in one frame"
+        );
+        assert_eq!(
+            repeat.min_filter, clamp.min_filter,
+            "and the same at minification, which is what a distant surface is"
+        );
+        assert_eq!(
+            repeat.mipmap_filter, clamp.mipmap_filter,
+            "and the same between mip levels"
+        );
+
+        // Whichever filter the two agree on, the mip chain has to be read, or the levels above zero are
+        // never sampled at all.
+        assert_eq!(
+            repeat.mipmap_filter,
+            wgpu::MipmapFilterMode::Linear,
+            "the atlas has a mip chain and a blend between its levels is what reads it"
+        );
+
+        // And the one thing that is meant to differ.
+        assert_eq!(repeat.address_mode_u, wgpu::AddressMode::Repeat);
+        assert_eq!(repeat.address_mode_v, wgpu::AddressMode::Repeat);
+        assert_eq!(repeat.address_mode_w, wgpu::AddressMode::Repeat);
+        assert_eq!(clamp.address_mode_u, wgpu::AddressMode::ClampToEdge);
+        assert_eq!(clamp.address_mode_v, wgpu::AddressMode::ClampToEdge);
+        assert_eq!(clamp.address_mode_w, wgpu::AddressMode::ClampToEdge);
+    }
+}
+
+#[cfg(test)]
 mod sprite_metadata_path_tests {
     use super::*;
 
@@ -632,6 +689,52 @@ fn halve(image: &ImageBuffer<Rgba<u8>, Vec<u8>>) -> ImageBuffer<Rgba<u8>, Vec<u8
     out
 }
 
+/// **The sampler both block atlases are drawn with**, and the one thing about it worth a function.
+///
+/// Two atlases are in play in one frame: a face whose sprite the game animates is baked with the
+/// game's own coordinates and samples the game's `blocks.png`, and every face beside it samples this
+/// side's copy of its sprite. Both go through here, so both take the same answer.
+///
+/// **`Nearest` on both filters, and that is a deliberate step back from the game's own answer.** The
+/// game bilinears its terrain and always has - `LevelRenderer` builds one sampler for it,
+/// `CLAMP_TO_EDGE, FilterMode.LINEAR, FilterMode.LINEAR` plus the video settings' anisotropy, and hands
+/// it to both groups; the texture-filtering option only ever moves the anisotropy, because
+/// `TextureFilteringMethod` is `NONE`/`RGSS`/`ANISOTROPIC`, `FilterMode` has no off switch, and two of
+/// the three resolve to `maxAnisotropy = 1`. This side had bilinear for one revision.
+///
+/// It was rolled back because the difference showed up as the **distant-lava flicker**, and which filter
+/// is right is not a question that can be settled while that is open: changing the sampling rate is not
+/// something to carry while debugging a sample-frequency artifact, because it moves the thing being
+/// measured. See the note on `mag_filter` below for the part that *is* settled and is not what was
+/// rolled back - the two atlases disagreeing with each other.
+///
+/// `address_mode` is the one thing that differs: this side's atlas is sampled with `Repeat`, because
+/// its coordinates come from its own packing, and the game's with `ClampToEdge`, which is what the game
+/// asks for. Both are the game's own choices for their own atlas.
+pub fn block_atlas_sampler(address_mode: wgpu::AddressMode) -> wgpu::SamplerDescriptor<'static> {
+    wgpu::SamplerDescriptor {
+        address_mode_u: address_mode,
+        address_mode_v: address_mode,
+        address_mode_w: address_mode,
+        // **Both atlases take the same answer, and that is the property to keep whatever the answer
+        // is.** There was a revision where only the game's sampler was bilinear - which is what it was
+        // for the frames after the game atlas was first bound - and a frame holding one of each is a
+        // frame with both filters in it. A player handed that path said "these are all blurry, there is
+        // none of the game's crisp pixels left" about the fire, the lava and every other animated
+        // sprite, while the blocks around them were clean. Rolling back to `Nearest` rolls back *both*,
+        // which is why this is one function.
+        mag_filter: wgpu::FilterMode::Nearest,
+        min_filter: wgpu::FilterMode::Nearest,
+        // The atlases have mip chains (see [`ATLAS_MIP_LEVELS`]) and this is what picks between their
+        // levels: a blend between the two it lands between, so a surface crossing a level boundary does
+        // not snap, and without it the chain would never be read at all. That half is the game's own
+        // choice too - `OptionalDouble.empty()` for the maximum level is "every level the texture has" -
+        // and it is *not* part of what was rolled back.
+        mipmap_filter: wgpu::MipmapFilterMode::Linear,
+        ..Default::default()
+    }
+}
+
 /// Stores uploaded textures which will be automatically updated whenever necessary
 #[derive(Debug)]
 pub struct TextureManager {
@@ -643,20 +746,9 @@ pub struct TextureManager {
 impl TextureManager {
     #[must_use]
     pub fn new(wgpu_state: &Gpu) -> Self {
-        let sampler = wgpu_state.device.create_sampler(&wgpu::SamplerDescriptor {
-            address_mode_u: wgpu::AddressMode::Repeat,
-            address_mode_v: wgpu::AddressMode::Repeat,
-            address_mode_w: wgpu::AddressMode::Repeat,
-            mag_filter: wgpu::FilterMode::Nearest,
-            min_filter: wgpu::FilterMode::Nearest,
-            // The atlas has a mip chain (see [ATLAS_MIP_LEVELS]) and this is what picks between its
-            // levels: nearest within the level it lands on - the blocky look the game has - and a blend
-            // between the two levels it lands between, so a surface crossing a level boundary does not
-            // snap. That is the game's own `GL_NEAREST_MIPMAP_LINEAR`, and without it the chain would
-            // never be read at all.
-            mipmap_filter: wgpu::MipmapFilterMode::Linear,
-            ..Default::default()
-        });
+        let sampler = wgpu_state
+            .device
+            .create_sampler(&block_atlas_sampler(wgpu::AddressMode::Repeat));
 
         Self {
             default_sampler: Arc::new(sampler),

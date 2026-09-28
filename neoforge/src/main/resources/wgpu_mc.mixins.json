@@ -23,6 +23,8 @@
     "entity.EntityRenderersMixin",
     "entity.ModelPartDataMixin",
     "entity.ModelPartMixin",
+    "level.RenderSectionNodeAccessor",
+    "level.VisibleSectionsAccessor",
     "render.BuiltChunkMixin",
     "render.GameRendererMixin",
     "render.InGameHudMixin",

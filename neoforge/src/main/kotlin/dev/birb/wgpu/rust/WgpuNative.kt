@@ -282,6 +282,8 @@ object WgpuNative {
 	const val LAYER_CUTOUT = 1
 	const val LAYER_TRANSPARENT = 2
 
+	external fun setVisibleSections(keys: LongArray)
+
 	external fun registerBlockStateFaceFlags(
 		key: Int,
 		occlusion: Int,

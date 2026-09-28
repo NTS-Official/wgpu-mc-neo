@@ -1,6 +1,7 @@
 //! Rust implementations of minecraft concepts that are important to us.
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 
@@ -303,6 +304,29 @@ pub struct Scene {
     pub render_effects: ArcSwap<RenderEffectsData>,
 
     pub depth_texture: RwLock<wgpu::Texture>,
+
+    /// The sections Minecraft's own occlusion culling says are visible this frame, or `None` before the
+    /// JVM has ever sent a list.
+    ///
+    /// **The reason this exists is that a frustum is not occlusion culling.** The terrain pass culled
+    /// its sections against the camera's frustum, which is what the game's own renderer does *first* and
+    /// what its [`SectionOcclusionGraph`] then throws most of away: the graph walks outward from the
+    /// camera through the sections it can actually see - a section is reached only through a neighbour
+    /// whose face toward it is not fully opaque - so the ~2,000 sections inside the frustum of a normal
+    /// view become the few hundred that are not behind a hill. Drawing the frustum's set means submitting
+    /// every section in a cave system, a ravine or a forest floor, and the vertex stage then transforms
+    /// geometry the depth test discards. `visibleSections` is that graph's answer, once per frame.
+    ///
+    /// `None` and `Some(empty)` are **different**, which is why this is an `Option`: `None` is "the JVM
+    /// has not told this side anything", where a frustum is the best answer there is, and `Some(empty)`
+    /// is "the game looked and saw nothing", where drawing the arena would be drawing exactly what the
+    /// game decided not to. A session with the terrain switch off never sends either.
+    ///
+    /// The positions are absolute section coordinates, the same space [`Scene::camera_section_pos`] and
+    /// the arena's keys are in. See `set_visible_sections`.
+    ///
+    /// [`SectionOcclusionGraph`]: https://minecraft.wiki/w/Occlusion_culling
+    pub visible_sections: RwLock<Option<HashSet<IVec3>>>,
 }
 
 impl Scene {
@@ -349,6 +373,10 @@ impl Scene {
                     view_formats: &[],
                 })
                 .into(),
+
+            // `None` rather than an empty set: nothing has been sent yet, and an empty set means "the
+            // game looked and saw nothing", which would draw no terrain at all. See the field.
+            visible_sections: RwLock::new(None),
         }
     }
 

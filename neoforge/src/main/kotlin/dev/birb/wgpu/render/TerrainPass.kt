@@ -5,6 +5,8 @@ import dev.birb.wgpu.backend.Diagnostics
 import dev.birb.wgpu.backend.bindAtlasToTerrainPass
 import dev.birb.wgpu.backend.bindLightmapToTerrainPass
 import dev.birb.wgpu.chunk.RustChunkBake
+import dev.birb.wgpu.mixin.level.RenderSectionNodeAccessor
+import dev.birb.wgpu.mixin.level.VisibleSectionsAccessor
 import dev.birb.wgpu.rust.WmNative
 import dev.birb.wgpu.rust.WgpuNative
 import net.minecraft.client.Minecraft
@@ -246,6 +248,7 @@ object TerrainPass {
 		lastSectionZ = sectionZ
 
 		WgpuNative.setCameraSection(sectionX, sectionY, sectionZ)
+		sendVisibleSections()
 
 		WgpuNative.setMatrix(MATRIX_PROJECTION, projection)
 		WgpuNative.setMatrix(MATRIX_VIEW, view)
@@ -265,8 +268,15 @@ object TerrainPass {
 			if (now - fogReportedAt >= 1_000_000_000L) {
 				fogReportedAt = now
 				WgpuMcMod.LOGGER.info(
-					"wgpu: fog colour ({}, {}, {}, {}), environmental {}..{}, render distance {}..{}, fogType {}",
+					"wgpu: fog colour ({}, {}, {}, {}), environmental {}..{}, render distance {}..{}, fogType {}, waterVision {}",
 					fog[0], fog[1], fog[2], fog[3], fog[4], fog[5], fog[6], fog[7], cameraState.fogType,
+					// The game brightens the *fog colour itself* by this while the camera is underwater
+					// (`FogRenderer`, lerping the colour toward `colour / max(r,g,b)`) - and the water
+					// fog colour's blue is already 1.0, so the whole of the brightening lands on red and
+					// green: a camera whose water vision has not ramped yet reads as a uniformly *darker*
+					// picture whose blue is unaffected. Printing it next to the colour is what tells
+					// "the fog is not brightened" from "the fog is fine and something else is dark".
+					(Minecraft.getInstance().player?.waterVision ?: -1.0f),
 				)
 			}
 		}
@@ -314,10 +324,51 @@ object TerrainPass {
 		WgpuNative.setFogEnvironment(fog)
 	}
 
+	/** The packed section keys of the last frame that was sent, so an unchanged frame is no call. */
+	private var lastVisibleSections: LongArray? = null
+
+	/**
+	 * Hands the renderer Minecraft's own answer to "what can be seen", once per frame.
+	 *
+	 * The native terrain pass used to cull its sections against the camera's frustum, which is what the
+	 * game does *first* - and what its `SectionOcclusionGraph` then throws most of away. The graph walks
+	 * outward from the camera through sections it can actually see, so the couple of thousand a frustum
+	 * names become the few hundred that are not behind a hill. Drawing the frustum's set submits every
+	 * section of a cave, a ravine or a forest floor, and the vertex stage transforms geometry the depth
+	 * test then discards.
+	 *
+	 * `LevelRenderer#visibleSections` is that graph's answer and it is rebuilt every frame in
+	 * `setupRender`, which is before this runs. It is read rather than recomputed because recomputing it
+	 * is what the game is already doing, and the game's version is the one with the graph in it.
+	 *
+	 * The keys are `SectionPos.asLong`, taken straight off each section's own node: the same packing
+	 * `RustChunkBake` keys its records by and the native side unpacks, so a section cannot be named one
+	 * way here and another way there. A frame whose list is identical to the last one is not sent again -
+	 * the list only changes when the camera's view does, and the native side keeps the last one.
+	 */
+	private fun sendVisibleSections() {
+		val levelRenderer = Minecraft.getInstance().levelRenderer ?: return
+
+		val visible = (levelRenderer as VisibleSectionsAccessor).`wgpu_mc$visibleSections`()
+		val keys = LongArray(visible.size)
+
+		for (index in visible.indices) {
+			keys[index] = (visible[index] as RenderSectionNodeAccessor).`wgpu_mc$sectionNode`()
+		}
+
+		// Identity of contents rather than of the array: the list is the same list most frames, and a
+		// native call per frame to hand over the same thousand longs is the cost this avoids.
+		if (lastVisibleSections?.contentEquals(keys) == true) {
+			return
+		}
+
+		lastVisibleSections = keys
+		WgpuNative.setVisibleSections(keys)
+	}
+
 	/** The lightmap texture the graph was last handed, so the handover is one call rather than sixty a second. */
 	@Volatile
 	private var boundLightmap: Any? = null
-
 	/**
 	 * Hands the renderer the lightmap of the frame being drawn, the first time it sees it.
 	 *

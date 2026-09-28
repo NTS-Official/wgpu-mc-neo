@@ -20,12 +20,49 @@ pipelines:
   # for its lighting (`sample_lightmap(Sampler2, UV2)`): one fetch per vertex, the colour interpolated
   # across the quad, so the gamma, the brightness option, the time of day, night vision and the
   # darkness effect all come from the game rather than from a curve written here. See `GAME_LIGHTMAP`.
+  #
+  # **This pipeline draws the cutout layer and not the solid one.** The two are separate pipelines
+  # because of one instruction: this shader's fragment stage has a `discard`, and a `discard` anywhere
+  # in a fragment shader is what makes a driver give up on early-Z and hierarchical-Z for the whole
+  # pipeline, since it cannot know whether a fragment survives until the shader has run. The solid
+  # layer is most of the screen, so drawing it through a shader with a test that can never fire cost it
+  # early-Z for nothing. `terrain_solid` below is the same shader without the test. Minecraft's own
+  # terrain is split the same way - `SOLID_TERRAIN` defines no `ALPHA_CUTOUT`, `CUTOUT_TERRAIN`
+  # declares 0.5 - and `terrain_layers` in `graph.rs` is where a layer is paired with its pipeline.
   terrain:
     geometry: "@geo_terrain"
     depth: "@texture_depth"
     output: [ "@framebuffer_texture" ]
     # Minecraft's main target is an `Rgba8Unorm` texture of its own, not the surface: a pipeline built
     # for the swapchain's `Bgra8Unorm` is refused by wgpu the moment it is set in a pass.
+    output_format: rgba8unorm
+    blending: replace
+    bind_groups:
+      0:
+        0: "@mat4_model"
+        1: "@mat4_view"
+        2: "@mat4_perspective"
+        3: "@texture_block_atlas"
+        4: "@sampler"
+        5: "@texture_mc_block_atlas"
+        6: "@sampler_mc_block_atlas"
+        7: "@texture_game_lightmap"
+        8: "@sampler_game_lightmap"
+        9: "@fog_environment"
+      1: "@bg_ssbo_chunks"
+    immediates:
+      0: "@pc_section_position"
+
+  # The solid layer of the same arena: the opaque block models, which is most of what the terrain pass
+  # draws. A copy of `terrain` in every respect but one - its shader has no `discard` in it at all -
+  # and the copy is the price of wgpu having no pipeline-overridable constant, which is what one shader
+  # would need to compile the test out for one layer and in for another. `shader:` is what makes the
+  # graph read `wgpu_mc:shaders/terrain_solid.wgsl` rather than a file named after this pipeline.
+  terrain_solid:
+    geometry: "@geo_terrain"
+    shader: terrain_solid
+    depth: "@texture_depth"
+    output: [ "@framebuffer_texture" ]
     output_format: rgba8unorm
     blending: replace
     bind_groups:

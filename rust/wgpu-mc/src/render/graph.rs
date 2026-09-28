@@ -1,5 +1,6 @@
 use linked_hash_map::LinkedHashMap;
 use std::collections::HashMap;
+use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use treeculler::{AABB, BVol, Frustum, Vec3};
@@ -32,9 +33,53 @@ use crate::util::WmArena;
 /// Diagnostics, and the numbers the terrain path is checked with: "the graph pass ran and drew the
 /// arena" is a count here rather than a screenshot, and a frustum built from a matrix convention the
 /// culler does not share shows up as everything culled rather than as missing terrain.
+/// What the game's own occlusion culling says about one section. See [`RenderGraph::section_visibility`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SectionVisibility {
+    /// A named section: submit it.
+    Draw,
+    /// The game looked and did not name this one: do not.
+    OutOfSight,
+    /// Nothing has been sent, so the frustum is the best answer there is.
+    AskTheFrustum,
+}
+
+/// One section that survived the gather: where it is, what the arena holds for each layer, and how far
+/// away it is.
+///
+/// The two ranges per layer are the ones a draw needs - the index range to draw and the vertex range to
+/// draw it *from*, which is the section's slot in the arena - and they are carried here rather than
+/// looked up again so that the draw loops never touch the arena's `HashMap`.
+#[derive(Debug, Clone)]
+struct VisibleSection {
+    /// The section's position relative to the camera's section: the number the push constant carries,
+    /// and the origin every vertex of the section is placed against. See the terrain pass.
+    relative_position: glam::IVec3,
+    /// Per [`RenderLayer`], the `(indices, vertices)` the arena holds, or `None` for no layer.
+    ranges: [Option<(Range<u32>, Range<u32>)>; 3],
+    /// Distance from the camera's section to this one, squared, in sections. See the sort.
+    distance_squared: f32,
+}
+
+/// The gather's list of drawable sections, kept between passes so its capacity is not re-earned sixty
+/// times a second.
+///
+/// A field on the graph and a `RefCell` rather than a local `Vec`, because the point is that the
+/// allocation happens once: a local would be one allocation per pass, and the gather is on the path that
+/// this exists to make cheaper. The graph is shared but only the render thread draws, and a `RefCell`
+/// borrow that overlapped would panic rather than corrupt - which is the right failure for scratch.
+#[derive(Debug, Default)]
+pub struct TerrainScratch(std::cell::RefCell<Vec<VisibleSection>>);
+
 static TERRAIN_DRAWN: AtomicU64 = AtomicU64::new(0);
 static TERRAIN_CULLED: AtomicU64 = AtomicU64::new(0);
 static TERRAIN_EMPTY: AtomicU64 = AtomicU64::new(0);
+/// Sections the arena holds that the game's own occlusion graph did not name.
+///
+/// The number that says whether the graph's list is arriving and doing anything: it is the frustum's
+/// count *minus* this one, and a run where this is zero while the frustum culls hard is a run whose
+/// list never got there. See [`report_terrain_pass`].
+static TERRAIN_OUT_OF_SIGHT: AtomicU64 = AtomicU64::new(0);
 static TERRAIN_REPORTED: AtomicU64 = AtomicU64::new(0);
 
 /// The same three counts, per layer.
@@ -42,8 +87,25 @@ static TERRAIN_REPORTED: AtomicU64 = AtomicU64::new(0);
 /// A layer that is not on screen has two very different explanations - the arena has nothing in it for
 /// those sections, or it has and the pass is not drawing it - and the total above cannot tell them
 /// apart. Indexed by `RenderLayer as usize`.
+///
+/// These are **drained by the report**, and since the opaque group is two pipelines over one geometry
+/// that means whichever of them the graph reaches last is the one that reports: `terrain_solid` clears
+/// the counters and the report that follows `terrain` then shows the cutout layer's own count and a
+/// zero where the solid layer's should be. That reads as a solid layer that never drew, which is why
+/// the totals below exist and why the report prints those.
 static LAYER_DRAWN: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 static LAYER_EMPTY: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+
+/// And the same per layer **since the renderer started**, which nothing drains.
+///
+/// The whole frame's count rather than the last pipeline's, for the reason above: a report taken at a
+/// pipeline boundary cannot see the pass's other pipelines, and the question the numbers are asked -
+/// "is the solid layer being drawn at all" - is about the frame. A caller subtracts two reads to get a
+/// rate; the report simply prints them.
+static LAYER_DRAWN_TOTAL: [AtomicU64; 3] =
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+static LAYER_EMPTY_TOTAL: [AtomicU64; 3] =
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 
 /// Drains those six counters, for a caller outside this module.
 ///
@@ -107,13 +169,20 @@ pub fn set_pipeline_diagnostics(no_cull: bool, greater_depth: bool) -> bool {
 
 /// Reports what the terrain pass drew, once a second and only while the section diagnostics are on.
 ///
-/// The counters are always kept - they are relaxed increments on the render thread, one per section -
-/// because the line they feed is the only place a run says whether the Rust terrain reached the
-/// screen at all.
+/// The counters are always kept, because the line they feed is the only place a run says whether the Rust
+/// terrain reached the screen at all - but they are *local* `u64`s on the pass's own stack, added to these
+/// atomics once each at the end of it. See the terrain branch: a relaxed `fetch_add` per section per layer
+/// is a contended read-modify-write for a number read once a second.
+///
+/// **`culled` and `out of sight` now count sections and not section-layers.** They are decided while the
+/// gather runs - once per section, before any layer is chosen - so a two-layer pass divides the old
+/// figures by two. The rate is what the line is read for, and the ratio between the two is unchanged.
+/// "drawn" and "empty" are still per layer, because they are decided where the layer is drawn.
 fn report_terrain_pass() {
     let drawn = TERRAIN_DRAWN.swap(0, Ordering::Relaxed);
     let culled = TERRAIN_CULLED.swap(0, Ordering::Relaxed);
     let empty = TERRAIN_EMPTY.swap(0, Ordering::Relaxed);
+    let out_of_sight = TERRAIN_OUT_OF_SIGHT.swap(0, Ordering::Relaxed);
 
     if !crate::mc::chunk::DIAGNOSTIC_LOGGING.load(Ordering::Relaxed) {
         return;
@@ -128,11 +197,19 @@ fn report_terrain_pass() {
         return;
     }
 
-    // Per layer as well as in total, and the three numbers answer three different questions about a
-    // layer that is not on screen: "drawn" is geometry that reached the GPU, "empty" is a layer the
-    // arena has nothing in for that section, and "culled" is a section the frustum rejected. A layer
-    // whose drawn count is zero while the arena holds it is a pipeline problem; a layer whose empty
-    // count is every section is a bake that never landed. Lumped together they say nothing.
+    // Per layer as well as in total, and the numbers answer different questions about a layer that is
+    // not on screen: "drawn" is geometry that reached the GPU, "empty" is a layer the arena has nothing
+    // in for that section, "culled" is a section the frustum rejected, and "out of sight" is one the
+    // game's own occlusion graph did not name. The last two are the interesting pair: out-of-sight much
+    // larger than culled is the game culling properly, and out-of-sight at zero with the frustum culling
+    // hard is the graph's list not arriving at all. Those two count sections; the per-layer ones count
+    // draws.
+    //
+    // The per-layer figures are the **totals**, not the drained ones: this report runs at a pipeline
+    // boundary and the opaque group is two pipelines, so the drained per-layer count would be whichever
+    // of the two the graph reached last - a solid layer reported as zero while it drew, which is exactly
+    // how this was noticed. The pass-wide counts below are still per report, which is what makes them
+    // readable as a rate.
     let per_layer: Vec<String> = [
         RenderLayer::Solid,
         RenderLayer::Cutout,
@@ -143,15 +220,16 @@ fn report_terrain_pass() {
         let index = *layer as usize;
         format!(
             "{layer:?} {} drawn {} empty",
-            LAYER_DRAWN[index].swap(0, Ordering::Relaxed),
-            LAYER_EMPTY[index].swap(0, Ordering::Relaxed)
+            LAYER_DRAWN_TOTAL[index].load(Ordering::Relaxed),
+            LAYER_EMPTY_TOTAL[index].load(Ordering::Relaxed)
         )
     })
     .collect();
 
     log::info!(
         "wgpu-mc: terrain pass: {drawn} section draw(s) - solid and cutout of one pass, transparent of \
-         the other -, {culled} culled by the frustum, {empty} with no layer at all; per layer: {}",
+         the other -, {out_of_sight} not named by the game's occlusion graph, {culled} culled by the \
+         frustum, {empty} with no layer at all; per layer: {}",
         per_layer.join(", ")
     );
 }
@@ -428,6 +506,28 @@ pub struct BoundPipeline {
     pub pipeline: wgpu::RenderPipeline,
     pub bind_groups: Vec<(u32, WmBindGroup)>,
     pub config: PipelineConfig,
+    /// Every immediate this pipeline's layout declares, as `(byte offset, byte size)` in slot order.
+    ///
+    /// Resolved from `config.immediates` **once, when the pipeline is built**, so that drawing does not
+    /// have to: the offsets and the sizes are properties of the layout, and the layout is built here.
+    /// What is left for a draw is the data, handed over as a slice parallel to this one - see
+    /// [`set_immediates`]. Two `Vec`s of two `u32`s, one per pipeline, once.
+    pub immediates: Vec<(u32, u32)>,
+}
+
+impl BoundPipeline {
+    /// Where in the layout the immediate named `resource` sits, or `None` when the pipeline has none.
+    ///
+    /// A name rather than an index, because a call site asks for the data it has - "the section's
+    /// position" - and not for "the second immediate". The lookup is over a list that is one entry long
+    /// in every graph this repository ships, and it happens once per pass rather than once per draw.
+    pub fn immediate_offset(&self, resource: &str) -> Option<u32> {
+        self.config
+            .immediates
+            .iter()
+            .find(|(_, name)| name.as_str() == resource)
+            .map(|(offset, _)| *offset as u32)
+    }
 }
 
 #[derive(Debug)]
@@ -435,6 +535,8 @@ pub struct RenderGraph {
     pub config: ShaderPackConfig,
     pub pipelines: LinkedHashMap<String, BoundPipeline>,
     pub resources: HashMap<String, ResourceBacking>,
+    /// The terrain gather's list. See [`TerrainScratch`].
+    terrain_visible: TerrainScratch,
 }
 
 /// What a caught panic said, as one line.
@@ -595,14 +697,12 @@ impl RenderGraph {
             let immediate_size: u32 = pipeline_config
                 .immediates
                 .iter()
-                .map(|(index, name)| match &name[..] {
-                    "@pc_mat4_model" => 64,
-                    "@pc_section_position" => 16,
-                    "@pc_total_sections" => 4,
-                    "@pc_parts_per_entity" => 4,
-                    "@pc_electrum_color" => 16,
-                    "@pc_environment_data" => 68,
-                    _ => unimplemented!("immediate {index} ({name}) has no size"),
+                .map(|(index, name)| {
+                    if immediate_size_of(name) == 0 {
+                        unimplemented!("immediate {index} ({name}) has no size")
+                    }
+
+                    immediate_size_of(name)
                 })
                 .sum();
 
@@ -800,6 +900,14 @@ impl RenderGraph {
                 BoundPipeline {
                     pipeline: render_pipeline,
                     bind_groups: wm_bind_groups,
+                    // The sizes are the ones the layout was just built with, kept beside the offsets so
+                    // a draw can check that the data it hands over is the data the slot holds. See
+                    // `set_immediates`.
+                    immediates: pipeline_config
+                        .immediates
+                        .iter()
+                        .map(|(index, name)| (*index as u32, immediate_size_of(name)))
+                        .collect(),
                     config: pipeline_config.clone(),
                 },
             );
@@ -877,6 +985,7 @@ impl RenderGraph {
             config,
             pipelines: LinkedHashMap::new(),
             resources,
+            terrain_visible: TerrainScratch::default(),
         };
 
         // The sampler is always available; the atlas only once a resource reload has baked one. The
@@ -890,24 +999,27 @@ impl RenderGraph {
         // The game's own block atlas, for the faces whose sprite the game animates - fire, lava, the
         // campfire, a lantern - and the sampler those faces are drawn with.
         //
-        // **It is deliberately the same sampler as this side's own atlas**: nearest within a mip level,
-        // a blend between the two it lands between, both ways, no anisotropy, level 0 to the top of the
-        // chain. Which is *not* what the game samples its own terrain with - `LevelRenderer` builds
-        // `CLAMP_TO_EDGE, LINEAR, LINEAR` plus the video settings' anisotropy - and that difference is
-        // the whole point of writing it down here.
+        // **The filters are not decided here.** Both block atlases go through
+        // `crate::render::atlas::block_atlas_sampler`, so this one and `TextureManager`'s cannot drift
+        // apart - and drifting apart is the failure this arrangement exists for. There was a revision
+        // where only this sampler was bilinear, while the blocks beside every animated sprite were point
+        // sampled, and a player handed that path said "these are all blurry, there is none of the
+        // game's crisp pixels left" about the fire, the lava and every other animated sprite. One
+        // function, two callers, one answer.
         //
-        // Two atlases are in play in one frame: a face whose sprite the game animates is baked with the
-        // game's coordinates and samples this one, and every face beside it - grass, stone, the leaves
-        // above the fire - samples this side's copy through `TextureManager`'s `NEAREST`. A bilinear
-        // sampler on one of the two is not a subtle difference at the magnification a block texture is
-        // seen at: a sixteen-texel texture filling two hundred pixels is either sixteen squares or a
-        // smear, and a player who had just been handed this path said exactly that - "these are all
-        // blurry, there is none of the game's crisp pixels left" - about the fire, the lava and every
-        // other sprite the game animates, while the blocks around them were clean.
+        // The answer it currently gives is `Nearest`, on both filters, which is a **step back from the
+        // game's own sampler** and is where this stands until the distant-lava flicker is settled:
+        // changing the sampling rate while debugging a sample-frequency artifact moves the thing being
+        // measured. The game's own is `CLAMP_TO_EDGE, FilterMode.LINEAR, FilterMode.LINEAR` plus the
+        // video settings' anisotropy - `LevelRenderer` builds one and `ChunkSectionsToRender#renderGroup`
+        // binds the block atlas with it for *both* groups - and the full note, including why the
+        // texture-filtering option does not turn that off, is on `block_atlas_sampler`.
         //
-        // The filter that decides that is `mag_filter`, and it is the one thing here that is not the
-        // game's own choice: the renderer's two atlases are the same textures at the same size, so the
-        // picture has to be filtered the same way whichever of them a face was baked for.
+        // The address mode is the one thing that is this site's own: the game asks for `ClampToEdge`.
+        //
+        // The lightmap below stays `LINEAR`, which is the game's own choice for it: its `Sampler2` is
+        // bound `getClampToEdge(FilterMode.LINEAR)` on the line after the block atlas's. It is a 16x16
+        // lookup table rather than a texture, so it is not part of the question above.
         //
         // Always registered, even before the JVM has handed the atlas over: a named resource that is
         // missing is a pipeline the graph *skips* (`create_pipelines`), and losing the whole terrain
@@ -917,22 +1029,13 @@ impl RenderGraph {
         // built again - with the real atlas in this slot - before any such face can be drawn.
         graph.resources.insert(
             "@sampler_mc_block_atlas".into(),
-            ResourceBacking::Sampler(Arc::new(wm.gpu.device.create_sampler(
-                &wgpu::SamplerDescriptor {
-                    label: Some("wgpu-mc: the game's block atlas"),
-                    // `ClampToEdge` rather than `Repeat`, and everything else - the two filters, the
-                    // mipmap filter, the level range, the anisotropy - left at its default, which is
-                    // what `TextureManager::new` builds for this side's own atlas. One texture, one
-                    // filter, whichever atlas a face was baked for.
-                    address_mode_u: wgpu::AddressMode::ClampToEdge,
-                    address_mode_v: wgpu::AddressMode::ClampToEdge,
-                    address_mode_w: wgpu::AddressMode::ClampToEdge,
-                    mag_filter: wgpu::FilterMode::Nearest,
-                    min_filter: wgpu::FilterMode::Nearest,
-                    mipmap_filter: wgpu::MipmapFilterMode::Linear,
-                    ..Default::default()
-                },
-            ))),
+            ResourceBacking::Sampler(Arc::new(wm.gpu.device.create_sampler(&{
+                let mut descriptor =
+                    crate::render::atlas::block_atlas_sampler(wgpu::AddressMode::ClampToEdge);
+                descriptor.label = Some("wgpu-mc: the game's block atlas");
+
+                descriptor
+            }))),
         );
 
         let game_atlas = game_block_atlas();
@@ -1091,12 +1194,66 @@ impl RenderGraph {
     /// declares **0.01** - small, and not zero: a translucent texture with a *nearly* empty texel has to
     /// leave a hole, and a mip level of one has a small non-zero alpha everywhere, so a cutoff of zero
     /// would paint the holes in.
-    fn terrain_layers(geometry: &str) -> &'static [(RenderLayer, f32)] {
-        match geometry {
-            "@geo_terrain_translucent" => &[(RenderLayer::Transparent, 0.01)],
-            // Solid and cutout, which is every other name that reaches this: `@geo_terrain` is the only
-            // other terrain pipeline there is.
-            _ => &[(RenderLayer::Solid, 0.0), (RenderLayer::Cutout, 0.5)],
+    ///
+    /// **Keyed on the pipeline and not on the geometry**, because the opaque group is now two pipelines
+    /// over one geometry: `terrain_solid` draws the solid layer and `terrain` draws the cutout one, and
+    /// the split exists for one reason - only the cutout shader has a `discard` in it, and a `discard`
+    /// costs the whole pipeline its early-Z. See `terrain_solid.wgsl` and the two pipelines in
+    /// `graph.yaml`. Asking the *geometry* would hand both pipelines both layers and put the solid layer
+    /// straight back through the shader with the test in it.
+    fn terrain_layers(pipeline_name: &str) -> &'static [(RenderLayer, f32)] {
+        match pipeline_name {
+            // The cutout half of Minecraft's opaque group: `CUTOUT_TERRAIN`, cutoff 0.5.
+            "terrain" => &[(RenderLayer::Cutout, 0.5)],
+            // The solid half, whose shader declares no cutoff at all. The number here is written down
+            // for the push constant to carry, and nothing in that shader reads it.
+            "terrain_solid" => &[(RenderLayer::Solid, 0.0)],
+            "@geo_terrain_translucent" | "translucent_terrain" => {
+                &[(RenderLayer::Transparent, 0.01)]
+            }
+            // Every other pipeline draws no terrain layers at all, which is what the callers of this
+            // that ask about `RenderLayer::Solid` are relying on: the opaque group is the one that
+            // claims the frame's depth, and a pass that draws none must not take it.
+            _ => &[],
+        }
+    }
+
+    /// Whether a section is worth submitting, and if not, why not.
+    ///
+    /// Split out of the draw loop so the one distinction that matters can be tested: `None` is "the JVM
+    /// has not said", which is a frustum question, and `Some` is the game's own answer, which is obeyed
+    /// as it stands **including when it is empty**. An empty set meaning "not told" is the bug this
+    /// variant exists to make impossible - it draws the whole arena for a frame in which the game
+    /// deliberately culled everything, and it reads as "occlusion culling does nothing".
+    fn section_visibility(
+        visible: Option<&std::collections::HashSet<glam::IVec3>>,
+        pos: &glam::IVec3,
+    ) -> SectionVisibility {
+        match visible {
+            None => SectionVisibility::AskTheFrustum,
+            Some(visible) if visible.contains(pos) => SectionVisibility::Draw,
+            Some(_) => SectionVisibility::OutOfSight,
+        }
+    }
+
+    /// Puts the gather's list in the order the layers being drawn need it in.
+    ///
+    /// **Far to near when one of them blends**, and untouched otherwise. The translucent layer is the
+    /// only one that cares: it is drawn with `depth_write: false` and blending on, so each face mixes
+    /// with whatever is already in the target and has to be drawn before the face behind it. The opaque
+    /// two write depth and are then ordered by the depth test, so their order is free.
+    ///
+    /// `sort_unstable_by` because a `VisibleSection` is a position, six `u32`s and a `f32`: two entries
+    /// with the same distance are two sections at the same distance, and which of them goes first is not
+    /// a fact about either. `total_cmp` rather than `partial_cmp` because a `f32` that is NaN would make
+    /// the ordering a partial one, and a sort that wants a total order given a partial one is a panic or
+    /// a silent mess; `total_cmp` is a total order over every bit pattern a distance can hold.
+    fn sort_for_drawing(list: &mut [VisibleSection], layers: &[(RenderLayer, f32)]) {
+        if layers
+            .iter()
+            .any(|(layer, _)| *layer == RenderLayer::Transparent)
+        {
+            list.sort_unstable_by(|a, b| b.distance_squared.total_cmp(&a.distance_squared));
         }
     }
 
@@ -1144,7 +1301,7 @@ impl RenderGraph {
         );
     }
 
-    /// The same, recording **one named pipeline and nothing else**.
+    /// The same, recording **the named pipelines and nothing else**.
     ///
     /// The two terrain groups are one graph but two moments in a frame, and the moment is not cosmetic.
     /// Minecraft draws its opaque terrain, then its entities and features, then its translucent terrain
@@ -1154,8 +1311,12 @@ impl RenderGraph {
     /// what "a mob in a lake looks like it never entered the water" is.
     ///
     /// So each group is recorded when the game reaches that group's own pass, and each one opens its own
-    /// render pass over the frame's colour and depth. `only` is the pipeline name, or `None` for the
-    /// whole graph - which is what a caller drawing a frame of its own wants.
+    /// render pass over the frame's colour and depth. `only` is the names of the pipelines to record, or
+    /// `None` for the whole graph - which is what a caller drawing a frame of its own wants. It is a
+    /// **list** because one of the groups is more than one pipeline now: Minecraft's opaque group draws
+    /// the solid layer and the cutout layer, and this side draws them with two pipelines
+    /// (`terrain_solid` and `terrain`) so that only the cut-out one carries a `discard`. See
+    /// [`RenderGraph::terrain_layers`].
     #[allow(clippy::too_many_arguments)]
     pub fn render_with_mvp_only(
         &self,
@@ -1167,7 +1328,7 @@ impl RenderGraph {
         clear_color: [f32; 3],
         view_projection: [[f32; 4]; 4],
         model_translation: [f32; 3],
-        only: Option<&str>,
+        only: Option<&[&str]>,
     ) {
         let frustum = Frustum::from_modelview_projection(with_gl_depth_range(view_projection));
         let mut geometry = HashMap::new();
@@ -1198,14 +1359,15 @@ impl RenderGraph {
         geometry: &mut HashMap<String, Box<dyn Geometry>>,
         frustum: &Frustum<f32>,
         model_translation: [f32; 3],
-        only: Option<&str>,
+        only: Option<&[&str]>,
     ) {
         let arena = WmArena::new(4096);
 
         let mut should_clear_depth = true;
 
         for (pipeline_name, bound_pipeline) in &self.pipelines {
-            if only.is_some_and(|only| pipeline_name != only) {
+            // A name not in the list is skipped, and None means every pipeline is wanted.
+            if only.is_some_and(|only| !only.contains(&pipeline_name.as_str())) {
                 continue;
             }
 
@@ -1263,7 +1425,7 @@ impl RenderGraph {
                     //
                     // Which pass claims it is asked of the **layers**, not of a name: the opaque group is
                     // the one that draws solid geometry, and the translucent one draws none.
-                    let opaque_group = Self::terrain_layers(&pipeline_config.geometry)
+                    let opaque_group = Self::terrain_layers(pipeline_name)
                         .iter()
                         .any(|(layer, _)| *layer == RenderLayer::Solid);
 
@@ -1345,7 +1507,26 @@ impl RenderGraph {
                     render_pass
                         .set_index_buffer(chunk_buffer.buffer.slice(..), wgpu::IndexFormat::Uint32);
 
-                    let sections = scene.section_storage.write();
+                    let sections_source = scene.section_storage.write();
+
+                    // **The counters are local `u64`s and they are added once, at the end.**
+                    //
+                    // They were a relaxed `fetch_add` per section per layer, which is a lock-prefixed
+                    // read-modify-write on a cache line every other core on the machine wants: a few
+                    // hundred sections over two layers, every frame, for numbers that are only read once
+                    // a second by a log line. Two of them are not even reported - `drawn_total` and the
+                    // two `*_total` arrays exist only for the log line - so those were atomics with no
+                    // reader at all. A `u64` on this stack and one `fetch_add` each is the same number
+                    // and no contention. See `report_terrain_pass`, which takes them.
+                    let mut drawn = 0u64;
+                    let mut drawn_total = 0u64;
+                    let mut culled = 0u64;
+                    let mut empty = 0u64;
+                    let mut out_of_sight = 0u64;
+                    let mut layer_drawn = [0u64; 3];
+                    let mut layer_empty = [0u64; 3];
+                    let mut layer_drawn_total = [0u64; 3];
+                    let mut layer_empty_total = [0u64; 3];
 
                     // The section the camera is in, which is the origin every draw is placed *relative
                     // to*. The alternative - the section's own absolute position - is a number of up to
@@ -1366,6 +1547,13 @@ impl RenderGraph {
                     // for the same reason.
                     let camera_section = *scene.camera_section_pos.read();
 
+                    // The game's own answer to "what can be seen", held for the whole pass rather than
+                    // read per section: it is one lock for a few hundred lookups either way, and the
+                    // guard cannot be held across a `continue` in a way that matters here. `None` is
+                    // "nothing has been sent", which is not the same as an empty list. See
+                    // `Scene::visible_sections` and the test below.
+                    let visible = scene.visible_sections.read();
+
                     // The frustum the culler below is handed is built from this same view-projection
                     // matrix, so the boxes have to be in the space that matrix reads - which is
                     // camera-section-relative blocks, and that is what the model matrix being the
@@ -1383,84 +1571,167 @@ impl RenderGraph {
                         );
                     }
 
-                    // The layers this pass draws, in the order the pass it stands in for draws them - see
-                    // `terrain_layers`, which is the whole of which pass draws which.
+                    // **One pass over the sections, then one pass over what survived.**
                     //
-                    // The pass being stood in for is the game's OPAQUE group, which is *one* render pass
-                    // with two pipelines inside it - `ChunkSectionsToRender#renderGroup` walks the
-                    // group's layers, calling `setPipeline` for each, and opens nothing in between. A
-                    // group whose first pipeline is the solid layer is therefore taken over whole:
-                    // drawing only the solid layer here dropped every cutout face in the world from the
-                    // frame, and there is no other pass for them - every leaf, plant and grass overlay
-                    // simply disappeared, because Minecraft's own cutout draws would have happened
-                    // further down the pass this one replaced.
+                    // Everything that decides whether a section is drawn at all - is it named by the
+                    // game's occlusion graph, is it inside the frustum, does the arena hold the layer -
+                    // is asked once, here, and what comes out is a list of `(position, ranges, distance)`.
+                    // The draw loops below then walk that list and nothing else: they do not touch the
+                    // arena's `HashMap`, they do not rebuild a box, and they do not re-run the frustum
+                    // test per layer. The box and the two visibility answers do not depend on which layer
+                    // is being drawn, so asking them twice was asking them once too often.
                     //
-                    // The second entry of `terrain_layers` is the same arrangement for the game's
-                    // TRANSLUCENT group, which is where water is.
-                    for (layer_index, alpha_cutout) in
-                        Self::terrain_layers(&pipeline_config.geometry)
-                    {
+                    // The list is a field on the graph rather than a local so that its capacity survives
+                    // the pass: a few hundred entries, cleared and refilled sixty times a second, is a
+                    // thousand allocations a second otherwise. See [`TerrainScratch`].
+                    let mut scratch = self.terrain_visible.0.borrow_mut();
+                    let out = &mut *scratch;
+
+                    out.clear();
+                    for (pos, section) in sections_source.iter() {
+                        if Self::section_visibility(visible.as_ref(), pos)
+                            == SectionVisibility::OutOfSight
+                        {
+                            out_of_sight += 1;
+                            continue;
+                        }
+
+                        // The section's position *relative to the camera's section*: the view matrix
+                        // carries the camera's offset within its own section and nothing else, so a draw
+                        // is placed by naming where it is with the big part taken out of it. See
+                        // `camera_section` above for the whole of it.
+                        let rel_pos = *pos - camera_section;
+
+                        // The box the section occupies *where the shader draws it*: the same
+                        // camera-section-relative position the immediate carries, times sixteen to the
+                        // block units the frustum is measured in. A box built from the absolute name
+                        // instead would be thousands of blocks from the geometry it stands for, and the
+                        // sections around the camera would be culled out of their own frame.
+                        let a: Vec3<f32> = [
+                            rel_pos.x as f32 * 16.0,
+                            rel_pos.y as f32 * 16.0,
+                            rel_pos.z as f32 * 16.0,
+                        ]
+                        .into();
+                        let b: Vec3<f32> = a + Vec3::new(16.0, 16.0, 16.0);
+
+                        let bounds: AABB<f32> = AABB::new(a.into_array(), b.into_array());
+
+                        // Still tested, because it is nearly free and the two disagree in both
+                        // directions: the game's graph is a frame old and conservative about what a
+                        // neighbour hides, and a section it left out may be one the camera has since
+                        // turned toward.
+                        if !bounds.coherent_test_against_frustum(frustum, 0).0 {
+                            culled += 1;
+                            continue;
+                        }
+
+                        // Which layers the arena actually holds for this section, gathered once. Both
+                        // ranges travel, because a draw needs both: the index range to draw and the
+                        // vertex range to draw it *from* (`draw_indexed`'s instance range is the
+                        // section's slot in the arena). A section the arena has nothing in for the layer
+                        // being drawn is counted where the layer is drawn, because "the arena has no
+                        // cutout here" is a fact about the layer and not about the section.
+                        let mut ranges: [Option<(Range<u32>, Range<u32>)>; 3] = [None, None, None];
+                        let mut any = false;
+
+                        for (layer_index, layer) in section.layers.iter().enumerate() {
+                            if let Some(layer) = layer {
+                                ranges[layer_index] = Some((
+                                    layer.index_range.clone(),
+                                    layer.vertex_range.start..layer.vertex_range.start + 1,
+                                ));
+                                any = true;
+                            }
+                        }
+
+                        if !any {
+                            continue;
+                        }
+
+                        // The distance the translucent layer is sorted by, measured between section
+                        // centres the way the game measures it - in sections, and squared, because a
+                        // square root would be thrown away by the comparison it feeds.
+                        let dx = rel_pos.x as f32;
+                        let dy = rel_pos.y as f32;
+                        let dz = rel_pos.z as f32;
+
+                        out.push(VisibleSection {
+                            relative_position: rel_pos,
+                            ranges,
+                            distance_squared: dx * dx + dy * dy + dz * dz,
+                        });
+                    }
+
+                    // **Far to near, which is what a blending layer needs and what it did not have.**
+                    //
+                    // The translucent layer blends with what is already in the target, so the order it
+                    // is drawn in is the picture: every face has to be drawn before the face behind it.
+                    // This pass walked the arena's `HashMap` in *hash order*, which is not any order at
+                    // all - so two panes of glass, or a lake and the water behind it, blended in
+                    // whatever sequence the hasher happened to produce, and it produced a different one
+                    // as the map grew. Sorting once, here, is the whole fix: the draw loops below walk
+                    // this list in order.
+                    //
+                    // Keyed on the section and not on the face. Sorting faces is what the game does for
+                    // *its* translucent mesh, which is built per section and re-sorted when the camera
+                    // moves a block; a section is the granularity this side has, and it is the granularity
+                    // the game's own `ChunkSectionLayer.TRANSLUCENT` is ordered at too.
+                    Self::sort_for_drawing(out, Self::terrain_layers(pipeline_name));
+
+                    // The section position, written into a fixed-size array on this stack once per
+                    // draw: sixteen bytes in the layout the shader's `SectionPosition` spells out - the
+                    // three integers, then the layer's alpha cutoff. See `set_immediates`.
+                    let mut constants = [0u8; 16];
+
+                    for (layer_index, alpha_cutout) in Self::terrain_layers(pipeline_name) {
                         let layer_index = *layer_index as usize;
                         let alpha_cutout = *alpha_cutout;
-                        for (pos, section) in sections.iter() {
-                            // The section's position *relative to the camera's section*: the view matrix
-                            // carries the camera's offset within its own section and nothing else, so a
-                            // draw is placed by naming where it is with the big part taken out of it.
-                            // See `camera_section` above for the whole of it.
-                            let rel_pos = *pos - camera_section;
 
-                            // The box the section occupies *where the shader draws it*: the same
-                            // camera-section-relative position the immediate carries, times sixteen to
-                            // the block units the frustum is measured in. A box built from the absolute
-                            // name instead would be thousands of blocks from the geometry it stands for,
-                            // and the sections around the camera would be culled out of their own frame.
-                            let a: Vec3<f32> = [
-                                rel_pos.x as f32 * 16.0,
-                                rel_pos.y as f32 * 16.0,
-                                rel_pos.z as f32 * 16.0,
-                            ]
-                            .into();
-                            let b: Vec3<f32> = a + Vec3::new(16.0, 16.0, 16.0);
-
-                            let bounds: AABB<f32> = AABB::new(a.into_array(), b.into_array());
-
-                            if !bounds.coherent_test_against_frustum(frustum, 0).0 {
-                                TERRAIN_CULLED.fetch_add(1, Ordering::Relaxed);
-                                continue;
-                            }
-
-                            let Some(layer) = &section.layers[layer_index] else {
-                                TERRAIN_EMPTY.fetch_add(1, Ordering::Relaxed);
-                                LAYER_EMPTY[layer_index].fetch_add(1, Ordering::Relaxed);
+                        for visible in out.iter() {
+                            let Some((index_range, vertex_range)) =
+                                visible.ranges[layer_index].clone()
+                            else {
+                                empty += 1;
+                                layer_empty[layer_index] += 1;
+                                layer_empty_total[layer_index] += 1;
                                 continue;
                             };
 
-                            let mut pc: HashMap<String, (Vec<u8>, ShaderStages)> = HashMap::new();
-                            // Sixteen bytes in the layout the shader's `SectionPosition` spells out:
-                            // the three integers, then the layer's alpha cutoff.
-                            let mut constants = [0u8; 16];
-                            constants[..12]
-                                .copy_from_slice(bytemuck::cast_slice(&rel_pos.to_array()));
+                            constants[..12].copy_from_slice(bytemuck::cast_slice(
+                                &visible.relative_position.to_array(),
+                            ));
                             constants[12..].copy_from_slice(&alpha_cutout.to_ne_bytes());
 
-                            pc.insert(
-                                "@pc_section_position".to_string(),
-                                (
-                                    constants.to_vec(),
-                                    ShaderStages::VERTEX | ShaderStages::FRAGMENT,
-                                ),
+                            set_immediates(
+                                &bound_pipeline.immediates,
+                                &mut render_pass,
+                                &[&constants],
                             );
-                            set_push_constants(pipeline_config, &mut render_pass, Some(pc));
-                            render_pass.draw_indexed(
-                                layer.index_range.clone(),
-                                0,
-                                layer.vertex_range.start..layer.vertex_range.start + 1,
-                            );
+                            render_pass.draw_indexed(index_range, 0, vertex_range);
 
-                            TERRAIN_DRAWN.fetch_add(1, Ordering::Relaxed);
-                            TERRAIN_DRAWN_TOTAL.fetch_add(1, Ordering::Relaxed);
-                            LAYER_DRAWN[layer_index].fetch_add(1, Ordering::Relaxed);
+                            drawn += 1;
+                            drawn_total += 1;
+                            layer_drawn[layer_index] += 1;
+                            layer_drawn_total[layer_index] += 1;
                         }
+                    }
+
+                    // One `fetch_add` each, for the whole pass: the atomics are drained by a log line
+                    // once a second and nothing on the draw path reads them.
+                    TERRAIN_DRAWN.fetch_add(drawn, Ordering::Relaxed);
+                    TERRAIN_DRAWN_TOTAL.fetch_add(drawn_total, Ordering::Relaxed);
+                    TERRAIN_CULLED.fetch_add(culled, Ordering::Relaxed);
+                    TERRAIN_EMPTY.fetch_add(empty, Ordering::Relaxed);
+                    TERRAIN_OUT_OF_SIGHT.fetch_add(out_of_sight, Ordering::Relaxed);
+
+                    for layer in 0..3 {
+                        LAYER_DRAWN[layer].fetch_add(layer_drawn[layer], Ordering::Relaxed);
+                        LAYER_EMPTY[layer].fetch_add(layer_empty[layer], Ordering::Relaxed);
+                        LAYER_DRAWN_TOTAL[layer]
+                            .fetch_add(layer_drawn_total[layer], Ordering::Relaxed);
+                        LAYER_EMPTY_TOTAL[layer]
+                            .fetch_add(layer_empty_total[layer], Ordering::Relaxed);
                     }
 
                     report_terrain_pass();
@@ -1709,6 +1980,56 @@ pub fn set_push_constants(
     });
 }
 
+/// How many bytes the shader reads out of each immediate, by the name the config gives it.
+///
+/// The sizes the shaders themselves declare: an immediate whose layout is smaller than the struct the
+/// shader reads out of it is a draw that reads whatever follows in the buffer. One place, because the
+/// layout is built from it and every draw checks against it.
+fn immediate_size_of(name: &str) -> u32 {
+    match name {
+        "@pc_mat4_model" => 64,
+        "@pc_section_position" => 16,
+        "@pc_total_sections" => 4,
+        "@pc_parts_per_entity" => 4,
+        "@pc_electrum_color" => 16,
+        "@pc_environment_data" => 68,
+        _ => 0,
+    }
+}
+
+/// Writes a draw's immediates, **without allocating**.
+///
+/// `slots` is the pipeline's [`BoundPipeline::immediates`] - every `(offset, size)` its layout
+/// declares, in slot order - and `data` is the values, one per slot and in the same order. The caller
+/// builds `data` in a fixed-size array on its own stack, which is the whole point of the shape: the
+/// previous version took a `HashMap<String, (Vec<u8>, ShaderStages)>` and the terrain pass built one
+/// **per section per layer**, so a pass over four hundred sections allocated four hundred `HashMap`s,
+/// four hundred `String`s and four hundred `Vec`s to write sixteen bytes each.
+///
+/// The values are lengths, not a buffer, because the two callers have sixteen bytes and sixty-eight and
+/// a slice of one is not a slice of the other. A slot with nothing to write is skipped rather than
+/// zeroed: an immediate a draw does not set keeps whatever the last draw left there, which is the
+/// behaviour the map version had too - a name that was not in the map was an `unimplemented!`.
+pub fn set_immediates(slots: &[(u32, u32)], render_pass: &mut wgpu::RenderPass, data: &[&[u8]]) {
+    for (index, (offset, size)) in slots.iter().enumerate() {
+        let Some(bytes) = data.get(index) else {
+            continue;
+        };
+
+        // A value shorter than the slot is a shader reading whatever follows it in the buffer, and a
+        // longer one is a write past the end of the slot. Both are wrong, and the layout is where the
+        // right answer is written down.
+        assert_eq!(
+            bytes.len() as u32,
+            *size,
+            "immediate {index} at offset {offset} is {size} byte(s) and was handed {}",
+            bytes.len()
+        );
+
+        render_pass.set_immediates(*offset, bytes);
+    }
+}
+
 /// Rewrites a clip-space matrix from wgpu's depth range into the one the culler extracts from.
 ///
 /// wgpu's clip space is `0..1` in z, always - that is the WebGPU convention rather than a backend's -
@@ -1730,7 +2051,7 @@ fn with_gl_depth_range(mvp: [[f32; 4]; 4]) -> [[f32; 4]; 4] {
     converted
 }
 
-/// Which layer each of the two terrain passes draws. See [`RenderGraph::terrain_layers`].
+/// Which layer each of the terrain pipelines draws. See [`RenderGraph::terrain_layers`].
 #[cfg(test)]
 mod terrain_layer_tests {
     use super::*;
@@ -1744,28 +2065,41 @@ mod terrain_layer_tests {
     /// The values are `RenderPipelines.SOLID_TERRAIN` (no `ALPHA_CUTOUT` at all), `CUTOUT_TERRAIN`
     /// (`0.5`) and `TRANSLUCENT_TERRAIN` (`0.01`), and the layers are `ChunkSectionLayerGroup.OPAQUE`
     /// and `TRANSLUCENT`.
+    ///
+    /// **The opaque group is three pipelines now and the test asks all three**, because the split that
+    /// matters is the one between `terrain_solid` and `terrain`: they share one geometry, so a lookup
+    /// keyed on the geometry would give both of them both layers - which is the early-Z problem back
+    /// again, in the one place a wrong answer costs performance rather than a picture.
     #[test]
-    fn the_two_terrain_passes_draw_one_layer_each_and_neither_draws_the_other_s() {
-        let opaque = RenderGraph::terrain_layers("@geo_terrain");
-        let translucent = RenderGraph::terrain_layers("@geo_terrain_translucent");
+    fn the_terrain_pipelines_draw_one_layer_each_and_none_draws_another_s() {
+        let solid = RenderGraph::terrain_layers("terrain_solid");
+        let cutout = RenderGraph::terrain_layers("terrain");
+        let translucent = RenderGraph::terrain_layers("translucent_terrain");
 
         assert_eq!(
-            opaque,
-            [(RenderLayer::Solid, 0.0), (RenderLayer::Cutout, 0.5)],
-            "the opaque group is the solid layer and then the cutout one, at the cutoffs the game's \
-             two pipelines declare"
+            solid,
+            [(RenderLayer::Solid, 0.0)],
+            "the solid pipeline draws the solid layer, and its shader declares no cutoff at all"
+        );
+
+        assert_eq!(
+            cutout,
+            [(RenderLayer::Cutout, 0.5)],
+            "the cutout pipeline draws the cutout layer at Minecraft's CUTOUT_TERRAIN cutoff, and it \
+             is the only one of the two with a discard in its shader"
         );
 
         assert_eq!(
             translucent,
             [(RenderLayer::Transparent, 0.01)],
-            "the translucent group is one layer, and its cutoff is Minecraft's 0.01 rather than zero"
+            "the translucent pipeline is one layer, and its cutoff is Minecraft's 0.01 rather than zero"
         );
 
-        // The two together are every layer there is, once each: a layer both drew would be drawn twice
-        // and a layer neither drew would be baked and invisible, which is the state water was in.
-        let mut drawn: Vec<usize> = opaque
+        // The three together are every layer there is, once each: a layer two drew would be drawn twice
+        // and a layer none drew would be baked and invisible, which is the state water was in.
+        let mut drawn: Vec<usize> = solid
             .iter()
+            .chain(cutout)
             .chain(translucent)
             .map(|(layer, _)| *layer as usize)
             .collect();
@@ -1774,9 +2108,363 @@ mod terrain_layer_tests {
         assert_eq!(
             drawn,
             [0, 1, 2],
-            "the two passes between them have to draw the solid, cutout and transparent layers exactly \
-             once each"
+            "the three pipelines between them have to draw the solid, cutout and transparent layers \
+             exactly once each"
         );
+
+        // And the geometry-keyed lookup that would have handed the solid layer to the shader with the
+        // test in it is gone: a name the graph does not know draws nothing.
+        assert!(
+            RenderGraph::terrain_layers("@geo_terrain").is_empty(),
+            "the geometry is not the key any more - two pipelines share it"
+        );
+    }
+
+    /// **Only the pipelines that are cut out carry a `discard`**, which is the whole reason there are
+    /// two of them.
+    ///
+    /// Read off the shipped shader sources rather than from the graph config, because the graph cannot
+    /// see this: `discard` is not a pipeline state, it is an instruction inside the fragment stage, and
+    /// its effect on early-Z is a property of the compiled program. A pipeline that draws the solid
+    /// layer and has one is the bug this pair of files exists to fix.
+    #[test]
+    fn only_the_cut_out_terrain_shaders_discard() {
+        let source = |name: &str| {
+            let path = format!(
+                "{}/../../neoforge/src/main/resources/assets/wgpu_mc/shaders/{name}.wgsl",
+                env!("CARGO_MANIFEST_DIR")
+            );
+
+            std::fs::read_to_string(&path)
+                .unwrap_or_else(|err| panic!("{path} is unreadable: {err}"))
+        };
+
+        // The two that are allowed one: the cutout layer's, and the translucent layer's.
+        for name in ["terrain", "translucent_terrain"] {
+            let text = if name == "translucent_terrain" {
+                source("terrain")
+            } else {
+                source(name)
+            };
+
+            assert!(
+                text.contains("discard;"),
+                "{name} draws a cut-out layer and has to discard"
+            );
+        }
+
+        // And the one that must not, which is the entire point of its file.
+        assert!(
+            !source("terrain_solid").contains("discard;"),
+            "the solid layer's shader must have no discard in it at all: one is enough to cost the \
+             whole pipeline its early-Z, and the solid layer is most of the screen"
+        );
+    }
+
+    /// **An empty visible set is not the same as no visible set.**
+    ///
+    /// The three cases, and the middle one is the bug worth a test: a section the game named is drawn, a
+    /// section it did not name is not - and an empty set, which is what a frame with nothing on screen
+    /// produces, must not fall back to the frustum. Read as "not told", it draws the entire arena for a
+    /// frame the game deliberately emptied, and the feature looks like it does nothing at all.
+    #[test]
+    fn an_empty_visible_set_draws_nothing_rather_than_everything() {
+        let here = glam::ivec3(3, 4, 5);
+        let elsewhere = glam::ivec3(-1, 0, 2);
+        let mut told = std::collections::HashSet::new();
+        told.insert(here);
+
+        // Nothing has been sent: the frustum decides, so anything might still be drawn.
+        assert_eq!(
+            RenderGraph::section_visibility(None, &here),
+            SectionVisibility::AskTheFrustum
+        );
+        assert_eq!(
+            RenderGraph::section_visibility(None, &elsewhere),
+            SectionVisibility::AskTheFrustum
+        );
+
+        // A set that names this section draws it and one that does not, does not.
+        assert_eq!(
+            RenderGraph::section_visibility(Some(&told), &here),
+            SectionVisibility::Draw
+        );
+        assert_eq!(
+            RenderGraph::section_visibility(Some(&told), &elsewhere),
+            SectionVisibility::OutOfSight
+        );
+
+        // And the empty set: the game looked and saw nothing.
+        let empty = std::collections::HashSet::new();
+        assert_eq!(
+            RenderGraph::section_visibility(Some(&empty), &here),
+            SectionVisibility::OutOfSight,
+            "an empty list is the game saying it saw nothing, not the JVM saying nothing"
+        );
+    }
+
+    fn at(distance_squared: f32) -> VisibleSection {
+        VisibleSection {
+            relative_position: glam::IVec3::ZERO,
+            ranges: [None, None, None],
+            distance_squared,
+        }
+    }
+
+    /// **The translucent layer is drawn far to near, and that is a picture difference.**
+    ///
+    /// It blends and does not write depth, so a face drawn late mixes with a face drawn early - which
+    /// means the near face has to come last or the far one is painted over it. The pass used to walk the
+    /// arena's `HashMap` in hash order, which is no order at all.
+    ///
+    /// The opaque layers are deliberately **not** sorted: they write depth, so the depth test orders
+    /// them, and sorting a few hundred sections for a layer that does not care is work for nothing.
+    #[test]
+    fn a_blending_layer_is_sorted_far_to_near_and_an_opaque_one_is_left_alone() {
+        let unsorted = || vec![at(4.0), at(400.0), at(64.0), at(1.0)];
+
+        // The translucent layer, alone and beside an opaque one.
+        for layers in [
+            &[(RenderLayer::Transparent, 0.01)][..],
+            &[(RenderLayer::Solid, 0.0), (RenderLayer::Transparent, 0.01)][..],
+        ] {
+            let mut list = unsorted();
+            RenderGraph::sort_for_drawing(&mut list, layers);
+
+            let distances: Vec<f32> = list.iter().map(|s| s.distance_squared).collect();
+            assert_eq!(
+                distances,
+                [400.0, 64.0, 4.0, 1.0],
+                "the furthest section has to be drawn first: {layers:?}"
+            );
+        }
+
+        // The opaque pipelines, which have nothing to gain from an order.
+        for layers in [
+            &[(RenderLayer::Solid, 0.0)][..],
+            &[(RenderLayer::Cutout, 0.5)][..],
+            &[(RenderLayer::Solid, 0.0), (RenderLayer::Cutout, 0.5)][..],
+        ] {
+            let mut list = unsorted();
+            RenderGraph::sort_for_drawing(&mut list, layers);
+
+            let distances: Vec<f32> = list.iter().map(|s| s.distance_squared).collect();
+            assert_eq!(
+                distances,
+                [4.0, 400.0, 64.0, 1.0],
+                "an opaque layer is ordered by the depth test, not here: {layers:?}"
+            );
+        }
+    }
+}
+
+/// **No `textureSample` under an `if`**, checked on the shader both terrain pipelines build from.
+///
+/// `textureSample` takes an implicit level of detail from the derivatives of its coordinates, and WGSL
+/// only defines those in *uniform* control flow: a `textureSample` inside a branch is undefined
+/// behaviour, whether or not the condition happens to hold for every fragment of a primitive. The
+/// terrain shader picked which atlas to read with exactly that shape -
+///
+/// ```wgsl
+/// if (in.game_atlas == 1u) { texel = textureSample(t_game_atlas, ...); }
+/// else                     { texel = textureSample(t_texture, ...); }
+/// ```
+///
+/// - and the argument for it was that `game_atlas` is `@interpolate(flat)`, so every fragment of one
+/// primitive takes the same branch. That is an argument about the picture, not about the program: it is
+/// true of the hardware it was tried on and it is not what the specification says. The samples are
+/// hoisted out of the branch now and the choice is a `select` on the two values.
+///
+/// **Structural rather than a search for the text**, which is the only reason this is worth writing: the
+/// offending code is quoted in the comment above the fix, and in `terrain_solid.wgsl` beside it, so a
+/// test that looked for the string would fail on the explanation of why it must not be there. Instead the
+/// shader is parsed and walked: every `ImageSample` in a fragment entry point whose level is `Auto`, and
+/// which sits inside an `If` block - at any depth - is a failure.
+#[cfg(test)]
+mod texture_sample_uniformity_tests {
+    use crate::wgpu::naga;
+
+    /// How many auto-level image fetches the module holds, at any depth. The sanity check beside the
+    /// assertion: "found no sample in a branch" is also true of a shader with no samples at all.
+    fn total_auto_samples(module: &naga::Module) -> usize {
+        module
+            .entry_points
+            .iter()
+            .map(|entry| {
+                entry
+                    .function
+                    .expressions
+                    .iter()
+                    .filter(|(_, expression)| {
+                        matches!(
+                            expression,
+                            naga::Expression::ImageSample {
+                                level: naga::SampleLevel::Auto,
+                                ..
+                            }
+                        )
+                    })
+                    .count()
+            })
+            .sum()
+    }
+
+    /// Every auto-level `textureSample` in `source` that is inside a branch, as `(entry point, depth)`.
+    fn samples_inside_branches(source: &str) -> Vec<(String, usize)> {        let module = naga::front::wgsl::parse_str(source).expect("the terrain shader parses");
+
+        let mut found = Vec::new();
+
+        for entry in &module.entry_points {
+            if entry.stage != naga::ShaderStage::Fragment {
+                // The vertex stage's lightmap fetch is a `textureSampleLevel` with an explicit level,
+                // which is legal anywhere - and it has to be, because a vertex stage has no derivatives
+                // to take a level from.
+                continue;
+            }
+
+            walk(
+                &entry.function,
+                &entry.function.body,
+                0,
+                entry.name.clone(),
+                &mut found,
+            );
+        }
+
+        found
+    }
+
+    /// Walks a block, carrying how many branches deep it is.
+    ///
+    /// Only `Emit` ranges are inspected, and only their own expressions - see the note there on why
+    /// nothing follows a handle. An `If` condition and a `Switch` selector are read directly, because
+    /// they are single handles rather than ranges: a sample *there* is a sample outside the branch it
+    /// guards, which is why they are reported at this depth and not one deeper.
+    fn walk(
+        function: &naga::Function,
+        block: &naga::Block,
+        branch_depth: usize,
+        entry: String,
+        found: &mut Vec<(String, usize)>,
+    ) {
+        for statement in block.iter() {
+            match statement {
+                naga::Statement::If {
+                    condition,
+                    accept,
+                    reject,
+                } => {
+                    if let Ok(expression) = function.expressions.try_get(*condition)
+                        && is_auto_sample(expression)
+                    {
+                        found.push((entry.clone(), branch_depth));
+                    }
+
+                    walk(function, accept, branch_depth + 1, entry.clone(), found);
+                    walk(function, reject, branch_depth + 1, entry.clone(), found);
+                }
+                naga::Statement::Switch { selector, cases } => {
+                    if let Ok(expression) = function.expressions.try_get(*selector)
+                        && is_auto_sample(expression)
+                    {
+                        found.push((entry.clone(), branch_depth));
+                    }
+
+                    for case in cases {
+                        walk(
+                            function,
+                            &case.body,
+                            branch_depth + 1,
+                            entry.clone(),
+                            found,
+                        );
+                    }
+                }
+                naga::Statement::Loop {
+                    body, continuing, ..
+                } => {
+                    // A loop body is not a branch: every invocation runs it the same number of times in
+                    // the shaders here, and what WGSL's uniformity analysis objects to is divergence.
+                    walk(function, body, branch_depth, entry.clone(), found);
+                    walk(function, continuing, branch_depth, entry.clone(), found);
+                }
+                naga::Statement::Block(inner) => {
+                    walk(function, inner, branch_depth, entry.clone(), found)
+                }
+                naga::Statement::Emit(range) => {
+                    // **A range of handles, and every expression in it is looked at on its own.** naga
+                    // emits each expression an evaluation needs, in dependency order, into one slice, so
+                    // the sample and the `select` that consumes it are both in this range and both are
+                    // visited. That is why nothing here follows a handle: following one would reach an
+                    // operand a second time, from its consumer as well as from the range, and report one
+                    // sample twice - which is exactly what the first version of this did.
+                    let indices = range.index_range();
+                    let length = (indices.end - indices.start) as usize;
+
+                    for (_, expression) in function
+                        .expressions
+                        .iter()
+                        .skip(indices.start as usize)
+                        .take(length)
+                    {
+                        if is_auto_sample(expression) {
+                            found.push((entry.clone(), branch_depth));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Whether this expression is a texture fetch that asks the hardware for a level of detail.
+    ///
+    /// `SampleLevel::Auto` is the one that needs derivatives; `Zero` and `Exact` name a level outright
+    /// and are legal wherever they appear, which is why the vertex stage's lightmap fetch - a
+    /// `textureSampleLevel(.., 0.0)` - is not a finding.
+    fn is_auto_sample(expression: &naga::Expression) -> bool {
+        matches!(
+            expression,
+            naga::Expression::ImageSample {
+                level: naga::SampleLevel::Auto,
+                ..
+            }
+        )
+    }
+
+    /// The invariant, on both shipped terrain shaders.
+    #[test]
+    fn the_terrain_shaders_never_sample_a_texture_under_a_branch() {
+        for name in ["terrain", "terrain_solid"] {
+            let path = format!(
+                "{}/../../neoforge/src/main/resources/assets/wgpu_mc/shaders/{name}.wgsl",
+                env!("CARGO_MANIFEST_DIR")
+            );
+
+            let source = std::fs::read_to_string(&path)
+                .unwrap_or_else(|err| panic!("{path} is unreadable: {err}"));
+
+            // The sanity check first, so a shader that lost its samples says *that* rather than passing
+            // the assertion below by finding nothing.
+            let module = naga::front::wgsl::parse_str(&source).expect("the terrain shader parses");
+            let auto = total_auto_samples(&module);
+
+            assert_eq!(
+                auto, 2,
+                "{name}.wgsl has {auto} auto-level texture fetch(es); it is expected to have exactly the \
+                 two the fragment stage selects between"
+            );
+
+            let found = samples_inside_branches(&source);
+
+            assert!(
+                found.is_empty(),
+                "{name}.wgsl samples a texture inside a branch at {found:?}; the level of detail comes \
+                 from derivatives, which WGSL only defines in uniform control flow, so this is undefined \
+                 behaviour however uniform the condition looks. Sample both textures unconditionally and \
+                 `select` between the results."
+            );
+        }
     }
 }
 
@@ -1794,6 +2482,17 @@ mod binding_visibility_tests {
     const TERRAIN: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../neoforge/src/main/resources/assets/wgpu_mc/shaders/terrain.wgsl"
+    ));
+
+    /// The solid layer's terrain shader: the same program with the cutout test taken out.
+    ///
+    /// Kept next to [`TERRAIN`] so a change to one that has to be made to the other is a change two
+    /// lines apart, and validated by the same test - because the one thing that must not happen is that
+    /// the solid shader stops parsing. It is skipped in silence when it does (`create_pipelines`), and a
+    /// skipped pipeline here is the solid layer of the world not drawn at all.
+    const TERRAIN_SOLID: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../neoforge/src/main/resources/assets/wgpu_mc/shaders/terrain_solid.wgsl"
     ));
 
     /// Every global a function reaches, following the calls it makes.
@@ -1865,6 +2564,23 @@ mod binding_visibility_tests {
         }
 
         calls_in(module, &function.body, seen, out);
+    }
+
+    /// **The solid shader parses and validates**, with naga rather than the device.
+    ///
+    /// It is a copy of `terrain.wgsl` with one branch taken out, and a copy is exactly the kind of file
+    /// that drifts: a binding only one of them declares, a `var` left unused, a name one of them uses and
+    /// the other does not. `create_pipelines` skips a pipeline whose shader will not build and says so in
+    /// the log, but what that costs is the entire solid layer of the world not being drawn - so it is
+    /// worth a test that fails here rather than a log line that is easy to miss.
+    #[test]
+    fn the_solid_terrain_shader_parses_and_validates() {
+        let module =
+            naga::front::wgsl::parse_str(TERRAIN_SOLID).expect("the solid terrain shader parses");
+
+        Validator::new(ValidationFlags::all(), Capabilities::all())
+            .validate(&module)
+            .expect("the solid terrain shader validates");
     }
 
     /// Which global bindings each stage of every entry point of the shader reaches for, and what the

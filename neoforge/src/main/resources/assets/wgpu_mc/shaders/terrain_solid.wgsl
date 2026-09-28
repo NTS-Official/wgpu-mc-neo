@@ -103,10 +103,10 @@ struct SectionPosition {
     x: i32,
     y: i32,
     z: i32,
-    // `0.5` for the cutout layer: Minecraft's own `CUTOUT_TERRAIN`, which declares `ALPHA_CUTOUT`.
-    // The solid layer is **not** drawn with this shader - it has its own, with no test at all and no
-    // `discard` in it, because a `discard` anywhere costs the whole pipeline its early-Z. See
-    // `terrain_solid.wgsl`.
+    // **Declared and never read.** Minecraft's own `SOLID_TERRAIN` defines no `ALPHA_CUTOUT` at all,
+    // and the point of this file is that neither does it - there is no test at the fragment stage, so
+    // a driver keeps early-Z. The field is here only because this push constant block is one layout
+    // shared with `terrain.wgsl`, and a struct that left it out would be a different size.
     alpha_cutout: f32,
 };
 
@@ -374,24 +374,19 @@ fn frag(
     // shading, and the corner value is the ambient occlusion above.
     let col = in.color * vec4(light, 1.0) * vec4(ao, ao, ao, 1.0) * texel;
 
-    // The cutout test, at the cutoff the layer being drawn declares.
+    // **There is no cutout test here, and that is the whole reason this file exists.**
     //
-    // This read `if (col.a == 0.0f)` for as long as the atlas had one mip level, where "transparent"
-    // and "exactly zero alpha" are the same texel. The atlas has a mip chain now (`ATLAS_MIP_LEVELS`,
-    // sampled with `mipmap_filter: Linear`), and a hole in a leaf texture is only zero at level 0: at
-    // any level above it, the hole is an *average* of leaves and gaps, a small non-zero alpha - so
-    // nothing was discarded and the face was painted whole, at full strength, because this pass
-    // replaces the target rather than blending into it. Leaves therefore came out solid beyond the
-    // distance at which a sprite stops covering enough pixels to stay on level 0, and the boundary
-    // between the two moved with the camera's distance, angle and field of view.
+    // The solid layer is most of the screen, and a `discard` anywhere in a fragment shader is what
+    // makes a driver give up on early-Z and hierarchical-Z for the *whole pipeline* - the hardware
+    // cannot know whether a fragment will be thrown away until the shader has run, so it has to run
+    // it, and one test that can never fire therefore costs exactly what one that always does. That is
+    // what drawing the solid layer through a shader built for the cutout layer cost, and it is why
+    // the cutoff is not merely `0.0` here: the branch is gone rather than dead.
     //
-    // **This shader is only bound for layers that are cut out** - the cutout layer here, and the
-    // translucent one through the pipeline that names it. The solid layer draws with
-    // `terrain_solid.wgsl`, which has no test, because the mere presence of the `discard` below is
-    // what makes a driver drop early-Z for the entire pipeline. See `terrain_layers` in `graph.rs`.
-    if(col.a < section_pos.alpha_cutout){
-        discard;
-    }
+    // Minecraft's own `SOLID_TERRAIN` defines no `ALPHA_CUTOUT`, so it has no test either. Its
+    // `CUTOUT_TERRAIN` declares `0.5`, and that one lives in `terrain.wgsl` - the two pipelines this
+    // side draws the opaque group with, and the same split the game makes. See `terrain_layers` in
+    // `graph.rs`, which is where a layer is paired with the pipeline that draws it.
 
     // And the fog, in the same place the game's own fragment shader applies it: after the alpha test, so
     // what is tested is the texture's own alpha rather than a fogged one. It is applied to the whole

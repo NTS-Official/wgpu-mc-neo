@@ -4553,10 +4553,20 @@ pub extern "C" fn render_terrain_pass(
         // One group at a time, because the two are one frame apart in the game's own order: the opaque
         // terrain, then the entities and features, then the translucent terrain. See
         // `RenderGraph::render_with_mvp_only`.
-        let only = if translucent {
-            "translucent_terrain"
+        //
+        // The opaque group is **two** pipelines and has been since the solid layer got a shader of its
+        // own: Minecraft's opaque group draws the solid layer and then the cutout one, and this side
+        // draws them with `terrain_solid` and `terrain` because only the second has a `discard` in it -
+        // and a `discard` anywhere costs a pipeline its early-Z, which the solid layer - most of the
+        // screen - must not pay. Naming only one of them here is a layer that is baked and never drawn,
+        // which is the state water was in for a while; see `terrain_layers` in `graph.rs`.
+        let opaque = ["terrain_solid", "terrain"];
+        let translucent_only = ["translucent_terrain"];
+
+        let only: &[&str] = if translucent {
+            &translucent_only
         } else {
-            "terrain"
+            &opaque
         };
 
         graph.render_with_mvp_only(
@@ -4980,6 +4990,57 @@ pub fn setCameraSection(_env: JNIEnv, _class: JClass, x: jint, y: jint, z: jint)
     };
 
     *scene.camera_section_pos.write() = glam::ivec3(x, y, z);
+}
+
+/// Hands over the sections Minecraft's own occlusion culling says are visible this frame.
+///
+/// **A frustum is not occlusion culling.** This renderer culled its sections against the camera's
+/// frustum, which is what the game does *first* and what its `SectionOcclusionGraph` then throws most of
+/// away: the graph walks outward from the camera through the sections it can actually see - a section is
+/// reached only through a neighbour whose face toward it is not fully opaque - so the couple of thousand
+/// sections inside the frustum of a normal view become the few hundred that are not behind a hill.
+/// Drawing the frustum's set submits every section of a cave system or a forest floor, and the vertex
+/// stage transforms geometry the depth test then discards.
+///
+/// The keys are `SectionPos.asLong`, packed the way Minecraft packs them - 22 bits per coordinate,
+/// sign-extended from bit 63 - and the JVM gets them straight off each `RenderSection`'s own node, so
+/// nothing is unpacked and repacked on the way. See `Scene::visible_sections` for what the other side
+/// does with the set, and for why an empty array is not the same as never having sent one.
+///
+/// Called once per frame from the render thread, before the terrain pass. A frame whose call is missed
+/// leaves the previous list in place, which is a frame of the graph's answer being one frame old - and
+/// that is what the game's own renderer does with it too.
+#[jni_fn("dev.birb.wgpu.rust.WgpuNative")]
+pub fn setVisibleSections(mut env: JNIEnv, _class: JClass, keys: jni::objects::JLongArray) {
+    let Some(wm) = RENDERER.get() else {
+        return;
+    };
+
+    let Some(scene) = wm.scene() else {
+        return;
+    };
+
+    // `NoCopyBack`: this only ever reads, and asking the JVM to copy the array back would be a
+    // write-back of a few thousand longs per frame for nothing.
+    let Ok(elements) =
+        (unsafe { env.get_array_elements_critical(&keys, jni::objects::ReleaseMode::NoCopyBack) })
+    else {
+        return;
+    };
+
+    let packed =
+        unsafe { std::slice::from_raw_parts(elements.as_ptr() as *const i64, elements.len()) };
+
+    let mut visible = std::collections::HashSet::with_capacity(packed.len());
+
+    for key in packed {
+        // The layout lives in one place: `section::section_key` writes it - the JVM keys its own records
+        // by the same packing - and `section::section_pos` reads it back. Hand-writing the shifts here
+        // is how `y` came to be twenty-one bits wide for one revision of this function.
+        visible.insert(crate::section::section_pos(*key));
+    }
+
+    *scene.visible_sections.write() = Some(visible);
 }
 
 /// Blits the frame into the swapchain image, and submits it.

@@ -352,6 +352,7 @@ mod tests {
             "stars",
             "sun_moon_cycle",
             "terrain",
+            "terrain_solid",
             "transparent",
         ];
 
