@@ -2690,14 +2690,69 @@ side, along `+z` on an UP face and `-z` on a DOWN one.
 
 The six hand-written blocks are one table now (`face_vertices`, the corner of the box and the corner of
 the sprite side by side, because it is the *pairing* that has to be right), the two faces are corrected,
-and the test checks the table against those six lines rather than against itself: for each face, take the
-two vertices that differ only along the axis `u` runs on and assert that the sprite's `u` grows with the
-world's - or shrinks, where the game subtracts. Run against the old pairings it fails on the UP face with
-`u runs the wrong way`, and the walk-around check catches a table that jumps across the rectangle.
+and the test checks the table against those six lines rather than against itself.
 
-The corner *orders* stayed this baker's own: they are what its index list and its winding are written
-against, and the game's order is not the same thing - vanilla re-sorts its vertices afterwards
-(`recalculateWinding`), so its table order says nothing about which way the triangles face here.
+**The last line of that section used to say the corner orders stayed this baker's own, and that was the
+wrong call** - see "The order was the game's all along" below. Those orders were the third thing wrong in
+this table, and they are why this round went as deep as it did.
+
+### The order was the game's all along, and a mirror hides from every test that only asks 'which corner'
+
+The paragraph above left the four corners in an order of this baker's own invention: `FaceInfo`'s four
+corners for the face, re-arranged to suit this renderer, with the sprite corners worked out to match. The
+reasoning looked sound - vanilla re-sorts its vertices after baking (`recalculateWinding`), so the game's
+order "says nothing about" this side's - and it is what the next report was about:
+
+> there is a new problem: one or some of a block's faces are rotated against the game's - for example some
+> stones' top faces, by 90, 180 or 270 degrees
+
+Three separate mistakes were stacked in that arrangement, and each one hid the next.
+
+**One: `FaceInfo`'s winding is not this renderer's.** `FaceInfo` is written for `calculateFacing`, which
+only asks which direction a quad is *about* - so a face comes out of it wound against `Ccw`, and vanilla
+turns it round afterwards. This renderer culls back faces, so every face in the old table that was wound
+the game's way was a face that was **never drawn**: the DOWN face's normal came out `(0, 1, 0)` where the
+face points `(0, -1, 0)`. That is the one mistake here with a test that catches it without any reference
+to the game - take the normal of the first three vertices and compare it with the direction the face is
+supposed to point (`every_face_turns_the_way_the_renderer_draws_it`).
+
+**Two: the bit order of a corner is `z`, `y`, `x` - not `x`, `y`, `z`.** The baker writes its eight
+corners out as `p000`..`p111` and puts them in one array, so the bit a name carries is `x` in 4, `y` in 2,
+`z` in 1 - the reverse of the order the axes are usually spoken in. A test that reads the bits as
+`(x, y, z)` gets a **mirrored box**, and a mirrored box is a symmetry of all six faces: every fact about
+a full cube still holds, every "which corner is which" check still passes, and nothing shows up until a
+pairing is asked about an axis by name. `corner_position` is that array written out by name now, shared by
+the bake and the tests, so there is one reading of the bits rather than one per caller.
+
+**Three: `16 - y` is a statement about the box's axes, and only `u` is mirrored between the two sides.**
+`defaultFaceUV` writes each of a face's lines out of two of the box's axes, and which two - and which way
+round - is the whole of the pairing:
+
+| face | `u` runs | `v` runs |
+| --- | --- | --- |
+| DOWN | with `x` | with `z` |
+| UP | with `x` | against `z` |
+| NORTH | against `x` | against `y` |
+| SOUTH | with `x` | against `y` |
+| WEST | with `z` | against `y` |
+| EAST | against `z` | against `y` |
+
+Getting that table right by hand is what took three attempts, so nothing here is a hand-derivation any
+more. The test **derives** it, from `default_face_uv` itself: each of the game's six lines writes each of
+its coordinates out of one axis only, so the axis a coordinate runs along is the one that moves it - move
+that axis, and *that* coordinate changes and the other does not. The test asks the function, for a slab
+(where all three axes have different extents, so no two are confusable), and then asks `face_vertices`
+whether the corner of the box it names really samples what the line says. It is the one statement of the
+pairing that is not the table, and it is what found the third version.
+
+The table itself is now one row per face and looks like the game's own: the four corners of `FaceInfo`'s
+row, read backwards, each with the corner of the sprite the game's line puts there.
+
+**The lesson worth keeping** is about which tests can see what. Two of the three mistakes are invisible to
+any test that only asks *which corner of the box is this* or *does the walk go round*: a mirrored box
+satisfies all of them, and a pairing turned as a whole satisfies the first two tests in this file - which
+is exactly why they passed for two rounds while four of the six faces were wrong. What sees a mirror is a
+question about a **named axis**; what sees a turn is a question about a **specific corner of the sprite**.
 
 ### The title screen wrote a warning per frame
 
@@ -3121,6 +3176,47 @@ own rows is a page that silently rewrites the config.
 written before the setting existed, or hand-edited without it, would have turned the animation off for
 exactly the player who never asked. The field names its default function instead
 (`animated_textures_default`), and a test reads a legacy config and asserts the animation is on.
+
+### The same switch had to reach the first-person fire and the fire on a burning entity
+
+Three places draw fire, and the switch only reached one of them. The terrain is this renderer's, and it
+answers the question once per face at bake time - the coordinates are baked in the game's atlas's space or
+this side's, with a flag saying which. The other two are **Minecraft's own passes**:
+`ScreenEffectRenderer` draws the burning overlay over the first-person view, and `FlameFeatureRenderer`
+draws the flames on a burning entity. Both sample `fire_0` and `fire_1` out of the block atlas, and
+neither of them asks this mod anything - so with the switch on `Fast` the terrain went still and the player
+and the mobs went on crackling.
+
+**What the three share is the atlas, and that is where this is fixed.** `TextureAtlas.tick` (26.1 calls it
+`cycleAnimationFrames`) ticks every animated sprite in the atlas, which is what advances their frames; an
+animation that does not advance does not move, whichever pass reads it. So the mixin stops the ticks for
+the two fire sprites while the switch is off, and all three places stop at once:
+
+```java
+@Redirect(method = "cycleAnimationFrames",
+          at = @At(value = "INVOKE",
+                   target = "Lnet/minecraft/client/renderer/texture/SpriteContents$AnimationState;tick()V"))
+private void wgpu_mc$tickUnlessFrozen(SpriteContents.AnimationState state) { … }
+```
+
+**Which state is fire is the fiddly part.** `AnimationState` does not say which sprite it belongs to, so it
+is traced back three links - the state to its `AnimatedTexture`, that to the outer `SpriteContents`, and
+that to the sprite's name - and the name is compared against the identifiers `ModelBakery` builds its
+`FIRE_0`/`FIRE_1` sprite ids from, rather than against the paths spelled out again. Two notes from writing
+that:
+
+- **`AnimatedTexture` is package-private, so the accessors answer `Object`.** An `@Accessor` whose return
+  type is that class cannot be named from a mod's own package. The JVM widens a reference to `Object` for
+  free, and only the last link (`SpriteContents`) has to be named. The chain was checked against the real
+  classes before shipping, because an accessor is looked up by name the *first time it is called* - which
+  is in the middle of a running client, not at build time. A `@Shadow` field added to an accessor interface
+  does not get that check either; it built fine with a deliberately wrong name.
+- **If the trace ever fails, fire animates and one warning is logged.** It does not fall back to freezing
+  the whole atlas: an atlas that quietly stops moving would be a stranger bug than the one being fixed.
+
+The frame it stops on is a real one. Both strips are 32 frames - `fire_1` in order, `fire_0` starting at
+the back half of its sheet - and holding whatever frame is in the atlas is the same thing the terrain does
+with this switch off, which is to hold the one frame it copied.
 
 ### The corners were dark in the right places and only a third as deep as the game's
 
@@ -3668,6 +3764,41 @@ pipeline is skipped - which is what every other failure on that path already doe
 unreadable shader, a device without `immediates`). A graph missing one pipeline draws the rest of the
 frame, so the next mistake of this kind costs the terrain and a log line rather than the session. It is a
 guard and not a licence: a pipeline that will not build is still a bug, and the message is still an error.
+
+### A face that writes no `uv` was covering the whole sprite, and that is not what a slab's side is
+
+A model face may leave `uv` out, and what the game does then is `FaceBakery#defaultFaceUV` - it derives
+the rectangle from the **element's own box**, six lines, one per facing:
+
+```java
+case DOWN  -> new UVs(from.x(), 16.0F - to.z(), to.x(), 16.0F - from.z());
+case UP    -> new UVs(from.x(), from.z(), to.x(), to.z());
+case NORTH -> new UVs(16.0F - to.x(), 16.0F - to.y(), 16.0F - from.x(), 16.0F - from.y());
+case SOUTH -> new UVs(from.x(), 16.0F - to.y(), to.x(), 16.0F - from.y());
+case WEST  -> new UVs(from.z(), 16.0F - to.y(), to.z(), 16.0F - from.y());
+case EAST  -> new UVs(16.0F - to.z(), 16.0F - to.y(), 16.0F - from.z(), 16.0F - from.y());
+```
+
+This side was using `[0, 0, 16, 16]` - the whole sprite - for every face without one, which is right for
+exactly one shape: a full cube. Everything else that is part of a block and samples a sprite the game cut
+for it was drawing the texture at the wrong **scale**. A bottom slab's side is half a block tall and its
+sprite is not, so it drew the whole sprite squeezed into half a block; a pane drew a full block of glass
+in the middle of an empty one; a plant's cross drew its four quads all sampling everything.
+
+`default_face_uv` is the six lines above, evaluated for the element's `from`/`to`, and a face gets it when
+it writes no `uv` of its own (`face_data`, so every face that is looked up goes through it). The four
+corners come out 180° round from the game's own version of them, and that is not a bug: this side's
+vertices are in the opposite order from the game's, and reversing a quad turns both of its texture axes.
+Both versions agree on every full cube - where the mirroring cancels - which is exactly why the difference
+survived this long.
+
+Two tests hold it down. `a_face_without_a_uv_covers_the_element_and_not_the_sprite` pins the six answers
+for a bottom slab and for a post, where every one of the six is different; and
+`a_slab_side_covers_half_the_sprite` follows one all the way to the vertex: a bottom slab's side samples
+half the sprite, in **texel coordinates the vertex buffer actually holds**, rather than the whole of it.
+
+`ElementBounds` is what carries the element's `from`/`to` into `face_data` in the sixteen units a model
+file writes them in, because that is the space the game's six lines are written in.
 
 ### Known gaps
 

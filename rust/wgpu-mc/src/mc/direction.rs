@@ -1,4 +1,4 @@
-use glam::{IVec3, ivec3};
+use glam::{IVec3, Vec3, ivec3};
 
 static VECTOR: [IVec3; 6] = [
     ivec3(-1, 0, 0),
@@ -20,6 +20,24 @@ pub enum Direction {
 impl Direction {
     pub fn to_vec(&self) -> IVec3 {
         VECTOR[*self as usize]
+    }
+    /// The unit vector this direction points along, in the same three components [`Self::to_vec`]
+    /// gives as integers.
+    ///
+    /// The float one exists because it is what a quad's *normal* is - `BlockModelFace::normal` is a
+    /// `Vec3` in block space, and it is the model's own direction turned by the variant. Written as a
+    /// table next to the integer one rather than converted from it, because a normal is read by
+    /// lighting and by backface culling and a `as f32` through an `IVec3` would be the one place the
+    /// two tables could disagree.
+    pub fn normal(&self) -> Vec3 {
+        match self {
+            Self::West => Vec3::new(-1.0, 0.0, 0.0),
+            Self::East => Vec3::new(1.0, 0.0, 0.0),
+            Self::Down => Vec3::new(0.0, -1.0, 0.0),
+            Self::Up => Vec3::new(0.0, 1.0, 0.0),
+            Self::North => Vec3::new(0.0, 0.0, -1.0),
+            Self::South => Vec3::new(0.0, 0.0, 1.0),
+        }
     }
     pub fn opposite(&self) -> Self {
         match self {

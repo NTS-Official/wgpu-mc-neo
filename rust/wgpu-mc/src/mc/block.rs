@@ -453,6 +453,11 @@ struct FaceData {
 /// order, because that is the order Minecraft applies them in. The `cullface` is turned too, by the
 /// variant's rotation alone.
 ///
+/// A face that writes no `uv` is handed the one its element's box implies, in the units a model file
+/// writes them in. That happens here rather than at the six call sites because it is the same field
+/// either way, and because `drawXFaces`-style callers do not exist: every face is read by this
+/// function, so every face gets the default - see [`default_face_uv`].
+///
 /// Which atlas those UVs are *in* is the other half, and it is decided by
 /// [`Atlas::game_atlas_rect`]: a face whose sprite the game animates and whose atlas the pass can
 /// sample is baked with the game's coordinates and flagged for it, and every other face keeps the
@@ -460,6 +465,7 @@ struct FaceData {
 /// atlases - which is why the flag and the coordinates are written together, here, and never apart.
 fn face_data(
     tex: &schemas::models::ElementFace,
+    bounds: ElementBounds,
     declared: Direction,
     atlas: &Atlas,
     rotation: ModelRotation,
@@ -467,14 +473,18 @@ fn face_data(
 ) -> Option<FaceData> {
     let texture: ResourcePath = (&tex.texture.0).into();
 
+    // `#all` and every other reference is resolved by `resolve_model` before this runs, so the sprite
+    // named here is a concrete one - or one the atlas does not have, which `get_atlas_uv` reports.
+    let uv = tex.uv.unwrap_or_else(|| default_face_uv(bounds, declared));
+
     // `Some` only for a sprite the game animates in an atlas the built pass samples: see
     // `Atlas::game_atlas_rect`, which is the whole of the decision.
     let game_rect = atlas.game_atlas_rect(&texture);
 
     let (uv, uv_flags) = match game_rect {
-        Some(rect) => (get_game_atlas_uv(tex, rect), UV_GAME_ATLAS),
+        Some(rect) => (get_game_atlas_uv(uv, tex.rotation, rect), UV_GAME_ATLAS),
         None => {
-            let Some(uv) = get_atlas_uv(tex, atlas) else {
+            let Some(uv) = get_atlas_uv(uv, tex.rotation, atlas, &texture) else {
                 // The one silent way this baker can fail, and the reason `MISSING_SPRITES` exists: the
                 // face is gone, and whether the block is drawn with a hole in it or not at all is not
                 // something any other line in the log can tell you.
@@ -512,16 +522,9 @@ fn face_data(
         // Rotated as Minecraft rotates it, so the direction that comes out is the neighbour this face
         // now touches rather than the one the model file was written against. The culling loop tests
         // this one against the world as baked.
-        cull: tex.cull_face.map(|face| {
-            rotation.rotate_direction(match face {
-                schemas::models::BlockFace::Down => Direction::Down,
-                schemas::models::BlockFace::Up => Direction::Up,
-                schemas::models::BlockFace::North => Direction::North,
-                schemas::models::BlockFace::South => Direction::South,
-                schemas::models::BlockFace::West => Direction::West,
-                schemas::models::BlockFace::East => Direction::East,
-            })
-        }),
+        cull: tex
+            .cull_face
+            .map(|face| rotation.rotate_direction(direction_of(face))),
     })
 }
 
@@ -791,26 +794,134 @@ fn unresolved_texture(model: &schemas::Model) -> Option<String> {
         .map(|(direction, face)| format!("face {direction:?} samples {}", face.texture.0))
 }
 
-fn get_atlas_uv(face: &schemas::models::ElementFace, block_atlas: &Atlas) -> Option<UV> {
-    let uv = face.uv.unwrap_or([0.0, 0.0, 16.0, 16.0]).map(|x| x as u16);
+/// The direction a model file's face key names.
+///
+/// Three places need this and they need the same answer: the atlas UVs a face gets, the direction its
+/// `cullface` is turned by, and the normal its quad is given. Written once because a face key that
+/// mapped to two different directions would bake a face lit and culled on one side and drawn on
+/// another - which is a shape of bug that looks like a texture problem.
+const fn direction_of(face: schemas::models::BlockFace) -> Direction {
+    match face {
+        schemas::models::BlockFace::Down => Direction::Down,
+        schemas::models::BlockFace::Up => Direction::Up,
+        schemas::models::BlockFace::North => Direction::North,
+        schemas::models::BlockFace::South => Direction::South,
+        schemas::models::BlockFace::West => Direction::West,
+        schemas::models::BlockFace::East => Direction::East,
+    }
+}
+
+/// Every face a model may write, each paired with the direction it names.
+///
+/// This is the walk an element's faces are baked in. Six entries and not `element.faces.keys()`,
+/// because a `HashMap`'s order is not an order: two loads of the same model would emit the same faces
+/// in different orders, and while the mesh is merged per direction afterwards, a difference that only
+/// shows up on a reload is a difference nobody can debug.
+const MODEL_FACES: [(schemas::models::BlockFace, Direction); 6] = [
+    (schemas::models::BlockFace::Down, Direction::Down),
+    (schemas::models::BlockFace::Up, Direction::Up),
+    (schemas::models::BlockFace::North, Direction::North),
+    (schemas::models::BlockFace::South, Direction::South),
+    (schemas::models::BlockFace::West, Direction::West),
+    (schemas::models::BlockFace::East, Direction::East),
+];
+
+/// The `from` and `to` of one element, in the sixteen units a model file writes them in.
+///
+/// Kept in those units rather than in blocks, because the one thing that reads them is
+/// [`default_face_uv`], which is written in them too: an element's `uv` is sixteen units to the sprite,
+/// so a face's default rectangle is the element's *own* rectangle, in the space the model file used.
+#[derive(Clone, Copy)]
+struct ElementBounds {
+    from: [f32; 3],
+    to: [f32; 3],
+}
+
+/// The `uv` a face samples when the model file does not write one: the sprite the element *covers*.
+///
+/// A face with no `uv` does not sample the whole sprite - it samples the part of it the element's own
+/// box is, which is why a bottom slab's top face is the top half of the sprite and its sides are cut
+/// down to the slab's height. It is not an optimization the game could have skipped: a slab's side is
+/// half as tall as the block and its sprite is not, so stretching the sprite over it draws the texture
+/// at half scale, and a pane drawn that way is a full block of glass in the middle of an empty one.
+///
+/// Minecraft's version is `FaceBakery#defaultFaceUV`, six lines that pick two of the box's axes for `u`
+/// and two for `v`, one line per facing - and the facing is the key the model file wrote the face
+/// under, *not* where the face ends up pointing after a variant rotation. That is why this takes the
+/// direction the caller looked the face up by:
+///
+/// ```java
+/// case DOWN  -> new UVs(from.x(), 16.0F - to.z(), to.x(), 16.0F - from.z());
+/// case UP    -> new UVs(from.x(), from.z(), to.x(), to.z());
+/// case NORTH -> new UVs(16.0F - to.x(), 16.0F - to.y(), 16.0F - from.x(), 16.0F - from.y());
+/// case SOUTH -> new UVs(from.x(), 16.0F - to.y(), to.x(), 16.0F - from.y());
+/// case WEST  -> new UVs(from.z(), 16.0F - to.y(), to.z(), 16.0F - from.y());
+/// case EAST  -> new UVs(16.0F - to.z(), 16.0F - to.y(), 16.0F - from.z(), 16.0F - from.y());
+/// ```
+///
+/// **Those six lines are not what this function returns, and the difference is real.** They are the
+/// game's answer in the game's own terms - the u and v a corner of the box samples, with the `16 -`
+/// giving which way each runs. This side's vertices are in the opposite order from the game's (see
+/// [`face_vertices`]: the game's winding is read backwards here to put the normals the way the renderer
+/// culls them), and reversing a quad flips *both* of its texture axes. So `u` and `v` come back 180
+/// degrees round from the game's version of them, and the six lines above are evaluated with both axes
+/// turned: `16 - to.x` becomes `from.x` and `16 - from.y` becomes `to.y`.
+///
+/// That is not a second opinion - it is the same six lines read against this side's vertex order, and
+/// `a_face_pairs_its_corners_the_way_the_games_own_uv_lines_do` checks exactly that: it evaluates the
+/// game's lines for a full cube, where they say which world axis each texture axis runs along and which
+/// way, and asks this table's corners whether they sample what those lines say. The two versions of the
+/// lines agree everywhere the axes are symmetric, which is every full cube; they differ on
+/// [`face_vertices`]' own order, and that is the half a turned texture hides in.
+///
+/// The `16 -` in four of the game's lines is not a mirror for its own sake either: `u` runs along `+x`
+/// on an UP face and along `-x` on a NORTH one. A negative span - an element whose axes are the other
+/// way round - keeps its sign, and swapping the two numbers flips the texture, so nothing is sorted or
+/// clamped here.
+fn default_face_uv(bounds: ElementBounds, declared: Direction) -> [f32; 4] {
+    let [fx, fy, fz] = bounds.from;
+    let [tx, ty, tz] = bounds.to;
+
+    // The sprite's four corners, built from the two axes each face samples and the direction each runs.
+    // The six lines of the game's `defaultFaceUV` are the comment above, one per arm, and each arm here
+    // is that line with both axes turned - see the note there for why the turn is not optional.
+    match declared {
+        Direction::Down => [fx, fz, tx, tz],
+        Direction::Up => [fx, 16.0 - fz, tx, 16.0 - tz],
+        Direction::North => [tx, ty, fx, fy],
+        Direction::South => [fx, fy, tx, ty],
+        Direction::West => [fz, fy, tz, ty],
+        Direction::East => [16.0 - fz, fy, 16.0 - tz, ty],
+    }
+}
+
+/// One face's corners in **this** side's atlas, in whole pixels of it.
+///
+/// `uv` is the rectangle the face samples, in the model file's own units - the one it wrote, or the
+/// one [`default_face_uv`] derived from its element. It is handed in rather than read off the face,
+/// because by the time a face gets here the two are the same field and only the caller knows which.
+fn get_atlas_uv(
+    uv: [f32; 4],
+    rotation: u32,
+    block_atlas: &Atlas,
+    texture: &ResourcePath,
+) -> Option<UV> {
+    let uv = uv.map(|x| x as u16);
     let atlas_map = block_atlas.uv_map.read();
-    atlas_map
-        .get(&(&face.texture.0).into())
-        .copied()
-        .map(|tex| {
-            let tw = (tex.1.0 - tex.0.0, tex.1.1 - tex.0.1);
-            let uvs = match face.rotation {
-                0 => ((uv[0], uv[1]), (uv[2], uv[3])),
-                90 => ((tw.1 - uv[1], uv[0]), (tw.1 - uv[3], uv[2])),
-                180 => ((tw.0 - uv[0], tw.1 - uv[1]), (tw.0 - uv[2], tw.1 - uv[3])),
-                270 => ((uv[1], tw.0 - uv[0]), (uv[3], tw.0 - uv[2])),
-                _ => unreachable!(),
-            };
-            (
-                (tex.0.0 + uvs.0.0, tex.0.1 + uvs.0.1),
-                (tex.0.0 + uvs.1.0, tex.0.1 + uvs.1.1),
-            )
-        })
+    atlas_map.get(texture).copied().map(|tex| {
+        let tw = (tex.1.0 - tex.0.0, tex.1.1 - tex.0.1);
+        let uvs = match rotation {
+            0 => ((uv[0], uv[1]), (uv[2], uv[3])),
+            90 => ((tw.1 - uv[1], uv[0]), (tw.1 - uv[3], uv[2])),
+            180 => ((tw.0 - uv[0], tw.1 - uv[1]), (tw.0 - uv[2], tw.1 - uv[3])),
+            270 => ((uv[1], tw.0 - uv[0]), (uv[3], tw.0 - uv[2])),
+            _ => unreachable!(),
+        };
+        (
+            (tex.0.0 + uvs.0.0, tex.0.1 + uvs.0.1),
+            (tex.0.0 + uvs.1.0, tex.0.1 + uvs.1.1),
+        )
+    })
 }
 
 /// One face's corners as fractions of the sprite it samples, in the order the model's own vertices
@@ -818,17 +929,14 @@ fn get_atlas_uv(face: &schemas::models::ElementFace, block_atlas: &Atlas) -> Opt
 /// in pixels - with the face's own `rotation` applied, about the middle.
 ///
 /// Fractions rather than pixels, because this is the one part of a face that is written the same way
-/// in both atlases: a model's `uv` is sixteen units to the sprite (`[0, 0, 16, 16]` when the model
-/// does not write one), and how many *pixels* that is depends on which atlas the face is being baked
-/// for. The turn is Minecraft's, a quarter turn at a time, and these are the same four cases
-/// [`get_atlas_uv`] writes out in whole pixels of this side's atlas.
-fn sprite_fractions(face: &schemas::models::ElementFace) -> ((f32, f32), (f32, f32)) {
-    let uv = face
-        .uv
-        .unwrap_or([0.0, 0.0, 16.0, 16.0])
-        .map(|unit| unit / 16.0);
+/// in both atlases: a model's `uv` is sixteen units to the sprite (the element's own box when the model
+/// does not write one - see [`default_face_uv`]), and how many *pixels* that is depends on which atlas
+/// the face is being baked for. The turn is Minecraft's, a quarter turn at a time, and these are the
+/// same four cases [`get_atlas_uv`] writes out in whole pixels of this side's atlas.
+fn sprite_fractions(uv: [f32; 4], rotation: u32) -> ((f32, f32), (f32, f32)) {
+    let uv = uv.map(|unit| unit / 16.0);
 
-    match face.rotation {
+    match rotation {
         0 => ((uv[0], uv[1]), (uv[2], uv[3])),
         90 => ((1.0 - uv[1], uv[0]), (1.0 - uv[3], uv[2])),
         180 => ((1.0 - uv[0], 1.0 - uv[1]), (1.0 - uv[2], 1.0 - uv[3])),
@@ -859,8 +967,8 @@ fn game_rect_to_bits(rect: [f32; 4]) -> UV {
 /// for both atlases, and the reason the game's atlas never has to be measured here: the sprite's
 /// rectangle already says where it is in an atlas this side does not own. See
 /// [`UV_GAME_ATLAS`] for why a face is sent there at all.
-fn get_game_atlas_uv(face: &schemas::models::ElementFace, rect: [f32; 4]) -> UV {
-    let corners = sprite_fractions(face);
+fn get_game_atlas_uv(uv: [f32; 4], rotation: u32, rect: [f32; 4]) -> UV {
+    let corners = sprite_fractions(uv, rotation);
 
     let to_game = |(x, y): (f32, f32)| {
         (
@@ -872,8 +980,15 @@ fn get_game_atlas_uv(face: &schemas::models::ElementFace, rect: [f32; 4]) -> UV 
     (to_game(corners.0), to_game(corners.1))
 }
 
-/// One corner of an element's box, as a bit an axis: bit 0 is x, bit 1 is y, bit 2 is z, each set when
-/// that axis takes the element's `to` bound rather than its `from`. So `6` is `p110`.
+/// One corner of an element's box, as a bit per axis: **bit 0 is `z`, bit 1 is `y`, bit 2 is `x`**, each
+/// set when that axis takes the element's `to` bound rather than its `from`. So `6` is `p110`, and
+/// [`corner_position`] is the function that turns one of these back into a point.
+///
+/// The order of the bits is the order the baker's corner list is indexed in - which is *not* the order of
+/// `x`, `y`, `z`. Reading it as that mirrors the box, and a mirrored box is a symmetry of the six faces:
+/// every test that only asks which corner is which still passes, and the mirror only shows up when a
+/// pairing is checked against the game's tables by axis - which took a slab, whose sides are not a full
+/// block in `y`, to see.
 type Corner = u8;
 
 /// Where one vertex of a face samples its sprite: `(the rectangle's high u, the rectangle's high v)`.
@@ -882,72 +997,87 @@ type SpriteCorner = (bool, bool);
 /// The four vertices of one face of an element's box: **which corner of the box**, and **which corner of
 /// the sprite's `uv` rectangle** it samples, in the order the baker writes them.
 ///
-/// Two tables in the game - `FaceInfo`, which gives the corner of the box for each vertex index, and
-/// `CuboidFace.UVs#getVertexU`/`#getVertexV`, which give the sprite's corner for the same index:
-///
-/// ```java
-/// public float getVertexU(int index) { return index != 0 && index != 1 ? this.maxU : this.minU; }
-/// public float getVertexV(int index) { return index != 0 && index != 3 ? this.maxV : this.minV; }
-/// ```
-///
-/// and one table here, because it is the *pairing* of the two that has to be right: a corner of the box
-/// joined to the wrong corner of its sprite is that face turned by a quarter turn about its own middle.
-/// Which is invisible on a texture with no direction to it and plain on every texture that has one:
+/// Both halves come from the game, and a mistake in either is a face turned about its own middle -
+/// invisible on a texture with no direction to it, and plain on every texture that has one:
 ///
 /// > some blocks' faces are rotated against the game's - 90, 180 or 270 degrees
 ///
-/// The **corner orders** here are this baker's own - they are what its index list and its winding are
-/// written against - and the **sprite corners** are the game's, read off `FaceBakery#defaultFaceUV`,
-/// which is the same table written as six lines of arithmetic:
+/// The corners are the game's `FaceInfo` row for the face, and the sprite corners are
+/// `CuboidFace.UVs#getVertexU`/`#getVertexV` for the same index - which is two lines rather than four
+/// cases, so the four corners of the sprite they name are always the same four in the same walking order,
+/// and what changes from face to face is where the box's corners sit in it.
 ///
-/// ```java
-/// case DOWN  -> new UVs(from.x(), 16.0F - to.z(), to.x(), 16.0F - from.z());
-/// case UP    -> new UVs(from.x(), from.z(), to.x(), to.z());
-/// case NORTH -> new UVs(16.0F - to.x(), 16.0F - to.y(), 16.0F - from.x(), 16.0F - from.y());
-/// case SOUTH -> new UVs(from.x(), 16.0F - to.y(), to.x(), 16.0F - from.y());
-/// case WEST  -> new UVs(from.z(), 16.0F - to.y(), to.z(), 16.0F - from.y());
-/// case EAST  -> new UVs(16.0F - to.z(), 16.0F - to.y(), 16.0F - from.z(), 16.0F - from.y());
-/// ```
+/// **What is not the game's is the direction the list runs in.** `FaceInfo` is written for
+/// `calculateFacing`, which only asks which direction a quad is *about*, so a face comes out of it wound
+/// against this renderer's `Ccw` - and the game turns it round afterwards, in `recalculateWinding`, by
+/// reading the quad from its other end. That is the order below, and it is not cosmetic here: this
+/// renderer culls back faces, so a face wound the wrong way is a face that is never drawn.
 ///
-/// so `u` runs along `+x` on an UP face and along `+z` on a WEST one, and `v` runs *down* every side face.
-/// The test below checks this against those six lines rather than against itself, which is how the two
-/// faces that were a quarter turn out - an UP face and a DOWN one - were found.
+/// Three versions of this table were tried before it, and each of the first two was turned against the
+/// game on four of the six faces while every test of the day passed. What found the third is
+/// [`default_face_uv`] - the *same* six lines of the game, read as a statement about which corner of the
+/// box samples which corner of the sprite - because that is one fact per face rather than a pairing.
+/// `a_face_pairs_its_corners_the_way_the_games_own_uv_lines_do` runs that comparison, and
+/// `every_face_turns_the_way_the_renderer_draws_it` checks the winding, on every test run.
 fn face_vertices(dir: Direction) -> [(Corner, SpriteCorner); 4] {
-    // The sprite's four corners, walking around its rectangle: `(min u, min v)`, `(min u, max v)`,
-    // `(max u, max v)`, `(max u, min v)`. That walk is `getVertexU`/`getVertexV` for the four indices.
-    const AROUND: [SpriteCorner; 4] = [(false, false), (false, true), (true, true), (true, false)];
+    // The four corners of the face, in the order this renderer winds its quads, each paired with the
+    // corner of the sprite the game's own `defaultFaceUV` line for the face puts it at.
+    //
+    // Each row is that line's two axes read against the four corners the face is on, and the *order* is
+    // the game's `FaceInfo` row read backwards: `FaceInfo` is written for `calculateFacing`, which only
+    // asks which direction a quad is *about*, so its quads wind against this renderer's `Ccw` and the
+    // game turns them round after baking. Winding them the other way here is the same four corners in the
+    // other order, which is why the sprite corners below run against the corner list and not with it.
+    //
+    // Three tables got this wrong before, and both of the first two passed every test of the day. What
+    // found the working one is the two checks that run on every test now:
+    // `every_face_turns_the_way_the_renderer_draws_it` for the winding, and
+    // `a_face_pairs_its_corners_the_way_the_games_own_uv_lines_do` for the pairing.
+    let pairs: [(Corner, SpriteCorner); 4] = match dir {
+        // from.x, 16 - to.z -> `u` runs with `x`, `v` against `z`.
+        Direction::Down => [
+            (4, (true, false)),
+            (5, (true, true)),
+            (1, (false, true)),
+            (0, (false, false)),
+        ],
+        // from.x, from.z -> `u` with `x`, `v` against `z`.
+        Direction::Up => [
+            (7, (true, false)),
+            (6, (true, true)),
+            (2, (false, true)),
+            (3, (false, false)),
+        ], // 16 - to.x, 16 - to.y -> `u` against `x`, `v` against `y`.
+        Direction::North => [
+            (0, (false, false)),
+            (2, (false, true)),
+            (6, (true, true)),
+            (4, (true, false)),
+        ],
+        // from.x, 16 - to.y -> `u` with `x`, `v` against `y`.
+        Direction::South => [
+            (5, (true, false)),
+            (7, (true, true)),
+            (3, (false, true)),
+            (1, (false, false)),
+        ],
+        // from.z, 16 - to.y -> `u` with `z`, `v` against `y`.
+        Direction::West => [
+            (1, (true, false)),
+            (3, (true, true)),
+            (2, (false, true)),
+            (0, (false, false)),
+        ],
+        // 16 - to.z, 16 - to.y -> `u` against `z`, `v` against `y`.
+        Direction::East => [
+            (4, (true, false)),
+            (6, (true, true)),
+            (7, (false, true)),
+            (5, (false, false)),
+        ],
+    };
 
-    // The same walk, started at one of the four corners: a face whose first vertex is not the sprite's
-    // low corner starts somewhere else in it and goes round the same way.
-    let from =
-        |start: usize| -> [SpriteCorner; 4] { std::array::from_fn(|i| AROUND[(start + i) % 4]) };
-
-    match dir {
-        Direction::Down => {
-            let uv = from(1);
-            [(0, uv[0]), (1, uv[1]), (5, uv[2]), (4, uv[3])]
-        }
-        Direction::Up => {
-            let uv = from(0);
-            [(2, uv[0]), (6, uv[1]), (7, uv[2]), (3, uv[3])]
-        }
-        Direction::North => {
-            let uv = from(2);
-            [(0, uv[0]), (2, uv[1]), (3, uv[2]), (1, uv[3])]
-        }
-        Direction::South => {
-            let uv = from(2);
-            [(5, uv[0]), (7, uv[1]), (6, uv[2]), (4, uv[3])]
-        }
-        Direction::West => {
-            let uv = from(2);
-            [(4, uv[0]), (6, uv[1]), (2, uv[2]), (0, uv[3])]
-        }
-        Direction::East => {
-            let uv = from(2);
-            [(1, uv[0]), (3, uv[1]), (7, uv[2]), (5, uv[3])]
-        }
-    }
+    pairs
 }
 
 /// The four vertices of one face, ready to bake: the corner of the box each one is at, and the point of
@@ -1126,51 +1256,42 @@ impl ModelMesh {
                     .flatten()
                     .flat_map(|element| {
                         //Face textures
-                        // Each face is handed to `face_data`, which reads its UVs, its layer and the
-                        // direction it declared for culling, and applies the face's own rotation
-                        // followed by the variant's `uvlock` to the UVs.
-                        let north = element
-                            .faces
-                            .get(&schemas::models::BlockFace::North)
-                            .and_then(|tex| {
-                                face_data(tex, Direction::North, block_atlas, rotation, uv_lock)
-                            });
+                        // Each face is handed to `face_data`, which reads its UVs - the ones the model
+                        // wrote, or the ones its element's box implies - its layer and the direction it
+                        // declared for culling, and applies the face's own rotation followed by the
+                        // variant's `uvlock` to the UVs.
+                        //
+                        // The default is why the element's bounds go with each face: a face with no `uv`
+                        // samples the part of the sprite its own box covers, which is the element's
+                        // `from` and `to` and nothing else. See `default_face_uv`.
+                        let bounds = ElementBounds {
+                            from: element.from,
+                            to: element.to,
+                        };
 
-                        let east = element
-                            .faces
-                            .get(&schemas::models::BlockFace::East)
-                            .and_then(|tex| {
-                                face_data(tex, Direction::East, block_atlas, rotation, uv_lock)
-                            });
-
-                        let south = element
-                            .faces
-                            .get(&schemas::models::BlockFace::South)
-                            .and_then(|tex| {
-                                face_data(tex, Direction::South, block_atlas, rotation, uv_lock)
-                            });
-
-                        let west = element
-                            .faces
-                            .get(&schemas::models::BlockFace::West)
-                            .and_then(|tex| {
-                                face_data(tex, Direction::West, block_atlas, rotation, uv_lock)
-                            });
-
-                        let up =
-                            element
-                                .faces
-                                .get(&schemas::models::BlockFace::Up)
-                                .and_then(|tex| {
-                                    face_data(tex, Direction::Up, block_atlas, rotation, uv_lock)
-                                });
-
-                        let down = element
-                            .faces
-                            .get(&schemas::models::BlockFace::Down)
-                            .and_then(|tex| {
-                                face_data(tex, Direction::Down, block_atlas, rotation, uv_lock)
-                            });
+                        // Walked by direction rather than six hand-written lookups, because the
+                        // direction a face is looked up by is now a parameter and not a label: it is
+                        // what `default_face_uv` switches on, and what `uv_lock_matrix` needs. The
+                        // order is this table's rather than the file's, so that a model with several
+                        // faces bakes the same mesh every load - the faces are merged per direction
+                        // anyway, and an order that came out of a `HashMap` would be an order that
+                        // changed between runs.
+                        let faces: Vec<(Direction, FaceData)> =
+                            MODEL_FACES
+                                .into_iter()
+                                .filter_map(|(face, direction)| {
+                                    element
+                                        .faces
+                                        .get(&face)
+                                        .and_then(|tex| {
+                                            face_data(
+                                                tex, bounds, direction, block_atlas, rotation,
+                                                uv_lock,
+                                            )
+                                        })
+                                        .map(|data| (direction, data))
+                                })
+                                .collect();
 
                         let rot = &element.rotation;
                         let matrix = match rot.axis {
@@ -1196,104 +1317,25 @@ impl ModelMesh {
                             rotation.position(v)
                         };
 
-                        let p000 = vertex_transform(vec3(
-                            element.from[0] / 16.0,
-                            element.from[1] / 16.0,
-                            element.from[2] / 16.0,
-                        ));
-                        let p001 = vertex_transform(vec3(
-                            element.from[0] / 16.0,
-                            element.from[1] / 16.0,
-                            element.to[2] / 16.0,
-                        ));
-                        let p010 = vertex_transform(vec3(
-                            element.from[0] / 16.0,
-                            element.to[1] / 16.0,
-                            element.from[2] / 16.0,
-                        ));
-                        let p011 = vertex_transform(vec3(
-                            element.from[0] / 16.0,
-                            element.to[1] / 16.0,
-                            element.to[2] / 16.0,
-                        ));
-                        let p100 = vertex_transform(vec3(
-                            element.to[0] / 16.0,
-                            element.from[1] / 16.0,
-                            element.from[2] / 16.0,
-                        ));
-                        let p101 = vertex_transform(vec3(
-                            element.to[0] / 16.0,
-                            element.from[1] / 16.0,
-                            element.to[2] / 16.0,
-                        ));
-                        let p110 = vertex_transform(vec3(
-                            element.to[0] / 16.0,
-                            element.to[1] / 16.0,
-                            element.from[2] / 16.0,
-                        ));
-                        let p111 = vertex_transform(vec3(
-                            element.to[0] / 16.0,
-                            element.to[1] / 16.0,
-                            element.to[2] / 16.0,
-                        ));
+                        let p = std::array::from_fn(|corner| {
+                            vertex_transform(corner_position(
+                                corner as Corner,
+                                Vec3::from_array(element.from) / 16.0,
+                                Vec3::from_array(element.to) / 16.0,
+                            ))
+                        });
 
-                        // The eight corners of the box, indexed the way [`Corner`] is: `x` is 1, `y` is 2
-                        // and `z` is 4. [`face_vertices`] names the four of each face.
-                        let p = [
-                            p000, p100, p010, p110, p001, p101, p011, p111,
-                        ];
-
-                        let mut faces = vec![];
-                        faces.extend(south.map(|south_face| BlockModelFace {
-                            vertices: sprite_vertices(Direction::South, &p, south_face.uv),
-                            normal: rotation.direction(vec3(0.0, 0.0, 1.0)),
-                            tint_index: south_face.tint_index,
-                            uv_flags: south_face.uv_flags,
-                            layer: model_layer.stronger(south_face.layer),
-                            cull: south_face.cull,
-                        }));
-                        faces.extend(west.map(|west_face| BlockModelFace {
-                            vertices: sprite_vertices(Direction::West, &p, west_face.uv),
-                            normal: rotation.direction(vec3(-1.0, 0.0, 0.0)),
-                            tint_index: west_face.tint_index,
-                            uv_flags: west_face.uv_flags,
-                            layer: model_layer.stronger(west_face.layer),
-                            cull: west_face.cull,
-                        }));
-                        faces.extend(north.map(|north_face| BlockModelFace {
-                            vertices: sprite_vertices(Direction::North, &p, north_face.uv),
-                            normal: rotation.direction(vec3(0.0, 0.0, -1.0)),
-                            tint_index: north_face.tint_index,
-                            uv_flags: north_face.uv_flags,
-                            layer: model_layer.stronger(north_face.layer),
-                            cull: north_face.cull,
-                        }));
-                        faces.extend(east.map(|east_face| BlockModelFace {
-                            vertices: sprite_vertices(Direction::East, &p, east_face.uv),
-                            normal: rotation.direction(vec3(1.0, 0.0, 0.0)),
-                            tint_index: east_face.tint_index,
-                            uv_flags: east_face.uv_flags,
-                            layer: model_layer.stronger(east_face.layer),
-                            cull: east_face.cull,
-                        }));
-                        faces.extend(up.map(|up_face| BlockModelFace {
-                            vertices: sprite_vertices(Direction::Up, &p, up_face.uv),
-                            normal: rotation.direction(vec3(0.0, 1.0, 0.0)),
-                            tint_index: up_face.tint_index,
-                            uv_flags: up_face.uv_flags,
-                            layer: model_layer.stronger(up_face.layer),
-                            cull: up_face.cull,
-                        }));
-
-                        faces.extend(down.map(|down_face| BlockModelFace {
-                            vertices: sprite_vertices(Direction::Down, &p, down_face.uv),
-                            normal: rotation.direction(vec3(0.0, -1.0, 0.0)),
-                            tint_index: down_face.tint_index,
-                            uv_flags: down_face.uv_flags,
-                            layer: model_layer.stronger(down_face.layer),
-                            cull: down_face.cull,
-                        }));
                         faces
+                            .into_iter()
+                            .map(|(direction, face): (Direction, FaceData)| BlockModelFace {
+                                vertices: sprite_vertices(direction, &p, face.uv),
+                                normal: rotation.direction(direction.normal()),
+                                tint_index: face.tint_index,
+                                uv_flags: face.uv_flags,
+                                layer: model_layer.stronger(face.layer),
+                                cull: face.cull,
+                            })
+                            .collect::<Vec<BlockModelFace>>()
                     })
                     .collect::<Vec<BlockModelFace>>())
             })
@@ -1363,91 +1405,106 @@ impl ModelMesh {
 /// Resolving a model, and the check that catches what resolution could not do. See [`resolve_model`]
 /// and [`unresolved_texture`].
 /// The pairing of a face's four corners with the four corners of its sprite. See [`face_vertices`].
+/// The position of a corner of an element's box, **named the way the baker names it**.
+///
+/// The baker writes its eight corners out as `p000`..`p111`, and this is that list as a function: the
+/// three bits of a [`Corner`] are `x` in 4, `y` in 2, `z` in 1.
+///
+/// Written by name and not by shifting, because the bit order is the *reverse* of `x`, `y`, `z` - and a
+/// mirrored box is a symmetry of the six faces, so nothing about a full cube looks wrong when it is read
+/// the wrong way. It took a test on a slab, whose sides are not a full block in `y`, for the mirror to
+/// show up at all.
+#[cfg_attr(not(test), allow(dead_code))]
+fn corner_position(corner: Corner, from: Vec3, to: Vec3) -> Vec3 {
+    match corner {
+        0 => vec3(from.x, from.y, from.z), // p000
+        4 => vec3(to.x, from.y, from.z),   // p100
+        2 => vec3(from.x, to.y, from.z),   // p010
+        6 => vec3(to.x, to.y, from.z),     // p110
+        1 => vec3(from.x, from.y, to.z),   // p001
+        5 => vec3(to.x, from.y, to.z),     // p101
+        3 => vec3(from.x, to.y, to.z),     // p011
+        7 => vec3(to.x, to.y, to.z),       // p111
+        _ => unreachable!("a corner is one of the box's eight"),
+    }
+}
+
 #[cfg(test)]
 mod face_orientation_tests {
     use super::*;
 
-    /// **The bug this test is for.** A face whose corners are joined to the wrong corners of its sprite is
-    /// that face turned by a quarter turn, and the report was exactly that:
+    /// **What one face's four vertices actually draw**, which is the pairing read the way the renderer
+    /// reads it: [`sprite_vertices`] and [`face_vertices`] together, on a full cube against a sprite with
+    /// four corners the test can tell apart.
     ///
-    /// > some blocks' faces are rotated against the game's - 90, 180 or 270 degrees
+    /// The three tests around this one check the table against the game's tables; this one checks that
+    /// the thing the vertex buffer ends up holding is the same table. It is here because the two are not
+    /// one function: the corner of the box comes from [`face_vertices`], the point of the sprite it
+    /// samples comes from the same table, and a face whose corners are right and whose texture
+    /// coordinates are turned is the whole of the report this work started from.
     ///
-    /// The check is against `FaceBakery#defaultFaceUV` rather than against the table itself, because that
-    /// is the independent statement of the same thing: six lines that say which way round each face's
-    /// texture goes, and from which both the axis a face's `u` runs along *and* its direction fall out.
-    ///
-    /// ```java
-    /// case DOWN  -> new UVs(from.x(), 16.0F - to.z(), to.x(), 16.0F - from.z());
-    /// case UP    -> new UVs(from.x(), from.z(), to.x(), to.z());
-    /// case NORTH -> new UVs(16.0F - to.x(), 16.0F - to.y(), 16.0F - from.x(), 16.0F - from.y());
-    /// case SOUTH -> new UVs(from.x(), 16.0F - to.y(), to.x(), 16.0F - from.y());
-    /// case WEST  -> new UVs(from.z(), 16.0F - to.y(), to.z(), 16.0F - from.y());
-    /// case EAST  -> new UVs(16.0F - to.z(), 16.0F - to.y(), 16.0F - from.z(), 16.0F - from.y());
-    /// ```
-    ///
-    /// `from` is the element's low corner and `to` its high one, so each line is two facts: **which world
-    /// axis the sprite's `u` runs along** (`x` on an UP face, `z` on a WEST one, and the negative of one
-    /// where the line is written `16 - to`), and **which way the sprite's `v` runs** - down every side
-    /// face, along `+z` on an UP face, along `-z` on a DOWN one. A pairing that reverses either is the
-    /// face turned, which is invisible on a texture with no direction to it and plain on every texture
-    /// that has one; the table here had an UP face a half turn out and a DOWN face a quarter turn.
+    /// A full sprite of sixteen texels is used, and the rectangle is written in *texture* coordinates
+    /// `0..1` the way the vertex holds them - so a corner of it is `0.0` or `1.0`, and the four corners
+    /// are the four pairs of those.
     #[test]
-    fn a_face_pairs_its_corners_with_its_sprite_the_way_the_game_does() {
-        // `(direction, the axis u runs along, its sign, the axis v runs along, its sign)` - the six lines
-        // above, one row each. The axes are `0 = x, 1 = y, 2 = z`.
-        for (dir, u_axis, u_sign, v_axis, v_sign) in [
-            (Direction::Up, 0, 1, 2, 1),
-            (Direction::Down, 0, 1, 2, -1),
-            (Direction::North, 0, -1, 1, -1),
-            (Direction::South, 0, 1, 1, -1),
-            (Direction::West, 2, 1, 1, -1),
-            (Direction::East, 2, -1, 1, -1),
+    fn a_faces_vertices_sample_the_corners_its_table_names() {
+        // A full cube in blocks, and its corners in the same `x` in 4, `y` in 2, `z` in 1 reading.
+        let corners: [glam::Vec3; 8] = std::array::from_fn(|n| {
+            glam::Vec3::new(
+                if n & 4 == 0 { 0.0 } else { 1.0 },
+                if n & 2 == 0 { 0.0 } else { 1.0 },
+                if n & 1 == 0 { 0.0 } else { 1.0 },
+            )
+        });
+
+        // The whole sprite, in the units the vertex holds a texture coordinate in: `0` and `1` are the
+        // two ends of the rectangle, and `sprite_vertices` copies them straight into the vertex.
+        let uv = ((0u16, 0u16), (1u16, 1u16));
+
+        for dir in [
+            Direction::Up,
+            Direction::Down,
+            Direction::North,
+            Direction::South,
+            Direction::West,
+            Direction::East,
         ] {
-            let vertices = face_vertices(dir);
+            let expected = face_vertices(dir);
+            let vertices = sprite_vertices(dir, &corners, uv);
 
-            for (axis, sign, is_u) in [(u_axis, u_sign, true), (v_axis, v_sign, false)] {
-                // The sprite coordinate this check is about, of one vertex's sprite corner.
-                let coordinate = |sprite: SpriteCorner| if is_u { sprite.0 } else { sprite.1 };
+            assert_eq!(vertices.len(), 4);
 
-                // The two vertices that differ only along this axis are the two ends of it: the sprite
-                // coordinate has to grow from the low one to the high one when the sign is positive, and
-                // shrink when it is negative.
-                for first in 0..4 {
-                    for second in 0..4 {
-                        let (first_corner, first_sprite) = vertices[first];
-                        let (second_corner, second_sprite) = vertices[second];
+            for (index, vertex) in vertices.iter().enumerate() {
+                let (corner, (high_u, high_v)) = expected[index];
 
-                        if first_corner ^ second_corner != 1 << axis {
-                            continue;
-                        }
+                assert_eq!(
+                    vertex.position, corners[corner as usize],
+                    "{dir:?}: vertex {index} is not at the corner of the box the table names",
+                );
 
-                        // `low` is the end of the axis the element's `from` is at, whichever of the two
-                        // vertices that is, and `high` the end its `to` is at.
-                        let (low, high) = if first_corner & (1 << axis) == 0 {
-                            (first_sprite, second_sprite)
-                        } else {
-                            (second_sprite, first_sprite)
-                        };
-
-                        assert_ne!(
-                            coordinate(low),
-                            coordinate(high),
-                            "{dir:?}: two corners of the face that differ only along {axis} sample the \
-                             same edge of the sprite, so the face is squashed rather than turned"
-                        );
-
-                        assert_eq!(
-                            coordinate(high),
-                            sign > 0,
-                            "{dir:?}: {} runs the wrong way - the sprite's {} has to grow towards the \
-                             world's {axis} (or shrink, where the game's line is written `16 - to`). \
-                             This is the face turned by a quarter turn",
-                            if is_u { "u" } else { "v" },
-                            if is_u { "high u" } else { "high v" }
-                        );
-                    }
-                }
+                assert_eq!(
+                    vertex.tex_coords,
+                    [if high_u { 1u16 } else { 0 }, if high_v { 1u16 } else { 0 },],
+                    "{dir:?}: vertex {index} does not sample the corner of the sprite the table names",
+                );
             }
+
+            // All four corners of the sprite, once each: a pairing that sampled one twice would leave a
+            // quarter of the sprite unread and draw the face with a corner of the texture stretched
+            // across half of it.
+            let mut sampled: Vec<(u16, u16)> = vertices
+                .iter()
+                .map(|vertex| (vertex.tex_coords[0], vertex.tex_coords[1]))
+                .collect();
+            sampled.sort_unstable();
+            sampled.dedup();
+
+            assert_eq!(
+                sampled.len(),
+                4,
+                "{dir:?}: the four vertices sample {} different corners of the sprite - {sampled:?}",
+                sampled.len(),
+            );
         }
     }
 
@@ -1484,6 +1541,285 @@ mod face_orientation_tests {
                 );
             }
         }
+    }
+
+    /// **The test that catches a pairing turned against the game.** The two tests above are about the
+    /// *shape* of the pairing - which way the sprite's axes run, and that the walk around the box is the
+    /// walk around the sprite - and both of them passed while four of the six faces were a quarter turn
+    /// out, because a pairing that is turned still has both of those properties.
+    ///
+    /// This one is the one that found it, and it is not a second copy of the table: it asks the game's
+    /// own six lines, [`default_face_uv`], which corner of the sprite each corner of the box samples, and
+    /// then asks the table whether the vertex at that corner of the box really samples it.
+    ///
+    /// **The axes are derived, not assumed.** Each of the game's lines writes each of its two coordinates
+    /// out of one of the box's axes only, so the axis a coordinate runs along is the one that changes it:
+    /// move that axis and the coordinate moves, move the other two and it does not. Asking that of
+    /// `default_face_uv` itself - for a slab, where all three axes have different extents - reads the six
+    /// lines' choices back out of them instead of restating them here, which matters because assumptions
+    /// about those choices are exactly what the three wrong tables got wrong.
+    ///
+    /// The box corner is read by [`corner_position`], the same function the bake reads it by: a test that
+    /// works the bits out for itself can mirror the box, and a mirrored box is a symmetry of the six faces
+    /// that nothing else here notices.
+    #[test]
+    fn a_face_pairs_its_corners_the_way_the_games_own_uv_lines_do() {
+        // A slab: `x` and `z` are a block, `y` is half of one, so no two axes are confusable.
+        let bounds = ElementBounds {
+            from: [0.0, 0.0, 0.0],
+            to: [16.0, 8.0, 16.0],
+        };
+
+        for (dir, outward) in [
+            (Direction::Down, glam::Vec3::NEG_Y),
+            (Direction::Up, glam::Vec3::Y),
+            (Direction::North, glam::Vec3::NEG_Z),
+            (Direction::South, glam::Vec3::Z),
+            (Direction::West, glam::Vec3::NEG_X),
+            (Direction::East, glam::Vec3::X),
+        ] {
+            let uv = default_face_uv(bounds, dir);
+
+            // Which axis each of the rectangle's two coordinates runs along. Moving one end of one axis
+            // moves exactly that axis's coordinate: the low end sets which of the two numbers is the low
+            // one, so the coordinate that ends up with the *smaller* value is the one this axis runs
+            // along - and the other coordinate is untouched.
+            // Which axis each of the rectangle's two coordinates runs along, asked of the game's own
+            // line: moving one end of one axis moves exactly that axis's coordinate, and nothing else.
+            // Both the low and the high end of the axis are tried, because the six lines run each of
+            // their two coordinates either way round.
+            let runs_along = |axis: usize| {
+                let mut u_moved = false;
+                let mut v_moved = false;
+
+                for end in [true, false] {
+                    let mut moved = bounds;
+
+                    if end {
+                        moved.to[axis] += 4.0;
+                    } else {
+                        moved.from[axis] += 4.0;
+                    }
+
+                    let moved = default_face_uv(moved, dir);
+
+                    u_moved |= moved[0] != uv[0] || moved[2] != uv[2];
+                    v_moved |= moved[1] != uv[1] || moved[3] != uv[3];
+                }
+
+                (u_moved, v_moved)
+            };
+
+            let mut u_axis = None;
+            let mut v_axis = None;
+
+            for axis in 0..3 {
+                match runs_along(axis) {
+                    (true, false) => u_axis = Some(axis),
+                    (false, true) => v_axis = Some(axis),
+                    _ => {}
+                }
+            }
+
+            let u_axis = u_axis.unwrap_or_else(|| panic!("{dir:?}: no axis moves `u`"));
+            let v_axis = v_axis.unwrap_or_else(|| panic!("{dir:?}: no axis moves `v`"));
+
+            assert_ne!(u_axis, v_axis, "{dir:?}: `u` and `v` follow the same axis");
+
+            // And which way each runs: growing the axis, does the coordinate the game gives grow with it?
+            // Read off the line rather than off the rectangle, because a rectangle with both ends at the
+            // same value - any full-face of an element that fills the block - says nothing about which end
+            // is which, and that is exactly the case a full cube is made of.
+            let u_grows_with_axis = {
+                let mut moved = bounds;
+                moved.to[u_axis] += 4.0;
+
+                let moved = default_face_uv(moved, dir);
+
+                // The coordinate that moved is `u`; the direction it moved in is the answer.
+                moved[0] > uv[0] || moved[2] > uv[2]
+            };
+
+            let v_grows_with_axis = {
+                let mut moved = bounds;
+                moved.to[v_axis] += 4.0;
+
+                let moved = default_face_uv(moved, dir);
+
+                moved[1] > uv[1] || moved[3] > uv[3]
+            };
+
+            println!(
+                "{dir:?} uv {uv:?} axes u{u_axis} v{v_axis} grows ({u_grows_with_axis}, \
+                 {v_grows_with_axis}) wind {outward}"
+            );
+
+            for (index, (corner, sprite)) in face_vertices(dir).into_iter().enumerate() {
+                let p = corner_position(corner, glam::Vec3::ZERO, glam::Vec3::ONE);
+                let at = |axis: usize| match axis {
+                    0 => p.x,
+                    1 => p.y,
+                    _ => p.z,
+                };
+
+                // The sprite corner the game's line puts this corner of the box at. `from` is zero and
+                // `to` is one here, so a fraction above a half is the `to` end - and which end that
+                // samples which side of the sprite is what the two directions above say.
+                let high = |grows: bool, value: f32| (value > 0.5) == grows;
+
+                let wanted = (
+                    high(u_grows_with_axis, at(u_axis)),
+                    high(v_grows_with_axis, at(v_axis)),
+                );
+
+                assert_eq!(
+                    sprite, wanted,
+                    "{dir:?}: vertex {index} is at box corner {corner} - world {p} - and the game's own \
+                     default uv says a corner there samples {wanted:?}, while the table says {sprite:?}. A \
+                     corner of the box joined to the wrong corner of the sprite is that face turned about \
+                     its own middle, which is the report this test was written for: 'some blocks' faces \
+                     are rotated against the game's'",
+                );
+            }
+        }
+    }
+
+    /// The order the four vertices are written in is what the renderer culls on, and this is the check
+    /// the game itself runs on it: `FaceBakery#calculateFacing` takes the normal of the first three
+    /// quad, and the quad is only wound the way the renderer draws it if that normal is the outward one.
+    ///
+    /// It is worth a test of its own because the order is what the other two tests cannot see. A table of
+    /// pairings turned as a whole - every corner of the box still joined to a corner of the sprite, the
+    /// walk still going the right way round - draws every face with its texture turned, and it was three
+    /// tables before this one that had the order right.
+    ///
+    /// The renderer's `front_face` is `Ccw` and its cull mode is back, so "the outward normal" here is
+    /// also what stops a face being culled: an inward one is a face that is never drawn.
+    #[test]
+    fn every_face_turns_the_way_the_renderer_draws_it() {
+        for (dir, outward) in [
+            (Direction::Down, glam::Vec3::NEG_Y),
+            (Direction::Up, glam::Vec3::Y),
+            (Direction::North, glam::Vec3::NEG_Z),
+            (Direction::South, glam::Vec3::Z),
+            (Direction::West, glam::Vec3::NEG_X),
+            (Direction::East, glam::Vec3::X),
+        ] {
+            // A full cube in blocks, read by the same function the baker reads its corners by - so that
+            // this test and the bake agree about which corner is which, which is the disagreement that
+            // hid a mirrored box from every test here for a while.
+            let corner = |n: Corner| corner_position(n, glam::Vec3::ZERO, glam::Vec3::ONE);
+
+            let [a, b, c, _d] =
+                face_vertices(dir).map(|(corner_index, _sprite)| corner(corner_index));
+
+            let normal = (b - a).cross(c - a).normalize();
+
+            assert!(
+                normal.abs_diff_eq(outward, 1e-6),
+                "{dir:?}: the first three vertices wind to {normal}, and this face points {outward}. \
+                 The renderer culls back faces, so an inward normal here is a face that is never drawn \
+                 - and `FaceBakery#calculateFacing`, which reads the facing off these same three \
+                 vertices, would call this quad the opposite face"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+/// The `uv` a face gets when its model writes none. See [`default_face_uv`].
+mod default_uv_tests {
+    use super::*;
+
+    /// **What this test is for.** A face that writes no `uv` was covering the whole sprite, which is
+    /// the one answer that is wrong for every model that is not a full cube: a bottom slab, a stair, a
+    /// pane and every plant are all *part* of a block sampling the sprite the game cut out for them.
+    ///
+    /// The numbers are `FaceBakery#defaultFaceUV`'s six lines for a bottom slab - `from [0, 0, 0]`,
+    /// `to [16, 8, 16]` - evaluated in this side's terms. Every one of the six is different, so nothing
+    /// here can pass by the axes being right and the signs being wrong, or the other way round.
+    ///
+    /// Up and Down keep the `v` axis the game does not turn on them; the four sides are the game's lines
+    /// with `16 - y` read as `y`, which is what a box corner *is* on this side's winding - see
+    /// [`default_face_uv`].
+    #[test]
+    fn a_face_without_a_uv_covers_the_element_and_not_the_sprite() {
+        let bottom_slab = ElementBounds {
+            from: [0.0, 0.0, 0.0],
+            to: [16.0, 8.0, 16.0],
+        };
+
+        for (dir, expected) in [
+            (Direction::Up, [0.0, 16.0, 16.0, 0.0]),
+            (Direction::Down, [0.0, 0.0, 16.0, 16.0]),
+            (Direction::North, [16.0, 8.0, 0.0, 0.0]),
+            (Direction::South, [0.0, 0.0, 16.0, 8.0]),
+            (Direction::West, [0.0, 0.0, 16.0, 8.0]),
+            (Direction::East, [16.0, 0.0, 0.0, 8.0]),
+        ] {
+            assert_eq!(
+                default_face_uv(bottom_slab, dir),
+                expected,
+                "{dir:?} of a bottom slab",
+            );
+        }
+
+        // An element that does not fill the block across and down either, so that a face which took
+        // the whole sprite on one axis is not hidden by the other axis being full.
+        let post = ElementBounds {
+            from: [4.0, 0.0, 4.0],
+            to: [12.0, 16.0, 12.0],
+        };
+
+        for (dir, expected) in [
+            (Direction::Up, [4.0, 12.0, 12.0, 4.0]),
+            (Direction::Down, [4.0, 4.0, 12.0, 12.0]),
+            (Direction::North, [12.0, 16.0, 4.0, 0.0]),
+            (Direction::South, [4.0, 0.0, 12.0, 16.0]),
+            (Direction::West, [4.0, 0.0, 12.0, 16.0]),
+            (Direction::East, [12.0, 0.0, 4.0, 16.0]),
+        ] {
+            assert_eq!(default_face_uv(post, dir), expected, "{dir:?} of a post");
+        }
+    }
+
+    /// The default is what a face's four vertices sample, which is the end of the chain: a bottom slab's
+    /// side is **half the sprite**, and a face that stretched the sprite over itself would have corners
+    /// at `0` and `1` instead.
+    ///
+    /// `v` is the one that shows it, because `16 - y` is where a slab's height enters the uv: the side
+    /// of a slab that is half a block tall samples the half of the sprite that is eight sixteenths,
+    /// whatever half that turns out to be.
+    #[test]
+    fn a_slab_side_covers_half_the_sprite() {
+        let bottom_slab = ElementBounds {
+            from: [0.0, 0.0, 0.0],
+            to: [16.0, 8.0, 16.0],
+        };
+
+        // A sprite that covers the whole of a normalized rectangle, so that a fraction of the sprite
+        // is the number itself.
+        let uv = get_game_atlas_uv(
+            default_face_uv(bottom_slab, Direction::North),
+            0,
+            [0.0, 0.0, 1.0, 1.0],
+        );
+
+        let vs: Vec<u16> = face_vertices(Direction::North)
+            .map(|(_corner, (max_u, max_v))| {
+                let _ = max_u;
+                if max_v { uv.1.1 } else { uv.0.1 }
+            })
+            .to_vec();
+
+        let span = *vs.iter().max().expect("four") as i32 - *vs.iter().min().expect("four") as i32;
+
+        assert_eq!(
+            span,
+            game_bits(0.5) as i32,
+            "a bottom slab's side sampled {vs:?}, which is not half the sprite - a slab is half a block \
+             tall and its sprite is not, so this is the texture drawn at the wrong scale",
+        );
     }
 }
 
@@ -1740,9 +2076,12 @@ fn decide_game_atlas(
 mod game_atlas_tests {
     use super::*;
 
-    /// Runs `check` over one north face of a full cube, with the `uv` and `rotation` written into the
-    /// JSON - the two fields every test here is about.
-    fn with_face(uv: &str, rotation: u32, check: impl FnOnce(&schemas::models::ElementFace)) {
+    /// Runs `check` over the `uv` and `rotation` one north face of a full cube was written with - the
+    /// two fields every test here is about, in the units the model file wrote them in.
+    ///
+    /// The model is parsed on the way, so that a fixture which is not valid JSON - or not a model this
+    /// build can read - fails here rather than testing arithmetic on a rectangle nothing wrote.
+    fn with_face(uv: &str, rotation: u32, check: impl FnOnce([f32; 4], u32)) {
         let json = format!(
             r##"{{
                 "textures": {{ "all": "minecraft:block/fire_0" }},
@@ -1766,15 +2105,15 @@ mod game_atlas_tests {
             .get(&schemas::models::BlockFace::North)
             .expect("the face the fixture wrote");
 
-        check(face);
+        check(face.uv.expect("the fixture writes a uv"), face.rotation);
     }
 
     /// A face that writes no `uv` covers the whole sprite: sixteen units to the sprite, whatever the
     /// sprite's size in the game's atlas, so the corners are the rectangle's own.
     #[test]
     fn a_face_that_names_no_uv_covers_the_whole_sprite() {
-        with_face("[0, 0, 16, 16]", 0, |face| {
-            let corners = get_game_atlas_uv(face, [0.25, 0.5, 0.75, 1.0]);
+        with_face("[0, 0, 16, 16]", 0, |uv, rotation| {
+            let corners = get_game_atlas_uv(uv, rotation, [0.25, 0.5, 0.75, 1.0]);
 
             assert_eq!(
                 corners,
@@ -1789,8 +2128,8 @@ mod game_atlas_tests {
     /// game's atlas does not have to be measured here: half a sprite is half of the *rectangle*.
     #[test]
     fn a_face_is_a_fraction_of_the_sprite_and_not_of_the_atlas() {
-        with_face("[0, 0, 8, 8]", 0, |face| {
-            let corners = get_game_atlas_uv(face, [0.0, 0.0, 0.5, 0.5]);
+        with_face("[0, 0, 8, 8]", 0, |uv, rotation| {
+            let corners = get_game_atlas_uv(uv, rotation, [0.0, 0.0, 0.5, 0.5]);
 
             assert_eq!(
                 corners,
@@ -1805,9 +2144,9 @@ mod game_atlas_tests {
     /// as soon as the sprite was not at the origin.
     #[test]
     fn a_quarter_turn_stays_inside_the_sprite() {
-        with_face("[0, 0, 8, 16]", 90, |face| {
+        with_face("[0, 0, 8, 16]", 90, |uv, rotation| {
             let rect = [0.25, 0.25, 0.5, 0.5];
-            let corners = get_game_atlas_uv(face, rect);
+            let corners = get_game_atlas_uv(uv, rotation, rect);
 
             for (u, v) in [corners.0, corners.1] {
                 // The bounds are the rectangle through the same rounding the corners went through:
@@ -1839,15 +2178,15 @@ mod game_atlas_tests {
             ("[2, 3, 9, 14]", 0, ((2.0, 3.0), (9.0, 14.0))),
             ("[2, 3, 9, 14]", 180, ((14.0, 13.0), (7.0, 2.0))),
         ] {
-            with_face(uv, rotation, |face| {
-                let corners = sprite_fractions(face);
+            with_face(uv, rotation, |uv, rotation| {
+                let corners = sprite_fractions(uv, rotation);
 
                 let to_pixels = |(x, y): (f32, f32)| ((x * 16.0).round(), (y * 16.0).round());
 
                 assert_eq!(
                     (to_pixels(corners.0), to_pixels(corners.1)),
                     expected,
-                    "uv {uv} turned by {rotation} degrees"
+                    "uv {uv:?} turned by {rotation} degrees"
                 );
             });
         }
