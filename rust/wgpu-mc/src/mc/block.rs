@@ -136,6 +136,15 @@ pub struct FaceFlags {
     pub blocks_motion: bool,
     pub offset_max_y: f32,
     pub offset_xz: bool,
+    /// **Whether this block is a `LeavesBlock`**, which the game asks as `instanceof LeavesBlock` and
+    /// which is why it comes from the JVM: a mod's leaves are leaves too, and a name comparison here
+    /// would miss every one of them.
+    ///
+    /// It has exactly one reader, and it is not a rendering decision on its own -
+    /// `ModelBlockRenderer#forceOpaque` is `!cutoutLeaves && blockState.getBlock() instanceof
+    /// LeavesBlock`, so this is the half of that question the registry can answer. See
+    /// [`crate::mc::block::cutout_leaves`] for the other half and for what the two decide together.
+    pub leaves: bool,
 }
 
 /// `Mth.getSeed`, the hash every block's random offset is derived from.
@@ -191,6 +200,12 @@ impl FaceFlags {
                 0.0
             },
             offset_xz: self.offset_xz && other.offset_xz,
+            // And the class check, which all states of one block agree on by construction - `leaves` is
+            // a property of the block and not of its state, so an `and` here is an `and` over answers
+            // that are always the same. It is written as one anyway rather than picking either side,
+            // for the same reason the two above are: the combination rule is the contract, and a key
+            // that somehow held both would be answered conservatively.
+            leaves: self.leaves && other.leaves,
         }
     }
 
@@ -455,6 +470,46 @@ pub static UNREADABLE_TEXTURES: MissingSprites = MissingSprites::new();
 /// JVM side logs the answer after the block cache, where its own log lives. See `blockBakeDiagnostics`.
 pub static MISSING_SPRITES: MissingSprites = MissingSprites::new();
 
+/// **How many faces this side baked with the game's atlas, and how many with its own.**
+///
+/// The two numbers that say whether the atlas routing works, and the reason they exist: a face baked
+/// with the game's rectangle samples a mip chain built per sprite, and one baked with this side's
+/// rectangle samples a chain built from the whole packed sheet - which is the difference between a
+/// clean block and a blurred, half-transparent one. Both are 2048x2048 and both answer to the same
+/// filters, so **the picture cannot tell you which one a face went to**; only the counts can.
+///
+/// The decisive reading is at a large view distance in a normal world: the first number should be very
+/// nearly all of them and the second very nearly none. A second number in the thousands means the
+/// rectangles are not arriving - `registerSprite` not called yet, a name that does not match, or
+/// [`crate::render::graph::game_atlas_bound`] still false - and every one of those faces is drawn from
+/// the chain that made the blocks blurry.
+pub static FACES_GAME_ATLAS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// See [`FACES_GAME_ATLAS`].
+pub static FACES_OWN_ATLAS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// **How many faces the leaves switch has moved out of their sprite's layer into the solid one.**
+///
+/// The count of `ModelBlockRenderer#forceOpaque` firing, and the reason it exists: with the game's
+/// `cutoutLeaves` off, a leaf face leaves the cutout layer - which has an alpha test - and joins the
+/// solid one, which has none. The layer report cannot show that, because it counts the whole world:
+/// leaves are a small part of a section and the solid layer is already the largest of the three.
+///
+/// So the reading is direct: **zero with the option off means the switch is not reaching the baker**,
+/// which is exactly the bug this was written to find - the option did nothing at all here before, and
+/// the symptom was that `Fast` and `Fancy` drew identical leaves.
+pub static FACES_FORCED_OPAQUE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The two counts of [`FACES_GAME_ATLAS`], read and not reset - they are a running total for the
+/// session, because "how many" is the question and a per-second rate would need a reader to integrate
+/// it in their head.
+pub fn atlas_face_counts() -> (u64, u64) {
+    (
+        FACES_GAME_ATLAS.load(std::sync::atomic::Ordering::Relaxed),
+        FACES_OWN_ATLAS.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 /// How many sprites [`MISSING_SPRITES`] remembers by name, so a broken pack cannot grow it forever.
 const MISSING_SPRITE_NAMES: usize = 24;
 
@@ -575,7 +630,11 @@ fn face_data(
     let game_rect = atlas.game_atlas_rect(&texture);
 
     let (uv, uv_flags) = match game_rect {
-        Some(rect) => (get_game_atlas_uv(uv, tex.rotation, rect), UV_GAME_ATLAS),
+        Some(rect) => {
+            FACES_GAME_ATLAS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+            (get_game_atlas_uv(uv, tex.rotation, rect), UV_GAME_ATLAS)
+        }
         None => {
             let Some(uv) = get_atlas_uv(uv, tex.rotation, atlas, &texture) else {
                 // The one silent way this baker can fail, and the reason `MISSING_SPRITES` exists: the
@@ -585,6 +644,8 @@ fn face_data(
 
                 return None;
             };
+
+            FACES_OWN_ATLAS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
             (uv, 0)
         }
@@ -2423,13 +2484,15 @@ mod diagnostic_tests {
 
     /// Which atlas a face belongs to, over every combination of what the decision reads.
     ///
-    /// The three inputs are a setting (`Fast`/`Fancy` on the options screen), whether the pass that
-    /// would draw the face has the game's atlas, and whether the game animates the sprite at all. A
-    /// truth table rather than three examples because a "yes" that should have been a "no" is a face
-    /// drawn with the wrong texture on it, and that is the one outcome nobody would guess from a still
-    /// picture.
+    /// The two inputs that decide it are a setting (the options screen's `animated textures`) and
+    /// whether the pass that would draw the face has the game's atlas. **Whether the game animates the
+    /// sprite no longer decides anything** - every sprite goes to the game's atlas, because that is the
+    /// one whose mip chain was built per sprite before packing. See [`decide_game_atlas`].
+    ///
+    /// A truth table rather than examples because a "yes" that should have been a "no" is a face drawn
+    /// with the wrong texture on it, and that is the one outcome nobody would guess from a still picture.
     #[test]
-    fn a_face_goes_to_the_game_atlas_only_when_every_input_agrees() {
+    fn a_face_goes_to_the_game_atlas_when_the_setting_and_the_binding_agree() {
         let rect = [0.25, 0.25, 0.5, 0.5];
 
         for animation_on in [false, true] {
@@ -2437,20 +2500,31 @@ mod diagnostic_tests {
                 for animated in [false, true] {
                     let decided =
                         decide_game_atlas(animation_on, atlas_bound, animated, Some(rect));
-                    let expected = (animation_on && atlas_bound && animated).then_some(rect);
+                    let expected = (animation_on && atlas_bound).then_some(rect);
 
                     assert_eq!(
                         decided, expected,
                         "animation {animation_on}, atlas bound {atlas_bound}, animated sprite \
                          {animated}"
                     );
+
+                    // **The sprite's own animation must make no difference**, which is the change this
+                    // round: an unanimated sprite reads the game's atlas exactly as an animated one
+                    // does, because the reason is the mip chain rather than the movement.
+                    assert_eq!(
+                        decided,
+                        decide_game_atlas(animation_on, atlas_bound, !animated, Some(rect)),
+                        "whether the game animates the sprite must not change the answer"
+                    );
                 }
             }
         }
 
-        // And a sprite with no rectangle to point at is this side's copy whatever the other three say:
+        // And a sprite with no rectangle to point at is this side's copy whatever the other inputs say:
         // there is nowhere in the game's atlas for the face to go.
-        assert_eq!(decide_game_atlas(true, true, true, None), None);
+        for animated in [false, true] {
+            assert_eq!(decide_game_atlas(true, true, animated, None), None);
+        }
     }
 
     /// The switch is on unless something turned it off, which is the game's own behaviour and what a
@@ -2518,6 +2592,43 @@ pub fn set_animated_textures(enabled: bool) {
     ANIMATED_TEXTURES.store(enabled, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// **Whether a leaf block's faces are cut out or drawn opaque**, which is the game's own `cutoutLeaves`
+/// option - `Fancy` leaves it on, `Fast` turns it off, and the video settings screen exposes it directly.
+///
+/// On by default, which is the game's own default and the reason leaves look like leaves.
+///
+/// **Off is `ModelBlockRenderer#forceOpaque`, and the whole of it is one line:**
+///
+/// ```java
+/// public static boolean forceOpaque(boolean cutoutLeaves, BlockState blockState) {
+///     return !cutoutLeaves && blockState.getBlock() instanceof LeavesBlock;
+/// }
+/// ```
+///
+/// In the game that sends a leaf face to the **solid** layer whatever its sprite says, and the solid layer
+/// has no alpha test - so the transparent gaps in a leaf texture are filled by the texture's own colour
+/// rather than cut away, and the block reads as a solid mass. This side decides a face's layer from its
+/// *sprite* (`Atlas::sprite_layer`, where leaves are cut out because their texture has holes), so without
+/// this the option did nothing here at all: `Fast` and `Fancy` drew identical leaves. That is the bug
+/// this closes.
+///
+/// Read while a face is baked, so moving it costs a re-bake - see [`set_cutout_leaves`], whose caller on
+/// the JVM side asks for one.
+static CUTOUT_LEAVES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Whether a leaf block's faces are cut out. See [`CUTOUT_LEAVES`].
+pub fn cutout_leaves() -> bool {
+    CUTOUT_LEAVES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Sets [`CUTOUT_LEAVES`].
+///
+/// Nothing is re-baked here, for the same reason [`set_animated_textures`] does not: the caller is the
+/// settings path, and the re-bake is asked for separately. See `WgpuNative.setCutoutLeaves`.
+pub fn set_cutout_leaves(cutout: bool) {
+    CUTOUT_LEAVES.store(cutout, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Which atlas a face belongs to: the game's own rectangle for its sprite, or `None` for this side's.
 ///
 /// The whole of the decision, in one place, and it takes three answers that come from three different
@@ -2543,18 +2654,33 @@ pub fn face_uses_game_atlas(animated_sprite: bool, rect: Option<[f32; 4]>) -> Op
 
 /// The gate itself, with every input handed in rather than read.
 ///
-/// Split out so that the decision can be tested: the three globals behind it are a setting, a handed-over
-/// GPU texture and a table the game fills, and none of them can be moved in a test. The truth table is
-/// the contract - all three have to agree, and the failure modes are not symmetric: a "no" is a face
-/// drawn from this side's copy of its sprite, while a "yes" that should have been a "no" is a face with
-/// the wrong texture on it.
+/// Split out so that the decision can be tested: the globals behind it are a setting, a handed-over GPU
+/// texture and a table the game fills, and none of them can be moved in a test.
+///
+/// **`animated_sprite` is taken and ignored, and that is the fix this round.** Every sprite goes to the
+/// game's atlas now, not only the ones the game animates, because the game's atlas is the one whose mip
+/// chain was built **per sprite, before packing** - `SpriteContents#increaseMipLevel` runs during
+/// stitching, `MipmapGenerator#generateMipLevels` applies `AUTO -> hasTransparent() ? CUTOUT : MEAN`
+/// with alpha-coverage preservation, and `Stitcher` pads each sprite by `1 << mipLevel` so no sprite's
+/// mips can reach its neighbours'. This side's own atlas packs first and mips the **whole packed image**
+/// afterwards, which is wrong twice over: a sprite's transparent padding is averaged with whatever sits
+/// next to it in the sheet, and the alpha average leaves a 16x16 cutout sprite with no fully opaque
+/// texel at the coarse levels. The first bleeds a neighbour's colour into a face's edge; the second
+/// makes a face half-transparent at distance. **Both are invisible under `Nearest` and obvious under a
+/// bilinear filter**, which is why the filter was ever a question.
+///
+/// The parameter is kept rather than deleted so that the truth table below still documents the case it
+/// was written for, and so that a future reason to route one kind of sprite differently has somewhere to
+/// go. The truth table is the contract, and the failure modes are not symmetric: a "no" is a face drawn
+/// from this side's copy of its sprite - frozen, and the failure this renderer has always had - while a
+/// "yes" that should have been a "no" is a face with the wrong texture on it.
 fn decide_game_atlas(
     animation_on: bool,
     atlas_bound: bool,
-    animated_sprite: bool,
+    _animated_sprite: bool,
     rect: Option<[f32; 4]>,
 ) -> Option<[f32; 4]> {
-    if animation_on && atlas_bound && animated_sprite {
+    if animation_on && atlas_bound {
         rect
     } else {
         None

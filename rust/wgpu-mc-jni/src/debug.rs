@@ -25,9 +25,10 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use log::warn;
+use crate::JNIEnv;
+use log::{info, warn};
 
-use crate::settings::{DebugSettings, Settings};
+use crate::settings::{DebugSettings, FullscreenMode, Settings};
 
 /// Whether to report what the renderer is doing: pipeline binds, passes, counters, shader dumps.
 static DIAGNOSTICS: AtomicBool = AtomicBool::new(false);
@@ -106,7 +107,24 @@ static GPU_TIMESTAMPS: AtomicBool = AtomicBool::new(false);
 /// Whether a PIX timing capture has been asked for.
 static PIX_CAPTURE: AtomicBool = AtomicBool::new(false);
 
+/// Whether the wgpu instance is created with wgpu's own host-side validation.
+///
+/// The outer of the two validation layers, and the one that decides whether a mistake is *reported* at
+/// all: it is wgpu checking, in this process, that every call the renderer records is a legal one. With
+/// it off, an illegal call is whatever the driver makes of it - a device loss, a validation error from
+/// the driver's own layer if one is loaded, or a frame that is quietly wrong.
+///
+/// Read once, when the instance is built: an instance flag cannot be changed afterwards, which is why
+/// the setting that feeds it is marked as needing a restart.
+static HOST_VALIDATION: AtomicBool = AtomicBool::new(false);
+
 /// Whether the wgpu instance is created with the driver's GPU-based validation.
+///
+/// **The inner layer, and it needs the outer one.** GPU-based validation checks the commands wgpu
+/// recorded, so with [`HOST_VALIDATION`] off there is nothing for it to check and wgpu ignores the flag.
+/// The two are therefore resolved together in [`validation_flags`] rather than independently - a player
+/// who turns this on alone gets host-side validation as well, because that is the only state in which
+/// this switch does anything.
 ///
 /// Read once, when the instance is built: an instance flag cannot be changed afterwards, which is
 /// why the setting that feeds it is marked as needing a restart.
@@ -125,6 +143,46 @@ static TERRAIN_NO_CULL: AtomicBool = AtomicBool::new(false);
 /// Whether the graph's pipelines are built with the depth test the other way round. The other half
 /// of the pair above.
 static TERRAIN_GREATER_DEPTH: AtomicBool = AtomicBool::new(false);
+
+/// Whether shaders and objects are built with debug information - wgpu's `DEBUG` instance flag.
+///
+/// The flags that are decided when the wgpu instance is created rather than read as something is drawn.
+/// They are kept here with the rest of the switches because that is what they are - an options-screen
+/// switch with an atomic behind it - and read once, in `device::instance_flags`, for the same reason:
+/// an instance flag cannot be changed after the instance exists.
+static SHADER_DEBUG_INFO: AtomicBool = AtomicBool::new(true);
+
+/// Whether an indirect draw whose arguments are out of bounds is turned into a no-op.
+static VALIDATE_INDIRECT_CALLS: AtomicBool = AtomicBool::new(true);
+
+/// Whether object labels are kept from the backend.
+static DISCARD_BACKEND_LABELS: AtomicBool = AtomicBool::new(false);
+
+/// Whether an adapter whose driver is not compliant with the graphics API may be chosen.
+static ALLOW_NONCOMPLIANT_ADAPTER: AtomicBool = AtomicBool::new(false);
+
+/// The four instance flags above, as one answer, because they are always wanted together.
+///
+/// Returned as a struct rather than read one at a time by the caller for the reason
+/// [`validation_flags`] is a pair: the flag set is only correct as a whole, and four separate reads are
+/// four chances to combine them wrongly.
+#[derive(Copy, Clone, Debug)]
+pub struct InstanceFlagSettings {
+    pub shader_debug_info: bool,
+    pub validate_indirect_calls: bool,
+    pub discard_backend_labels: bool,
+    pub allow_noncompliant_adapter: bool,
+}
+
+#[inline]
+pub fn instance_flag_settings() -> InstanceFlagSettings {
+    InstanceFlagSettings {
+        shader_debug_info: SHADER_DEBUG_INFO.load(Ordering::Relaxed),
+        validate_indirect_calls: VALIDATE_INDIRECT_CALLS.load(Ordering::Relaxed),
+        discard_backend_labels: DISCARD_BACKEND_LABELS.load(Ordering::Relaxed),
+        allow_noncompliant_adapter: ALLOW_NONCOMPLIANT_ADAPTER.load(Ordering::Relaxed),
+    }
+}
 
 /// Whether a pipeline-state switch has moved since the graph was last built. See
 /// [`rebuild_pipelines_if_stale`], which is what spends it.
@@ -202,9 +260,23 @@ pub fn section_timing() -> bool {
     SECTION_TIMING.load(Ordering::Relaxed)
 }
 
+/// The two validation switches, resolved into the pair they actually are.
+///
+/// **The order between them is not a preference, it is a dependency.** GPU-based validation checks the
+/// commands wgpu recorded; it is the driver's layer looking over wgpu's shoulder. With host-side
+/// validation off, wgpu records without checking and the driver's layer has nothing to compare
+/// against, so wgpu ignores `GPU_BASED_VALIDATION` in that state. Asking for the inner layer therefore
+/// turns on the outer one too, and the pair returned here is the only honest reading of "the player
+/// asked for validation".
+///
+/// Returned together rather than as two accessors because a caller that read them separately would be
+/// free to combine them wrongly, and one place combining them wrongly is a validation layer that
+/// silently does nothing.
 #[inline]
-pub fn gpu_based_validation() -> bool {
-    GPU_BASED_VALIDATION.load(Ordering::Relaxed)
+pub fn validation_flags() -> (bool, bool) {
+    let gpu = GPU_BASED_VALIDATION.load(Ordering::Relaxed);
+
+    (HOST_VALIDATION.load(Ordering::Relaxed) || gpu, gpu)
 }
 
 /// Whether the graph's pipelines are built without back-face culling.
@@ -232,7 +304,12 @@ pub fn terrain_greater_depth() -> bool {
 /// is where a switch belongs: it is visible, it is saved, and it is the same place as everything else.
 pub fn apply(settings: &Settings) {
     let DebugSettings {
+        host_validation,
         gpu_based_validation,
+        shader_debug_info,
+        validate_indirect_calls,
+        discard_backend_labels,
+        allow_noncompliant_adapter,
         diagnostics,
         bind_group_cache,
         dynamic_offsets,
@@ -247,6 +324,8 @@ pub fn apply(settings: &Settings) {
         terrain_greater_depth,
         terrain_occlusion,
         atlas_base_mip_only,
+        atlas_lod_bias,
+        game_atlas_blend_mips,
     } = settings.debug();
 
     set(&LOGGING, logging);
@@ -256,7 +335,12 @@ pub fn apply(settings: &Settings) {
     set(&TRACE_DYNAMIC_OFFSETS, trace_dynamic_offsets);
     set(&BINDING_VERBOSITY, binding_verbosity);
     set(&DUMP_SHADERS, dump_shaders);
+    set(&HOST_VALIDATION, host_validation);
     set(&GPU_BASED_VALIDATION, gpu_based_validation);
+    set(&SHADER_DEBUG_INFO, shader_debug_info);
+    set(&VALIDATE_INDIRECT_CALLS, validate_indirect_calls);
+    set(&DISCARD_BACKEND_LABELS, discard_backend_labels);
+    set(&ALLOW_NONCOMPLIANT_ADAPTER, allow_noncompliant_adapter);
     // These two are not flags to be read somewhere: they *are* the action, so the switch does
     // something the moment it moves. See the setting docs for why neither is set here.
     set(&GPU_TIMESTAMPS, gpu_timestamps);
@@ -290,11 +374,33 @@ pub fn apply(settings: &Settings) {
         PIPELINES_STALE.store(true, Ordering::Relaxed);
     }
 
+    // **Whether the game atlas blends between mip levels, which is built into its sampler** - so like the
+    // clamp above it invalidates the pipelines rather than taking effect on its own.
+    if wgpu_mc::render::atlas::game_atlas_blend_mips() != game_atlas_blend_mips {
+        wgpu_mc::render::atlas::set_game_atlas_blend_mips(game_atlas_blend_mips);
+        PIPELINES_STALE.store(true, Ordering::Relaxed);
+    }
+
+    // **The level-of-detail bias, which is neither of the two above** - not baked, and not built into a
+    // sampler. It is written into the per-draw immediate block, so storing it is the whole of applying
+    // it and the next frame uses it. That is exactly why it is not a shader constant any more: as a
+    // constant it needed the shader copied into the build directory and a restart, and the two readings
+    // "it works" and "it never reached the GPU" were the same picture.
+    wgpu_mc::render::atlas::set_atlas_lod_bias(atlas_lod_bias);
+
     // The animated-texture switch, which is a *graphics* setting rather than one of the debug switches
     // above: it decides, per face, which atlas that face samples, and the answer is baked into the
     // vertex. Moving it therefore invalidates every baked block model, and the re-bake is asked for by
     // [`sendSettings`], which is the only caller that knows a setting moved rather than was loaded.
     wgpu_mc::mc::block::set_animated_textures(settings.animated_textures());
+
+    // **The window mode, which is the one setting here that this side does not own the effect of.**
+    //
+    // `DisplayMode` on the JVM side is what puts the window into a mode - three GLFW calls, and GLFW is
+    // reached from there because `Window` is there. So what is recorded here is only the *value*, and the
+    // change is reported by [`reapply_window_mode`], which `sendSettings` calls once the settings are
+    // stored. Recording it unconditionally is what that function's comparison reads.
+    WINDOW_MODE.store(settings.fullscreen_mode() as u8, Ordering::Relaxed);
 
     // The `wgpu-mc` crate writes lines of its own - the per-bake report, for one - and the switch
     // that decides whether they are sampled or written is the same one this file just resolved.
@@ -304,6 +410,63 @@ pub fn apply(settings: &Settings) {
     crate::timing::set_enabled(gpu_timestamps);
     crate::pix::set_capturing(pix_capture);
 }
+
+/// **Tells the JVM to put the window into the mode the setting now names**, if it moved.
+///
+/// The window is the JVM's - GLFW is reached from there because `Window` is there, and the three modes
+/// are three GLFW calls - so this side cannot apply it. What it *can* do is notice that it changed and
+/// say so, which is what this is: the comparison is here rather than on the JVM because the settings
+/// document is here.
+///
+/// **Called from `sendSettings` after the settings are stored**, so the value the JVM reads back through
+/// `RendererSettings` is the new one. That is why nothing is passed: one source of truth for which mode
+/// it is, and this call is only the moment to look it up.
+///
+/// A window that is already in the mode, or a settings apply that touched nothing, is a no-op - there is
+/// a GLFW call behind this that switches the display mode, and running it on every Apply would flicker
+/// the screen for a player who moved only the vsync switch.
+pub fn reapply_window_mode(env: &mut JNIEnv) {
+    let mode = WINDOW_MODE.load(Ordering::Relaxed);
+
+    let moved = PREVIOUS_WINDOW_MODE.swap(mode, Ordering::Relaxed) != mode;
+
+    crate::set_window_mode(mode, moved);
+
+    if !moved {
+        return;
+    }
+
+    info!("wgpu-mc: the window mode is now {mode:?}; asking the JVM to put the window in it");
+
+    if let Err(err) = crate::call_static_from_class_loader(
+        env,
+        "dev.birb.wgpu.backend.DisplayMode",
+        "reapply",
+        "()V",
+        &[],
+    ) {
+        warn!(
+            "wgpu-mc: the window mode moved, but the JVM could not be asked to apply it, so the window \
+             keeps the mode it has until the next launch: {err}"
+        );
+    }
+}
+
+/// The window mode [`apply`] last resolved from the settings.
+///
+/// Here rather than read back out of `SETTINGS` in [`reapply_window_mode`], because that function runs
+/// after the settings have been *stored* and what it needs to compare against is what the last apply
+/// resolved - the two are the same value in every ordinary sequence and saying so once is cheaper than
+/// reasoning about the order.
+static WINDOW_MODE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(FullscreenMode::Exclusive as u8);
+
+/// The window mode the last apply ended with, for [`reapply_window_mode`]'s comparison.
+///
+/// A `u8` set to a value no variant has (`0xff`), so the first apply always counts as a move: the window
+/// is created by the game before this side has read a config, so its mode at that point is whatever
+/// `options.txt` asked for and putting it into the configured one is a real change.
+static PREVIOUS_WINDOW_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0xff);
 
 /// Rebuilds the render graph if a pipeline-state switch has moved since it was last built.
 ///
@@ -359,6 +522,57 @@ fn name(flag: &AtomicBool) -> &'static str {
         f if std::ptr::eq(f, &SECTION_TIMING) => "section timing",
         f if std::ptr::eq(f, &TERRAIN_NO_CULL) => "terrain no-cull",
         f if std::ptr::eq(f, &TERRAIN_GREATER_DEPTH) => "terrain greater depth",
+        f if std::ptr::eq(f, &HOST_VALIDATION) => "host validation",
+        f if std::ptr::eq(f, &SHADER_DEBUG_INFO) => "shader debug info",
+        f if std::ptr::eq(f, &VALIDATE_INDIRECT_CALLS) => "validate indirect calls",
+        f if std::ptr::eq(f, &DISCARD_BACKEND_LABELS) => "discard backend labels",
+        f if std::ptr::eq(f, &ALLOW_NONCOMPLIANT_ADAPTER) => "allow noncompliant adapter",
         _ => "gpu based validation",
+    }
+}
+
+#[cfg(test)]
+mod validation_tests {
+    use super::*;
+
+    /// **The inner layer needs the outer one, and asking for it says so.**
+    ///
+    /// GPU-based validation checks the commands wgpu recorded, so with host-side validation off wgpu
+    /// ignores the flag. A pair that reported `(false, true)` would be a player who turned on the
+    /// driver's layer and got nothing at all - no error, no warning, just validation that is not
+    /// running. So the outer flag is implied rather than required of the player.
+    #[test]
+    fn asking_for_the_drivers_layer_turns_on_the_hosts() {
+        for (host, gpu, want_host, want_gpu) in [
+            // host, gpu, expected host, expected gpu
+            (false, false, false, false),
+            (true, false, true, false),
+            // The one that matters: the driver's layer alone.
+            (false, true, true, true),
+            (true, true, true, true),
+        ] {
+            HOST_VALIDATION.store(host, Ordering::Relaxed);
+            GPU_BASED_VALIDATION.store(gpu, Ordering::Relaxed);
+
+            let (got_host, got_gpu) = validation_flags();
+
+            // The GPU flag is passed through exactly as asked, and never invented.
+            assert_eq!(got_gpu, want_gpu, "gpu based validation is passed through");
+            assert_eq!(
+                got_host, want_host,
+                "host validation is what was asked for, or what gpu based validation needs - \
+                 host={host} gpu={gpu}"
+            );
+
+            assert!(
+                !got_gpu || got_host,
+                "no combination may report the inner layer without the outer one: with host={host} \
+                 and gpu={gpu} the driver's layer would be on with nothing to check"
+            );
+        }
+
+        // Left off, which is the state the process starts in and the state other tests read.
+        HOST_VALIDATION.store(false, Ordering::Relaxed);
+        GPU_BASED_VALIDATION.store(false, Ordering::Relaxed);
     }
 }

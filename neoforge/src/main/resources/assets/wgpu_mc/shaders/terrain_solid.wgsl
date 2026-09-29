@@ -122,6 +122,13 @@ struct SectionPosition {
     // a driver keeps early-Z. The field is here only because this push constant block is one layout
     // shared with `terrain.wgsl`, and a struct that left it out would be a different size.
     alpha_cutout: f32,
+    // The level-of-detail bias, read by the two atlas fetches below. See the same member in
+    // `terrain.wgsl`, which documents why it is an immediate rather than a constant.
+    //
+    // **Read here even though the alpha cutoff above is not**, and the difference is worth noting: the
+    // cutoff exists only for the fragment stage's test, which this shader has none of, while the bias
+    // changes what the *texture* fetch returns, so both shaders' fragment stages read it.
+    lod_bias: f32,
 };
 
 var<immediate> section_pos: SectionPosition;
@@ -374,8 +381,10 @@ fn frag(
     // both were live, and the two mip chains are indexed identically because the atlases are the same
     // size. `select` on a `vec4<f32>` rather than `mix`, because this is a choice and not a blend: a
     // half-way value would be one atlas bleeding into the other at every sprite edge.
-    let texel_from_game = textureSample(t_game_atlas, t_game_sampler, in.tex_coords);
-    let texel_from_ours = textureSample(t_texture, t_sampler, in.tex_coords);
+    // `textureSampleBias` with the immediate bias, which is zero unless a diagnostic run moved it; the two
+    // behave identically at zero. See the constant in `terrain.wgsl` for what moving it is for.
+    let texel_from_game = textureSampleBias(t_game_atlas, t_game_sampler, in.tex_coords, section_pos.lod_bias);
+    let texel_from_ours = textureSampleBias(t_texture, t_sampler, in.tex_coords, section_pos.lod_bias);
     let texel = select(texel_from_ours, texel_from_game, in.game_atlas == 1u);
 
     // The light is a colour now, not a number: the game's lightmap has a colour in it (the sky light

@@ -4,6 +4,7 @@ import dev.birb.wgpu.WgpuMcMod
 import net.minecraft.core.BlockPos
 import net.minecraft.core.Direction
 import net.minecraft.world.level.EmptyBlockGetter
+import net.minecraft.world.level.block.LeavesBlock
 import net.minecraft.world.level.block.state.BlockState
 import net.minecraft.world.phys.shapes.Shapes
 
@@ -135,6 +136,14 @@ object BlockFaceFlags {
 			motion,
 			offsetMaxY,
 			offsetXz,
+			// **The game's own `blockState.getBlock() instanceof LeavesBlock`**, which the native side
+			// cannot answer for itself: it holds block *names*, and a mod's leaves are leaves.
+			//
+			// Read outside the `try` above because it is a class check on an object the game handed us
+			// and not one of the cached shape reads - there is nothing to fail, and a state that is not
+			// a `LeavesBlock` answers `false`, which leaves its faces in whatever layer their sprite
+			// asked for. See `wgpu_mc::mc::block::FaceFlags::leaves`.
+			if (state.block is LeavesBlock) 1 else 0,
 		)
 		described++
 	}

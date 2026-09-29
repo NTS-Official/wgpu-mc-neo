@@ -139,7 +139,9 @@ object TerrainPass {
 				"wgpu: the render graph is drawing the solid, cutout and translucent terrain; " +
 					"Minecraft's own meshes for those three layers are skipped"
 			)
+
 		}
+
 		return canDraw
 	}
 
@@ -193,7 +195,14 @@ object TerrainPass {
 		lastBobX = bob.last().pose().m30()
 		lastBobY = bob.last().pose().m31()
 
-		Matrix4f(cameraState.projectionMatrix).mul(bob.last().pose()).get(projection)
+		// The frame's sub-pixel jitter goes on here, and `TaaJitter` applies the same offset to
+		// Minecraft's own projection UBO (`ProjectionMatrixBufferMixin`). The two have to agree - a
+		// shift on one and not the other is exactly what TAA reads as motion. See `TaaJitter`.
+		TaaJitter.apply(
+			Matrix4f(cameraState.projectionMatrix).mul(bob.last().pose()),
+			TaaJitter.renderWidth(),
+			TaaJitter.renderHeight(),
+		).get(projection)
 
 		val position = cameraState.pos
 

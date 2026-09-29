@@ -32,6 +32,24 @@ pub struct Settings {
     pub backend: EnumSetting,
     #[serde(default)]
     pub vsync: BoolSetting,
+    /// **How the game's window fills the screen**, which vanilla has only two answers to.
+    ///
+    /// `Exclusive` is what the game's own fullscreen is: GLFW's monitor mode, the swapchain owned by the
+    /// display, which is a real mode switch. `Borderless` is a window covering the monitor with no
+    /// decorations - the same pixels and none of the mode switch, which is what a player wants when they
+    /// alt-tab. `Off` is a window.
+    ///
+    /// Applied by `DisplayMode` on the JVM side, which is what `Window#setMode` is redirected to; see
+    /// that file for why the seam is there and not at `toggleFullScreen`. The answer is in this document
+    /// because it is this side that decides what the game's fullscreen key does.
+    ///
+    /// **Named rather than `#[serde(default)]`, and this is the trap it avoids.** `EnumSetting`'s own
+    /// `Default` is `selected: 0` - the *first* variant, which is `Exclusive` - so a bare
+    /// `#[serde(default)]` here hands every fresh config exclusive fullscreen however the enum is ordered,
+    /// and `#[default]` on the variant does nothing. That was measured: the config was deleted, the client
+    /// started, and it took the display over. See `no_fullscreen_mode`.
+    #[serde(default = "no_fullscreen_mode")]
+    pub fullscreen_mode: EnumSetting,
     /// Whether the terrain is drawn from the Rust baker's meshes rather than from Minecraft's own.
     ///
     /// On by default, because the path is what the renderer is being built towards; the switch is here
@@ -90,7 +108,23 @@ pub struct Settings {
     /// The ones that are off unless asked for name [`off`] as their serde default, because
     /// `#[serde(default)]` alone would take `BoolSetting::default()`, which is `true`.
     #[serde(default = "off")]
+    pub host_validation: BoolSetting,
+    #[serde(default = "off")]
     pub gpu_based_validation: BoolSetting,
+    /// Whether the instance is built with wgpu's `DEBUG` flag: debug information in shaders and
+    /// objects. See [`SettingInfo::debug`] for where it sits on the options screen.
+    #[serde(default = "on")]
+    pub shader_debug_info: BoolSetting,
+    /// Whether an indirect draw whose arguments are out of bounds is turned into a no-op rather than
+    /// being undefined. See [`SettingInfo::debug`].
+    #[serde(default = "on")]
+    pub validate_indirect_calls: BoolSetting,
+    /// Whether labels are passed to the backend at all. See [`SettingInfo::debug`].
+    #[serde(default = "off")]
+    pub discard_backend_labels: BoolSetting,
+    /// Whether a driver whose major Vulkan compliance version is 0 may be chosen at all.
+    #[serde(default = "off")]
+    pub allow_noncompliant_adapter: BoolSetting,
     /// Whether the renderer writes its diagnostic log lines. See [`SettingInfo::debug`] and
     /// [`SettingInfo::optimization`] for how the switches are grouped on the options screen.
     #[serde(default = "off")]
@@ -158,6 +192,43 @@ pub struct Settings {
     pub atlas_base_mip_only: BoolSetting,
     #[serde(default = "off")]
     pub terrain_greater_depth: BoolSetting,
+    /// **How many mip levels the terrain shaders bias their block-atlas fetches by**, which is a
+    /// diagnostic for "is the level of detail chosen correctly" rather than a picture setting. See
+    /// [`Settings::atlas_lod_bias`].
+    #[serde(default = "no_lod_bias")]
+    pub atlas_lod_bias: FloatSetting,
+    /// **Whether the game atlas' mip levels are blended**, which is the one field where its sampler
+    /// differs from this renderer's own. See [Settings::game_atlas_blend_mips].
+    #[serde(default = "off")]
+    pub game_atlas_blend_mips: BoolSetting,
+}
+
+/// The default of [`Settings::atlas_lod_bias`]: **no bias at all**, which is the fetch a plain
+/// `textureSample` would make.
+///
+/// The range is small on purpose. A bias is a *shift of the chosen level*, and the whole question this
+/// exists to answer is whether the level is off by one or two - a range wide enough to reach the end of
+/// the chain would answer "yes it moved" without answering "by how much". The ends are still reachable
+/// enough to be obvious: minus four is four levels finer, which on a five-level chain is level 0 for
+/// almost every surface, and plus four is the opposite.
+fn no_lod_bias() -> FloatSetting {
+    FloatSetting {
+        min: -4.0,
+        max: 4.0,
+        step: 0.5,
+        // **-4, and it is a calibration rather than a taste.** A player's runs settled it: at `-4` the
+        // fluid shimmer is gone, at `0` it is there. That is a *level* the sampler is choosing wrongly and
+        // a bias that cancels it, not a preference about sharpness.
+        //
+        // **What it is compensating for is not known**, and that is worth stating plainly rather than
+        // dressed up. Every reading of the coordinate path says the level should already be right - the
+        // sprite's UVs span its own texels, `atlas_base_mip_only` proves the sampler honours a clamp, and
+        // the bias itself moves the picture - so the fault is somewhere between the coordinates and the
+        // derivative that has not been found. A global shift is the *wrong* shape of fix either way,
+        // because it moves every surface including the ones that are already correct, which is why the
+        // default is a calibration to be replaced by a per-sprite clamp rather than the answer.
+        value: -4.0,
+    }
 }
 
 /// The default of a setting that is off unless a player asks for it.
@@ -166,6 +237,16 @@ pub struct Settings {
 /// wrong for a log.
 fn off() -> BoolSetting {
     BoolSetting::of(false)
+}
+
+/// The default of a setting that is on unless a player turns it off.
+///
+/// `BoolSetting::default()` is already `true`, so this exists to say *which* `true` a setting means
+/// rather than to change a value - a `#[serde(default)]` would read as "whatever the type does", and
+/// the two instance flags that were hardcoded in `device.rs` are on because that is what the renderer
+/// was building by hand, not because the type defaults that way.
+fn on() -> BoolSetting {
+    BoolSetting::of(true)
 }
 
 /// The default of `frames_in_flight`: one frame recorded ahead of the one being presented.
@@ -183,10 +264,20 @@ fn animated_textures_default() -> EnumSetting {
     EnumSetting::from_variant(AnimatedTextures::default())
 }
 
+/// The default of `fullscreen_mode`: **a window**, which is what `options.txt`'s `fullscreen: false` means
+/// and what a fresh install should open with.
+///
+/// Explicit for the reason on the field: `EnumSetting`'s own default is its zero variant rather than the
+/// enum's `#[default]`, so the two have to be said separately and only one of them is a behaviour.
+fn no_fullscreen_mode() -> EnumSetting {
+    EnumSetting::from_variant(FullscreenMode::default())
+}
+
 #[derive(Serialize)]
 pub struct SettingsInfo {
     backend: EnumSettingInfo<GraphicsBackend>,
     vsync: SettingInfo,
+    fullscreen_mode: EnumSettingInfo<FullscreenMode>,
     terrain: SettingInfo,
     /// On the Quality page rather than on the renderer's own, which is why the page skips it: one row
     /// in one place. See `OptionPages`' `DRAWN_ELSEWHERE`.
@@ -198,7 +289,12 @@ pub struct SettingsInfo {
     /// from this schema. See the note on [`Settings::bind_group_cache`].
     bind_group_cache: SettingInfo,
     dynamic_offsets: SettingInfo,
+    host_validation: SettingInfo,
     gpu_based_validation: SettingInfo,
+    shader_debug_info: SettingInfo,
+    validate_indirect_calls: SettingInfo,
+    discard_backend_labels: SettingInfo,
+    allow_noncompliant_adapter: SettingInfo,
     logging: SettingInfo,
     diagnostics: SettingInfo,
     trace_dynamic_offsets: SettingInfo,
@@ -213,6 +309,8 @@ pub struct SettingsInfo {
     terrain_occlusion: SettingInfo,
     atlas_base_mip_only: SettingInfo,
     terrain_greater_depth: SettingInfo,
+    atlas_lod_bias: SettingInfo,
+    game_atlas_blend_mips: SettingInfo,
 }
 
 /// The section the options screen puts a setting under, when it is not one of the plain ones.
@@ -248,6 +346,18 @@ lazy_static! {
             needs_restart: false,
             section: None,
         },
+        fullscreen_mode: EnumSettingInfo::new(
+            "How the window fills the screen.\n\n\
+            **Exclusive** is GLFW's monitor mode - a real display mode switch, and what the game's own \
+            fullscreen has always been. **Borderless** covers the monitor with no decorations and does \
+            not change the display mode, which is what to pick if you alt-tab. **Off** is a window.\n\n\
+            The game's own fullscreen key (F11 by default) toggles between Off and whichever mode is \
+            chosen here, so the key keeps working and the page decides what it returns to.\n\n\
+            Takes effect as soon as it is applied: none of the three touches the device or the \
+            swapchain's format, so there is nothing to restart for - the surface is reconfigured when \
+            the window's size changes, which this does.",
+            false,
+        ),
         terrain: SettingInfo {
             desc: "Draw the terrain from the Rust baker's meshes instead of from Minecraft's own. \
             The sections are baked natively and drawn by the render graph in the pass Minecraft's own \
@@ -278,14 +388,82 @@ lazy_static! {
             needs_restart: false,
             section: None,
         },
+        host_validation: SettingInfo::debug(
+            "Load the graphics backend's own validation layer: D3D12's debug layer, Vulkan's \
+            validation layer, or GL's debug output. It is written by the graphics vendor rather than \
+            by wgpu, it reports through the driver's debug output, and it catches what wgpu cannot see \
+            - a barrier in the wrong place, a resource used before its GPU work finished, a \
+            descriptor the driver disagrees about. It was unconditional here, so every player loaded \
+            a vendor debug layer they were not reading; it is off by default now. `gpu based \
+            validation` needs it. \
+            **This does not switch wgpu's own validation on or off.** wgpu checks every call it is \
+            given whatever this says - that is what an error naming the call comes from, and it is \
+            what produces the `wgpu_core::validation` warnings in the log with this setting off. So \
+            turning this off does not make an invalid call silent; it removes the vendor's second \
+            opinion and its debug output. The wgpu instance is created with this flag, so switching \
+            takes effect on the next launch.",
+            true,
+        ),
         gpu_based_validation: SettingInfo::debug(
-            "Ask the driver's own validation layer to check what the GPU is actually asked to do, \
-            rather than only what wgpu was asked to record. It catches the mistakes host-side \
-            validation cannot see - a resource read after it was freed, a shader reading past a \
-            binding, a barrier in the wrong place - and reports them through the driver's debug \
-            output. It costs performance and it is a development tool, so it is off by default. \
+            "Ask the backend's validation layer to check what the GPU is actually asked to do, rather \
+            than only the commands that were recorded: it runs the same vendor layer as `host \
+            validation` above, but on the GPU. That is what catches a mistake only the hardware can \
+            see - a read of a resource whose earlier write has not landed, a shader reading past a \
+            binding, a missing barrier between two passes. It is the slowest thing here by a wide \
+            margin and it is a development tool, so it is off by default. \
+            **It needs `host validation`**, because it is that same layer doing more; asking for this \
+            alone turns that on with it rather than doing nothing. \
             The wgpu instance is created with this flag, so switching takes effect on the next \
             launch.",
+            true,
+        ),
+        shader_debug_info: SettingInfo::debug(
+            "Build the instance with wgpu's `DEBUG` flag: debug information in shaders and objects. \
+            It does not validate anything and it does not cost anything per draw - what it decides is \
+            whether the objects this renderer creates carry the information a graphics debugger reads \
+            (RenderDoc, Nsight, PIX, `spirv-dis`). On by default, and worth turning off only if a \
+            driver is measurably slowed by the extra metadata, because a capture without it names \
+            things like `texture_47` instead of `wgpu-mc block atlas`. \
+            The wgpu instance is created with this flag, so switching takes effect on the next \
+            launch. `WGPU_DEBUG=0` still overrides it from outside the game.",
+            true,
+        ),
+        validate_indirect_calls: SettingInfo::debug(
+            "Check the arguments in an indirect draw buffer before issuing the draw, and turn the draw \
+            into a no-op when they are out of bounds: an index range that does not fit the bound index \
+            buffer, an instance range that does not fit an instance-stepped vertex buffer, and - the \
+            one that matters here - a non-zero `first instance` on a device without indirect-first-\
+            instance support. On by default and it should stay on: **without it, an out-of-bounds \
+            indirect argument is undefined behaviour rather than an error**, and on D3D12 the built-in \
+            `instance index` stops accounting for `first instance` at all, which would draw terrain \
+            from the wrong offsets rather than fail. What it costs is a bounds check on a handful of \
+            integers per indirect call, not per drawn section. \
+            The wgpu instance is created with this flag, so switching takes effect on the next \
+            launch. `WGPU_VALIDATION_INDIRECT_CALL=0` still overrides it from outside the game.",
+            true,
+        ),
+        discard_backend_labels: SettingInfo::debug(
+            "Do not pass the labels this renderer gives its objects down to the graphics backend. Every \
+            buffer, texture, pipeline and bind group here is named, and a name is a string lookup and a \
+            driver call each time one is created - measurable in a world that allocates as it loads, and \
+            not measurable at all once it has settled. Off by default, because what the names buy is \
+            that a driver's own validation error and a graphics debugger both say `wgpu-mc section arena` \
+            instead of a handle, which is most of what makes either readable. \
+            The wgpu instance is created with this flag, so switching takes effect on the next \
+            launch. `WGPU_DISCARD_HAL_LABELS=1` still overrides it from outside the game.",
+            true,
+        ),
+        allow_noncompliant_adapter: SettingInfo::debug(
+            "Allow wgpu to offer an adapter whose driver does not meet the graphics API's own \
+            requirements - in practice a Vulkan driver reporting a major compliance version of 0, which \
+            wgpu otherwise refuses to use at all. Off by default, because the point of the requirement \
+            is that such a driver may be broken in ways wgpu cannot see: it is an escape hatch for a \
+            machine where nothing else is offered, not a setting to leave on. With it off and no \
+            compliant adapter, the renderer reports that it could not create one and the game shows its \
+            \"no supported graphics backend\" screen. \
+            The wgpu instance is created with this flag, so switching takes effect on the next \
+            launch. `WGPU_ALLOW_UNDERLYING_NONCOMPLIANT_ADAPTER=1` still overrides it from outside the \
+            game.",
             true,
         ),
         logging: SettingInfo::debug(
@@ -479,6 +657,35 @@ lazy_static! {
             rebuilds the graph's pipelines.",
             false,
         ),
+        game_atlas_blend_mips: SettingInfo::debug(
+            "Blend between mip levels when sampling the game's own block atlas. Off - which is what the \
+            renderer ships - picks one level and writes it, so a scrolling animated sprite is never shown \
+            as a mix of two of its moments. On blends them the way vanilla does \
+            (`GL_LINEAR_MIPMAP_LINEAR`), which is smoother for a static texture and is where the \
+            fluid shimmer comes from.\
+\
+\
+            The reason this is a switch and not a decision: the two differ only for content that moves, \
+            and which of the two a player prefers is a picture rather than an argument. It takes effect on \
+            the next frame - the sampler is built with the graph, so applying it rebuilds the graph's \
+            pipelines and nothing is baked.",
+            false,
+        ),
+        atlas_lod_bias: SettingInfo::debug(
+            "Shift the mip level the terrain shaders pick for the block atlases. `0` is no shift and \
+            the fetch a plain `textureSample` would make; **positive samples a coarser level and \
+            negative a finer one**, so a blurry picture that sharpens as this goes negative means the \
+            chosen level was too coarse, and one that never changes means the level was never the \
+            problem.\n\n\
+            It is a measure rather than a picture setting. The level comes from the screen-space \
+            derivative of the texture coordinates, and every reading of this renderer's coordinates \
+            says that derivative should match the game's - so the number is here to disagree with the \
+            reading if the picture does.\n\n\
+            Read per draw, so it takes effect on the next frame: nothing is baked and no pipeline is \
+            rebuilt. That is the point of it - the same value as a shader constant could not be told \
+            apart from one that never reached the GPU.",
+            false,
+        ),
     };
     pub static ref SETTINGS_INFO_JSON: String = serde_json::to_string(&*SETTINGS_INFO).unwrap();
 }
@@ -604,6 +811,14 @@ impl Settings {
     ///
     /// See [`Settings::animated_textures`]: `Fancy` (the default) is yes, `Fast` is the frozen picture
     /// this renderer drew before the animated-texture path existed.
+    /// How the window fills the screen. See [FullscreenMode].
+    ///
+    /// Read by `DisplayMode` on the JVM side through `getFullscreenMode`, once per mode change rather
+    /// than per frame - there is nothing on the draw path that depends on it.
+    pub fn fullscreen_mode(&self) -> FullscreenMode {
+        self.fullscreen_mode.get_variant::<FullscreenMode>()
+    }
+
     pub fn animated_textures(&self) -> bool {
         self.animated_textures
             .get_variant::<AnimatedTextures>()
@@ -617,6 +832,23 @@ impl Settings {
     pub fn atlas_base_mip_only(&self) -> bool {
         self.atlas_base_mip_only.value
     }
+
+    /// How many mip levels the terrain shaders bias their block-atlas fetches by. See
+    /// `Settings::atlas_lod_bias` for what the value is for; it is read per draw, so moving it takes
+    /// effect on the next frame and nothing has to be rebuilt.
+    pub fn atlas_lod_bias(&self) -> f32 {
+        self.atlas_lod_bias.value as f32
+    }
+
+    /// **Whether the sampler for the game's own block atlas blends between mip levels.**
+    ///
+    /// alse - the default - gives MipmapFilterMode::Nearest: the level chosen from the screen-space
+    /// derivative is written to directly, and the blend that Linear would do between two of them is
+    /// skipped. The reason to want that, and the switch to test it against, are in
+    /// `wgpu_mc::render::atlas::game_atlas_sampler`.
+    pub fn game_atlas_blend_mips(&self) -> bool {
+        self.game_atlas_blend_mips.value
+    }
 }
 
 impl Default for Settings {
@@ -624,6 +856,7 @@ impl Default for Settings {
         Settings {
             backend: EnumSetting::from_variant(GraphicsBackend::default()),
             vsync: BoolSetting::default(),
+            fullscreen_mode: EnumSetting::from_variant(FullscreenMode::default()),
             // `BoolSetting::default()` is `true`, which is the right default for the terrain path: it is
             // what the renderer is being built towards, and the switch is here to turn it *off*.
             terrain: BoolSetting::default(),
@@ -632,10 +865,22 @@ impl Default for Settings {
             animated_textures: EnumSetting::from_variant(AnimatedTextures::default()),
             frames_in_flight: two_frames_in_flight(),
             // The debug switches default to the behaviour the renderer had before they existed:
-            // logging and tracing off, the bind group cache and dynamic offsets on, and GPU-based
-            // validation off - it used to be unconditional, which cost every player the driver's
-            // slowest validation path.
+            // logging and tracing off, the bind group cache and dynamic offsets on, and both
+            // validation layers off. Host-side validation and GPU-based validation used to be
+            // unconditional here, which charged every launch for a development tool - and the outer
+            // layer is the more expensive of the two per recorded call, so it is the one worth a
+            // switch rather than a constant.
+            host_validation: BoolSetting::of(false),
             gpu_based_validation: BoolSetting::of(false),
+            // The instance flags that were constants in `device.rs` until they were settings. Two are
+            // on because that is what the renderer was building by hand: `DEBUG` (it set the flag
+            // directly) and `VALIDATION_INDIRECT_CALL` (it lost the flag by setting `DEBUG` alone
+            // instead of `InstanceFlags::debugging()`). The other two were off because they were
+            // never set at all.
+            shader_debug_info: BoolSetting::of(true),
+            validate_indirect_calls: BoolSetting::of(true),
+            discard_backend_labels: BoolSetting::of(false),
+            allow_noncompliant_adapter: BoolSetting::of(false),
             logging: BoolSetting::of(false),
             diagnostics: BoolSetting::of(false),
             bind_group_cache: BoolSetting::of(true),
@@ -654,6 +899,8 @@ impl Default for Settings {
             terrain_occlusion: BoolSetting::of(true),
             atlas_base_mip_only: BoolSetting::of(false),
             terrain_greater_depth: BoolSetting::of(false),
+            atlas_lod_bias: no_lod_bias(),
+            game_atlas_blend_mips: BoolSetting::of(true),
         }
     }
 }
@@ -662,9 +909,27 @@ impl Default for Settings {
 ///
 /// A struct rather than six getters because the flags are always wanted together: they are applied
 /// in one place (when the settings are loaded or sent) and read in another (the draw path).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+///
+/// **`PartialEq` without `Eq`, because one member is a float.** The renderer's own convention elsewhere
+/// is that a rate or a fraction that never has to be a hash key is an integer, and the bias was written
+/// as a float because that is what the shader takes - so this is the one struct here that cannot be
+/// `Eq`. Comparing two of these with `==` is still legal and is all any caller does; what is given up is
+/// being able to use one as a key.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DebugSettings {
+    /// Whether wgpu's own validation runs in this process. See [`Settings::host_validation`].
+    pub host_validation: bool,
     pub gpu_based_validation: bool,
+    /// Whether shaders and objects are built with debug information. See
+    /// [`Settings::shader_debug_info`].
+    pub shader_debug_info: bool,
+    /// Whether an indirect draw with out-of-bounds arguments is made a no-op. See
+    /// [`Settings::validate_indirect_calls`].
+    pub validate_indirect_calls: bool,
+    /// Whether object labels are kept from the backend. See [`Settings::discard_backend_labels`].
+    pub discard_backend_labels: bool,
+    /// Whether a non-compliant driver may be chosen. See [`Settings::allow_noncompliant_adapter`].
+    pub allow_noncompliant_adapter: bool,
     /// Whether the renderer's diagnostic *log lines* are written.
     pub logging: bool,
     /// Whether its *dumps* are written. The two are separate switches, so a run can take a frame
@@ -685,6 +950,11 @@ pub struct DebugSettings {
     /// Whether the game's block atlas is sampled from its base mip level only. See
     /// [`Settings::atlas_base_mip_only`].
     pub atlas_base_mip_only: bool,
+    /// How many mip levels the terrain shaders bias their block-atlas fetches by. See
+    /// `Settings::atlas_lod_bias`.
+    pub atlas_lod_bias: f32,
+    /// Whether the game atlas blends between mip levels. See [Settings::game_atlas_blend_mips].
+    pub game_atlas_blend_mips: bool,
     /// Whether every pipeline the graph builds keeps its back faces. See
     /// [`Settings::terrain_no_cull`], which is the switch - and
     /// `wgpu_mc::render::graph::set_pipeline_diagnostics`, which is what applies it to a pipeline.
@@ -697,7 +967,12 @@ pub struct DebugSettings {
 impl Settings {
     pub fn debug(&self) -> DebugSettings {
         DebugSettings {
+            host_validation: self.host_validation.value,
             gpu_based_validation: self.gpu_based_validation.value,
+            shader_debug_info: self.shader_debug_info.value,
+            validate_indirect_calls: self.validate_indirect_calls.value,
+            discard_backend_labels: self.discard_backend_labels.value,
+            allow_noncompliant_adapter: self.allow_noncompliant_adapter.value,
             logging: self.logging.value,
             diagnostics: self.diagnostics.value,
             bind_group_cache: self.bind_group_cache.value,
@@ -711,6 +986,8 @@ impl Settings {
             terrain_no_cull: self.terrain_no_cull.value,
             terrain_occlusion: self.terrain_occlusion.value,
             atlas_base_mip_only: self.atlas_base_mip_only.value,
+            atlas_lod_bias: self.atlas_lod_bias.value as f32,
+            game_atlas_blend_mips: self.game_atlas_blend_mips.value,
             terrain_greater_depth: self.terrain_greater_depth.value,
         }
     }
@@ -833,6 +1110,58 @@ impl LanguageKey for AnimatedTextures {
         match self {
             AnimatedTextures::Fast => "wgpu_mc.option.animated_textures.fast",
             AnimatedTextures::Fancy => "wgpu_mc.option.animated_textures.fancy",
+        }
+    }
+}
+
+/// **How the game's window fills the screen**, which is three answers where the game has two.
+///
+/// The two the game has are `Off` and `Exclusive`: `Window#setMode` decides between
+/// `GLFW.glfwSetWindowMonitor(handle, monitor, ..)` and `(handle, 0L, ..)`, and `options.txt`'s
+/// `fullscreen` is a boolean. `Borderless` is the third, and it is not a variation on either: it is a
+/// window that covers the monitor with its decorations off, so it changes no display mode and owns no
+/// output - which is the whole reason to want it.
+///
+/// See `DisplayMode` on the JVM side for what each becomes in GLFW calls.
+#[derive(EnumIter, IntoStaticStr, Eq, PartialEq, Clone, Copy, Debug, Default)]
+pub enum FullscreenMode {
+    /// GLFW's monitor mode: the display switches resolution, and the swapchain belongs to the output.
+    /// This is what the game's own fullscreen is - reachable, but no longer what a fresh install gets.
+    #[strum(serialize = "Exclusive")]
+    Exclusive,
+    /// A decorated-free window covering the monitor's whole bounds, moved to its origin. No mode
+    /// switch, no exclusive ownership - the desktop stays as it is underneath.
+    #[strum(serialize = "Borderless")]
+    Borderless,
+    /// A window, at the size and position it was last left at.
+    ///
+    /// **The default**, because the value this setting replaces was `options.txt`'s `fullscreen`, whose own
+    /// default is `false` - a fresh install is a window. `#[serde(default)]` on the field takes
+    /// `EnumSetting`'s zero variant, which is this one, so a config that has never named a mode opens
+    /// windowed and nothing has to be written for it.
+    #[default]
+    #[strum(serialize = "Off")]
+    Off,
+}
+
+impl FullscreenMode {
+    /// Whether this mode is *any* kind of fullscreen, which is what the rest of the game is told.
+    ///
+    /// `Window#isFullscreen` is read in three places - the F11 handler writes the vanilla option from it,
+    /// the pause menu draws a tick from it, and `Options` compares it to decide whether to call
+    /// `toggleFullScreen` - and for all three, "covers the screen" is the question. Answering `false` for
+    /// borderless would make the pause menu say windowed while the window covered the monitor.
+    pub fn is_fullscreen(self) -> bool {
+        !matches!(self, FullscreenMode::Off)
+    }
+}
+
+impl LanguageKey for FullscreenMode {
+    fn lang_key(&self) -> &'static str {
+        match self {
+            FullscreenMode::Exclusive => "wgpu_mc.option.fullscreen_mode.exclusive",
+            FullscreenMode::Borderless => "wgpu_mc.option.fullscreen_mode.borderless",
+            FullscreenMode::Off => "wgpu_mc.option.fullscreen_mode.off",
         }
     }
 }
@@ -1054,12 +1383,60 @@ mod tests {
         );
     }
 
+    /// **The order of `fullscreen_mode`'s values is an ABI**, and this is the half of it that can be
+    /// checked here.
+    ///
+    /// The JVM's `DisplayMode.Mode` enum is declared in the same order and the value crosses as an
+    /// *index* (`WgpuNative.windowMode` returns `FullscreenMode as u8`), so reordering this enum silently
+    /// reorders that one - and the failure would not be an error, it would be `Borderless` selecting
+    /// exclusive fullscreen. The other half is a list of three names in `DisplayMode.Mode`, which has no
+    /// test source set of its own to live in; this is the half that can be asserted, and it is the half
+    /// that would be edited first.
+    #[test]
+    fn the_window_modes_are_in_the_order_the_jvm_reads_them_in() {
+        let modes: Vec<&'static str> = FullscreenMode::iter().map(|mode| mode.into()).collect();
+
+        assert_eq!(
+            modes,
+            vec!["Exclusive", "Borderless", "Off"],
+            "the JVM's DisplayMode.Mode declares EXCLUSIVE, BORDERLESS, OFF in this order and a value \
+             crosses as an index - see `windowMode`"
+        );
+
+        // And the first variant is the default, which is what `#[serde(default)]` on the field means:
+        // `EnumSetting`'s own default is variant zero, and zero has to be the game's own fullscreen so
+        // that a config written before this setting existed behaves as it did.
+        // The default is a window, because the value this setting stands in for is `options.txt`'s
+        // `fullscreen` - a boolean whose own default is false. A fresh install opens windowed.
+        assert_eq!(
+            FullscreenMode::default(),
+            FullscreenMode::Off,
+            "a config with no `fullscreen_mode` key must open a window, which is what the game's own \
+             `fullscreen: false` means"
+        );
+
+        // Every variant answers the question the rest of the game asks, and only `Off` says no.
+        assert!(FullscreenMode::Exclusive.is_fullscreen());
+        assert!(
+            FullscreenMode::Borderless.is_fullscreen(),
+            "a borderless window covers the screen, so the pause menu and the F11 handler have to be \
+             told it is fullscreen - otherwise the video settings screen offers to turn fullscreen on \
+             for a window that already fills the display"
+        );
+        assert!(!FullscreenMode::Off.is_fullscreen());
+    }
+
     #[test]
     fn the_debug_switches_are_offered_under_a_heading() {
         let info: serde_json::Value = serde_json::from_str(&SETTINGS_INFO_JSON).expect("schema");
 
         for name in [
+            "host_validation",
             "gpu_based_validation",
+            "shader_debug_info",
+            "validate_indirect_calls",
+            "discard_backend_labels",
+            "allow_noncompliant_adapter",
             "logging",
             "diagnostics",
             "trace_dynamic_offsets",
@@ -1192,15 +1569,21 @@ mod tests {
 
     /// Every setting's name, which is the same in both documents. Kept as a list because the two
     /// documents' own key order is not readable through `serde_json::Value` - see the test above.
-    const NAME_LIST: [&str; 22] = [
+    const NAME_LIST: [&str; 30] = [
         "backend",
         "vsync",
+        "fullscreen_mode",
         "terrain",
         "animated_textures",
         "frames_in_flight",
         "bind_group_cache",
         "dynamic_offsets",
+        "host_validation",
         "gpu_based_validation",
+        "shader_debug_info",
+        "validate_indirect_calls",
+        "discard_backend_labels",
+        "allow_noncompliant_adapter",
         "logging",
         "diagnostics",
         "trace_dynamic_offsets",
@@ -1215,6 +1598,8 @@ mod tests {
         "terrain_occlusion",
         "atlas_base_mip_only",
         "terrain_greater_depth",
+        "atlas_lod_bias",
+        "game_atlas_blend_mips",
     ];
 
     /// The options screen, pulled in for the one part of it that is a contract with this side: how
@@ -1357,14 +1742,16 @@ mod tests {
 
         // A queue, and the drain adds to it rather than acting on the batch directly.
         assert!(
-            source.contains("pendingRedirty.add(key)"),
+            source.contains("pendingRedirty[key] = System.nanoTime()"),
             "the refusal drain has to remember the sections it could not act on; without this a refusal \
              past the per-frame budget is a section nothing will ever rebuild"
         );
 
         assert!(
-            source.contains("private val pendingRedirty = java.util.LinkedHashSet<Long>()"),
-            "a set, because a section refused twice before it was retried is one rebuild and not two"
+            source.contains("private val pendingRedirty = java.util.LinkedHashMap<Long, Long>()"),
+            "a map keyed by position, because a section refused twice before it was retried is one \
+             rebuild and not two - and because *when* it was queued is what says how long the hole it \
+             made was on screen"
         );
 
         // **Single-section dirty, never the neighbours variant.** `setSectionDirtyWithNeighbors` dirties
@@ -1445,7 +1832,7 @@ mod tests {
             .nth(1)
             .expect("`forgetRefused` is still there");
         let before_queue = forget
-            .split("pendingRedirty.add(key)")
+            .split("pendingRedirty[key] = System.nanoTime()")
             .next()
             .expect("the refusal still queues a rebuild");
 
@@ -1605,15 +1992,27 @@ mod tests {
     }
 
     #[test]
-    fn only_gpu_based_validation_needs_a_restart() {
+    fn only_the_instance_flags_need_a_restart() {
         let info: serde_json::Value = serde_json::from_str(&SETTINGS_INFO_JSON).expect("schema");
 
-        // `dynamic_offsets` is the third, and the one this test got wrong first: it was declared
-        // live, on the reasoning that it is only read as a draw is recorded - but *what* it decides
-        // is whether a uniform's offset is part of the number the JVM identifies a draw's bind groups
-        // by, and a pass that is holding bind groups built under the other answer cannot follow it.
+        // The three that are decided when the wgpu *instance* is created, which is once per renderer and
+        // cannot be revisited: an instance flag is not a field that can be written afterwards.
+        //
+        // `dynamic_offsets` is the one this test got wrong first, and it is not an instance flag: it was
+        // declared live, on the reasoning that it is only read as a draw is recorded - but *what* it
+        // decides is whether a uniform's offset is part of the number the JVM identifies a draw's bind
+        // groups by, and a pass holding bind groups built under the other answer cannot follow it.
         // Flipping it in a running world ended the process. See `set_dynamic_offsets` in `debug.rs`.
-        for name in ["gpu_based_validation", "pix_capture", "dynamic_offsets"] {
+        for name in [
+            "host_validation",
+            "gpu_based_validation",
+            "pix_capture",
+            "dynamic_offsets",
+            "shader_debug_info",
+            "validate_indirect_calls",
+            "discard_backend_labels",
+            "allow_noncompliant_adapter",
+        ] {
             assert_eq!(
                 info[name]["needs_restart"],
                 serde_json::Value::Bool(true),
@@ -1659,6 +2058,35 @@ mod tests {
         assert!(
             !debug.gpu_based_validation,
             "GPU-based validation is a development tool, not a default"
+        );
+        // **The one default that is a departure rather than a restoration**, and named as such so that
+        // nobody reads this test as a promise the renderer keeps validation on. It used to be
+        // unconditional: every launch paid wgpu's validation for every recorded call, and the switch
+        // exists because that is a development tool's cost. See `instance_flags` in `device.rs` for
+        // what is lost with it off - a wgpu error naming the call that caused it.
+        assert!(
+            !debug.host_validation,
+            "host-side validation is off by default now; it used to be unconditional"
+        );
+        // **The four instance flags that were constants in `device.rs`.** Two are on because that is
+        // what the renderer was building by hand, and two are off because it never set them - so this
+        // is a record of what changed as much as of what the defaults are.
+        assert!(
+            debug.shader_debug_info,
+            "the DEBUG instance flag was unconditional, so it stays on by default"
+        );
+        assert!(
+            debug.validate_indirect_calls,
+            "indirect-call validation was on - `InstanceFlags::from_build_config` returns it in a \
+             release build, and the renderer lost it by setting `DEBUG` alone"
+        );
+        assert!(
+            !debug.discard_backend_labels,
+            "labels were always passed to the backend"
+        );
+        assert!(
+            !debug.allow_noncompliant_adapter,
+            "a non-compliant driver was never offered"
         );
         assert!(
             !debug.terrain_no_cull && !debug.terrain_greater_depth,

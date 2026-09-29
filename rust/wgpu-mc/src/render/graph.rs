@@ -1081,46 +1081,11 @@ impl RenderGraph {
         // built again - with the real atlas in this slot - before any such face can be drawn.
         graph.resources.insert(
             "@sampler_mc_block_atlas".into(),
-            ResourceBacking::Sampler(Arc::new(wm.gpu.device.create_sampler(&{
-                let mut descriptor =
-                    crate::render::atlas::block_atlas_sampler(wgpu::AddressMode::ClampToEdge);
-                descriptor.label = Some("wgpu-mc: the game's block atlas");
-
-                // **No `lod_max_clamp`, and the reason is worth writing down because "clamp it to the
-                // level the game is animating" is the obvious thing to try.**
-                //
-                // The game does not animate one level. `TextureAtlas#uploadAnimationFrames` walks the
-                // whole chain and renders the current frame of every animated sprite into each level in
-                // turn, through that level's own view and that level's own UBO:
-                //
-                //     for (int level = 0; level <= this.maxMipLevel; level++) {
-                //         try (RenderPass pass = ...createRenderPass(() -> "Animate " + this.location,
-                //                                          this.mipViews[level], OptionalInt.empty())) {
-                //             ...
-                //             animationState.drawToAtlas(pass, animationState.getDrawUbo(level));
-                //
-                // `getDrawUbo(level)` is `spriteUbosByMip[level]`, and there is one UBO per entry of
-                // `byMipLevel` - so every level receives the frame, in the same call, and no level is
-                // staler than any other. Clamping to the level that moves would therefore clamp to
-                // *every* level, which is no clamp at all.
-                //
-                // What a clamp to 0.0 would actually do is throw the mip chain away for this atlas:
-                // a distant lump of lava would sample one texel of a 16x16 sprite, which is the
-                // aliasing the chain exists to prevent - more temporal noise at distance, not less.
-                // The two block atlases take the same filters for the same reason; see
-                // `render::atlas::block_atlas_sampler`, which is where that agreement is enforced.
-                //
-                // It is nevertheless reachable, as the `atlas_base_mip_only` switch, because the case
-                // for it is a picture rather than an argument: with the clamp in place the sampler can
-                // only return level 0, so a run comparing the two says whether the shimmer was the
-                // chain or something else.
-                if ATLAS_BASE_MIP_ONLY.load(Ordering::Relaxed) {
-                    descriptor.lod_min_clamp = 0.0;
-                    descriptor.lod_max_clamp = 0.0;
-                }
-
-                descriptor
-            }))),
+            ResourceBacking::Sampler(Arc::new(
+                wm.gpu
+                    .device
+                    .create_sampler(&crate::render::atlas::game_atlas_sampler()),
+            )),
         );
 
         let game_atlas = game_block_atlas();
@@ -1597,7 +1562,12 @@ impl RenderGraph {
                     // arena 1.
                     let mut bound_arena: Option<u32> = None;
 
-                    let sections_source = scene.section_storage.write();
+                    // **A read lock, because nothing under it writes.** This was `write()`, and it is
+                    // only ever iterated (`sections_source.iter()` below) - so the render thread was
+                    // taking the arena's exclusive lock for the whole of the gather, once a frame, and
+                    // every bake thread's `allocate` needs that same lock. A read lock is also what makes
+                    // the two sides' access patterns compatible rather than merely brief.
+                    let sections_source = scene.section_storage.read();
 
                     // **The counters are local `u64`s and they are added once, at the end.**
                     //
@@ -1778,9 +1748,10 @@ impl RenderGraph {
                     Self::sort_for_drawing(out, Self::terrain_layers(pipeline_name));
 
                     // The section position, written into a fixed-size array on this stack once per
-                    // draw: sixteen bytes in the layout the shader's `SectionPosition` spells out - the
-                    // three integers, then the layer's alpha cutoff. See `set_immediates`.
-                    let mut constants = [0u8; 16];
+                    // draw: twenty bytes in the layout the shader's `SectionPosition` spells out - the
+                    // three integers, the layer's alpha cutoff, and the atlas level-of-detail bias.
+                    // See `set_immediates`.
+                    let mut constants = [0u8; 20];
 
                     for (layer_index, alpha_cutout) in Self::terrain_layers(pipeline_name) {
                         let layer_index = *layer_index as usize;
@@ -1827,7 +1798,14 @@ impl RenderGraph {
                             constants[..12].copy_from_slice(bytemuck::cast_slice(
                                 &visible.relative_position.to_array(),
                             ));
-                            constants[12..].copy_from_slice(&alpha_cutout.to_ne_bytes());
+                            constants[12..16].copy_from_slice(&alpha_cutout.to_ne_bytes());
+                            // Read per draw rather than hoisted out of the loop, because it is a
+                            // setting: a value cached for the pass would be a frame behind the options
+                            // screen, and the whole point of moving this out of the shader was that
+                            // moving it takes effect.
+                            constants[16..].copy_from_slice(
+                                &crate::render::atlas::atlas_lod_bias().to_ne_bytes(),
+                            );
 
                             set_immediates(
                                 &bound_pipeline.immediates,
@@ -2114,7 +2092,10 @@ pub fn set_push_constants(
 fn immediate_size_of(name: &str) -> u32 {
     match name {
         "@pc_mat4_model" => 64,
-        "@pc_section_position" => 16,
+        // **Five four-byte members, and the fifth is why this is not sixteen.** `SectionPosition` is
+        // three integers, the layer's alpha cutoff and the atlas level-of-detail bias; see the struct in
+        // `terrain.wgsl` for what the bias is for and why it had to stop being a `const`.
+        "@pc_section_position" => 20,
         "@pc_total_sections" => 4,
         "@pc_parts_per_entity" => 4,
         "@pc_electrum_color" => 16,
@@ -2412,6 +2393,11 @@ mod texture_sample_uniformity_tests {
 
     /// How many auto-level image fetches the module holds, at any depth. The sanity check beside the
     /// assertion: "found no sample in a branch" is also true of a shader with no samples at all.
+    ///
+    /// Counts `Auto` **and** `Bias`, because both ask the hardware for a level from the derivatives and
+    /// both are therefore subject to the invariant. See [`is_auto_sample`], which is the same rule used
+    /// for the branch walk - one predicate, so the count and the walk cannot disagree about what they
+    /// are looking for.
     fn total_auto_samples(module: &naga::Module) -> usize {
         module
             .entry_points
@@ -2421,15 +2407,7 @@ mod texture_sample_uniformity_tests {
                     .function
                     .expressions
                     .iter()
-                    .filter(|(_, expression)| {
-                        matches!(
-                            expression,
-                            naga::Expression::ImageSample {
-                                level: naga::SampleLevel::Auto,
-                                ..
-                            }
-                        )
-                    })
+                    .filter(|(_, expression)| is_auto_sample(expression))
                     .count()
             })
             .sum()
@@ -2546,14 +2524,19 @@ mod texture_sample_uniformity_tests {
 
     /// Whether this expression is a texture fetch that asks the hardware for a level of detail.
     ///
-    /// `SampleLevel::Auto` is the one that needs derivatives; `Zero` and `Exact` name a level outright
-    /// and are legal wherever they appear, which is why the vertex stage's lightmap fetch - a
-    /// `textureSampleLevel(.., 0.0)` - is not a finding.
+    /// **`Auto` and `Bias` both do**, and both therefore need derivatives: `Auto` takes the level from
+    /// them, `Bias` takes it from them and shifts it. A `Bias` of zero behaves exactly as an `Auto`, so
+    /// the shipped shader's `textureSampleBias(.., ATLAS_LOD_BIAS)` is the same fetch as long as that
+    /// constant is zero - and the invariant below has to apply to it either way, because a bias whose
+    /// level is computed inside a branch is the same undefined behaviour a plain sample is.
+    ///
+    /// `Zero` and `Exact` name a level outright and are legal wherever they appear, which is why the
+    /// vertex stage's lightmap fetch - a `textureSampleLevel(.., 0.0)` - is not a finding.
     fn is_auto_sample(expression: &naga::Expression) -> bool {
         matches!(
             expression,
             naga::Expression::ImageSample {
-                level: naga::SampleLevel::Auto,
+                level: naga::SampleLevel::Auto | naga::SampleLevel::Bias(_),
                 ..
             }
         )

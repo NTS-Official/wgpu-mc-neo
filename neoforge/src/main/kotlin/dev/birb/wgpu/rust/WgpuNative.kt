@@ -303,6 +303,8 @@ object WgpuNative {
 		blocksMotion: Int,
 		offsetMaxY: Float,
 		offsetXz: Int,
+		/** Whether the state's block is a `LeavesBlock` - the game's own `instanceof` check. */
+		leaves: Int,
 	)
 
 	@JvmStatic
@@ -426,6 +428,65 @@ object WgpuNative {
 	 */
 	@JvmStatic
 	external fun blockBakeDiagnostics(): String
+
+	/**
+	 * Hands the game's `cutoutLeaves` option over, before a bake, because the answer is written into the
+	 * geometry rather than read as it draws.
+	 *
+	 * That is `Options#cutoutLeaves` - the Fancy/Fast leaves switch the graphics presets move - and it
+	 * reaches baking as `ModelBlockRenderer#forceOpaque`: with it off a leaf block's faces go to the
+	 * solid layer whatever their sprite says, so a leaf texture's transparent gaps are filled by its own
+	 * colour instead of being cut away. See `wgpu_mc::mc::block::CUTOUT_LEAVES`.
+	 */
+	@JvmStatic
+	external fun setCutoutLeaves(cutout: Boolean)
+
+	/**
+	 * The window mode the renderer's setting names, as the index of its variant - `0` exclusive
+	 * fullscreen, `1` borderless, `2` off.
+	 *
+	 * Read by [dev.birb.wgpu.backend.DisplayMode.Mode.current] rather than through
+	 * [dev.birb.wgpu.rust.RendererSettings], because it is read on the path that *puts the window into a
+	 * mode* - and `RendererSettings` caches for a second, so a mode applied immediately after the setting
+	 * moved could read the value from before it and put the window back where it was.
+	 */
+	@JvmStatic
+	external fun windowMode(): Int
+
+	/**
+	 * Whether the window mode moved in the apply that just happened, so the settings screen can say so:
+	 * `-1` when it did, and the current variant index when it did not.
+	 *
+	 * The schema cannot answer this. It says whether a setting *may* need a restart; this is whether it
+	 * *did* - and for a player who opened the page and moved nothing, it did not.
+	 */
+	@JvmStatic
+	external fun windowModeReloadResult(): Int
+	/**
+	 * Stores the window mode and puts the window into it, for the cycle button on **Minecraft's own video
+	 * settings screen** - see [dev.birb.wgpu.backend.DisplayMode.windowModeOption].
+	 *
+	 * The value goes to this renderer's config rather than to `options.txt`, because it is three states and
+	 * `options.txt`'s `fullscreen` is a boolean; the row is the game's because that is where a player looks.
+	 * The apply is done by the native side rather than here so that there is one writer and one path.
+	 */
+	@JvmStatic
+	external fun setFullscreenMode(mode: Int)
+
+	/**
+	 * Which atlas the faces baked since the last call went to, as a short string, and **reset** so the
+	 * next call reports the next interval.
+	 *
+	 * The one thing about the atlas routing that cannot be seen: both atlases are 2048x2048 and answer to
+	 * the same filters, so a face on the wrong one is not drawn differently - it samples a mip chain built
+	 * from the whole packed sheet instead of per sprite, which is a blurred, half-transparent block. The
+	 * game-atlas number should be nearly all of them and the own-atlas number nearly none.
+	 *
+	 * Read on the once-a-second report rather than beside [blockBakeDiagnostics], which runs right after
+	 * the block cache is built and therefore before a single section has been baked.
+	 */
+	@JvmStatic
+	external fun atlasFaceCounts(): String
 
 	/**
 	 * What the watched blocks have been seen, drawn and culled for - empty until one of them is baked.

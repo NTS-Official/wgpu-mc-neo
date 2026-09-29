@@ -29,14 +29,13 @@
     "render.GameRendererMixin",
     "render.InGameHudMixin",
     "render.LightmapTextureManagerMixin",
-    "render.ProjectionMatrixBufferMixin",
     "render.RebuildTaskMixin",
     "render.RenderSystemMixin",
     "render.SkyRendererMixin",
     "render.SpriteContentsMixin",
     "render.TextureAtlasMixin",
     "render.WindowMixin",
-
+    "render.WindowModeMixin",
     "render.WorldRendererMixin",
     "world.BlockStateMixin",
     "world.PackedIntegerArrayMixin"

@@ -119,12 +119,53 @@ object Wgpu {
 		return timesTexSubImageCalled
 	}
 
+	/**
+	 * Offers the RenderDoc capture layer to the renderer, **quietly when it is not installed**.
+	 *
+	 * RenderDoc is a developer's tool: it is present on a machine where somebody is profiling, and absent
+	 * on every other machine - including an ordinary player's and this project's own development
+	 * environment. `System.loadLibrary` is the all-or-nothing version of "load it if it is there", so an
+	 * absent library is an `UnsatisfiedLinkError` and nothing else, and logging that as a warning with a
+	 * full stack trace made every single launch look broken.
+	 *
+	 * So the search is done first and the load is only attempted when it can succeed: the library is
+	 * looked for on `java.library.path`, and its absence is a debug line rather than a warning. When it
+	 * *is* found, finding it is worth a line of its own - that is the state a capture is possible in, and
+	 * knowing which state a run was in is the whole reason this hook reports at all.
+	 *
+	 * A library that is present but refuses to load is still a warning with the exception attached: that
+	 * is not an absence, it is a broken install, and it is the one case where the stack trace is the
+	 * useful part.
+	 */
 	@JvmStatic
 	fun linkRenderDoc() {
+		val path = System.getProperty("java.library.path").orEmpty()
+			.split(java.io.File.pathSeparatorChar)
+			.filter { it.isNotBlank() }
+
+		val found = path.firstOrNull { directory ->
+			val name = if (java.io.File.separatorChar == '\\') "renderdoc.dll" else "librenderdoc.so"
+			java.io.File(directory, name).isFile
+		}
+
+		if (found == null) {
+			// The ordinary case, and not worth a warning - see above. `debug` rather than nothing at all,
+			// so a log with debug on still says why there is no capture layer.
+			WgpuMcMod.LOGGER.debug(
+				"wgpu: RenderDoc is not installed; the capture layer is off (looked in {} director{} on " +
+					"java.library.path)",
+				path.size,
+				if (path.size == 1) "y" else "ies",
+			)
+			return
+		}
+
 		try {
 			System.loadLibrary("renderdoc")
+			WgpuMcMod.LOGGER.info("wgpu: the RenderDoc capture layer is loaded from {}", found)
 		} catch (e: UnsatisfiedLinkError) {
-			WgpuMcMod.LOGGER.warn("Error while loading RenderDoc", e)
+			// Present and refusing - a broken install, not an absence, and the trace is the useful part.
+			WgpuMcMod.LOGGER.warn("wgpu: RenderDoc is installed at {} but could not be loaded", found, e)
 		}
 	}
 
@@ -181,4 +222,68 @@ object Wgpu {
 		val b = color and 0xFF
 		return r or (g shl 8) or (b shl 16)
 	}
+
+	/**
+	 * The colour a **fluid** is tinted by at a position, which is a different question from
+	 * [helperGetBlockColor] and one that function cannot answer.
+	 *
+	 * `FluidRenderer#tesselate` asks the *fluid* model rather than the block model:
+	 *
+	 * ```java
+	 * FluidModel model = this.fluidModels.get(fluidState);
+	 * int tintColor = model.fluidTintSource() != null
+	 *     ? model.fluidTintSource().colorInWorld(fluidState, blockState, level, pos)
+	 *     : -1;
+	 * ```
+	 *
+	 * and for water that source is NeoForge's `FluidTintSources.water()`, whose answer is the **biome's**
+	 * water colour - so an ocean, a swamp and a cold river are three different colours in the game. The
+	 * native side used one constant for all three, which is why water did not follow the biome.
+	 *
+	 * The `-1` above is the game's own "no tint" and is passed through unaltered: white in the packing
+	 * the native side reads, so a fluid with no tint source draws untinted rather than black. Lava is
+	 * exactly that case - `FluidStateModelSet` builds the lava model with a null tint source - and the
+	 * native side does not ask for lava in the first place.
+	 *
+	 * Packed the way the native side reads a tint: **red in the low byte**, the same packing
+	 * [helperGetBlockColor] returns.
+	 */
+	@JvmStatic
+	fun helperGetFluidColor(x: Int, y: Int, z: Int): Int {
+		val client = Minecraft.getInstance()
+		if (client == null || client.level == null) {
+			return 0xFFFFFFFF.toInt()
+		}
+		val level = client.level ?: return 0xFFFFFFFF.toInt()
+
+		val pos = BlockPos(x, y, z)
+
+		try {
+			val fluidState = level.getFluidState(pos)
+			val model = client.modelManager.fluidStateModelSet.get(fluidState)
+			val tintSource = model.fluidTintSource() ?: return 0xFFFFFFFF.toInt()
+			val color = tintSource.colorInWorld(fluidState, level.getBlockState(pos), level, pos)
+			val r = color shr 16 and 0xFF
+			val g = color shr 8 and 0xFF
+			val b = color and 0xFF
+			return r or (g shl 8) or (b shl 16)
+		} catch (failure: Throwable) {
+			// Wrapped like every other read this mod makes of the game: this runs on the bake thread
+			// while a world loads, and a failure here is water drawn with the default colour rather
+			// than a client that stops.
+			if (!warnedFluidTint) {
+				warnedFluidTint = true
+				WgpuMcMod.LOGGER.warn(
+					"wgpu: could not read a fluid's tint; water keeps the default colour",
+					failure,
+				)
+			}
+
+			return 0xFFFFFFFF.toInt()
+		}
+	}
+
+	/** One warning for the fluid tint rather than one per fluid block, for the life of the process. */
+	@Volatile
+	private var warnedFluidTint = false
 }

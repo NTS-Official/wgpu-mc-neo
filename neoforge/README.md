@@ -3918,6 +3918,704 @@ It exists anyway, as **`Atlas sampled from its base mip only`**, because the cas
 rather than an argument and the two runs are cheap to compare. Applying it rebuilds the graph, since a
 sampler is built with the pipelines.
 
+### Every instance flag is a setting now, and the WGPU_* escape hatch works again
+
+`instance_flags` was building the flag set by hand, and three of the four flags it touched were
+constants:
+
+| flag | was | is |
+| --- | --- | --- |
+| `DEBUG` | **always on** | `shader debug info`, on by default |
+| `VALIDATION` | always on until it became a switch | `host validation`, off |
+| `GPU_BASED_VALIDATION` | behind a switch | `gpu based validation`, off |
+| `VALIDATION_INDIRECT_CALL` | **never set** - the code set `DEBUG` alone instead of `InstanceFlags::debugging()` | `validate indirect calls`, on |
+| `DISCARD_HAL_LABELS` | never set | `discard backend labels`, off |
+| `ALLOW_UNDERLYING_NONCOMPLIANT_ADAPTER` | never set | `allow non-compliant adapter`, off |
+
+The last two are new switches rather than moved constants, and they are the two the renderer had no way
+to reach at all.
+
+**And the environment variables work again.** wgpu documents `WGPU_DEBUG`, `WGPU_VALIDATION`,
+`WGPU_GPU_BASED_VALIDATION`, `WGPU_VALIDATION_INDIRECT_CALL`, `WGPU_DISCARD_HAL_LABELS` and
+`WGPU_ALLOW_UNDERLYING_NONCOMPLIANT_ADAPTER`, and every one of them was silently ignored here: they are
+read by `InstanceFlags::with_env()`, which this renderer had never called. It is applied **last**, so the
+variables win over the settings - which is the convention they exist for, and a launcher passing
+`WGPU_VALIDATION=1` to diagnose a crash means it.
+
+Two flags are deliberately *not* offered, and the reasons are in `instance_flags`:
+
+- **`AUTOMATIC_TIMESTAMP_NORMALIZATION`** exists to save the caller the multiply by the timestamp
+  period, and `timing.rs` already does that multiply. Turning it on would add a compute shader to every
+  query resolve to save an operation that is not being performed.
+- **`STRICT_WEBGPU_COMPLIANCE`** restricts the feature set to the WebGPU specification's, and this
+  renderer asks for `IMMEDIATES` and timestamp queries, which are beyond it. The honest version of that
+  switch is one that turns off half the renderer, so it is not a switch.
+
+All six are read at launch, so all six need a restart, and the line that reports them is written once a
+world is loaded - the same line, and the same reason, as the validation layers: nothing from the adapter
+onwards reaches the log, because the instance is built before `setPanicHook` installs `env_logger`. It is
+built from the flags the instance **actually** has rather than from the settings, so a `WGPU_*` override
+shows up here instead of being invisible:
+
+```text
+wgpu-mc: the instance was built with backend validation on, GPU-based validation off, shader debug info
+on, indirect-call validation on, backend labels kept, non-compliant adapters off.
+```
+
+### The arena drain: one write per run, and a read lock instead of a write lock
+
+Two things on the section-upload path, both found by reading it rather than by a symptom.
+
+**`write_buffer` was called twice per layer per section.** `Queue::write_buffer` is not free and the copy
+is not what it costs: wgpu-core allocates a **`StagingBuffer` per call** and frees it after the next
+submission. So a frame moving a thousand sections over three layers was making thousands of short-lived
+allocations and thousands of small transfers - the exact shape of loading a world or flying forward,
+which is when this work is real. A settled world moves nothing and none of it runs.
+
+The ranges are gathered into one scratch buffer and written **one `write_buffer` per run of contiguous
+bytes**, with vertices and indices sorted by offset within a layer so a run is always ascending. Whether
+ranges are contiguous turned out not to be a guess - consecutive allocations from the free list are
+adjacent - so measured on a loading world:
+
+```text
+136 baked section(s) moved into the arena (140 in it now), 562 upload range(s) in 1 write(s) - 561 merges
+ 62 baked section(s) moved into the arena (202 in it now), 244 upload range(s) in 1 write(s) - 243 merges
+```
+
+**One write for the whole frame's drain**, against 562 and 244 before. The merge count is on the line
+because "coalescing helps" is a claim about those two numbers and nothing else.
+
+The runs are collected first and written afterwards, deliberately: writing inline would mean holding a
+borrow of the scratch buffer across the `extend_from_slice` that appends to it.
+
+**And the gather held a `write` lock it never wrote through.** `let sections_source =
+scene.section_storage.write()` is only ever iterated - so the render thread took the arena's *exclusive*
+lock for the whole of the gather, once a frame, while every bake thread's `allocate` needs that same
+lock. The two contend in both directions: a bake holding it makes the frame wait, and the frame holding
+it makes every waiting bake wait longer, on the threads trying to keep Minecraft's chunk build moving. It
+is a `read()` now, which is also what makes the two access patterns compatible rather than merely brief.
+
+### Three window modes: exclusive, borderless, windowed
+
+The game has two. `Options#fullscreen` is a boolean in `options.txt` whose handler calls
+`Window#toggleFullScreen`, and `Window#setMode` turns it into one of two GLFW calls -
+`glfwSetWindowMonitor(handle, monitor, ..)` for fullscreen and `glfwSetWindowMonitor(handle, 0L, ..)` for
+windowed. There is no third state for a window that covers the monitor **without owning the display mode**.
+
+| | GLFW | display mode | decorations |
+| --- | --- | --- | --- |
+| Exclusive | `glfwSetWindowMonitor(handle, monitor, ..)` | **changes** | none (the monitor owns it) |
+| Borderless | `glfwSetWindowMonitor(handle, 0L, x, y, w, h, -1)` | untouched | **removed by hand** |
+| Windowed | the same windowed call, at the saved bounds | untouched | restored |
+
+GLFW has no borderless mode, so borderless is the *windowed* call with the window moved to the monitor's
+origin, sized to its **video mode** (not its work area - a borderless window that leaves the taskbar
+visible is a maximised window), and `GLFW_DECORATED` cleared. The display mode is never touched, which is
+the whole reason to want it.
+
+**The default is windowed**, and it is named explicitly:
+
+```rust
+#[serde(default = "no_fullscreen_mode")]
+pub fullscreen_mode: EnumSetting,
+```
+
+**`#[serde(default)]` alone would have been wrong, and it was measured.** `EnumSetting`'s own `Default` is
+`selected: 0` - the *first* variant - so a bare attribute hands every fresh config exclusive fullscreen
+however the enum is ordered, and `#[default]` on the variant does nothing. The config was deleted, the
+client started, and it took the display over. This is the same trap the `animated_textures` field
+documents, hit a second time in the same file.
+
+#### The two dead ends, and what they cost
+
+Both are worth recording because each looked correct and each wasted a round.
+
+**A mixin on `Window#setMode` cannot report its own failure.** That method is called from `Window`'s
+constructor, and `Minecraft` wraps the construction in a `try` that catches **exactly one type**:
+
+```java
+try {
+    windowCandidate = new Window(this, displayData, ..., backend);
+    ...
+} catch (BackendCreationException var24) { ... }
+```
+
+so anything else raised in there escapes, leaves the window null, and the client exits through a path that
+**reports nothing** - no crash report, no fatal line, one unrelated `warn` as the only clue, twice. The mode
+is therefore applied **after** the window exists, by reflection on the private `setMode` plus the private
+`fullscreen` and `handle` fields, from a client tick. A failure there is a logged warning instead of a
+silent exit, and nothing runs inside a constructor.
+
+**A row injected into `VideoSettingsScreen` is a row on a screen nothing opens.** `OptionsScreenMixin`
+already replaces that whole screen:
+
+```java
+if (VIDEO.equals(title)) {
+    cir.setReturnValue(Button.builder(VIDEO, btn -> parent.getMinecraft().setScreen(new OptionPageScreen(parent))).build());
+}
+```
+
+The renderer's own `OptionPageScreen` **is** the video settings page, so the row belongs on the Electrum
+page, in the place the game's fullscreen checkbox already occupied - same caption, so a player finds it
+where they always did. Two separate mixins (a `@ModifyArg` and then a `@Redirect`, the second with
+`require = 1`) were written and both were pointless: they applied cleanly to a screen that is never
+constructed.
+
+`options.fullscreen()` itself is left alone. The F11 handler still writes it from `Window#isFullscreen`, the
+game still reads it at startup to decide what window to create, and `Window#isFullscreen` is answered from
+the mode actually applied - so a player who never opens the page gets exactly the behaviour they had.
+
+#### The mode has to be applied when the settings are read, not on the first frame
+
+The first version applied it from a client tick, `DisplayMode.applyOnFirstFrame`, and that is one frame too
+early: **the settings are read later than the first frame**, so `windowMode` answered the static's initial
+value - `Exclusive` - and the client took the display over before switching to the mode the config named.
+Measured, in one log:
+
+```
+[22:15:32] wgpu: the window is in EXCLUSIVE mode
+[22:15:43] wgpu-mc: the window mode is now 2; asking the JVM to put the window in it
+[22:15:43] wgpu: the window is in OFF mode
+```
+
+Eleven seconds of a display mode switch nobody asked for, on the way to the right answer. The apply now
+happens in `sendRunDirectory`, right after `Settings::load_or_default`, so the value read back is the one
+that was just loaded - and the first-frame call stays as a belt for the mod-constructor path, where the
+settings arrive before there is a window. One line, once, in the log now:
+
+```
+wgpu: the window is in OFF mode
+```
+
+### The fluid flicker: the levels are not blended any more, because two of them are two phases
+
+**Measured, by the player, and it is the kind of reading that settles a question static analysis had been
+going round in circles on:** with `atlas_base_mip_only` on - which clamps `lod_max_clamp` to `0.0`, so the
+sampler can only return level 0 - **the fluid flicker goes away.** With it off, it comes back.
+
+So the flicker involves the levels above the base one, and there are exactly two things such a level can
+contribute. They have to be separated, because only one of them is fixable at the sampler:
+
+- **the level's own content is current.** `TextureAtlas#uploadAnimationFrames` walks every level and draws
+  the due frame into each through that level's own view **and its own UBO** -
+  `animationState.getDrawUbo(level)` is `spriteUbosByMip[level]`, one per entry of `byMipLevel` - so no
+  level is staler than any other. This was checked before anything changed, which is why "the higher
+  levels hold no live frame" is not the answer;
+- **the blend between two of them is not a blend of two resolutions of one image.** An animated sprite is
+  a *scrolling* pattern: `water_flow` and `lava_flow` move their sample point within the frame, so levels
+  *n* and *n+1* hold the same frame at the same instant **sampled at two different rates**, and
+  `MipmapFilterMode::Linear` mixes two phases of a moving pattern. A static sprite's levels are a
+  consistent pyramid and blend cleanly; a moving one's do not.
+
+So the blend is what goes, not the chain - `game_atlas_sampler()` is `block_atlas_sampler()` with
+`mipmap_filter: Nearest`, and nothing else differs. The chosen level is still computed from the
+screen-space derivative exactly as before, so the chain keeps doing its job at distance; what is gone is
+mixing two levels together.
+
+**This is a hypothesis with a measurement behind it rather than a proof.** The measurement says "level 0
+is stable, something above it is not", and this removes the one mechanism that *mixes* levels without
+discarding them. If the flicker survives it, the remaining reading is that a single coarse level of a
+scrolling sprite is itself unstable at this scale, and the answer would be a per-sprite level clamp
+instead of a filter.
+
+**What it costs**, stated because it is a real regression for everything else: a static sprite crossing a
+level boundary now steps rather than fades. Vanilla asks for `GL_LINEAR_MIPMAP_LINEAR` (`GlSampler` maps
+`FilterMode.LINEAR` as the min filter to `9787`, `GL_LINEAR_MIPMAP_LINEAR`), so **this is a deliberate
+deviation from the game** and the only one in either sampler.
+
+**The chain is not clamped, and that is not an oversight.** "Sample the level the game is animating" is
+the obvious thing to try and the game does not animate one level: `uploadAnimationFrames` renders into
+every level in the same call, so a clamp would clamp to *every* level - which is no clamp at all. What it
+really does is throw the chain away, and a distant lump of lava would sample one texel of a 16x16 sprite,
+which is the aliasing the chain exists to prevent. It remains reachable as `atlas_base_mip_only`, honoured
+for both atlases, because the case for it is a picture rather than an argument.
+
+The device diagnostic line that used to claim the sampler's `anisotropy_clamp` was "in effect" now says
+what is true: magnification is `Nearest`, wgpu refuses any value above 1 unless all three filters are
+linear, so the feature being available changes nothing here.
+
+### Water follows the biome now, and the level-of-detail bias became observable
+
+Two changes that are the same lesson from opposite ends: **a value that cannot be observed cannot be
+verified**, and both of these were values that could not be.
+
+**Water was one constant.** The fluid mesher coloured every water face with `WATER_TINT`, a single
+`BiomeColors.getAverageWaterColor` value for the default biome, so an ocean, a swamp and a cold river were
+one colour where the game draws three. The tint was reachable all along, but not through the path that
+already existed: a fluid is coloured by its **fluid** model, not its block model -
+
+```java
+// FluidRenderer#tesselate
+FluidModel model = this.fluidModels.get(fluidState);
+int tintColor = model.fluidTintSource() != null
+    ? model.fluidTintSource().colorInWorld(fluidState, blockState, level, pos)
+    : -1;
+```
+
+- so `helperGetBlockColor` could not answer it even in principle. `helperGetFluidColor` asks the model set
+  (`ModelManager#getFluidStateModelSet().get(fluidState).fluidTintSource()`), which for water is NeoForge's
+  `FluidTintSources.water()` and answers with the biome.
+
+It is asked **per fluid block**, not per section, because the biome is a per-column property and a section
+on a boundary holds two colours - which is exactly what the constant could not do. Lava is not asked at
+all: `FluidStateModelSet` builds the lava model with a null tint source, so white is its answer and not a
+placeholder. The trait's default is still `WATER_TINT`, so every test and every provider that knows
+nothing about biomes draws what the renderer drew before.
+
+**The bias was a `const`, and a constant is not observable.** `ATLAS_LOD_BIAS` was a shader constant for a
+round, and with it "the bias works" and "the bias never reached the GPU" are the same picture - because
+`textureSampleBias(.., 0.0)` *is* a plain `textureSample`. Worse, moving it needed the shader copied into
+the build directory **and** a restart, since nothing watches the shader files (`mark_pipelines_stale` is
+called on atlas and lightmap handover only). Two rounds of "I moved it and nothing happened" could not
+distinguish those cases, and that is a fault in how it was built rather than in the reading.
+
+It is now a `FloatSetting` (`-4.0 .. 4.0`, step `0.5`, default `0.0`) written into the per-draw immediate
+block - `SectionPosition` grew a fifth `f32` member, so `@pc_section_position` is **20 bytes**, and the
+shaders read `section_pos.lod_bias` where they read the constant. **Read per draw**, so applying it takes
+effect on the next frame: nothing is baked and no pipeline is rebuilt.
+
+Both are counted, because in both cases the failure that matters looks like success:
+
+```
+faces baked since the last report: N game-atlas, 0 own-atlas, 0 leaf face(s) forced opaque,
+                                  2137411 fluid tint(s) read from the game
+```
+
+**Zero fluid tints** would mean the game answered "no tint" for every fluid - a different bug from the one
+this closed, and invisible without a count. The reading for the bias is the one the setting exists to
+produce: move it and watch the picture.
+
+### The game's leaves switch now reaches the baker
+
+**`Fast`/`Fancy` leaves did nothing here at all: both settings drew identical leaves.** That is the bug,
+and the cause is that the two sides decide a face's layer from different things.
+
+The game's answer is one line:
+
+```java
+// ModelBlockRenderer
+public static boolean forceOpaque(boolean cutoutLeaves, BlockState blockState) {
+    return !cutoutLeaves && blockState.getBlock() instanceof LeavesBlock;
+}
+```
+
+With it true, a leaf face goes to the **solid** layer whatever its sprite says - and the solid layer has
+no alpha test, so the transparent gaps in a leaf texture are filled by the texture's own colour and the
+block reads as a solid mass. `Options#cutoutLeaves` is the option, `GraphicsPreset` moves it (`Fast`
+false, both `Fancy` presets true), and the video settings screen exposes it directly.
+
+This side decides a face's layer from its **sprite** (`Atlas::sprite_layer`, where leaves are cut out
+because their texture has holes), and the option was never read at all - so there was nothing that could
+have moved a leaf. Two things were needed:
+
+- **`FaceFlags::leaves`**, the `instanceof LeavesBlock` half, read on the JVM where the `BlockState` is -
+  the native side holds block *names*, and a name comparison would miss every mod's leaves. It rides in
+  the per-state table `BlockFaceFlags.describe` already fills, which is one more argument on a call that
+  was already happening once per state.
+- **`CUTOUT_LEAVES`**, pushed by `WgpuNative.setCutoutLeaves` before each bake, because the answer is
+  written into the geometry and not read as the frame draws.
+
+`force_opaque(cutout_leaves, is_leaves)` is the rule, split out so its truth table can be tested without
+moving either global - and the test asserts the thing an `&&` written the wrong way round would break:
+**the switch moves leaves and nothing else.** With the operands swapped, `Fast` would force every
+non-leaf block opaque and leave the leaves alone, which is a world where the trees are fine and the
+glass, plants, ice and water are all wrong - a bug that would be blamed on the block models.
+
+`BlockCache` also watches the option per tick now, because it is a vanilla option and nothing in this
+mod's own settings path was ever going to notice it moving; a change takes the same route as the
+animated-texture switch (a note for the next tick, then `Bake.Setting`).
+
+**Measured, with `cutoutLeaves:false` in the run's own `options.txt`:**
+
+```
+faces baked since the last report: N game-atlas, 0 own-atlas, 191641 leaf face(s) forced opaque
+```
+
+The count is the reading that matters: **zero with the option off would mean the switch is still not
+reaching the baker**, which is exactly the state it was in before this. The layer report alone could not
+show it, because leaves are a small part of a section and the solid layer is already the largest of the
+three by a wide margin.
+
+### The translucent layer's quads are sorted, which is the one thing that cannot be deferred
+
+Blending is order-dependent and there is no depth test to hide it: two panes of glass or two surfaces of
+water inside one section blend in **the order they are drawn**, and this side drew them in bake order. The
+only sorting it had was between sections (`sort_for_drawing`, back to front), which is the game's own
+granularity for *its* translucent mesh but says nothing about the quads inside one.
+
+This is `SectionCompiler#compile`'s `mesh.sortQuads(builders.buffer(layer), vertexSorting)`, and the rule
+is the game's:
+
+- the point sorted by is the quad's **centroid**, and the game's centroid is the midpoint of its **first
+  and third vertices** (`MeshData#unpackQuadCentroids`: `x0` is the first vertex and `x1` the one two
+  strides later, then averaged);
+- the order is **descending** by squared distance - `VertexSorting#byDistance` sorts with
+  `Floats.compare(keys[o2], keys[o1])`, putting the largest first, so the farthest quad is drawn first;
+- the coordinates are **section-relative**, because that is the space a section's vertices are baked in.
+
+**Only the translucent layer.** The solid and cutout layers are opaque, so the depth test decides their
+order and sorting them would be work with no effect.
+
+**The index buffer is what gets sorted, not the vertices** - and that is the half worth copying. A quad's
+four vertices are the same four whichever order they are visited in, and its six indices are already
+relative within it (see the `INDICES` constant), so permuting the six-index groups reorders the quads and
+nothing else has to move. Our indices are relative where the game's are absolute, so the permutation is
+the only part that transfers.
+
+Three things are pinned by tests, because a wrong order here is **a wrong blend and nothing else** - all
+the geometry present, the depth test passing, and a player describing "the water looks off":
+
+| test | what it stops |
+| --- | --- |
+| `the_farthest_quad_is_drawn_first` | a sort that does nothing, or one that is ascending; the keys are read back out of the buffer it produced rather than from the order it was expected to produce |
+| `a_quad_keeps_its_own_indices` | a permutation that reorders within a group, which would turn every translucent face inside out and look like a lighting bug |
+| `a_layer_that_is_not_whole_quads_is_left_alone` | reordering against a vertex buffer whose quads are not where the sort assumes - which attaches each quad's indices to another quad's vertices |
+
+**Not done: the incremental re-sort.** The game re-sorts a section when the camera crosses a block
+boundary if the section's octant changed (`LevelRenderer#scheduleTranslucentSectionResort`, using
+`TranslucencyPointOfView` - the camera's section relative to the section's, clamped to `-1..1` - and
+spreading the work over frames). This side sorts once, at bake, from the section's origin, and a section
+baked with the camera in one octant keeps that order as the camera moves. For a section-sized mesh that is
+the same approximation the game itself falls back to for a camera that has not crossed a block, and it is
+the state this change leaves; the re-sort is a separate piece of work.
+
+### Every sprite is drawn from the game's atlas now, because the mip chain is the game's
+
+**The mip chain this side built was wrong in a way no filter could fix, and that is what the two-filter
+question was really about.**
+
+Vanilla builds a sprite's mip chain **before the atlas is packed**:
+
+```java
+// SpriteContents#increaseMipLevel, reached from the stitcher
+this.byMipLevel = MipmapGenerator.generateMipLevels(
+    this.name, this.byMipLevel, mipLevel, this.mipmapStrategy, this.alphaCutoffBias, this.transparency);
+```
+
+with `AUTO -> transparency.hasTransparent() ? CUTOUT : MEAN` (`MipmapGenerator:97-98`), and `CUTOUT`
+meaning the alpha **coverage** of each level is rescaled back to the base level's (`scaleAlphaToCoverage`,
+`:149-150`). The stitcher then pads each sprite by `1 << mipLevel`
+(`Stitcher:33: this.padding = 1 << mipLevel << Mth.clamp(anisotropyBit - 1, 0, 4)`), so **no sprite's
+mips can reach its neighbours'**.
+
+This side packed its own atlas first and mipped **the whole packed image** afterwards, which is wrong
+twice:
+
+| | vanilla | here |
+| --- | --- | --- |
+| when mips are built | per sprite, before packing | on the packed sheet, after |
+| what a sprite's edge averages with | its own padding | **whatever sprite is next to it in the sheet** |
+| alpha above level 2 | coverage held at the base level's | **arithmetic mean - a 16x16 cutout sprite has no opaque texel left** |
+
+The first bleeds a neighbour's colour into a face's edge; the second makes a face half-transparent at
+distance. **Both are invisible under `Nearest`, because `Nearest` never interpolates and so never reads
+the damaged texels** - which is exactly why `Nearest` was holding the picture together, and why turning
+bilinear on shipped a blurred, washed-out world.
+
+So `decide_game_atlas` no longer requires the game to animate the sprite. Every sprite with a rectangle
+from `registerSprite` is drawn from the game's atlas, whose chain is built the way above. The
+`animated_textures` setting still gates it, and `game_atlas_bound` is still a hard requirement - a
+rectangle from one stitch read against another atlas is a face with the wrong texture on it. The
+parameter is kept and ignored so the truth table still documents the case it was written for.
+
+**This side's own atlas is kept as a fallback**, not deleted: a sprite the game never told us about - a
+resource reload in flight, a sprite registered late - still has to be drawn from somewhere, and the
+frozen copy is the failure this renderer has always had. So the revert is one condition.
+
+And the sampler follows the chain rather than compensating for it:
+
+```rust
+mag_filter: wgpu::FilterMode::Linear,
+min_filter: wgpu::FilterMode::Linear,
+mipmap_filter: wgpu::MipmapFilterMode::Linear,
+anisotropy_clamp: 16,
+```
+
+`LevelRenderer:678-681` builds `CLAMP_TO_EDGE, FilterMode.LINEAR, FilterMode.LINEAR, maxAnisotropy`, so
+this is the game's own answer, and it is only *correct* against the game's chain.
+
+**16 is the honest maximum for `anisotropy_clamp`.** `wgpu-hal`'s `MAX_ANISOTROPY` is 16 and wgpu-core
+clamps to `[1, 16]` before the backend sees the value, so a larger number would be silently reduced - and
+there is no query for the driver's real limit, because `Limits` has no anisotropy field at all. It is
+only legal because all three filters are linear: wgpu rejects any `anisotropy_clamp` above 1 unless the
+min, mag **and** mipmap filters are linear, which is why `Nearest` had to stay and `anisotropy_clamp`
+had to be 1 for as long as it did.
+
+### Reverted: the non-indexed terrain draw path
+
+**This was rolled back, and the note is here because the idea is still right and the trap is worth not
+walking into twice.**
+
+The change made the terrain draws non-indexed - one `draw` per layer instead of `draw_indexed` - so that
+the six vertices of a quad are generated in the shader from the quad's number rather than fetched from an
+index buffer. The reasoning stands: an indirect *indexed* draw gives the shader a `vertex index` and the
+hardware an index buffer, and the terrain's vertices are in a storage buffer, so the shader cannot turn
+that `vertex index` into an address without reading the index value back out - which WGSL cannot do.
+
+It came out with wrong perspective, water missing in stripes, and what looked like holes. The corruption
+was reported, the addressing was re-derived from `allocate` (where `vertex_range` is provably counted in
+dwords, because `allocate_range` is handed a byte length divided by four), corrected, and **still wrong**.
+So the diagnosis was incomplete, and the change was reverted rather than iterated on blind: the draw path
+is back to `draw_indexed` with the index buffer bound, and both shaders are byte-identical to the commit
+before it.
+
+Two things learned that are worth keeping, both now recorded in the shader comments they belong to:
+
+- **`@builtin(first_instance)` does not exist in WGSL.** Naga rejects it outright. It does not need to
+  exist: an indirect draw's `first instance` is what `@builtin(instance_index)` reports for the first
+  instance, so a draw with an `instance_count` of one reads it there.
+- **The lightmap UV table is indexed by vertex, not by corner.** The six indices of a quad name vertices
+  `0, 3, 1, 1, 3, 2`, so `uv[vi & 3]` is the vertex and is correct for an indexed draw; a non-indexed draw
+  has `vi` running over six corners and needs a different table.
+
+What was **not** reverted is the sampler change below, which is a separate defect found on the way.
+
+### The two atlas samplers disagreed, and the switch that compares them only reached one
+
+`graph.rs` built the game's atlas sampler by hand on top of `render::atlas::block_atlas_sampler`, and
+applied `atlas_base_mip_only` itself:
+
+```rust
+if ATLAS_BASE_MIP_ONLY.load(Ordering::Relaxed) {
+    descriptor.lod_min_clamp = 0.0;
+    descriptor.lod_max_clamp = 0.0;
+}
+```
+
+That is the **only** place the switch was read. This renderer's own atlas - `@sampler`, built in
+`atlas.rs` - kept the default `lod_max_clamp` of 32, so turning the switch on clamped the game's atlas to
+its base level and left this side's at every level. Not the comparison its name describes, and not the
+comparison its own comment describes either.
+
+The switch now lives in `render::atlas::block_atlas_sampler`, which both samplers are built from, with
+`address_mode` the only difference between them (`Repeat` for this side's atlas, whose coordinates come
+from its own packing, and `ClampToEdge` for the game's). **A sampler constructed twice can disagree; one
+constructed once cannot** - and this is the second time these two have drifted, the first being the
+revision where only the game's sampler was bilinear and the fire and lava were blurry while the blocks
+around them were clean.
+
+The comment on why there is no clamp *by default* is still right and was kept: `TextureAtlas#uploadAnimationFrames`
+walks the whole mip chain and renders the current frame into every level through that level's own view and
+UBO, so no level is staler than any other and clamping to the level that moves clamps to every level.
+
+### The terrain draws are not indexed any more, which is what an indirect draw needs
+
+**This is groundwork, not the indirect buffer.** `Scene::indirect_buffer` is still created and still
+unused; what changed is the thing that was blocking it, and the reason is worth writing down before the
+next attempt.
+
+An indirect *indexed* draw hands the shader a `vertex index` and the hardware an index buffer. The
+terrain's vertices do not live in a vertex buffer - they are a storage buffer the shader addresses
+itself - so the shader cannot turn that `vertex index` into an address: it would have to **read the index
+value back out of a buffer**, and there is no way to do that in WGSL. `@builtin(vertex_index)` counts
+indices, and the index is what it needs.
+
+Unless there are no indices. Every quad the baker emits is the same six values over its own four
+vertices, in a winding that is fixed and already documented (`INDICES` in `chunk.rs`), so the six can be
+**generated** from the quad's number and the vertex's position within the six:
+
+```wgsl
+const QUAD_INDICES = array<u32, 6>(0u, 3u, 1u, 1u, 3u, 2u);
+
+let quad = vi / 6u;
+let corner = vi % 6u;
+let vertex_dword = base_vertex + 4u * (quad * 4u + QUAD_INDICES[corner]);
+```
+
+So the draws are now `draw(0..quads * 6, first_vertex..first_vertex + 1)` - **not indexed**, one instance
+each - and the index buffer is gone from the draw path. Nothing was given up for it: the four vertices of
+a quad are shared between its two triangles and by nothing else, so the vertex cache was not doing
+anything here.
+
+**Two things this turned up.**
+
+`@builtin(first_instance)` **does not exist in WGSL** - Naga rejects the shader, which the shader tests
+caught immediately. It does not need to exist: the value of an indirect draw's `first instance` is what
+`@builtin(instance_index)` reports for the first instance of that draw, so a draw with an `instance_count`
+of one reads the layer's vertex base there. That is the field that makes batching possible at all, because
+a push-constant block covers a whole `multi_draw_*` call.
+
+And the lightmap UV table had to stop being indexed by the vertex: the six corners name vertices
+`0, 3, 1, 1, 3, 2`, so a table indexed by corner is not a table indexed by vertex - corner 1 is vertex 3.
+`uv[vi & 3]` was the vertex when `vertex_index` ran over four vertices; it runs over six corners now.
+Getting that wrong is a lightmap that is subtly rotated per corner, which is exactly the kind of thing
+that looks like a texture bug.
+
+**What is still missing, precisely.** The indirect buffer needs `section_pos` to stop being a push
+constant, because one immediate block covers the whole batch and every section has a different position -
+so the section's **absolute** position has to live in the arena, written when it is baked (absolute
+because a camera-relative one would change as the camera moves, and that would mean rewriting the arena
+every frame). That is a 16-byte header per section: `SectionRanges` gains a range, and the allocator, the
+free paths, the refused/trimmed paths and the drain all learn about it.
+
+### Multi-draw indirect prerequisites, and a flag this renderer was clearing by accident
+
+`InstanceFlags::VALIDATION_INDIRECT_CALL` is not optional for an indirect-drawing renderer, and this one
+was not setting it. `InstanceFlags::debugging()` is `DEBUG | VALIDATION | VALIDATION_INDIRECT_CALL`, and
+the switch that replaced it chose `DEBUG` (plus `VALIDATION` when asked) - so the flag was dropped.
+
+It is not only validation. wgpu's own note: with it off, *"the value of `@builtin(instance_index)` will
+not take into account the value of the `first_instance` argument present in the indirect buffer"* - and
+`first_instance` is where a batched terrain draw would carry the vertex base the vertex stage addresses
+`chunk_data` with. On D3D12 that is a wrong picture rather than an error. It is set unconditionally now:
+what it costs is a bounds check on a handful of integers per *indirect call*, not per section, so it is
+not what the `host validation` switch trades against, and what it protects is the meaning of the
+arguments rather than whether they are legal.
+
+Measured on this machine, through the same reporting path as the validation layers:
+
+```text
+wgpu-mc: indirect draws: execution yes, real batched multi-draw yes.
+         Without the count feature wgpu emulates multi_draw_* as one draw per entry, which is a loop
+         by another name.
+```
+
+`MULTI_DRAW_INDIRECT_COUNT` is the feature that matters - **`wgpu` has no `Features::MULTI_DRAW_INDIRECT`
+at all**, the non-count calls are gated only on `DownlevelFlags::INDIRECT_EXECUTION`, and without the
+count feature they are emulated as one draw per entry. `INDIRECT_FIRST_INSTANCE` is the other
+prerequisite, because `first_instance` must be 0 without it and that is the field a shader's vertex base
+would ride in.
+
+### The section compile was skipped after the work, not before it
+
+`SectionCompilerMixin` used to redirect `new CompiledSectionMesh(...)` inside `RebuildTask.doTask`, which
+is **after** `SectionCompiler.compile` has built every vertex. So the only thing it saved was the upload
+and the derived data: the per-block model lookup, the part collection, the lighting, the vertex building,
+the packing into the scratch buffers and the sort-key pass were all still paid in full and then thrown
+away.
+
+It redirects the two calls that do the work instead, inside `compile`:
+
+| at | what is skipped |
+| --- | --- |
+| `ModelBlockRenderer.tesselateBlock` (`SectionCompiler.java:107`) | block geometry |
+| `FluidRenderer.tesselate` (`:103`) | fluid geometry |
+
+What is left per block is an `isAir` test, an `isSolidRender` test, an `hasBlockEntity` test and two
+virtual calls that return immediately. **Measured**: 1,109,503 block geometry calls skipped in one session.
+
+**The two things that must not be skipped are not.** `visGraph.setOpaque` feeds `results.visibilitySet`,
+which `SectionOcclusionGraph` walks to decide which sections are worth visiting at all - skipping it would
+make every section look transparent and the occlusion graph meaningless. `handleBlockEntity` fills
+`results.renderableBlockEntities`, which is how `LevelRenderer.extractVisibleBlockEntities` finds a chest
+or a sign. Both sit outside the two redirected calls and both still run.
+
+With no geometry produced, `startedLayers` stays empty, so `renderedLayers` is empty and
+`transparencyState` is never set - exactly the state an all-air section compiles to, which is the one state
+in this dispatcher known to be safe. Nothing has to be closed, because nothing was built, and that is the
+other half of the saving: `MeshData.close` is what returns the scratch buffers to a fixed pool.
+
+NeoForge's `ClientHooks.addAdditionalGeometry` is deliberately left alone. It is a different mechanism - a
+mod's renderer is handed the `ModelBlockRenderer` and builds its own geometry - and that geometry is not
+something this renderer can build in Rust, so it stays Minecraft's.
+
+**Two things about the injection that cost a round each, recorded because both are traps:**
+
+1. **A full descriptor that is right can still match nothing.** The namespace moves between versions -
+   `BlockAndTintGetter` is in `client.renderer.block` now and not `world.level`, `BlockStateModel` is in
+   `client.renderer.block.dispatch` - and Mixin reported `No refMap loaded` and `Scanned 0 target(s)` with
+   the descriptor taken from the decompiled source. It was verified against the bytecode instead
+   (`javap -c`), and then it applied. When an injection fails, read the descriptor out of the class file
+   rather than out of the source.
+2. **`method = "compile"` is not specific enough here.** `SectionCompiler` has two `compile` overloads -
+   a four-argument one that delegates to the five-argument one - and the injection only applied once the
+   target named the five-argument descriptor explicitly.
+
+### Host-side validation is a switch now, and it does not do what its name suggests
+
+`InstanceFlags::VALIDATION` was unconditional, so every launch loaded a vendor debug layer. It is the
+`host validation` debug setting now, off by default, and `gpu based validation` needs it - resolved as a
+pair in `debug::validation_flags` rather than left to the backend, because `wgpu-types` documents the
+implication and one place resolving it wrongly is a layer that silently does nothing.
+
+**What the flag actually does is not what this file used to say.** It does not turn wgpu's own checking on
+or off - wgpu-core validates every call unconditionally, which is why `wgpu_core::validation` warnings
+appear in the log with the setting off. What it asks for is the *backend's* validation:
+
+| | |
+| --- | --- |
+| D3D12 | `ID3D12Debug::EnableDebugLayer` |
+| Vulkan | the Vulkan validation layer |
+| GLES | `glEnable(GL_DEBUG_OUTPUT)` |
+
+A layer written by the graphics vendor, reporting through the driver's debug output, catching what wgpu
+cannot see - a barrier in the wrong place, a resource used before its GPU work finished. `GPU_BASED_VALIDATION`
+is that same layer running its checks on the GPU instead of on the recorded commands, which is why it needs
+`VALIDATION` and why it is the slow one.
+
+So turning `host validation` off does not make an invalid call silent. It removes the vendor's second
+opinion and its debug output, and it keeps wgpu's error that names the call that caused it.
+
+**The line about it could not be written where the flags are decided.** The instance is built in
+`create_renderer`, which runs a phase before `setPanicHook` installs `env_logger` - measured, not assumed:
+a `println!` beside `Instance::new` lands in the console about eleven seconds before the first line this
+side reaches the log. The pre-existing `renderer created through ..` line sits one statement after the
+instance is built and **has never appeared in a log either**, which is what made it obvious rather than
+mysterious. `instance_flags` records the answer and the line is written where the arena is sized, which is
+a line that does reach the log:
+
+```text
+wgpu-mc: the instance was built with the backend validation layer off and GPU-based validation off
+         (the `host validation` and `gpu based validation` debug settings). wgpu's own validation is
+         not a setting and never runs with those off - it is what names the call an error came from.
+```
+
+### Every entity model failed to parse, and the warning was the only sign
+
+```text
+wgpu-mc: 416 entity model layer(s) could not be read: minecraft:sheep#wool_undercoat (missing field
+`data`), minecraft:hanging_sign/crimson/wall#main (missing field `data`), minecraft:villager_no_hat#main
+(missing field `data`), ...
+```
+
+`LayerDefinitions.createRoots()` returns `Map<ModelLayerLocation, LayerDefinition>`, and `LayerDefinition`
+has two fields: `mesh` and `material`. The Rust side was reading this:
+
+```rust
+pub struct Wrapper2 { data: ModelPartData }
+pub struct Wrapper1 { data: Wrapper2 }
+```
+
+- the shape of a *baked* `ModelPart`, which no `LayerDefinition` has ever serialised as. So **all 416
+layers failed** with `missing field 'data'`, and the parse being per layer is the only reason it was a
+warning rather than a crash: the failures were skipped, the registry kept whatever it had, and entity
+rendering carried on with a stale or empty set.
+
+**What the game actually sends**, and what the code now reads:
+
+```text
+LayerDefinition  -> { mesh, material }
+MeshDefinition   -> { root }
+PartDefinition   -> { cubes, partPose, children }
+PartPose         -> a *record*: { x, y, z, xRot, yRot, zRot, xScale, yScale, zScale }
+CubeDefinition   -> { origin, dimensions, grow, mirror, texCoord, texScale, visibleFaces }
+```
+
+`ModelCuboidData` had `offset`, `textureUV` and `textureScale` - names no version of the game sends - and
+now has `origin`, `texCoord` and `texScale`. `material`, `comment`, `texScale` and `visibleFaces` are
+deliberately not named: serde ignores what it is not asked for, which is the right property for a shape
+this side is a guest in. Every field is `#[serde(default)]` for the same reason - a missing one degrades a
+model instead of discarding it.
+
+**Three things fell out of fixing the shape**, each of which had been broken as long as the parse failed:
+
+| | |
+| --- | --- |
+| `PartPose` scales were read as nothing | `scale_x/y/z` were hardcoded to `1.0`. The game expresses a baby variant as `PartPose.scaled(0.5)` **on the pose and nothing else**, so every baby model would have rendered at adult proportions. |
+| the pose was read as the translation | The game's `PartDefinition#bake` translates each cube by its **own** `origin` and rotates the part about the pose's pivot. The pose's `x`/`y`/`z` are almost always zero and the pivot almost never is, so this was backwards in both halves. |
+| `grow` was ignored | `CubeDefinition#bake` adds the deformation to each dimension, which is how a hat or an armour layer is "the head plus a quarter". |
+
+The last one is worth its own note, because it is the same trap one level down: `CubeDeformation`'s fields
+are `growX`/`growY`/`growZ`, where `origin` is a `Vector3f` whose fields really are `x`/`y`/`z`. A lookup
+with the wrong name does not fail - it misses, reads as zero, and every armoured model comes out a little
+too small. `a_grown_cube_is_its_dimensions_plus_the_growth` caught exactly that, in this side's own code,
+on its first run.
+
+**The guard is a fixture, not a comment.** `model_shape_tests` parses a literal transcription of what Gson
+emits - including `material`, `comment`, `texScale` and `visibleFaces`, which are ignored - and pins the
+part tree, the scale, the pivot-versus-origin split and the growth. A shape this side does not own has to
+be pinned by a sample of it, or the next rename is silent.
+
 ### The shape behind all of these: a section stops being drawn and nobody says so
 
 Five routes, one shape, and it took five rounds because each was found on its own:

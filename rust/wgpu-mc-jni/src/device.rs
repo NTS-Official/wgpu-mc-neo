@@ -524,21 +524,166 @@ fn wgpu_backends(backend: GraphicsBackend) -> wgpu::Backends {
     }
 }
 
-/// The instance flags, with GPU-based validation behind the debug setting it is offered as.
+/// The instance flags, with the backend's validation layer behind the switch it is offered as.
 ///
-/// Host-side validation and the debug utilities are always on - they are what makes a wgpu error
-/// name the call that caused it, and they cost little. GPU-based validation is the driver's own
-/// validation layer: it checks what the GPU is actually asked to do, and it is slow enough that it
-/// is off unless a player asks for it. It used to be unconditional here, which charged every
-/// launch for a development tool.
+/// **`DEBUG` is always on; the validation layer is not.** `DEBUG` is the debug utilities - the names,
+/// the `Debug` impls, the debug utils extension - and it costs nothing on the draw path, so it stays.
+///
+/// [`wgpu::InstanceFlags::VALIDATION`] does **not** turn wgpu's own checking on or off. wgpu-core
+/// validates every call unconditionally, which is why its warnings appear whatever this says. What the
+/// flag asks for is the *backend's* own validation: `ID3D12Debug::EnableDebugLayer` on D3D12, the
+/// Vulkan validation layer on Vulkan, `glEnable(GL_DEBUG_OUTPUT)` on GLES. That is a layer written by
+/// the graphics vendor, reporting through the driver's debug output, and it is what catches things wgpu
+/// cannot see - a barrier in the wrong place, a resource used before its GPU work finished. It was
+/// unconditional here, so every player loaded a vendor debug layer they were not reading.
+///
+/// The two layers are switches now and are read as the *pair* they are:
+/// [`crate::debug::validation_flags`] answers both, because GPU-based validation is that same vendor
+/// layer running its checks on the GPU rather than on the recorded commands. `wgpu-types` documents
+/// `GPU_BASED_VALIDATION` as implying `VALIDATION`; this resolves the implication rather than relying
+/// on the backend to.
+///
+/// **Nothing this side reports is lost with the layer off**, which is worth being exact about:
+/// wgpu-core still validates, so an illegal call still becomes an error naming the call. What is lost
+/// is the vendor's own checks and its debug output.
+/// The instance flags, every one of them a setting.
+///
+/// **Nothing here is a constant any more, and that is the point of the function.** The flags this
+/// renderer was building by hand were `DEBUG` (always), `VALIDATION` (always, before it became
+/// `host validation`), `GPU_BASED_VALIDATION` (behind a switch) and - by omission, because the code set
+/// `DEBUG` alone rather than `InstanceFlags::debugging()` - no `VALIDATION_INDIRECT_CALL` at all. Three
+/// of those four were constants that a player could not reach and one was a mistake; all four are
+/// settings now, and so are the two the renderer never set.
+///
+/// What the flags mean, since the names do not say it:
+///
+///  * `DEBUG` - debug information in shaders and objects. Nothing validates and nothing is paid per
+///    draw; it decides what a graphics debugger can name.
+///  * `VALIDATION` - the *backend's* validation layer, not wgpu's. wgpu-core validates every call
+///    unconditionally, which is why its warnings appear whatever this says. See `host_validation`.
+///  * `GPU_BASED_VALIDATION` - that same vendor layer running on the GPU, which implies `VALIDATION`.
+///  * `VALIDATION_INDIRECT_CALL` - bounds-checks an indirect draw's arguments and turns an
+///    out-of-bounds one into a no-op. **Not optional for this renderer**: on D3D12 its absence also
+///    stops `@builtin(instance_index)` accounting for `first_instance`, which is where a batched
+///    terrain draw carries its vertex base.
+///  * `DISCARD_HAL_LABELS` - stop passing object labels to the backend. Cheaper, and the labels are
+///    what a driver error and a capture use to name things.
+///  * `ALLOW_UNDERLYING_NONCOMPLIANT_ADAPTER` - offer a driver wgpu would otherwise refuse for not
+///    meeting the API's own requirements.
+///
+/// **And the environment still overrides all of it**, through [`wgpu::InstanceFlags::with_env`], which
+/// this renderer had never called - so every `WGPU_*` variable wgpu documents was silently ignored,
+/// including the ones whose whole purpose is to be set when the game cannot be started far enough to
+/// reach the options screen. It is applied last, so the variables win: that is the convention they
+/// exist for, and a launcher passing `WGPU_VALIDATION=1` to diagnose a crash means it.
+///
+/// `AUTOMATIC_TIMESTAMP_NORMALIZATION` is deliberately not offered. It exists to save a caller the
+/// multiply by the timestamp period, and this renderer already does that multiply (`timing.rs`), so
+/// turning it on would add a compute shader to every resolve to save an operation that is not being
+/// performed. `STRICT_WEBGPU_COMPLIANCE` is not offered either: it restricts the feature set to the
+/// WebGPU specification's, and this renderer asks for `IMMEDIATES` and timestamp queries, which are
+/// beyond it - so the honest version of that switch is one that turns off half the renderer.
 fn instance_flags() -> wgpu::InstanceFlags {
-    let flags = wgpu::InstanceFlags::VALIDATION | wgpu::InstanceFlags::DEBUG;
+    let (host_validation, gpu_based_validation) = crate::debug::validation_flags();
+    let flags = crate::debug::instance_flag_settings();
+    let mut instance = wgpu::InstanceFlags::empty();
 
-    if crate::debug::gpu_based_validation() {
-        flags | wgpu::InstanceFlags::GPU_BASED_VALIDATION
-    } else {
-        flags
+    if flags.shader_debug_info {
+        instance |= wgpu::InstanceFlags::DEBUG;
     }
+
+    if host_validation {
+        instance |= wgpu::InstanceFlags::VALIDATION;
+    }
+
+    if gpu_based_validation {
+        instance |= wgpu::InstanceFlags::GPU_BASED_VALIDATION;
+    }
+
+    if flags.validate_indirect_calls {
+        instance |= wgpu::InstanceFlags::VALIDATION_INDIRECT_CALL;
+    }
+
+    if flags.discard_backend_labels {
+        instance |= wgpu::InstanceFlags::DISCARD_HAL_LABELS;
+    }
+
+    if flags.allow_noncompliant_adapter {
+        instance |= wgpu::InstanceFlags::ALLOW_UNDERLYING_NONCOMPLIANT_ADAPTER;
+    }
+
+    // Last, so that `WGPU_DEBUG`, `WGPU_VALIDATION`, `WGPU_DISCARD_HAL_LABELS`,
+    // `WGPU_ALLOW_UNDERLYING_NONCOMPLIANT_ADAPTER`, `WGPU_GPU_BASED_VALIDATION` and
+    // `WGPU_VALIDATION_INDIRECT_CALL` all still mean what wgpu says they mean.
+    let instance = instance.with_env();
+
+    // Recorded rather than logged. This runs *before* `setPanicHook` installs `env_logger` - measured,
+    // not assumed: the instance is built about eleven seconds before the first line this side writes
+    // reaches the log - so a `log::info!` here is dropped, exactly as the renderer's config reading is.
+    // `reportRendererCapabilities` writes the line, because it runs once the logger is up.
+    VALIDATION_LAYERS.store(
+        instance.contains(wgpu::InstanceFlags::VALIDATION) as u8
+            | (instance.contains(wgpu::InstanceFlags::GPU_BASED_VALIDATION) as u8) << 1,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+
+    OTHER_INSTANCE_FLAGS.store(
+        instance.contains(wgpu::InstanceFlags::DEBUG) as u8
+            | (instance.contains(wgpu::InstanceFlags::VALIDATION_INDIRECT_CALL) as u8) << 1
+            | (instance.contains(wgpu::InstanceFlags::DISCARD_HAL_LABELS) as u8) << 2
+            | (instance.contains(wgpu::InstanceFlags::ALLOW_UNDERLYING_NONCOMPLIANT_ADAPTER) as u8)
+                << 3,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+
+    instance
+}
+
+/// Which validation layers the live instance was built with: bit 0 host, bit 1 GPU-based.
+///
+/// Read by [`register_renderer`], which is the first point after the instance where a line written
+/// here actually reaches the log. See [`instance_flags`].
+static VALIDATION_LAYERS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// The other instance flags of the live instance: bit 0 `DEBUG`, bit 1 `VALIDATION_INDIRECT_CALL`,
+/// bit 2 `DISCARD_HAL_LABELS`, bit 3 `ALLOW_UNDERLYING_NONCOMPLIANT_ADAPTER`.
+///
+/// Recorded for the same reason as [`VALIDATION_LAYERS`], and read by the same line. The bits are taken
+/// from the flags the instance was *actually* built with rather than from the settings, so a `WGPU_*`
+/// environment variable overriding a switch shows up here rather than being invisible.
+static OTHER_INSTANCE_FLAGS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// What this adapter can do with indirect draws: bit 0 `INDIRECT_EXECUTION`, bit 1
+/// `MULTI_DRAW_INDIRECT_COUNT`.
+///
+/// Recorded where the device is created and reported later, for the reason [`VALIDATION_LAYERS`] is:
+/// nothing from the adapter onwards reaches the log. See [`report_device_capabilities`].
+static MULTI_DRAW: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Writes the lines about what the device can do, from somewhere the log is actually listening.
+///
+/// Called once per world, beside the arena sizing, which is a line that is known to reach the log -
+/// unlike anything in or around `create_renderer`, which runs before `env_logger` exists.
+fn report_device_capabilities() {
+    let multi_draw = MULTI_DRAW.load(std::sync::atomic::Ordering::Relaxed);
+
+    info!(
+        "wgpu-mc: indirect draws: execution {}, real batched multi-draw {}. Without the count feature \
+         wgpu emulates multi_draw_* as one draw per entry, which is a loop by another name.",
+        if multi_draw & 1 != 0 { "yes" } else { "no" },
+        if multi_draw & 2 != 0 { "yes" } else { "no" }
+    );
+
+    info!(
+        "wgpu-mc: anisotropic filtering is {} on this device, and the atlas samplers ask for \
+         `anisotropy_clamp` 1 either way: magnification is `Nearest`, and wgpu refuses any value above 1 \
+         unless all three filters are linear - so the feature being present changes nothing here",
+        if multi_draw & 4 != 0 {
+            "available"
+        } else {
+            "NOT available"
+        }
+    );
 }
 
 /// Builds the instance, adapter, device and queue for one specific backend.
@@ -638,6 +783,42 @@ fn try_create_renderer(
         required_features |= wgpu::Features::IMMEDIATES;
     }
 
+    // **Multi-draw indirect, and whether it is real.** There is no `Features::MULTI_DRAW_INDIRECT` in
+    // this wgpu - the non-count calls are always available and gated only on
+    // `DownlevelFlags::INDIRECT_EXECUTION`, and **wgpu emulates them as a series of single draws**
+    // unless the adapter reports `MULTI_DRAW_INDIRECT_COUNT`. That distinction is the whole value of
+    // batching: an emulated multi-draw is a loop wearing a different name, so the number to read is the
+    // count feature, not the existence of the call.
+    let indirect_execution = adapter
+        .get_downlevel_capabilities()
+        .flags
+        .contains(wgpu::DownlevelFlags::INDIRECT_EXECUTION);
+    let anisotropic = adapter
+        .get_downlevel_capabilities()
+        .flags
+        .contains(wgpu::DownlevelFlags::ANISOTROPIC_FILTERING);
+    let multi_draw_count = adapter
+        .features()
+        .contains(wgpu::Features::MULTI_DRAW_INDIRECT_COUNT);
+
+    if multi_draw_count {
+        required_features |= wgpu::Features::MULTI_DRAW_INDIRECT_COUNT;
+    }
+
+    // Recorded rather than logged: everything from the adapter onwards runs before `setPanicHook`
+    // installs `env_logger`, so a line here is dropped - the same reason `instance_flags` records its
+    // answer instead of printing it. See `report_device_capabilities`.
+    //
+    // `ANISOTROPIC_FILTERING` is recorded because **it is the flag that decides whether the atlas'
+    // `anisotropy_clamp` means anything**. It is a *downlevel* flag - "WebGPU doesn't actually require
+    // aniso" - and wgpu-core silently sets the clamp to 1 when it is absent, so a device without it
+    // takes `Linear` filters and returns a texture that is blurred at every grazing angle with nothing
+    // in any log to say why. That is a plausible reading of "the blocks are blurry up close".
+    MULTI_DRAW.store(
+        indirect_execution as u8 | (multi_draw_count as u8) << 1 | (anisotropic as u8) << 2,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+
     let (device, queue) = match block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: None,
         required_features,
@@ -683,6 +864,26 @@ fn try_create_renderer(
 /// there, and because a `OnceCell` in a `static` is never dropped, the pointer stays valid for
 /// as long as the process runs.
 fn register_renderer(wm: WmRenderer, framebuffer: (u32, u32)) -> jlong {
+    // **What the two validation switches did**, said here rather than in `create_renderer` where the
+    // instance is actually built - because that runs a phase earlier than `setPanicHook` installs
+    // `env_logger`, so a line written there is dropped. Measured, not assumed: the sibling line
+    // `renderer created through ..` sits one statement after the instance is built and has never
+    // appeared in a log, while the lines this function reaches do.
+    //
+    // A line per launch, and worth it: whether the vendor's validation layer is loaded is the first
+    // thing a diagnosis asks, and the switch that controls it is on an options page that may never
+    // have been opened.
+    let layers = VALIDATION_LAYERS.load(std::sync::atomic::Ordering::Relaxed);
+
+    info!(
+        "wgpu-mc: the instance was built with the backend validation layer {} and GPU-based \
+         validation {} (the `host validation` and `gpu based validation` debug settings). wgpu's own \
+         validation is not a setting and never runs with those off - it is what names the call an \
+         error came from.",
+        if layers & 1 != 0 { "on" } else { "off" },
+        if layers & 2 != 0 { "on" } else { "off" },
+    );
+
     // The renderer's own atlases - the block atlas among them - are created here, as the Fabric
     // module did before the port. Nothing is packed into them yet: the atlas fills as block models
     // are read (`block.rs` allocates a texture the first time a model names one), so this only has to
@@ -4978,6 +5179,38 @@ pub fn setRenderDistance(_env: JNIEnv, _class: JClass, chunks: jint) {
             wanted,
             wanted as u64 * 4 / (1024 * 1024)
         );
+
+        // **The validation switches, said here because this is a line that reaches the log.**
+        //
+        // The obvious place for it is next to `Instance::new`, where the flags are decided - and a
+        // line written there is dropped, along with the pre-existing `renderer created through ..` one
+        // statement after it. That phase runs before `setPanicHook` installs `env_logger`; measured,
+        // not assumed, by putting a `println!` beside it and watching it land about eleven seconds
+        // before the first line this side reaches the log. `instance_flags` records the answer for
+        // exactly this reason and this is where it is spent.
+        //
+        // Once per world rather than once per launch, and worth it: whether the vendor's layer is
+        // loaded is the first thing a diagnosis asks and the switch that controls it is on an options
+        // page that may never have been opened.
+        let layers = VALIDATION_LAYERS.load(std::sync::atomic::Ordering::Relaxed);
+        let other = OTHER_INSTANCE_FLAGS.load(std::sync::atomic::Ordering::Relaxed);
+        let word = |set: bool| if set { "on" } else { "off" };
+
+        info!(
+            "wgpu-mc: the instance was built with backend validation {}, GPU-based validation {}, \
+             shader debug info {}, indirect-call validation {}, backend labels {}, non-compliant \
+             adapters {}. Every one of those is a debug setting read at launch and every one of them \
+             can be overridden by the matching WGPU_* variable. wgpu's own validation is not among \
+             them and never runs with them off - it is what names the call an error came from.",
+            word(layers & 1 != 0),
+            word(layers & 2 != 0),
+            word(other & 1 != 0),
+            word(other & 2 != 0),
+            if other & 4 != 0 { "dropped" } else { "kept" },
+            word(other & 8 != 0),
+        );
+
+        report_device_capabilities();
     } else {
         // The report lost the race with the first bake, so the arena cannot be re-created under the
         // sections it is holding. It can still be *grown*, which is the same change made without moving

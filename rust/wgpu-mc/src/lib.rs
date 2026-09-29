@@ -122,6 +122,36 @@ pub struct WmRenderer {
     /// size when it creates the renderer, and a renderer created before the window has one gets its
     /// scene on the first presented frame instead.
     pub scene: std::sync::OnceLock<Scene>,
+    /// The staging bytes a frame's section uploads are coalesced into. See
+    /// [`WmRenderer::submit_chunk_updates`], which is the only thing that touches it.
+    ///
+    /// `Mutex` rather than a plain field because the renderer is shared and a shared reference is what
+    /// `submit_chunk_updates` has. The render thread is the only writer, so this is one uncontended
+    /// compare-and-swap per frame - `parking_lot`'s lock, not a syscall - to protect a buffer with one
+    /// writer.
+    upload_scratch: Mutex<Vec<u8>>,
+    /// How many `write_buffer` calls the last drain made, and how many it would have made one per
+    /// range. Reported once a second beside the other counters, because "coalescing helps" is a claim
+    /// about these two numbers and nothing else.
+    uploads_written: std::sync::atomic::AtomicU64,
+    uploads_saved: std::sync::atomic::AtomicU64,
+}
+
+/// One run of contiguous arena bytes waiting to be written: where it goes, what it is, and where its
+/// bytes sit in the frame's upload scratch.
+///
+/// The bytes are identified by an offset into the scratch buffer rather than by a slice because the
+/// runs are collected *while* that buffer is still being appended to - see
+/// [`WmRenderer::submit_chunk_updates`], which writes them all once the gathering is done.
+struct PendingUpload {
+    /// Which arena, as its index in `Scene::chunk_buffers`.
+    buffer: u32,
+    /// Byte offset in that arena.
+    offset: u64,
+    /// How many bytes this run covers, which is the sum of the ranges merged into it.
+    len: u64,
+    /// Where those bytes start in the scratch buffer.
+    at: usize,
 }
 
 #[derive(Copy, Clone)]
@@ -194,6 +224,9 @@ impl WmRenderer {
             mc,
             chunk_update_queue: (sender, Mutex::new(receiver)),
             scene: std::sync::OnceLock::new(),
+            upload_scratch: Mutex::new(Vec::new()),
+            uploads_written: std::sync::atomic::AtomicU64::new(0),
+            uploads_saved: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -363,6 +396,35 @@ impl WmRenderer {
         // same frame.
         let chunk_buffers = scene.chunk_buffers.load_full();
 
+        // **One `write_buffer` per run of contiguous bytes, rather than two per layer per section.**
+        //
+        // `Queue::write_buffer` is not free and the cost is not the copy: wgpu-core allocates a
+        // *staging buffer* per call (`StagingBuffer::new`) and frees it after the next submission, so a
+        // frame that moves a thousand sections over three layers was making thousands of short-lived
+        // allocations and thousands of small transfers - which is exactly the shape of "loading a world"
+        // and "flying forward", the two states where this work is real. When the world is settled the
+        // drain moves nothing and none of this runs.
+        //
+        // The ranges of consecutive sections are not adjacent in general - they come from a free list -
+        // so *contiguity is what is detected rather than assumed*: ranges that happen to be adjacent in
+        // the same buffer are merged into one write, and a run that turns out to be a single range
+        // degenerates to the old behaviour. The bytes of a run are gathered into one scratch buffer,
+        // which costs one copy that the old path paid anyway inside `write_buffer`.
+        let mut scratch = self.upload_scratch.lock();
+
+        // Emptied, not freed: the point of keeping it is that the capacity survives the frame, so a
+        // world being loaded grows it to the largest frame's worth of uploads once and then reuses it.
+        scratch.clear();
+
+        let mut written = 0u64;
+        let mut saved = 0u64;
+
+        // The runs to write, gathered before any of them is written. See the loop at the end.
+        let mut runs: Vec<PendingUpload> = Vec::new();
+
+        // The run being gathered, or `None` when the next range starts a new one.
+        let mut pending: Option<PendingUpload> = None;
+
         updates.for_each(|(pos, layers)| {
             moved += 1;
 
@@ -394,23 +456,51 @@ impl WmRenderer {
 
             for (i, ranges) in section.layers.iter().enumerate() {
                 if let Some(ranges) = ranges {
-                    // **The arena this layer was handed out of, and not any other.** The write has to
+                    // **Which arena this layer was handed out of, and not any other.** The write has to
                     // land in the buffer whose offsets these are; with one arena that was a detail, and
                     // with several it is the difference between a section and somebody else's geometry.
-                    let Some(buffer) = chunk_buffers.get(ranges.buffer as usize) else {
-                        continue;
-                    };
+                    //
+                    // It is named here and resolved when the runs are written, because resolving it now
+                    // would mean holding a borrow of `chunk_buffers` across the whole drain. A range that
+                    // names an arena the renderer does not have is dropped at that point instead: the two
+                    // lists are kept in step, so it is a bug rather than a state, and skipping one range
+                    // beats panicking mid-drain.
+                    //
+                    // Vertices and indices, in whichever order they are laid out: a free-list allocator
+                    // can hand out the index range before the vertex range, and a run has to be in
+                    // ascending offsets to be one write.
+                    let mut pieces = [
+                        (ranges.vertex_range.clone(), &layers[i].vertices),
+                        (ranges.index_range.clone(), &layers[i].indices),
+                    ];
 
-                    self.gpu.queue.write_buffer(
-                        &buffer.buffer,
-                        ranges.vertex_range.start as u64 * 4,
-                        &layers[i].vertices,
-                    );
-                    self.gpu.queue.write_buffer(
-                        &buffer.buffer,
-                        ranges.index_range.start as u64 * 4,
-                        &layers[i].indices,
-                    );
+                    pieces.sort_by_key(|(range, _)| range.start);
+
+                    for (range, bytes) in pieces {
+                        let start = range.start as u64 * 4;
+
+                        let joins = pending.as_ref().is_some_and(|run| {
+                            run.buffer == ranges.buffer && run.offset + run.len == start
+                        });
+
+                        if !joins {
+                            if let Some(run) = pending.take() {
+                                runs.push(run);
+                            }
+
+                            pending = Some(PendingUpload {
+                                buffer: ranges.buffer,
+                                offset: start,
+                                len: 0,
+                                at: scratch.len(),
+                            });
+                        }
+
+                        let run = pending.as_mut().expect("just set");
+                        run.len += bytes.len() as u64;
+                        scratch.extend_from_slice(bytes);
+                        saved += 1;
+                    }
                 }
             }
 
@@ -418,13 +508,42 @@ impl WmRenderer {
             storage.defer_free(freed);
         });
 
+        // The last run, which nothing follows to flush it.
+        if let Some(run) = pending.take() {
+            runs.push(run);
+        }
+
+        // **The writes, after the gathering**, so that the bytes being written are the scratch buffer's
+        // and nothing else's. Doing it inline would mean holding a borrow of `scratch` across the next
+        // `extend_from_slice` into it.
+        for run in &runs {
+            let Some(buffer) = chunk_buffers.get(run.buffer as usize) else {
+                continue;
+            };
+
+            self.gpu.queue.write_buffer(
+                &buffer.buffer,
+                run.offset,
+                &scratch[run.at..run.at + run.len as usize],
+            );
+
+            written += 1;
+        }
+
+        self.uploads_written
+            .store(written, std::sync::atomic::Ordering::Relaxed);
+        self.uploads_saved
+            .store(saved, std::sync::atomic::Ordering::Relaxed);
+
         // The count of sections that became the arena's contents in this frame: the one number that
         // says the baker's output is reaching the buffer the terrain pass will draw from, and that
         // the queue is being drained rather than growing behind it.
         if moved != 0 && mc::chunk::DIAGNOSTIC_LOGGING.load(std::sync::atomic::Ordering::Relaxed) {
             log::info!(
-                "wgpu-mc: {moved} baked section(s) moved into the arena ({} in it now)",
-                scene.section_storage.read().len()
+                "wgpu-mc: {moved} baked section(s) moved into the arena ({} in it now), {saved} upload \
+                 range(s) in {written} write(s) - {} merge(s)",
+                scene.section_storage.read().len(),
+                saved.saturating_sub(written)
             );
         }
     }

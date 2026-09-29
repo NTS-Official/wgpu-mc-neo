@@ -1,6 +1,7 @@
 package dev.birb.wgpu.mixin.render;
 
 import dev.birb.wgpu.chunk.RustChunkBake;
+import dev.birb.wgpu.render.TaaJitter;
 import net.minecraft.client.DeltaTracker;
 import net.minecraft.client.renderer.GameRenderer;
 import org.spongepowered.asm.mixin.Mixin;
@@ -33,5 +34,11 @@ public abstract class GameRendererMixin {
     @Inject(method = "render", at = @At("HEAD"))
     private void wgpuMc$askForRefusedRebuilds(DeltaTracker deltaTracker, boolean advanceGameTime, CallbackInfo ci) {
         RustChunkBake.redirtyDue();
+
+        // The frame's sub-pixel sample, advanced before anything in this frame builds a projection:
+        // `ProjectionMatrixBuffer#getBuffer` is what puts it into Minecraft's own UBO (see
+        // `ProjectionMatrixBufferMixin`) and `TerrainPass.sendCameraMatrices` is what puts the same
+        // one into the Rust terrain pass's. See `TaaJitter` for why the two have to agree.
+        TaaJitter.advanceFrame();
     }
 }

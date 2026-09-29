@@ -4,6 +4,7 @@ import com.google.gson.GsonBuilder
 import com.google.gson.reflect.TypeToken
 import dev.birb.wgpu.WgpuMcMod
 import dev.birb.wgpu.backend.Diagnostics
+import dev.birb.wgpu.backend.DisplayMode
 import dev.birb.wgpu.gui.options.*
 import dev.birb.wgpu.gui.widgets.HeadingWidget
 import dev.birb.wgpu.gui.widgets.Widget
@@ -195,9 +196,27 @@ class OptionPages : Iterable<OptionPages.Page> {
             .setRange(0, 4)
             .build())
 
-        page.add(BoolOption.Builder()
+        // **The window mode, in place of the game's fullscreen checkbox**, and this page is where it has
+        // to be: `OptionsScreenMixin` replaces the whole video settings screen with this one, so a row
+        // injected into `VideoSettingsScreen` is a row on a screen nothing opens. That was measured, at
+        // the cost of a round of "the option is still a checkbox".
+        //
+        // Three states rather than the game's two, because `Options#fullscreen` is a boolean whose handler
+        // calls `Window#toggleFullScreen` - it can only mean the game's own fullscreen or windowed, and
+        // there is no third state for a window that covers the monitor without owning the display mode.
+        //
+        // `options.fullscreen()` itself is left alone and still written by the game's F11 handler, so the
+        // value in `options.txt` keeps meaning what it always did. The mode is this renderer's setting,
+        // stored in its own config; the row is the one the game's checkbox used to occupy, under the same
+        // caption, so a player finds it where they always did.
+        page.add(EnumOption.Builder(DisplayMode.Mode::class.java)
             .setName(Component.translatable("options.fullscreen"))
-            .setOption(options.fullscreen())
+            .setTooltip(Component.translatable("wgpu_mc.option.window_mode.tooltip"), false)
+            .setAccessors(
+                { DisplayMode.Mode.current() },
+                { mode -> WgpuNative.setFullscreenMode(mode.ordinal) }
+            )
+            .setFormatter { mode -> Component.translatable(mode.langKey()) }
             .build())
 
         // Vanilla's VSync toggle is deliberately not offered here. Its only effect on this backend
@@ -482,7 +501,7 @@ class OptionPages : Iterable<OptionPages.Page> {
          * next to the graphics preset is named here and skipped there. The list is short by design: it
          * is the exception, and a second entry is a second thing to keep in step.
          */
-        private val DRAWN_ELSEWHERE = setOf(ANIMATED_TEXTURES)
+        private val DRAWN_ELSEWHERE = setOf(ANIMATED_TEXTURES, WINDOW_MODE_SETTING)
 
         /**
          * One of the renderer's settings, as a row, for a page that is not the renderer's own.
@@ -512,6 +531,17 @@ class OptionPages : Iterable<OptionPages.Page> {
         private const val VSYNC_SETTING = "vsync"
 
         /**
+         * The window-mode setting's name in the renderer's schema.
+         *
+         * Skipped on this mod's own page because **it is drawn on Minecraft's**: the cycle button in the
+         * video settings screen, added by `VideoSettingsScreenMixin` and built by
+         * [dev.birb.wgpu.backend.DisplayMode.windowModeOption]. The value is still this renderer's - it
+         * lives in `config/wgpu-mc-renderer.json`, not in `options.txt` - so the schema entry stays, and it
+         * is what the row's name, tooltip and values come from.
+         */
+        const val WINDOW_MODE_SETTING = "fullscreen_mode"
+
+        /**
          * Copies the renderer's `vsync` setting into Minecraft's own option of the same name.
          *
          * The vanilla option no longer decides anything here - the renderer's setting does, and it
@@ -539,6 +569,4 @@ class OptionPages : Iterable<OptionPages.Page> {
             RendererSettings.bool(VSYNC_SETTING) ?: true
     }
 }
-
-
 

@@ -1,5 +1,6 @@
 package dev.birb.wgpu
 
+import dev.birb.wgpu.backend.DisplayMode
 import dev.birb.wgpu.chunk.BlockFaceFlags
 import dev.birb.wgpu.chunk.RustChunkBake
 import dev.birb.wgpu.backend.bindAtlasToTerrainPass
@@ -344,6 +345,17 @@ object BlockCache {
 			BlockRegistryFeed.replay()
 		}
 
+		// **The game's leaves switch, before the bake that reads it**, and before the very first bake as
+		// well as the others - the first one bakes the whole registry, so a `Fast` world would otherwise
+		// get one session of cut-out leaves before the option was ever consulted.
+		//
+		// It is written into the geometry rather than read as the frame draws
+		// (`ModelBlockRenderer#forceOpaque` puts a leaf face in the solid layer when it is off), so it has
+		// to arrive before `cacheBlockStates`. Sent on every bake because it is one store and a bake is
+		// seconds; watching it for changes would mean a cached copy here to compare against, which is one
+		// more thing to keep in step. See [leavesChanged].
+		WgpuNative.setCutoutLeaves(Minecraft.getInstance().options.cutoutLeaves().get())
+
 		WgpuNative.cacheBlockStates()
 
 		// What every state says about the faces around it went over during that call - the native side
@@ -406,6 +418,36 @@ object BlockCache {
 		pendingRebake.set(true)
 	}
 
+	/**
+	 * The last value of the game's leaves switch this side has asked for a re-bake over.
+	 *
+	 * `null` until the first tick, so the first tick does not compare against a value that was never read
+	 * - the bake that runs at startup already sent the option, and a `false` here would ask for a second
+	 * bake of an identical world.
+	 */
+	private var lastCutoutLeaves: Boolean? = null
+
+	/**
+	 * Whether the game's `cutoutLeaves` option has moved since the last tick, and if so, records it.
+	 *
+	 * **This is the Fancy/Fast leaves switch**, and it is the one vanilla option that changes how a
+	 * *baked* model looks without changing the pack: `ModelBlockRenderer#forceOpaque` puts a leaf block's
+	 * faces in the solid layer when it is off, so the answer is in the vertex data and moving it
+	 * invalidates every baked model, exactly as the animated-texture switch does. See [blockTexturesChanged],
+	 * which is the path it takes - a note left for the next tick rather than a bake started here, because
+	 * this runs on the render thread in the middle of the options screen's own work.
+	 *
+	 * The graphics presets move it (`GraphicsPreset`: `Fast` sets it false, the two `Fancy` presets set it
+	 * true), and so does the video settings screen directly.
+	 */
+	private fun leavesChanged(): Boolean {
+		val cutout = Minecraft.getInstance().options.cutoutLeaves().get()
+		val previous = lastCutoutLeaves
+		lastCutoutLeaves = cutout
+
+		return previous != null && previous != cutout
+	}
+
 	@SubscribeEvent
 	@JvmStatic
 	fun onClientTick(event: ClientTickEvent.Post) {
@@ -414,6 +456,19 @@ object BlockCache {
 			sinceReload = ticks + 1
 		}
 		start()
+
+		// **The window mode, once, on the first tick.** The mode itself is applied by the native side when
+		// it reads the settings (`sendRunDirectory`), which is earlier and is the ordering that matters -
+		// applying it here first, before the config had been read, took the display over on the way to the
+		// mode the config actually named. This call is the belt to that braces: it covers a client whose
+		// settings arrived before it had a window, which is the mod-constructor path. See `DisplayMode`.
+		DisplayMode.applyOnFirstFrame()
+
+		// The game's own leaves switch, which is baked into the models like the renderer's own
+		// baked settings are - and is not one of them, so nothing else was watching it.
+		if (leavesChanged()) {
+			blockTexturesChanged()
+		}
 
 		// A setting that is baked into the models, applied from the options screen. Claimed like a
 		// reload, and only when nothing else is baking: the flag is left set otherwise, so the next tick

@@ -385,17 +385,23 @@ object RustChunkBake {
 	 * gap that grows while the player stands still is sections being claimed and not published, and that
 	 * is the hole.
 	 *
-	 * Called with the settings poll, once a second, and only while the logging switch is on.
+	 * Called with the settings poll. Once a second while the logging switch is on, and **once every ten
+	 * seconds even when it is off** - because a switch that hides the only line able to describe a hole
+	 * is a trap: that is exactly how a round of this investigation was spent with the report "missing",
+	 * when it was the `logging` switch that was off. One line every ten seconds is not noise, and a run
+	 * that is looking at holes should never be blind.
 	 */
 	@JvmStatic
 	fun reportClaimAgainstArena() {
-		if (!Diagnostics.loggingEnabled()) {
-			return
-		}
-
 		val now = System.nanoTime()
 
-		if (now - claimReportedAt < 1_000_000_000L) {
+		val interval = if (Diagnostics.loggingEnabled()) {
+			1_000_000_000L
+		} else {
+			10_000_000_000L
+		}
+
+		if (now - claimReportedAt < interval) {
 			return
 		}
 
@@ -424,6 +430,22 @@ object RustChunkBake {
 			refusedAtCapacity,
 			firstLookCount,
 		)
+
+		// **Which atlas the faces baked in the last second went to**, which is the one thing about the
+		// atlas routing that cannot be seen: both atlases are 2048x2048 and answer to the same filters, so
+		// a face on the wrong one is not drawn differently - it samples a mip chain built from the whole
+		// packed sheet rather than per sprite, which is a blurred, half-transparent block. A large second
+		// number is the routing not working, and it is the reason a block can be blurry while every other
+		// explanation has been ruled out.
+		try {
+			val faces = WgpuNative.atlasFaceCounts()
+
+			if (faces.isNotEmpty()) {
+				WgpuMcMod.LOGGER.info("wgpu: faces baked since the last report: {}", faces)
+			}
+		} catch (error: Throwable) {
+			// A diagnostic that cannot be read is not worth taking the game down for.
+		}
 
 		// **And how long a hole lasted**, which is the number a run that heals its own holes needs.
 		//

@@ -122,6 +122,24 @@ struct SectionPosition {
     // `discard` in it, because a `discard` anywhere costs the whole pipeline its early-Z. See
     // `terrain_solid.wgsl`.
     alpha_cutout: f32,
+    // **The level-of-detail bias the two block-atlas fetches are given, per draw.**
+    //
+    // It was a `const` for a round, and that was a mistake worth recording: **a constant is not
+    // observable.** With `const ATLAS_LOD_BIAS: f32 = 0.0` the fetch is spelled `textureSampleBias` but
+    // behaves exactly as a plain `textureSample`, so "the bias does nothing" and "the bias is not
+    // reaching the GPU" produce the same picture - and changing the number needs the shader copied into
+    // the build directory *and* the client restarted, because **nothing watches the shader files**
+    // (`mark_pipelines_stale` is called on atlas and lightmap handover only). Two rounds of "I moved it
+    // and nothing happened" could not distinguish those cases.
+    //
+    // As an immediate it is a value the draw hands over, so a setting can move it and the next frame
+    // uses it - which is the whole difference between this and the constant.
+    //
+    // Zero is the honest default and the shader's normal state: it makes the fetch below identical to a
+    // plain `textureSample`. A positive value samples a *coarser* level, a negative one a finer level -
+    // which is how the two readings are told apart: blur that clears with a negative bias means the
+    // chosen level was too coarse, and blur unchanged by any bias means the level was never the problem.
+    lod_bias: f32,
 };
 
 var<immediate> section_pos: SectionPosition;
@@ -373,8 +391,11 @@ fn frag(
     // both were live, and the two mip chains are indexed identically because the atlases are the same
     // size. `select` on a `vec4<f32>` rather than `mix`, because this is a choice and not a blend: a
     // half-way value would be one atlas bleeding into the other at every sprite edge.
-    let texel_from_game = textureSample(t_game_atlas, t_game_sampler, in.tex_coords);
-    let texel_from_ours = textureSample(t_texture, t_sampler, in.tex_coords);
+    // `textureSampleBias` rather than `textureSample`, with the immediate bias - zero unless a
+    // diagnostic run moved it, and the two behave identically at zero. See the constant for what moving
+    // it is for.
+    let texel_from_game = textureSampleBias(t_game_atlas, t_game_sampler, in.tex_coords, section_pos.lod_bias);
+    let texel_from_ours = textureSampleBias(t_texture, t_sampler, in.tex_coords, section_pos.lod_bias);
     let texel = select(texel_from_ours, texel_from_game, in.game_atlas == 1u);
 
     // The light is a colour now, not a number: the game's lightmap has a colour in it (the sky light

@@ -470,6 +470,17 @@ pub fn sendSettings(mut env: JNIEnv, _class: JClass, settings: JString) -> bool 
     // change.
     crate::device::reapply_present_mode();
 
+    // **And the window mode, which is the same shape of thing with a different owner.** This side holds
+    // the setting; the window belongs to the JVM - GLFW is reached from there, `Window` is there, and the
+    // three modes are three GLFW calls. So what is applied here is the *change*, and the JVM is asked to
+    // re-read the setting and put the window in it. See `debug::reapply_window_mode`, which is where the
+    // comparison lives, and `DisplayMode` on the JVM side, which is what does it.
+    //
+    // Mirroring the answer rather than passing it: the callback is only a notification, and the JVM reads
+    // the same setting through `RendererSettings`, so there is one source of truth for which mode it is
+    // and this is only the moment to look.
+    crate::debug::reapply_window_mode(&mut env);
+
     true
 }
 
@@ -491,6 +502,18 @@ pub fn sendRunDirectory(mut env: JNIEnv, _class: JClass, dir: JString) {
     // Before the renderer exists in most launches, so the debug switches are already resolved by
     // the time the first draw asks for them.
     crate::debug::apply(&settings);
+
+    // **And the window mode, here rather than on the first frame**, which is where it was and why it was
+    // wrong: on the first frame the settings had not been read yet, so `windowMode` answered the static's
+    // initial value - `Exclusive` - and the client took the display over before switching to the mode the
+    // config actually named. Measured: `the window is in EXCLUSIVE mode`, then eleven seconds later
+    // `the window mode is now 2`.
+    //
+    // The JVM is asked only if there is a window to put into it: this runs from the mod constructor too,
+    // where there is not, and `DisplayMode.reapply` returns quietly in that case - so the call is safe
+    // either way and the ordering is what matters.
+    crate::debug::reapply_window_mode(&mut env);
+
     *write = Some(settings);
 }
 
@@ -623,6 +646,7 @@ pub fn registerBlockStateFaceFlags(
     blocks_motion: jint,
     offset_max_y: jfloat,
     offset_xz: jint,
+    leaves: jint,
 ) {
     BLOCK_STATE_FACE_FLAGS.lock().push((
         key as u32,
@@ -643,6 +667,9 @@ pub fn registerBlockStateFaceFlags(
             // And whether it is offset at all, which is *not* the same question: a flower's offset is
             // horizontal only, so its vertical limit is exactly zero.
             offset_xz: offset_xz != 0,
+            // And whether it is a `LeavesBlock`, which is the half of `forceOpaque` the registry can
+            // answer. See `FaceFlags::leaves`.
+            leaves: leaves != 0,
         },
     ));
 }
@@ -702,7 +729,17 @@ impl<'a> BlockStateProvider for MinecraftBlockStateProviderWrapper<'a> {
         .and_then(|value| value.i());
 
         match result {
-            Ok(color) => color as u32,
+            Ok(color) => {
+                // Counted so the answer is *readable* rather than merely error-free: the failure this
+                // whole change exists to fix looked exactly like success, because a constant is a valid
+                // colour. A total of zero here means the game answered "no tint" for every fluid, which
+                // is a different bug from the one this closed and would be invisible without a count.
+                if color as u32 != 0xffff_ffff {
+                    FLUID_TINTS.fetch_add(1, Ordering::Relaxed);
+                }
+
+                color as u32
+            }
             Err(err) => {
                 static WARNED: AtomicBool = AtomicBool::new(false);
                 if !WARNED.swap(true, Ordering::Relaxed) {
@@ -720,7 +757,173 @@ impl<'a> BlockStateProvider for MinecraftBlockStateProviderWrapper<'a> {
             }
         }
     }
+
+    /// **The colour water is tinted by, asked of the game rather than held as a constant.**
+    ///
+    /// The same shape as [`Self::get_block_color`] and for the same reasons - one JNI call per request,
+    /// one warning per failure mode, white when the call cannot be made - with one difference that
+    /// matters: it is a *different* question. A fluid is tinted by its **fluid** model, not its block
+    /// model (`FluidRenderer#tesselate` asks `model.fluidTintSource().colorInWorld(..)`, and the model
+    /// comes from `FluidStateModelSet#get(fluidState)`), so the block tint path cannot answer it even in
+    /// principle - a water block's block model is not what colours water.
+    ///
+    /// The default is `WATER_TINT` rather than white, through the trait's own default: this is only a
+    /// failure path, and the colour the game uses where no biome says otherwise is a better guess than
+    /// no tint at all. It is also what every test provider answers, so a test's water looks exactly as
+    /// it did before this existed.
+    fn get_fluid_color(&self, pos: IVec3) -> u32 {
+        let mut env = self.env.borrow_mut();
+
+        let result = call_static_from_class_loader(
+            &mut env,
+            "dev.birb.wgpu.render.Wgpu",
+            "helperGetFluidColor",
+            "(III)I",
+            &[JValue::Int(pos.x), JValue::Int(pos.y), JValue::Int(pos.z)],
+        )
+        .and_then(|value| value.i());
+
+        match result {
+            Ok(color) => {
+                // Counted so the answer is *readable* rather than merely error-free: the failure this
+                // whole change exists to fix looked exactly like success, because a constant is a valid
+                // colour. A total of zero here means the game answered "no tint" for every fluid, which
+                // is a different bug from the one this closed and would be invisible without a count.
+                if color as u32 != 0xffff_ffff {
+                    FLUID_TINTS.fetch_add(1, Ordering::Relaxed);
+                }
+
+                color as u32
+            }
+            Err(err) => {
+                static WARNED: AtomicBool = AtomicBool::new(false);
+                if !WARNED.swap(true, Ordering::Relaxed) {
+                    describe_and_clear(&mut env, "helperGetFluidColor");
+                    log::warn!(
+                        "wgpu-mc: could not ask the game for a fluid tint ({err}); water is drawn with \
+                         the default colour rather than its biome's"
+                    );
+                }
+
+                wgpu_mc::mc::chunk::WATER_TINT
+            }
+        }
+    }
 }
+
+/// **The window mode the renderer's setting names, mirrored for the JVM's callback.**
+///
+/// The mode itself lives in the settings document, but the callback that applies it runs *after* the
+/// settings have been stored and cannot read that document back - `SETTINGS.read()` would be reachable,
+/// and the whole point of the callback is to be callable from the paths that have already decided what
+/// moved. So the answer is mirrored here, set beside the other values `debug::apply` copies out.
+///
+/// The low two bits are the variant index (`0` exclusive, `1` borderless, `2` off) and bit 2 is
+/// "this moved and needs a restart to take effect". A single `u8` because both fit and because every
+/// reader of it wants both.
+pub static WINDOW_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Sets [`WINDOW_MODE`]: the variant index, and whether the change it came from needs a restart.
+pub fn set_window_mode(mode: u8, restart: bool) {
+    WINDOW_MODE.store(
+        mode & 0b11 | (restart as u8) << 2,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// **The window mode the renderer's setting names**, as the variant index the JVM's `Mode` enum is in the
+/// same order as: `0` exclusive fullscreen, `1` borderless, `2` off.
+///
+/// Read by `DisplayMode.Mode.current` on the path that puts the window into a mode, rather than through
+/// the settings document, because that path cannot afford a cached read: `RendererSettings` caches for a
+/// second, and a mode applied immediately after the setting moved could read the value from before it.
+#[jni_fn("dev.birb.wgpu.rust.WgpuNative")]
+pub fn windowMode(_env: JNIEnv, _class: JClass) -> jint {
+    // Read once per mode application rather than per frame, and **not** through the settings document:
+    // `RendererSettings` caches for a second, and this is read on the path that *applies* a mode, so a
+    // cached value would put the window back into the mode it was already in.
+    //
+    // Zero - `Exclusive` - when no settings have been read yet, which is what `options.txt`'s
+    // `fullscreen: true` has always meant here. See `WINDOW_MODE`.
+    (WINDOW_MODE.load(std::sync::atomic::Ordering::Relaxed) & 0b11) as jint
+}
+
+/// **Stores the window mode and puts the window into it**, for the cycle button in Minecraft's own video
+/// settings screen.
+///
+/// The value lives in this side's config rather than in `options.txt`, because it is three states and
+/// `options.txt`'s `fullscreen` is a boolean - but the *control* is on the game's screen, next to
+/// fullscreen, where a player looks for it. That is what the user asked for: the setting is this
+/// renderer's, the row is Minecraft's.
+///
+/// Applying it is a callback into the JVM rather than something this side does, because the window is
+/// GLFW's and GLFW is reached from the JVM. See `DisplayMode`.
+///
+/// **This is the only writer of [`WINDOW_MODE`]**, which is why the callback is invoked from here rather
+/// than from a settings apply: a value that arrives from the game's own screen does not go through
+/// `sendSettings` at all, and a value that does would otherwise need two paths to the same effect.
+#[jni_fn("dev.birb.wgpu.rust.WgpuNative")]
+pub fn setFullscreenMode(mut env: JNIEnv, _class: JClass, mode: jint) {
+    let mode = (mode.clamp(0, 2)) as u8;
+
+    // Written first, and unconditionally: `windowMode` reads it back, and a cycle button that read a
+    // stale value would jump back to the previous mode on the next click.
+    let moved = WINDOW_MODE.swap(mode, std::sync::atomic::Ordering::Relaxed) != mode;
+
+    crate::set_window_mode(mode, moved);
+
+    if SETTINGS.read().is_some() {
+        if let Some(settings) = SETTINGS.write().as_mut() {
+            settings.fullscreen_mode = crate::settings::EnumSetting {
+                selected: mode as usize,
+            };
+        }
+
+        if !SETTINGS
+            .read()
+            .as_ref()
+            .is_some_and(|settings| settings.write())
+        {
+            log::error!("wgpu-mc: the window mode could not be saved and will be lost on exit");
+        }
+    }
+
+    if let Err(err) = crate::call_static_from_class_loader(
+        &mut env,
+        "dev.birb.wgpu.backend.DisplayMode",
+        "reapply",
+        "()V",
+        &[],
+    ) {
+        log::warn!(
+            "wgpu-mc: the window mode was stored but the window could not be put into it: {err}"
+        );
+    }
+}
+
+/// **Whether the window mode moved in the apply that just happened**, so the settings screen can say so:
+/// `-1` when it did, and the current variant index when it did not.
+///
+/// The schema cannot answer this. It says whether a setting *may* need a restart; this is whether it
+/// *did* - and a player who opened the page and moved nothing is owed no message.
+#[jni_fn("dev.birb.wgpu.rust.WgpuNative")]
+pub fn windowModeReloadResult(_env: JNIEnv, _class: JClass) -> jint {
+    let value = WINDOW_MODE.load(std::sync::atomic::Ordering::Relaxed);
+
+    // The variant index is not the answer; whether it *moved* is, and that is bit 2. The index comes
+    // back when nothing moved, so a caller that logs the answer says which mode is current.
+    if value & 0b100 == 0 {
+        (value & 0b11) as jint
+    } else {
+        -1
+    }
+}
+
+/// How many fluid faces were asked for a biome colour and got one. See `get_fluid_color`.
+///
+/// Reported on the same once-a-second line as the atlas and leaves counts, for the same reason: the
+/// question is whether a number that *should* be large is zero.
+static FLUID_TINTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// One section rebuild, in one call.
 ///
@@ -1548,6 +1751,62 @@ pub fn cacheBlockStates(mut env: JNIEnv, _class: JClass) {
 /// Both are reported here rather than in the Rust log because the Rust log does not reach the game's
 /// log file, and a run that is being read afterwards is the run this has to explain. Called by the
 /// JVM right after [`cacheBlockStates`], which is where both are decided.
+/// **Which atlas the baked faces went to**, for the JVM's once-a-second report.
+///
+/// The one thing about the atlas routing that cannot be seen: both atlases are 2048x2048 and both answer
+/// to the same filters, so a face on the wrong one is not a face drawn differently - it is a face
+/// sampling a mip chain built from the whole packed sheet instead of per sprite, which is a blurred,
+/// half-transparent block. The first number should be nearly all of them and the second nearly none; a
+/// second number in the thousands is the routing not working.
+///
+/// Read and **reset**, so what a line reports is what happened since the last one - the counts are
+/// otherwise a session total that stops moving, and "it stopped moving" is indistinguishable from "the
+/// report is broken" in a log.
+///
+/// Not part of [`blockBakeDiagnostics`], which is called once right after the block cache is built and
+/// therefore before any section has been baked: it would report two zeroes whatever the answer is.
+#[jni_fn("dev.birb.wgpu.rust.WgpuNative")]
+pub fn atlasFaceCounts(env: JNIEnv, _class: JClass) -> jstring {
+    let game = wgpu_mc::mc::block::FACES_GAME_ATLAS.swap(0, std::sync::atomic::Ordering::Relaxed);
+    let own = wgpu_mc::mc::block::FACES_OWN_ATLAS.swap(0, std::sync::atomic::Ordering::Relaxed);
+    // The leaves switch's count, read here rather than in a report of its own: it answers the same
+    // question - did the faces go where they were supposed to - and this is already the line that
+    // answers it. **Zero with the game's `cutoutLeaves` off is the switch not reaching the baker.**
+    let forced =
+        wgpu_mc::mc::block::FACES_FORCED_OPAQUE.swap(0, std::sync::atomic::Ordering::Relaxed);
+
+    // And the fluid tints, which answer the same shape of question: a number that should be large and
+    // must not be zero. See `FLUID_TINTS`.
+    let tints = FLUID_TINTS.swap(0, Ordering::Relaxed);
+
+    let text = format!(
+        "{game} game-atlas, {own} own-atlas, {forced} leaf face(s) forced opaque, {tints} fluid tint(s) \
+         read from the game"
+    );
+
+    env.new_string(text)
+        .map(|string| string.into_raw())
+        .unwrap_or(std::ptr::null_mut())
+}
+
+/// **The game's `cutoutLeaves` option**, pushed before a bake because it is written into the geometry.
+///
+/// `Options#cutoutLeaves` is the Fancy/Fast leaves switch the graphics presets move, and it reaches
+/// baking as `ModelBlockRenderer#forceOpaque`: with it off, a `LeavesBlock`'s faces go to the *solid*
+/// layer whatever their sprite says, and the solid layer has no alpha test - so a leaf texture's
+/// transparent gaps are filled by its own colour and the block reads as a solid mass.
+///
+/// This side takes a face's layer from its sprite, so the option did nothing here at all before this
+/// existed: `Fast` and `Fancy` drew identical leaves. See `wgpu_mc::mc::block::CUTOUT_LEAVES`.
+///
+/// Sent on every bake rather than watched for changes, because the value is a `boolean` read from an
+/// option object on another thread and comparing it here would need a cached copy to compare *against* -
+/// a copy that is one more thing to keep in step. The bake is seconds long; one store is nothing.
+#[jni_fn("dev.birb.wgpu.rust.WgpuNative")]
+pub fn setCutoutLeaves(_env: JNIEnv, _class: JClass, cutout: jboolean) {
+    wgpu_mc::mc::block::set_cutout_leaves(cutout != 0);
+}
+
 #[jni_fn("dev.birb.wgpu.rust.WgpuNative")]
 pub fn blockBakeDiagnostics(env: JNIEnv, _class: JClass) -> jstring {
     let mut report = String::new();

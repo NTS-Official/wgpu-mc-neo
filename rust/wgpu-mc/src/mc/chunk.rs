@@ -87,6 +87,25 @@ pub trait BlockStateProvider {
     fn is_section_empty(&self, rel_pos: IVec3) -> bool;
 
     fn get_block_color(&self, pos: IVec3, tint_index: i32) -> u32;
+
+    /// **The colour a fluid's faces are tinted by**, which is not the block tint and not a constant.
+    ///
+    /// The game asks a *fluid* model, not a block one: `FluidRenderer#tesselate` calls
+    /// `model.fluidTintSource().colorInWorld(fluidState, blockState, level, pos)`, where the model comes
+    /// from `FluidStateModelSet#get(fluidState)`. For water that source is `FluidTintSources.water()`,
+    /// and what it returns is **the biome's water colour** - so an ocean, a swamp and a cold river are
+    /// three different colours in the game.
+    ///
+    /// This path used one constant for all of them (`WATER_TINT`), which is the default this returns -
+    /// so a provider that knows nothing about biomes, which is every test, draws the water the renderer
+    /// drew before this existed.
+    ///
+    /// The colour arrives in the game's own packing, ARGB with **red in the low byte**, which is the
+    /// packing the block tint already arrives in and the one the vertex format reads back. See
+    /// [`scale_rgb`].
+    fn get_fluid_color(&self, _pos: IVec3) -> u32 {
+        WATER_TINT
+    }
 }
 
 /// How many u32 slots of arena a render distance is worth, in chunks.
@@ -956,6 +975,37 @@ fn face_flags(block_manager: &BlockManager, state: ChunkBlockState) -> FaceFlags
     }
 }
 
+/// Whether this state is a `LeavesBlock`, which is the game's own `instanceof LeavesBlock`.
+///
+/// Read from the per-state table the JVM fills (`FaceFlags::leaves`), and not from the block's name:
+/// a mod's leaves are leaves, and the game's own test is a class check. A state with no table entry -
+/// which cannot happen for a state the JVM described, and is the common case for the stand-in keys
+/// tests build - answers `false`, which is the safe direction: it leaves the face in whatever layer its
+/// sprite asked for rather than forcing it opaque.
+///
+/// The one reader is [`bake_layers`], for `ModelBlockRenderer#forceOpaque`.
+fn state_is_leaves(block_manager: &BlockManager, state: ChunkBlockState) -> bool {
+    face_flags(block_manager, state).leaves
+}
+
+/// **The game's `ModelBlockRenderer#forceOpaque`**, which is the whole of what the leaves switch does:
+///
+/// ```java
+/// public static boolean forceOpaque(boolean cutoutLeaves, BlockState blockState) {
+///     return !cutoutLeaves && blockState.getBlock() instanceof LeavesBlock;
+/// }
+/// ```
+///
+/// Split out from [`bake_layers`] with both answers handed in, so that the combination can be tested
+/// without moving either global - the option is a `static` the settings path writes and the class check
+/// is a table the JVM fills, and neither can be reached from a test. The truth table is the contract, and
+/// the two halves fail in different directions: a leaf sent to the solid layer when the player asked for
+/// cut-out leaves is a leaf with its transparent gaps filled in, while a non-leaf sent there is a plant
+/// or a pane drawn without its alpha test at all.
+fn force_opaque(cutout_leaves: bool, is_leaves: bool) -> bool {
+    !cutout_leaves && is_leaves
+}
+
 /// Whether a block darkens the corners around it, which is the game's own `getShadeBrightness`.
 ///
 /// Minecraft's ambient-occlusion corner is the average of four `getShadeBrightness` samples, and that
@@ -1504,6 +1554,21 @@ fn bake_layers<Provider: BlockStateProvider>(
         let mut faces_culled = 0u32;
 
         if let Some(model_mesh) = get_block(block_manager, block_state) {
+            // **`ModelBlockRenderer#forceOpaque`, on this side of the fence.** The game sends a leaf
+            // block's faces to the *solid* layer when the player has leaves cut out turned off
+            // (`GraphicsPreset`'s `Fast`, `Options#cutoutLeaves`), whatever the leaf sprite says - and the
+            // solid layer has no alpha test, so the texture's transparent gaps are filled by its own
+            // colour and the block reads as a solid mass.
+            //
+            // This side takes a face's layer from its sprite (`Atlas::sprite_layer`), where leaves are
+            // cut out because their texture has holes - so without this line the option did nothing here
+            // and `Fast` and `Fancy` drew exactly the same leaves.
+            //
+            // Resolved once per block rather than once per face, because it is a property of the state.
+            let opaque_leaves = force_opaque(
+                crate::mc::block::cutout_leaves(),
+                state_is_leaves(block_manager, block_state),
+            );
             // The winding, and the one thing about a baked quad that nothing else can tell you is
             // wrong: the pass culls back faces with a front face of counter-clockwise, and this backend
             // gives Minecraft's shaders OpenGL's clip space (`preprocessing.rs`) - which *mirrors* the
@@ -1523,7 +1588,14 @@ fn bake_layers<Provider: BlockStateProvider>(
                 // model that turns shading off.
                 let color = scale_rgb(color, face_shade(dir));
 
-                let baked_layer = &mut layers[face.layer as usize];
+                let baked_layer = &mut layers[if opaque_leaves {
+                    crate::mc::block::FACES_FORCED_OPAQUE
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+                    RenderLayer::Solid
+                } else {
+                    face.layer
+                } as usize];
                 let vec_index = baked_layer.vertices.len() / Vertex::VERTEX_LENGTH;
 
                 let dir_vec = dir.to_vec();
@@ -1700,10 +1772,112 @@ fn bake_layers<Provider: BlockStateProvider>(
     }
 
     if let Some(atlas) = atlas {
-        bake_fluid_faces(block_manager, state_provider, atlas, &mut layers);
+        bake_fluid_faces(
+            block_manager,
+            state_provider,
+            atlas,
+            &mut layers,
+            section_offset,
+        );
     }
 
+    // **The translucent layer's quads are put in back-to-front order, which is the one thing about a
+    // translucent mesh that cannot be decided later.** Blending is order-dependent and there is no depth
+    // test to hide it: two panes of glass or two surfaces of water in one section blend in whatever
+    // order they are drawn, so the order has to be the camera's.
+    //
+    // This is `SectionCompiler#compile`'s `mesh.sortQuads(builders.buffer(layer), vertexSorting)` and the
+    // game's own rule, which is `VertexSorting.DISTANCE_TO_ORIGIN` for a perspective projection:
+    //
+    //   * the point sorted by is the quad's **centroid**, and the game's own centroid is the midpoint of
+    //     its **first and third vertices** (`MeshData#unpackQuadCentroids`: `x0` and `x1` are the first
+    //     vertex and the one two strides later, then averaged);
+    //   * the order is **descending** by squared distance - `VertexSorting#byDistance` sorts with
+    //     `Floats.compare(keys[o2], keys[o1])`, which puts the largest first, so the farthest quad is
+    //     drawn first;
+    //   * and the coordinates are **section-relative**, because that is the space a section's vertices
+    //     are baked in.
+    //
+    // Sorting the *index buffer* rather than the vertices is the half of this worth copying: a quad's
+    // four vertices are the same four whichever order they are visited in, and the six indices of a quad
+    // are already relative within it (see the `INDICES` constant), so reordering the six-index groups
+    // reorders the quads and nothing else has to move.
+    //
+    // **Only the translucent layer.** The solid and cutout layers are order-independent - they are
+    // opaque, so the depth test decides - and sorting them would be work with no effect.
+    sort_translucent_quads(&mut layers[RenderLayer::Transparent as usize]);
+
     layers
+}
+
+/// Puts a layer's quads in back-to-front order, for the camera at the section's origin.
+///
+/// The rule is the game's; see the call site for where each half of it comes from. The key is the quad
+/// centroid, recovered from the packed vertices rather than tracked beside them: a vertex's position is
+/// the first four bytes of its sixteen, so the first and third vertices of a quad are two loads each and
+/// the two extra `u8`s of a `256` are the game's own behaviour too - it reads the same bytes as floats
+/// and gets zero for the same case.
+///
+/// A quad is `4 * VERTEX_LENGTH` bytes and a quad's indices are six `u32`s, so both lists divide exactly;
+/// a layer whose vertex buffer is not a whole number of quads is left alone, because a sort cannot fix a
+/// buffer that does not describe quads and reordering it would attach each quad's indices to another
+/// quad's vertices.
+fn sort_translucent_quads(layer: &mut BakedLayer) {
+    const VERTEX_LENGTH: usize = crate::render::pipeline::Vertex::VERTEX_LENGTH;
+    const QUAD_VERTICES: usize = 4;
+    const QUAD_INDICES: usize = 6;
+
+    let quad_bytes = VERTEX_LENGTH * QUAD_VERTICES;
+    let index_bytes = QUAD_INDICES * size_of::<u32>();
+
+    if layer.vertices.is_empty() {
+        return;
+    }
+
+    if !layer.vertices.len().is_multiple_of(quad_bytes)
+        || layer.indices.len() != layer.vertices.len() / quad_bytes * index_bytes
+    {
+        return;
+    }
+
+    let quads = layer.vertices.len() / quad_bytes;
+
+    // The centroid of a quad, in the sixteenths a packed vertex stores its position in.
+    let centroid = |quad: usize| -> (i32, i32, i32) {
+        let first = quad * quad_bytes;
+        // The third vertex is two vertices further on, which is the pair the game averages.
+        let third = first + VERTEX_LENGTH * 2;
+
+        let axis = |at: usize, channel: usize| -> i32 {
+            (layer.vertices[at + channel] as i32 + layer.vertices[third + channel] as i32) / 2
+        };
+
+        (axis(first, 0), axis(first, 1), axis(first, 2))
+    };
+
+    let mut order: Vec<usize> = (0..quads).collect();
+
+    order.sort_by(|a, b| {
+        let (ax, ay, az) = centroid(*a);
+        let (bx, by, bz) = centroid(*b);
+
+        let a2 = ax * ax + ay * ay + az * az;
+        let b2 = bx * bx + by * by + bz * bz;
+
+        // Descending, so the farthest quad is drawn first. `cmp` rather than `partial_cmp` because these
+        // are integers with a total order, and a comparator that is not total is a sort whose result is
+        // not reproducible - the game is explicit about wanting a total one too (`Floats.compare`).
+        b2.cmp(&a2)
+    });
+
+    let source = layer.indices.clone();
+
+    for (position, quad) in order.iter().enumerate() {
+        let from = quad * index_bytes;
+        let to = position * index_bytes;
+
+        layer.indices[to..to + index_bytes].copy_from_slice(&source[from..from + index_bytes]);
+    }
 }
 
 /// The fluid textures. A fluid has no block model - no elements, no blockstate variant - so nothing
@@ -2546,6 +2720,7 @@ mod fluid_fixtures {
                     blocks_motion,
                     offset_max_y: 0.0,
                     offset_xz: false,
+                    leaves: false,
                 },
             );
         }
@@ -2855,7 +3030,9 @@ mod fluid_geometry_tests {
     fn bake_layer(world: &FluidWorld, layer: RenderLayer) -> Vec<[[f32; 3]; 4]> {
         let mut layers = vec![BakedLayer::default(); 3];
 
-        bake_fluid_faces_with(&manager(), world, &sprites(), &mut layers);
+        // The section at the origin: these fixtures build one section's worth of blocks and ask what
+        // came out, so the world position a fluid asks its tint for is the section-relative one.
+        bake_fluid_faces_with(&manager(), world, &sprites(), &mut layers, IVec3::ZERO);
 
         quads(&layers[layer as usize])
     }
@@ -3511,6 +3688,7 @@ fn bake_fluid_faces<Provider: BlockStateProvider>(
     state_provider: &Provider,
     atlas: &Atlas,
     layers: &mut [BakedLayer],
+    section_offset: IVec3,
 ) {
     // Indexed by kind - 1, so the geometry below does not have to know a `FluidSprites` from an atlas;
     // see [`bake_fluid_faces_with`], which is what a test calls.
@@ -3519,8 +3697,28 @@ fn bake_fluid_faces<Provider: BlockStateProvider>(
         fluid_sprites(atlas, 2, "lava"),
     ];
 
-    bake_fluid_faces_with(block_manager, state_provider, &sprites, layers);
+    bake_fluid_faces_with(
+        block_manager,
+        state_provider,
+        &sprites,
+        layers,
+        section_offset,
+    );
 }
+
+/// The colour water is tinted when nothing knows which biome it is in.
+///
+/// `BiomeColors.getAverageWaterColor` for the default biome, which is what the game uses where no biome
+/// says otherwise. It is the fallback of [`BlockStateProvider::get_fluid_color`] rather than the answer,
+/// so the renderer still draws water on a path that has no biome data - which is every test, and was the
+/// whole renderer before the tint was threaded through.
+///
+/// The alpha byte is not part of the tint. The shader builds the vertex colour as
+/// `vec4(red, green, blue, 1.0)` and the alpha that reaches the blend is the *texture's*, so this byte
+/// goes nowhere - it is `00` only because it is unused rather than because it means anything. **The two
+/// halves are not interchangeable and were briefly confused**: `0x00e4763f` is a colour, `0x00ffffff` is
+/// white, and white water is what this looks like when the colour half is mistaken for the alpha half.
+pub const WATER_TINT: u32 = 0x00e4_763f;
 
 /// Whether a fluid's **top face** is also drawn facing the other way - the one thing that makes the
 /// surface of a lake visible from inside it.
@@ -3603,28 +3801,17 @@ fn bake_fluid_faces_with<Provider: BlockStateProvider>(
     state_provider: &Provider,
     sprites: &[Option<(RenderLayer, FluidSprites)>; 2],
     layers: &mut [BakedLayer],
+    section_offset: IVec3,
 ) {
     // The same index list the block baker emits, for the same reason: a mirror in the clip space
     // (see `preprocessing.rs`) turns every triangle over, so the two triangles of a quad are emitted
     // in the order that comes back out wound counter-clockwise.
     const INDICES: [u32; 6] = [0, 3, 1, 1, 3, 2];
 
-    // Water is tinted by the biome it is in, which nothing on this path knows. This is the colour the
-    // game uses where no biome says otherwise, packed the way the terrain shader reads the vertex
-    // colour back: red in the low byte.
-    //
-    // **An approximation, and a visible one.** A face is tinted by `BiomeColors.getAverageWaterColor` in
-    // the game, which is a function of the biome's temperature and downfall - so an ocean, a swamp and a
-    // cold river are three different colours there and one here. Sending the tint with the payload is
-    // what closes it: the JVM has the biome at every position it meshes, and the fluid mesher would take
-    // a colour per block instead of this constant.
-    //
-    // The alpha byte is not part of that. The shader builds the vertex colour as `vec4(red, green, blue,
-    // 1.0)` and the alpha that reaches the blend is the *texture's*, so this byte goes nowhere - it is
-    // `ff` only because it is unused rather than because it means anything. **The two halves are not
-    // interchangeable and were briefly confused**: `0x00e4763f` is a colour, `0x00ffffff` is white, and
-    // white water is what this line looks like when the colour half is mistaken for the alpha half.
-    const WATER_TINT: u32 = 0x00e4_763f;
+    // Water is tinted by the biome it is in, and this is the colour the game uses where no biome says
+    // otherwise - see [`BlockStateProvider::get_fluid_color`], which is what replaces it when the provider
+    // knows. Packed the way the terrain shader reads the vertex colour back: red in the low byte. See
+    // [`WATER_TINT`].
 
     let mut add_quad = |layer: RenderLayer,
                         dir: Direction,
@@ -3719,7 +3906,21 @@ fn bake_fluid_faces_with<Provider: BlockStateProvider>(
         };
 
         let (fx, fy, fz) = (pos.x as f32, pos.y as f32, pos.z as f32);
-        let color = if kind == 1 { WATER_TINT } else { 0x00ff_ffff };
+        // **Water is asked for its colour; lava is not.** The game tints water by the biome it is in and
+        // leaves lava alone, and that is exactly what the `kind` test is: `FluidTintSources.water()` is
+        // water's, while the lava model carries no tint source at all - `FluidStateModelSet` builds
+        // `LAVA_MODEL` with `null` where `WATER_MODEL` passes the water source - so white is lava's
+        // answer and not a placeholder for one.
+        //
+        // Asked per block rather than per section because the biome is a per-column property: a section
+        // on a biome boundary holds two colours, and holding both is the thing the constant this replaced
+        // could never do. It is one call per fluid block, on the bake thread, where a block face's tint
+        // is already asked per face.
+        let color = if kind == 1 {
+            state_provider.get_fluid_color(pos + section_offset)
+        } else {
+            0x00ff_ffff
+        };
 
         // The light every face of this fluid is lit by, and the reason it is not the light of the block
         // the face is *towards*.
@@ -4413,6 +4614,221 @@ mod winding_tests {
     }
 }
 
+/// The translucent quad sort. See [`sort_translucent_quads`].
+///
+/// Worth a test rather than a picture, because **a wrong order here is a wrong blend and nothing else**:
+/// the geometry is all present, the depth test passes, and the only difference is which of two surfaces
+/// is drawn first. That is the one class of bug this renderer cannot see in a log and a player describes
+/// as "the water looks off".
+#[cfg(test)]
+mod translucent_sort_tests {
+    use super::*;
+    use crate::render::pipeline::Vertex;
+
+    /// A quad at `origin`, as the packed bytes a baked layer holds: four vertices of sixteen bytes, with
+    /// the position in the first three of each.
+    fn quad(origin: [u8; 3]) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(Vertex::VERTEX_LENGTH * 4);
+
+        for _ in 0..4 {
+            let mut vertex = [0u8; Vertex::VERTEX_LENGTH];
+            vertex[..3].copy_from_slice(&origin);
+            bytes.extend_from_slice(&vertex);
+        }
+
+        bytes
+    }
+
+    /// A layer of the given quads, with each quad's own indices in the fixture's six-value pattern.
+    fn layer(quads: &[[u8; 3]]) -> BakedLayer {
+        let mut vertices = Vec::new();
+        let mut indices = Vec::new();
+
+        for (number, origin) in quads.iter().enumerate() {
+            vertices.extend_from_slice(&quad(*origin));
+
+            for relative in [0u32, 3, 1, 1, 3, 2] {
+                indices.extend_from_slice(&(relative + (number as u32) * 4).to_ne_bytes());
+            }
+        }
+
+        BakedLayer { vertices, indices }
+    }
+
+    /// The distance a quad's centroid sits at, which is the key the sort is by.
+    fn centroid_distance(vertices: &[u8], position: usize) -> i32 {
+        let at = position * Vertex::VERTEX_LENGTH * 4;
+        let third = at + Vertex::VERTEX_LENGTH * 2;
+
+        let axis = |channel: usize| -> i32 {
+            (vertices[at + channel] as i32 + vertices[third + channel] as i32) / 2
+        };
+
+        let (x, y, z) = (axis(0), axis(1), axis(2));
+
+        x * x + y * y + z * z
+    }
+
+    /// **The farthest quad comes out first**, which is the whole of the rule: blending is
+    /// order-dependent and a translucent surface behind another has to be drawn before it.
+    #[test]
+    fn the_farthest_quad_is_drawn_first() {
+        // Deliberately not in order, so a sort that does nothing cannot pass.
+        let mut baked = layer(&[[4, 0, 0], [1, 0, 0], [3, 0, 0]]);
+
+        sort_translucent_quads(&mut baked);
+
+        let order: Vec<usize> = baked
+            .indices
+            .as_chunks::<{ 6 * 4 }>()
+            .0
+            .iter()
+            .map(|group| {
+                let first = u32::from_ne_bytes(group[..4].try_into().expect("four bytes"));
+                (first / 4) as usize
+            })
+            .collect();
+
+        assert_eq!(
+            order,
+            vec![0, 2, 1],
+            "the quads are at x=4, x=1 and x=3 in bake order, so farthest first is the first baked, \
+             then the third, then the second"
+        );
+
+        // And the keys really are descending, read back out of the buffer the sort produced rather than
+        // from the order it was expected to produce.
+        let keys: Vec<i32> = order
+            .iter()
+            .map(|quad| centroid_distance(&baked.vertices, *quad))
+            .collect();
+
+        assert!(
+            keys.windows(2).all(|pair| pair[0] >= pair[1]),
+            "the sort is descending by centroid distance, and read back it is {keys:?}"
+        );
+    }
+
+    /// **Only the six-index groups move.** A quad's winding is the order of its indices, so a sort that
+    /// permuted the values inside a group would turn every translucent face inside out - which is the
+    /// failure this checks for, and it is one that would look like a lighting bug rather than a sorting
+    /// one.
+    #[test]
+    fn a_quad_keeps_its_own_indices() {
+        let mut baked = layer(&[[2, 0, 0], [9, 0, 0]]);
+
+        sort_translucent_quads(&mut baked);
+
+        for group in baked.indices.as_chunks::<{ 6 * 4 }>().0 {
+            let values: Vec<u32> = group
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|word| u32::from_ne_bytes(*word))
+                .collect();
+
+            // The pattern is relative within the quad, so subtracting the quad's own base leaves the
+            // fixture's six values in their fixture order.
+            let base = values.iter().copied().min().expect("six values");
+
+            assert_eq!(
+                base % 4,
+                0,
+                "a quad's indices start at its own first vertex"
+            );
+
+            let relative: Vec<u32> = values.iter().map(|value| value - base).collect();
+
+            assert_eq!(
+                relative,
+                vec![0, 3, 1, 1, 3, 2],
+                "the winding inside a quad is untouched by the sort"
+            );
+        }
+    }
+
+    /// A layer that does not describe whole quads is left exactly as it is.
+    ///
+    /// The alternative is worse than not sorting: reordering index groups against a vertex buffer whose
+    /// quads are not where the sort assumes attaches each quad's indices to another quad's vertices, so a
+    /// buffer this side does not understand is a buffer this side does not touch.
+    #[test]
+    fn a_layer_that_is_not_whole_quads_is_left_alone() {
+        let mut ragged = layer(&[[1, 0, 0]]);
+        ragged.vertices.truncate(Vertex::VERTEX_LENGTH * 3);
+
+        let before = ragged.indices.clone();
+
+        sort_translucent_quads(&mut ragged);
+
+        assert_eq!(ragged.indices, before, "nothing moved");
+
+        // And the empty layer, which every section has two of.
+        let mut empty = BakedLayer::default();
+
+        sort_translucent_quads(&mut empty);
+
+        assert!(empty.indices.is_empty());
+    }
+}
+
+/// The leaves switch and the layer it decides. See [`force_opaque`].
+///
+/// Worth a test rather than a picture, because **the two wrong answers look like two different bugs and
+/// neither looks like a switch**: a leaf forced opaque when the player asked for cut-out leaves is a tree
+/// that lost its holes, and a non-leaf forced opaque is a pane or a plant drawn with no alpha test - which
+/// is not "leaves are wrong", it is "some blocks are wrong", and the connection between them is a single
+/// `&&`.
+#[cfg(test)]
+mod force_opaque_tests {
+    use super::*;
+
+    /// The truth table, over both inputs - which is the whole of the function and the whole of the
+    /// game's, so anything that is not this is a bug in one direction or the other.
+    #[test]
+    fn only_a_leaf_with_cut_out_leaves_off_is_forced_opaque() {
+        // `cutout_leaves`, `is_leaves`, expected.
+        let table = [
+            // The default: leaves are leaves, whatever the block is.
+            (true, true, false),
+            (true, false, false),
+            // Fast graphics: a leaf block goes opaque, and nothing else moves.
+            (false, true, true),
+            (false, false, false),
+        ];
+
+        for (cutout_leaves, is_leaves, expected) in table {
+            assert_eq!(
+                force_opaque(cutout_leaves, is_leaves),
+                expected,
+                "cutout leaves {cutout_leaves}, a leaf block {is_leaves}"
+            );
+        }
+    }
+
+    /// **The switch only ever moves leaves**, which is the assertion a `&&` written the wrong way round
+    /// fails: with the operands swapped, `Fast` would force every non-leaf block opaque and leave the
+    /// leaves alone - a world where the trees are fine and the glass, the plants, the ice and the water
+    /// are all wrong, which is a bug that would be blamed on the block models.
+    #[test]
+    fn the_switch_never_forces_a_block_that_is_not_a_leaf() {
+        for cutout_leaves in [false, true] {
+            assert!(
+                !force_opaque(cutout_leaves, false),
+                "a block that is not a leaf is forced opaque only when cutout leaves is {cutout_leaves}, \
+                 and it must never be"
+            );
+        }
+    }
+
+    /// And the default is on, which is the game's own default and what a player who has never opened the
+    /// graphics page sees.
+    #[test]
+    fn cut_out_leaves_is_on_by_default() {
+        assert!(crate::mc::block::cutout_leaves());
+    }
+}
+
 /// The face test, state by state. See [`face_is_hidden`].
 #[cfg(test)]
 mod face_culling_tests {
@@ -4481,6 +4897,7 @@ mod face_culling_tests {
             // A block stands where it was placed unless it asked not to.
             offset_max_y: 0.0,
             offset_xz: false,
+            leaves: false,
         }
     }
 
@@ -4498,6 +4915,7 @@ mod face_culling_tests {
             blocks_motion: true,
             offset_max_y: 0.0,
             offset_xz: false,
+            leaves: false,
         }
     }
 
@@ -4589,6 +5007,7 @@ mod face_culling_tests {
             blocks_motion: true,
             offset_max_y: 0.0,
             offset_xz: false,
+            leaves: false,
         };
 
         let manager = registry(&[(0, FULL_CUBE), (1, FULL_CUBE)], &[(1, partial)]);

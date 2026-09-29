@@ -253,14 +253,24 @@ pub(crate) const ARENA_USAGE: wgpu::BufferUsages = wgpu::BufferUsages::COPY_DST
 /// without an upper limit. That stopped being a bug about holes and became one about memory, so the
 /// budget is stated here and enforced where growth happens (`WmRenderer::grow_arena`).
 ///
-/// 3.5 GB: enough for a 32-chunk view, which was measured to want about 2.6 GB of meshed sections, and
-/// short of four full buffers. A view that needs more than this is one the arena cannot hold whatever
-/// this number is, and the answer then is the same as at any other limit - the sections that do not fit
-/// are left to Minecraft, which is what `at_capacity` tells the JVM.
+/// **5 GB, which is `ARENA_BUFFERS` x `max_buffer_size` on the machine this was measured on** - that is,
+/// the arena is allowed to use every buffer it may create, and the count of buffers is what bounds it.
+/// An earlier 3.5 GB was a guess, and a run at 32 chunks showed it was the wrong one: the arena reached
+/// the budget and handed **6,462** sections to Minecraft, which is a visible difference - those sections
+/// come out of the game's own mesher, and the point of this renderer is that they do not.
 ///
-/// It is a number of bytes rather than a number of buffers because the buffers are not all the same
-/// size: the first is whatever the world reported and the rest are created at the device's ceiling.
-pub const ARENA_MEMORY_BUDGET: u64 = 3_500_000_000;
+/// It cannot be derived from the device: wgpu reports a per-buffer limit and, in this version, no total
+/// budget (`MemoryBudgetThresholds` only turns memory pressure into OOM errors and a lost device, which
+/// is a worse failure than a bound). So it is a constant and the honest thing is to say so - the number
+/// to lower if a driver starts refusing allocations, and the number to read the log for:
+///
+/// ```text
+/// Rebuilds: ... N left to Minecraft because the arena is full, ...
+/// ```
+///
+/// That count climbing is this budget being reached, and it is the one number that says whether the
+/// arena is holding the view the player asked for.
+pub const ARENA_MEMORY_BUDGET: u64 = 5_000_000_000;
 
 /// How many arena buffers the arena may grow to.
 ///
