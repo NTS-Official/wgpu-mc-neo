@@ -234,20 +234,42 @@ pub struct RenderEffectsData {
 /// What the arena's buffer is used for: written by the section feed, read as vertices and indices by
 /// the graph's draws, and bound as a storage buffer by the shader that fetches a section's quads.
 ///
-/// One constant rather than the same four flags at both creation sites - the pool and the buffer are
-/// resized together by [`Scene::set_arena_slots`], and the second of those sites is where a missing
-/// flag would be a validation error at the first draw.
+/// One constant rather than the same flags at every creation site - the pool and the buffers are made
+/// together by [`Scene::set_arena_slots`] and `WmRenderer::grow_arena`, and a flag missing from one of
+/// those sites is a validation error at the first draw.
 ///
-/// `COPY_SRC` is there for the fifth: an arena that a section did not fit in is grown rather than left
-/// full (`WmRenderer::grow_arena`), and growing it is one `copy_buffer_to_buffer` of the old contents
-/// into the new buffer - every range keeps its offset, so the world does not have to be meshed again.
-/// Without the flag that copy is a validation error, and a validation error on this path ends the
-/// process.
+/// **No `COPY_SRC`.** It was there because a full arena used to grow by allocating a bigger buffer and
+/// copying the old one into it; growth appends another buffer now, so nothing copies an arena and the
+/// flag would be permission for a thing that does not happen. See [`ARENA_BUFFERS`].
 pub(crate) const ARENA_USAGE: wgpu::BufferUsages = wgpu::BufferUsages::COPY_DST
-    .union(wgpu::BufferUsages::COPY_SRC)
     .union(wgpu::BufferUsages::VERTEX)
     .union(wgpu::BufferUsages::STORAGE)
     .union(wgpu::BufferUsages::INDEX);
+
+/// **How much video memory the arena may use in total**, which is the bound that was missing.
+///
+/// A per-buffer limit is not a memory bound: `ARENA_BUFFERS` of them is four times whatever the device
+/// will make in one, and with the arena appending rather than refusing, a player flying forward grew it
+/// without an upper limit. That stopped being a bug about holes and became one about memory, so the
+/// budget is stated here and enforced where growth happens (`WmRenderer::grow_arena`).
+///
+/// 3.5 GB: enough for a 32-chunk view, which was measured to want about 2.6 GB of meshed sections, and
+/// short of four full buffers. A view that needs more than this is one the arena cannot hold whatever
+/// this number is, and the answer then is the same as at any other limit - the sections that do not fit
+/// are left to Minecraft, which is what `at_capacity` tells the JVM.
+///
+/// It is a number of bytes rather than a number of buffers because the buffers are not all the same
+/// size: the first is whatever the world reported and the rest are created at the device's ceiling.
+pub const ARENA_MEMORY_BUDGET: u64 = 3_500_000_000;
+
+/// How many arena buffers the arena may grow to.
+///
+/// Each is capped at the device's `max_buffer_size`, so this is the arena's ceiling in buffers - and
+/// [`ARENA_MEMORY_BUDGET`] is the ceiling that actually matters, because four buffers of 1.31 GB is more
+/// than a 32-chunk view needs and more than this renderer should be holding. This one exists so that a
+/// device with an unusually large `max_buffer_size` cannot reach the byte budget with a single buffer
+/// and then stop growing before a second would have fit.
+pub const ARENA_BUFFERS: usize = 4;
 
 pub struct Scene {
     pub section_storage: RwLock<SectionStorage>,
@@ -272,14 +294,18 @@ pub struct Scene {
     /// another section rather than once per frame: a frame where the camera stayed put has nothing to
     /// free, and the walk would cost more than the frames it ran on.
     pub trimmed_section_pos: RwLock<IVec2>,
-    /// The arena's buffer, and the bind group that reaches it.
+    /// **The arena's buffers, one entry per pool in `SectionStorage`.**
     ///
-    /// Swapped rather than fixed, because the arena is sized from the render distance the game
-    /// reports - and that report arrives when a world is joined, long after the scene was created. An
-    /// `ArcSwap` so the render thread reads it per frame without a lock, and so a frame that is still
-    /// drawing from the old buffer keeps it alive: the recorded pass holds its own reference to it.
-    /// See [`Scene::set_arena_slots`], which is the only thing that replaces it.
-    pub chunk_buffer: ArcSwap<BindableBuffer>,
+    /// A list because one buffer is not enough: each is capped at the device's `max_buffer_size` - 1.31 GB
+    /// on the machine this was measured on - while a 32-chunk view wants about 2.6 GB of meshed sections.
+    /// With one buffer the arena was half the size it needed to be, and every section it could not hold
+    /// was one neither renderer drew. See [`ARENA_BUFFERS`] for the limit.
+    ///
+    /// Index `i` here is `SectionRanges::buffer == i`, and the two lists are kept in step by
+    /// `WmRenderer::grow_arena` and `SectionStorage::grow_pool` - the only things that add either. The
+    /// list is replaced whole rather than mutated, so a frame still drawing from it keeps its own
+    /// reference; index 0 is the buffer a world starts with.
+    pub chunk_buffers: ArcSwap<Vec<Arc<BindableBuffer>>>,
 
     /// The pool size a section did not fit into asked to be grown to, or zero.
     ///
@@ -345,12 +371,12 @@ impl Scene {
             section_storage: RwLock::new(SectionStorage::new(crate::mc::chunk::ARENA_SLOTS)),
             camera_section_pos: RwLock::new(IVec3::ZERO),
             trimmed_section_pos: RwLock::new(ivec2(i32::MAX, i32::MAX)),
-            chunk_buffer: ArcSwap::from_pointee(BindableBuffer::new_deferred(
+            chunk_buffers: ArcSwap::from_pointee(vec![Arc::new(BindableBuffer::new_deferred(
                 wm,
                 crate::mc::chunk::ARENA_SLOTS as u64 * 4,
                 ARENA_USAGE,
                 "ssbo",
-            )),
+            ))]),
             pending_arena_growth: AtomicU32::new(0),
             arena_cap_slots: (wm.gpu.device.limits().max_buffer_size / 4).min(u32::MAX as u64)
                 as u32,
@@ -397,15 +423,15 @@ impl Scene {
             return false;
         }
 
-        // The old buffer goes when the last frame that recorded a draw from it is done with it: the
+        // The old buffers go when the last frame that recorded a draw from them is done with them: the
         // pass holds its own reference, and this drops ours.
-        self.chunk_buffer
-            .store(Arc::new(BindableBuffer::new_deferred(
+        self.chunk_buffers
+            .store(Arc::new(vec![Arc::new(BindableBuffer::new_deferred(
                 wm,
                 slots as u64 * 4,
                 ARENA_USAGE,
                 "ssbo",
-            )));
+            ))]));
 
         true
     }

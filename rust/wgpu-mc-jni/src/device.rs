@@ -4838,21 +4838,35 @@ pub extern "C" fn terrain_arena_can_grow() -> bool {
         .is_some_and(|scene| scene.section_storage.read().pool_slots() < scene.arena_cap_slots)
 }
 
-/// **Whether the arena is at the device's buffer limit**, so a refused section is one this side will
-/// never be able to draw.
+/// **Whether this side is currently failing to hold what it is given**, which is the condition that
+/// decides whether Minecraft should keep its own mesh.
 ///
-/// The JVM asks this to decide whether to keep Minecraft's own mesh for the sections being refused. It
-/// is the difference between a refusal that growth will answer and one that will not, and the JVM cannot
-/// work it out from the outside: it decides to drop the mesh on a chunk-build thread, before the bake is
-/// even queued, and by the time the refusal comes back the geometry is already gone. See
-/// `SectionStorage::at_capacity`, which is where the answer is recorded, and `RustChunkBake`, which is
-/// what acts on it.
+/// This started as "is the arena at the device's buffer limit" and that was the wrong question, which a
+/// run at a large view distance showed: the arena was **1 GB and 80% full** - twenty per cent of it free -
+/// and still refusing sections, because an arena is a pool of *contiguous* ranges and the largest section
+/// measured 122,760 slots. A pool with room in total and no room in the size class being asked for
+/// refuses exactly as a full one does. `at_capacity` was false through all 33 of those refusals, so the
+/// guard keyed on it never fired and the sections it was meant to protect were suppressed and not drawn.
+///
+/// So the question is the one the JVM actually needs answered: **is this side keeping up?** Anything it
+/// has refused since the last report is a section it does not have, and one it does not have is one the
+/// game has to draw. `refused_pending` is exactly that set, and it is already maintained - see
+/// `SectionStorage::refused`, which the tick drain empties.
+///
+/// Reading it here does not consume it: the drain is still the only thing that takes the positions out.
 #[jni_fn("dev.birb.wgpu.rust.WgpuNative")]
 pub fn terrainArenaAtCapacity(_env: JNIEnv, _class: JClass) -> crate::jboolean {
     RENDERER
         .get()
         .and_then(|wm| wm.scene())
-        .is_some_and(|scene| scene.section_storage.read().at_capacity()) as crate::jboolean
+        .is_some_and(|scene| {
+            let storage = scene.section_storage.read();
+
+            // At the buffer limit: nothing more can be had, so no refusal will ever be answered.
+            // Or holding refusals right now: this side is behind, and the sections it could not take
+            // are the game's to draw.
+            storage.at_capacity() || storage.refusals_waiting() > 0
+        }) as crate::jboolean
 }
 
 /// Whether the graph has a terrain pipeline, building it if it does not.

@@ -1283,6 +1283,9 @@ mod tests {
         "../../../neoforge/src/main/java/dev/birb/wgpu/mixin/chunk/RustChunkBakeMixin.java"
     );
 
+    /// The native side of the "is this side keeping up" question, pulled in for what it keys on.
+    const TERRAIN_ARENA_CAPACITY: &str = include_str!("device.rs");
+
     /// **Every place this side forgets what it told Rust, it forgets that Rust is drawing it too.**
     ///
     /// Minecraft's own mesh for a section is dropped once Rust has been handed that section
@@ -1463,9 +1466,26 @@ mod tests {
              returned normally"
         );
 
+        // **And the decision has to include what Rust accepted.** `send` can come back having taken
+        // nothing - the bake queue was full and the task was dropped, or the records were refused - and
+        // it was already reporting that while the decision ignored it. A section Rust refused then had
+        // Minecraft's mesh dropped too, and nothing asks for it back: only an *arena* refusal reaches
+        // the re-offer drain, not a dropped task.
+        assert!(
+            source.contains("noteTookSection(!firstLook[0] && !atCapacity() && accepted)"),
+            "the decision to drop Minecraft's mesh must require that Rust accepted the payload; \
+             otherwise a refused section is drawn by neither renderer"
+        );
+
+        assert!(
+            source.contains("val centreTaken = !resync && (rejected and (1 shl CENTER)) == 0"),
+            "`send` has to report what was accepted per section, which is the centre slot - a \
+             neighbour's refusal only costs the next payload"
+        );
+
         // And the capacity check itself, which is the part only the native side can answer.
         assert!(
-            source.contains("noteTookSection(!firstLook[0] && !atCapacity())"),
+            source.contains("!atCapacity()"),
             "the decision to drop Minecraft's mesh has to account for an arena that cannot grow: at the \
              device's buffer limit a refusal is permanent, so the game keeps its mesh for those sections"
         );
@@ -1473,6 +1493,18 @@ mod tests {
         assert!(
             source.contains("fun atCapacity()"),
             "and that decision needs the capacity answer from the native side, which is `atCapacity`"
+        );
+
+        // And what that native answer is keyed on, which a run corrected once already: an arena is a
+        // pool of *contiguous* ranges, so one with room in total and none in the size class being asked
+        // for refuses exactly as a full one does. Keying on "at the device's buffer limit" alone left 33
+        // real refusals - in an arena reporting 80% full - with the guard dormant.
+        let device = code_of(TERRAIN_ARENA_CAPACITY);
+        assert!(
+            device.contains("storage.refusals_waiting() > 0"),
+            "the guard has to fire on *refusals*, not only on the pool being at the device's limit: a \
+             fragmented pool refuses sections while reporting twenty per cent free, and `at_capacity` is \
+             false through all of it"
         );
 
         // The mixin must not write the answer a second time - a coarser one would overwrite it.

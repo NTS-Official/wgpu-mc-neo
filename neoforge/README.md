@@ -3918,6 +3918,272 @@ It exists anyway, as **`Atlas sampled from its base mip only`**, because the cas
 rather than an argument and the two runs are cheap to compare. Applying it rebuilds the graph, since a
 sampler is built with the pipelines.
 
+### The shape behind all of these: a section stops being drawn and nobody says so
+
+Five routes, one shape, and it took five rounds because each was found on its own:
+
+| route | how a section stops being drawn | what reported it |
+| --- | --- | --- |
+| an allocation was refused | it keeps the geometry it had, or has none | `refused_pending` -> `forgetRefused` (was capped at 4096, then gated on `canGrow`) |
+| the bake queue was full | the task is dropped and the bake never runs | **nothing** - fixed here |
+| the payload was rejected | `send` returned having taken nothing | `REJECTED_MASK`, but the mesh decision ignored it |
+| the trim dropped it | it is beyond `width + 2` chunks | **nothing** - fixed here |
+| a level change | the whole arena is dropped | `forgetAll` clears both sides together, which is why this one was never a hole |
+
+**The invariant is one line:** a section this side stops drawing has to be reported to the JVM, because the
+JVM is suppressing Minecraft's mesh for it on the strength of `rustHas` - and `rustHas` only means "this
+side was told about it". Every route above is a way for that claim to stop being true, and the answer is
+the same each time: hand the position over so `sent` and `rustHas` drop it, and ask the game for a rebuild.
+
+The queue-full route is worth reading in the source, because its comment asserted the opposite:
+
+```rust
+// The queue is full, so this bake is dropped on the floor ... this is the bit that makes the JVM
+// offer it again.
+None => return (rejected | (1 << CENTER)) as jint,
+```
+
+The bit makes the JVM forget the section was sent, so the *next* rebuild carries its blocks - and the next
+rebuild is the thing that does not happen, because a rebuild happens when the game decides a section is out
+of date and this section was just brought up to date. The offer was not "not lost work"; it was lost, and
+the mesh for it was already gone. Both drop paths now queue the position for a rebuild, which is the only
+mechanism that actively asks the game for one.
+
+### The trim dropped sections without telling anyone, and the buffer list had no memory bound
+
+Two problems with one cause, found by flying forward.
+
+**The trim was silent, which is a third route to the same hole.** `SectionStorage::trim` removed the
+sections beyond `width + 2` chunks and gave their ranges back, and said nothing to the JVM. The JVM
+suppresses Minecraft's mesh for every section it believes Rust holds - `rustHas` - so a trimmed section was
+drawn by neither renderer, and it did not come back either: the JVM counts it as sent, so the next rebuild
+carries nothing for it. Exactly the refusal hole and the dropped-bake hole, arriving by the trim.
+
+`trim` now returns the positions it dropped and they go down the same channel a refusal does
+(`refused_pending`), because to the other side the two mean the same thing: a section this renderer is not
+drawing, which Minecraft's mesh has to come back for. `forget_trimmed` is the name for it on the storage
+side.
+
+**And the memory bound was "four buffers", which is not a bound.** `ARENA_BUFFERS` was set to the number a
+32-chunk view needs, and each buffer is created at the device's own `max_buffer_size` - so the arena could
+reach four times 1.31 GB, and with the arena *appending* rather than refusing there was nothing to stop it.
+A player flying forward grew it without limit: a bug about holes became a bug about memory.
+
+`ARENA_MEMORY_BUDGET` is 3.5 GB and it is checked where growth happens, before an arena is added. Past it
+the arena stops growing and `at_capacity` does what it does at the device's limit: the sections that do not
+fit are left to Minecraft, which is the right answer for a view the arena cannot hold. It is bytes rather
+than a buffer count because the buffers are not the same size - the first is whatever the world reported,
+the rest are created at the ceiling.
+
+**What this says about the earlier rounds.** The trim being silent is the *same* mistake as the refusal
+path, the dropped queue task and the mesh-suppression decision: a section stops being drawn by this side and
+nothing tells the side that is suppressing its fallback. Four routes, one shape. The memory bound is the
+other half of the same change - making the arena bigger removed the limit that had been standing in for
+correctness.
+
+### The arena was sized for the world entry, not for the view
+
+A run at 48 chunks, measured:
+
+```text
+the section arena holds 50,460,000 slot(s), 192 MB, for 12 chunk(s) of view     <- at world entry
+the section arena was full, so it grew to 2 arena(s) of 536870911 slot(s), 2240 MB total
+```
+
+**The arena is sized to whatever render distance the world was entered at** - 12 chunks here, 192 MB -
+and the view then becomes whatever the player set. `set_arena_slots` cannot resize an arena that holds
+anything (`set_pool` refuses when the storage is non-empty, for the reason it gives: a range allocator
+cannot be resized under live allocations), so the only way up is appending arenas - and the growth path
+added **one per refusal**.
+
+That made the catch-up a race against the burst of bakes a growing view produces, and it is a race the
+refusals win: each one is a section whose bake did not fit. Since the mesh for those sections has already
+been dropped by the time the refusal is known, the sections in that window are the holes.
+
+**The growth now meets the target in one go.** `pending_arena_growth` is a marker rather than a size - the
+refusal that sets it only knows that something did not fit - so the target is read from what the view
+actually asks for, `arena_slots(current width)`, and arenas are appended until the pool reaches it or
+`ARENA_BUFFERS` runs out. The measured run went from 192 MB to 2.24 GB in one growth instead of ~15.
+
+`at_capacity` is now set from what happened rather than from whichever branch was taken last: true only
+when another arena was refused, cleared otherwise. It is what decides whether the JVM keeps Minecraft's
+mesh for a section this side cannot take, so it is cleared as deliberately as it is set.
+
+**A note on the measurement that misled me.** The terrain report's arena figure is
+`used_slots() of pool_slots()`, and `used_slots` is `pool - free`, where `free` is summed across every
+arena's free list. Read beside `LAYER_DRAWN_TOTAL` it looks like it should reconcile with the drawn
+count, and it does not - that counter is cumulative while the drawn/empty pair in the same line is
+per-report. Two runs an hour apart read "67% used, 3953 solid drawn" and "61% used, 106 solid drawn",
+which cannot both be a description of the same quantity. The utilisation number is sound on its own; it is
+the company it keeps on that line that is not.
+
+### `send` could return having taken nothing, and the mesh was dropped anyway
+
+`send` reports the other side's answer in one word, and the decision about Minecraft's mesh was reading
+only part of it:
+
+```kotlin
+val rejected = answer and REJECTED_MASK     // records refused: nothing was taken
+val resync = answer and RESYNC != 0
+...
+return resync                               // <- and nothing else came back
+```
+
+`bakeNow` then decided with `noteTookSection(!firstLook[0] && !atCapacity())` - which asks whether this side
+has *told* Rust about the section and whether the arena has room, but never whether Rust **accepted** the
+payload. So a rebuild whose payload was refused still dropped Minecraft's mesh, while `rustHas` was
+correctly left unset for it. The section was then drawn by neither renderer.
+
+The refusal paths are all real and all reachable while entering a world at a large view distance:
+
+- **the bake queue was full** and `BakeTask::new` dropped the task (`rejected | (1 << CENTER)`);
+- **the records were refused** because they were written for a world Rust has forgotten
+  (`rejected | RESYNC`);
+- **the block registry was empty**, which returns `REJECTED_MASK` for all 27.
+
+Only an *arena* refusal reaches the re-offer drain (`refused_pending`), so a dropped bake was not re-offered
+either - it depended entirely on a later rebuild happening, which is the assumption this whole file keeps
+running into.
+
+`send` now returns `Answer(resync, centreTaken)`:
+
+```kotlin
+val centreTaken = !resync && (rejected and (1 shl CENTER)) == 0
+```
+
+- the **centre slot** decides this section, because a neighbour's refusal only costs the next rebuild an
+  extra payload - and the decision is now `!firstLook[0] && !atCapacity() && accepted`.
+
+This is the third time the same mistake has been found in this file, at three different depths: `bake`
+answering "did it not throw", the mixin overwriting the recorded answer, and now `send` reporting only half
+of what it received. Each one dropped a mesh for a section Rust had not taken. The report line carries a
+counter per outcome now, so which one is wrong is a number rather than a reading:
+
+```
+Rebuilds: S meshed by Rust's answer, R refused by it, C left to Minecraft because the arena is full,
+          F left to it because Rust was never told
+```
+
+**`R` non-zero means Rust is refusing payloads** - the bake queue or a stale world - and is the number to
+look at first on a run that still has holes.
+
+### The arena is several buffers now, because one was half of what a large view needs
+
+The measurements that forced it:
+
+| | |
+| --- | --- |
+| `arena_cap_slots` (device `max_buffer_size / 4`) | 328,560,000 slots = **1.31 GB in one buffer** |
+| a section's measured cost | 264,591,404 slots / 13,744 drawn = **19,251 slots** |
+| sections a 32-chunk view is drawn from | 65 x 65 x 8 = about **33,800** |
+| what that needs | 33,800 x 19,251 = about **2.6 GB** |
+
+**One buffer stops at half of that**, so at 32 chunks the sections past the ceiling were refused, and a
+refused section was one neither renderer drew. No amount of care in the refusal path could change the
+ratio - which is why every earlier fix here made the holes fewer and never made them go.
+
+**What changed.** The arena is a list of buffers rather than one, and a range now names the buffer it is an
+offset into:
+
+- **`SectionRanges` gained `buffer: u32`**, and it travels with every range through every free path -
+  deferred, refused, trimmed, replaced - because a range given back to the wrong pool is a range that pool
+  hands out while the buffer holding it still does. `ReleasedRange` and `DrawnLayer` name those pairs
+  rather than spelling out the tuples, because three positional fields of which two are `Range<u32>` is
+  the shape that gets passed in the wrong order.
+- **The draw loop rebinds when a section's buffer changes** - both the bind group the vertex stage reads
+  `chunk_data` out of and the index buffer `draw_indexed` reads - because binding one and not the other
+  draws a section out of another section's geometry. Sections are gathered in storage order and the
+  allocator hands out of one arena until it is full, so this is a handful of rebinds per frame rather than
+  one per section. A section's layers are all placed in **one** arena for the same reason.
+- **Growth appends a buffer instead of growing one.** The old path allocated a bigger buffer and
+  `copy_buffer_to_buffer`'d the old contents into it; appending costs one allocation and no copy, because
+  every range already handed out still names the buffer it was handed out in. `ARENA_USAGE` therefore
+  loses `COPY_SRC`: nothing copies an arena any more.
+- **The ceiling is `ARENA_BUFFERS` (4) buffers**, about 5.2 GB - chosen rather than derived, because the
+  number it trades against is video memory the driver has to actually hand over and wgpu reports a
+  per-buffer limit and no total. It is the first thing to lower if a driver refuses the allocations. At the
+  limit, `at_capacity` is set and the JVM keeps Minecraft's mesh for whatever does not fit.
+- **The refusal path asks about refusals now, not about the ceiling.** An arena is a pool of *contiguous*
+  ranges, so one with twenty per cent free and no room in the size class being asked for refuses exactly as
+  a full one does - a run was measured at 80% full with 33 refusals and the guard dormant, because it was
+  keyed on the device limit. `terrainArenaAtCapacity` answers "is this side keeping up" -
+  `at_capacity || refusals_waiting() > 0` - which is the question the JVM actually needs.
+
+**Verified so far**: 109 + 58 tests, `clippy -D warnings`, and a run at 32 chunks that drew 9,970 sections
+with no validation errors and no panics. **That run's first arena fitted, so the second-buffer path has not
+executed yet** - the rebinding and the append are covered by compilation and by the single-arena path
+still working, and the multi-arena path needs a world that fills 1.31 GB to exercise. That is the thing to
+watch on the next run: the growth line names how many arenas there are.
+
+### The arena cannot hold a large view distance, and that is the whole of it
+
+At 32 chunks the holes are not occasional, they are everywhere - and the reason is a number rather than a
+bug. From a run at 32 chunks:
+
+```text
+264,591,404 of 328,560,000 slot(s) handed out (80%, 1009 MB), the largest section 122,760 slot(s), 33 refused
+```
+
+Two things that says, and they point the same way:
+
+- **The pool is the device's buffer limit**: `arena_cap_slots` is `max_buffer_size / 4`, so 328,560,000
+  slots is a hard ceiling of **1.31 GB in one buffer**. We already ask for `adapter.limits()`, so this is
+  the device's own number, not a request that could be raised.
+- **A section costs what it costs**: 264,591,404 slots across 13,744 drawn sections is **19,251 slots
+  each**, near the 20,000 the sizing constant assumes. So the pool holds `328,560,000 / 19,251 = ` **about
+  17,000 sections**, while a 32-chunk view is drawn from about `65 x 65 x 8 = ` **33,800**.
+
+**The arena is half the size it needs to be at 32 chunks**, and no amount of care in the refusal path
+changes that: sections are refused because there is nowhere to put them, and refused sections are sections
+this side does not draw. Every fix in this file so far has been about making a refusal *survivable* - and
+they are, which is why the holes got fewer - but the count of refusals is set by that ratio, not by the
+refusal handling.
+
+What follows from it, and what is left to do:
+
+- **The guard has to hold for the whole run, not after the first refusal.** It now asks the native side
+  whether *any* refusal is outstanding (`refusals_waiting`), rather than whether the pool is at the
+  device's limit - the earlier version of that question was answered `false` through all 33 of the
+  refusals above, because a pool with 20% free and no room in the size class being asked for refuses
+  exactly as a full one does.
+- **The fix that removes the holes is to stop having one buffer.** Nothing about the arena requires a
+  single allocation: draws would need a bind group per buffer and the pool would need to hand out
+  `(buffer, range)` rather than `range`. That is a real change and it is the one that raises the ceiling
+  from 1.31 GB to `max_buffer_size x how many buffers the device will give` - which is what the sizing
+  constant already assumed it had.
+- Until then the honest summary is: **at a view distance the arena can hold, there are no holes; past it,
+  the sections that do not fit are drawn by Minecraft**, which is what the guard is for.
+
+### The suppression decision now says which of its three answers fired
+
+A hole that survives a fix leaves the question "which input is still wrong", and the suppression decision
+has three of them: the section was already Rust's, the arena is at its buffer limit, or Rust was never told
+about the section. Counting them per rebuild answers that without another round of reading the code, and
+the line rides on the once-a-second report beside the claim:
+
+```
+wgpu: this side claims Rust has 1732 section(s); the arena is drawing 512, with 0 awaiting a rebuild
+      and 0 bake(s) queued. Rebuilds: 313 meshed by Rust's answer, 0 left to Minecraft because the
+      arena is full, 481 left to it because Rust was never told
+```
+
+**A whole run at 16 chunks:**
+
+| outcome | count |
+| --- | --- |
+| meshed by Rust's answer (so the mesh is dropped) | 2,247 |
+| left to Minecraft because the arena is full | **0** |
+| left to Minecraft because Rust was never told | 5,575 |
+| arena refusals | 1 |
+| empty bakes | 3 of 7,629 |
+
+Two things that says. The capacity guard added for the `max_buffer_size` case **never fired in this run**,
+because this arena never filled - so it is not what made the user's holes get fewer, and whatever did is
+still unaccounted for. And the largest bucket by far is "Rust was never told": a rebuild that runs before
+the section has been offered to Rust keeps Minecraft's mesh, and it is the *next* rebuild of that section
+that hands it over. A section rebuilt only once therefore keeps Minecraft's mesh for the session - the safe
+direction, but it is the shape to watch for the holes that remain.
+
 ### `bake` answered "did it not throw", and that answer dropped Minecraft's mesh
 
 The hook that starts a bake records whether Rust took the section, and that record is what

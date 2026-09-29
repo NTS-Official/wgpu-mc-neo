@@ -1,6 +1,5 @@
 use linked_hash_map::LinkedHashMap;
 use std::collections::HashMap;
-use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use treeculler::{AABB, BVol, Frustum, Vec3};
@@ -56,7 +55,12 @@ struct VisibleSection {
     /// and the origin every vertex of the section is placed against. See the terrain pass.
     relative_position: glam::IVec3,
     /// Per [`RenderLayer`], the `(indices, vertices)` the arena holds, or `None` for no layer.
-    ranges: [Option<(Range<u32>, Range<u32>)>; 3],
+    ///
+    /// The third number is **which arena buffer** those two ranges are offsets into. It travels with
+    /// them because the draw loop has to rebind the arena - as the index buffer and as the storage buffer
+    /// the shader reads vertices from - whenever it changes, and a section drawn against the wrong arena
+    /// is a section of somebody else's geometry. See `SectionRanges::buffer`.
+    ranges: [Option<crate::mc::chunk::DrawnLayer>; 3],
     /// Distance from the camera's section to this one, squared, in sections. See the sort.
     distance_squared: f32,
 }
@@ -1561,22 +1565,23 @@ impl RenderGraph {
                 "@geo_terrain" | "@geo_terrain_translucent" => {
                     render_pass.set_pipeline(&bound_pipeline.pipeline);
 
-                    // The arena's buffer, loaded once for this pass and held for all of it: it is
-                    // replaced when the arena is resized (a render distance report on joining a
-                    // world), and a pass that read the two halves of it at different moments could
-                    // bind the new buffer and index the old.
-                    let chunk_buffer = scene.chunk_buffer.load_full();
+                    // **The arenas, loaded once for this pass and held for all of it.** There is one
+                    // buffer per arena now, and a section names which one it lives in, so the draw loop
+                    // rebinds when that changes - see `SectionRanges::buffer`. The list is loaded once
+                    // rather than per section for the reason the single buffer used to be: it is replaced
+                    // when an arena is added, and a pass that read the list at two different moments
+                    // could bind one buffer and index another.
+                    let chunk_buffers = scene.chunk_buffers.load_full();
 
+                    // Everything the pipeline binds that is *not* the arena: the matrices, the two
+                    // atlases and their samplers, the lightmap, the fog block. The arena's own group is
+                    // left out here and bound per section, because which arena a draw reads is a property
+                    // of the section rather than of the pass.
                     for (index, bind_group) in bound_pipeline.bind_groups.iter() {
                         match bind_group {
                             WmBindGroup::Resource(name) => match &name[..] {
-                                "@bg_ssbo_chunks" => {
-                                    render_pass.set_bind_group(
-                                        *index,
-                                        &chunk_buffer.bind_group,
-                                        &[],
-                                    );
-                                }
+                                // Bound per draw - see `bound_arena`.
+                                "@bg_ssbo_chunks" => {}
                                 _ => unimplemented!(),
                             },
                             WmBindGroup::Custom(bind_group) => {
@@ -1585,8 +1590,12 @@ impl RenderGraph {
                         }
                     }
 
-                    render_pass
-                        .set_index_buffer(chunk_buffer.buffer.slice(..), wgpu::IndexFormat::Uint32);
+                    // Arena 0 is bound before the first draw and rebound whenever a section names a
+                    // different one: a bind group and an index buffer are per arena, and both have to
+                    // move together. `None` rather than `Some(0)` so the first draw always binds -
+                    // assuming the initial state is what would make a section of arena 0 draw from
+                    // arena 1.
+                    let mut bound_arena: Option<u32> = None;
 
                     let sections_source = scene.section_storage.write();
 
@@ -1716,12 +1725,17 @@ impl RenderGraph {
                         // section's slot in the arena). A section the arena has nothing in for the layer
                         // being drawn is counted where the layer is drawn, because "the arena has no
                         // cutout here" is a fact about the layer and not about the section.
-                        let mut ranges: [Option<(Range<u32>, Range<u32>)>; 3] = [None, None, None];
+                        let mut ranges: [Option<crate::mc::chunk::DrawnLayer>; 3] =
+                            [None, None, None];
                         let mut any = false;
 
                         for (layer_index, layer) in section.layers.iter().enumerate() {
                             if let Some(layer) = layer {
+                                // The arena the layer lives in travels with its ranges: the draw loop
+                                // rebinds when it changes, and drawing a section against another arena
+                                // is a section of somebody else's geometry.
                                 ranges[layer_index] = Some((
+                                    layer.buffer,
                                     layer.index_range.clone(),
                                     layer.vertex_range.start..layer.vertex_range.start + 1,
                                 ));
@@ -1773,7 +1787,7 @@ impl RenderGraph {
                         let alpha_cutout = *alpha_cutout;
 
                         for visible in out.iter() {
-                            let Some((index_range, vertex_range)) =
+                            let Some((arena, index_range, vertex_range)) =
                                 visible.ranges[layer_index].clone()
                             else {
                                 empty += 1;
@@ -1781,6 +1795,34 @@ impl RenderGraph {
                                 layer_empty_total[layer_index] += 1;
                                 continue;
                             };
+
+                            // **Rebind when the section lives in a different arena.** The bind group is
+                            // the storage buffer the vertex stage reads `chunk_data` out of and the index
+                            // buffer is where `draw_indexed` reads the indices, so both are per arena and
+                            // both have to move together - binding one and not the other draws a section
+                            // out of somebody else's geometry. Sections are gathered in storage order and
+                            // the allocator hands out of one arena until it is full, so this is a handful
+                            // of rebinds per frame rather than one per section.
+                            if bound_arena != Some(arena) {
+                                let Some(buffer) = chunk_buffers.get(arena as usize) else {
+                                    // An arena the storage knows about and the renderer does not: the two
+                                    // lists are kept in step, so this is a bug rather than a state - but
+                                    // skipping one section is better than panicking mid-pass, which ends
+                                    // the process.
+                                    log::warn!(
+                                        "wgpu-mc: a section names arena {arena}, which the renderer has \
+                                         no buffer for; skipping it"
+                                    );
+                                    continue;
+                                };
+
+                                render_pass.set_bind_group(1, &buffer.bind_group, &[]);
+                                render_pass.set_index_buffer(
+                                    buffer.buffer.slice(..),
+                                    wgpu::IndexFormat::Uint32,
+                                );
+                                bound_arena = Some(arena);
+                            }
 
                             constants[..12].copy_from_slice(bytemuck::cast_slice(
                                 &visible.relative_position.to_array(),

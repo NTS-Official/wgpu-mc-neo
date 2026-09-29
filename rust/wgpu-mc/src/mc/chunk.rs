@@ -190,16 +190,71 @@ impl RenderLayer {
     }
 }
 
+/// One range, and the arena buffer it is an offset into.
+///
+/// The pair travels together through every free path - deferred, refused, trimmed, replaced - because a
+/// range given back to the wrong pool is a range that pool will hand out while the buffer holding it
+/// still does. See [`SectionRanges::buffer`].
+pub type ReleasedRange = (u32, Range<u32>);
+
+/// One layer as the renderer needs it to draw: the arena to bind, the indices to draw, and the vertex to
+/// draw them from.
+///
+/// Named rather than written out because it is built in the gather and consumed in the draw loop, and
+/// three positional fields of which two are `Range<u32>` is exactly the shape that gets passed in the
+/// wrong order - a mistake that draws a section out of another section's bytes rather than failing.
+pub type DrawnLayer = (u32, Range<u32>, Range<u32>);
+
 #[derive(Clone)]
 pub struct SectionRanges {
     pub vertex_range: Range<u32>,
     pub index_range: Range<u32>,
+    /// **Which arena buffer these ranges are offsets into.**
+    ///
+    /// The arena was one buffer until it turned out that one is not enough: `arena_cap_slots` is the
+    /// device's `max_buffer_size / 4`, so the ceiling was 1.31 GB on the machine this was measured on -
+    /// and a 32-chunk view needs about 33,800 sections at a measured 19,251 slots each, which is 2.6 GB.
+    /// The arena was half the size it needed to be, and sections it could not hold were sections neither
+    /// renderer drew.
+    ///
+    /// The buffer is carried *with* the ranges rather than looked up, because a draw needs all three
+    /// together: the index buffer to draw from, the storage buffer the shader reads the vertices out of,
+    /// and the range within them. See `RenderGraph::render`, which rebinds when this changes.
+    pub buffer: u32,
+}
+
+/// One arena buffer's allocator and its size.
+///
+/// A list of these is what replaced a single pool: every entry is a buffer of up to the device's
+/// `max_buffer_size`, so the arena's ceiling is that size times how many of these there are rather than
+/// the size of one. See [`SectionStorage::add_arena`].
+struct SectionArena {
+    allocator: RangeAllocator<u32>,
+    pool: u32,
+}
+
+impl SectionArena {
+    fn new(slots: u32) -> Self {
+        SectionArena {
+            allocator: RangeAllocator::new(0..slots),
+            pool: slots,
+        }
+    }
 }
 
 ///The struct representing a Chunk section, with various render layers, split into sections
 pub struct SectionStorage {
     storage: HashMap<IVec3, Section>,
-    allocator: RangeAllocator<u32>,
+    /// One allocator per arena buffer, index for index with the renderer's list of buffers.
+    ///
+    /// A section names the buffer it lives in ([`SectionRanges::buffer`]), so index `i` here and buffer
+    /// `i` in `Scene` are the same arena - the two are kept in step by [`SectionStorage::add_arena`] and
+    /// `WmRenderer::grow_arena`, which are the only things that add either.
+    arenas: Vec<SectionArena>,
+    /// The arena a new section is tried in first, so consecutive allocations land in the same buffer and
+    /// the draw path rebinds as little as possible. A hint, not a rule: a section that does not fit here
+    /// is tried in the others.
+    current_arena: usize,
     /// Ranges waiting to be given back, one bucket per frame that may still be in flight.
     ///
     /// A range stops being *stored* one frame and is reused the next, and the frame that still draws it
@@ -207,14 +262,16 @@ pub struct SectionStorage {
     /// it. So a range is parked for as many frames as the renderer is allowed to have in flight - the
     /// same number the present paces itself by, because that is the first frame whose submission is
     /// known to have been waited for. See [`SectionStorage::free_deferred`].
-    deferred: Vec<Vec<Range<u32>>>,
+    ///
+    /// Each entry carries the arena it came from, because there is more than one now: a parked range
+    /// given back to the wrong pool is a range that pool will hand out while the buffer that holds it
+    /// still does. See [`SectionRanges::buffer`].
+    deferred: Vec<Vec<ReleasedRange>>,
     /// The bucket this frame's ranges are parked in.
     deferred_head: usize,
     /// How many buckets there are. See [`SectionStorage::set_deferred_depth`].
     deferred_depth: usize,
-    /// How many slots the pool holds, which is what an allocation is refused against.
-    pool: u32,
-    /// Whether the last [`SectionStorage::allocate_ranges`] ran out of pool.
+    /// Whether the last [`SectionStorage::allocate_ranges`] ran out of every arena.
     refused: bool,
     /// **Whether a growth request has been clamped by the device's buffer limit**, which is the state
     /// the JVM has to know about.
@@ -251,11 +308,11 @@ impl SectionStorage {
         SectionStorage {
             storage: HashMap::new(),
             width: 0,
-            allocator: RangeAllocator::new(0..range),
+            arenas: vec![SectionArena::new(range)],
+            current_arena: 0,
             deferred: vec![Vec::new()],
             deferred_head: 0,
             deferred_depth: 1,
-            pool: range,
             refused: false,
             at_capacity: false,
             refused_pending: std::collections::HashSet::new(),
@@ -263,28 +320,42 @@ impl SectionStorage {
     }
     /// Narrows or widens the pool to a render distance, which is only possible while it is empty.
     ///
-    /// The pool comes from one range allocator, and a range allocator cannot be resized under live
-    /// allocations: every stored section's ranges would have to be handed out again, and the data they
-    /// point at is in the buffer. The render distance is therefore taken from the *first* report, which
-    /// is a frame or two after the window opens and long before the world has anything to bake - and a
-    /// later change is refused here rather than corrupting what is already drawn.
+    /// A range allocator cannot be resized under live allocations: every stored section's ranges would
+    /// have to be handed out again, and the data they point at is in the buffer. The render distance is
+    /// therefore taken from the *first* report, which is a frame or two after the window opens and long
+    /// before the world has anything to bake - and a later change is refused here rather than corrupting
+    /// what is already drawn.
     pub fn set_pool(&mut self, slots: u32) -> bool {
         if !self.storage.is_empty() {
             return false;
         }
 
-        self.allocator = RangeAllocator::new(0..slots);
-        self.pool = slots;
+        self.arenas = vec![SectionArena::new(slots)];
+        self.current_arena = 0;
         self.refused = false;
+        self.at_capacity = false;
         self.deferred.clear();
         self.deferred_head = 0;
 
         true
     }
 
-    /// How many slots the pool has.
+    /// Adds an arena buffer, which is how the pool grows now. See [`Self::grow_pool`].
+    ///
+    /// The caller is responsible for creating the matching GPU buffer in the same position - index `i`
+    /// here is buffer `i` in `Scene`, and `WmRenderer::grow_arena` is the only other half.
+    pub fn add_arena(&mut self, slots: u32) {
+        self.arenas.push(SectionArena::new(slots));
+    }
+
+    /// How many arena buffers there are. See [`Self::add_arena`].
+    pub fn arena_count(&self) -> usize {
+        self.arenas.len()
+    }
+
+    /// How many slots the pool has, across every arena.
     pub fn pool_slots(&self) -> u32 {
-        self.pool
+        self.arenas.iter().map(|arena| arena.pool).sum()
     }
 
     /// How many slots of the pool are handed out right now.
@@ -294,31 +365,38 @@ impl SectionStorage {
     /// fragmented. Reported on the terrain line beside the refusal count - see [`LARGEST_SECTION`] for
     /// the other half of the same question.
     pub fn used_slots(&self) -> u32 {
-        self.pool.saturating_sub(self.free_slots())
+        self.pool_slots().saturating_sub(self.free_slots())
     }
 
     /// How many slots of the pool are free, counted across the free list rather than as one run.
     pub fn free_slots(&self) -> u32 {
-        self.allocator.total_available()
+        self.arenas
+            .iter()
+            .map(|arena| arena.allocator.total_available())
+            .sum()
     }
 
-    /// Widens the pool, keeping every range that is already handed out where it is.
+    /// Adds one more arena buffer of this many slots, and answers whether that was allowed.
     ///
-    /// Growing is the one resize a range allocator *can* do under live allocations, and the only reason
-    /// this is possible at all: the new pool is the old one with more space after it, so every offset
-    /// already handed out stays valid - which is what makes a bigger arena a buffer *copy* rather than
-    /// a re-bake of the world. [`SectionStorage::set_pool`] replaces the pool and can therefore only run
-    /// while it is empty; this one is the opposite trade, and `WmRenderer::grow_arena` does the copy.
+    /// **This replaced growing a single buffer in place, and it is the better trade twice over.** The
+    /// old growth allocated a bigger buffer and copied the old one into it (`copy_buffer_to_buffer`),
+    /// which is a full pass over everything already meshed; appending an arena costs one allocation and
+    /// no copy at all, because every range that was handed out still names the buffer it was handed out
+    /// in. See [`SectionRanges::buffer`].
     ///
-    /// `false` when the pool is already at least this large: a growth request that arrives twice for one
-    /// refusal must not count as one.
-    pub fn grow_pool(&mut self, slots: u32) -> bool {
-        if slots <= self.pool {
+    /// The ceiling is therefore `max_buffer_size` times how many arenas there are, rather than the size
+    /// of one - which is what the arena needed: a 32-chunk view wants about 2.6 GB and one buffer stops
+    /// at 1.31 GB on the machine this was measured on, so half the world could not be held and the
+    /// sections that did not fit were drawn by neither renderer.
+    ///
+    /// `false` when the list is already at `limit`: the caller decides what the limit is, because it is
+    /// the one that knows how much video memory it is willing to ask the driver for.
+    pub fn grow_pool(&mut self, limit: usize, slots: u32) -> bool {
+        if self.arenas.len() >= limit {
             return false;
         }
 
-        self.allocator.grow_to(slots);
-        self.pool = slots;
+        self.arenas.push(SectionArena::new(slots));
 
         true
     }
@@ -338,6 +416,16 @@ impl SectionStorage {
         self.at_capacity
     }
 
+    /// How many refused sections are waiting to be handed over. See [`SectionStorage::refused`].
+    ///
+    /// Read by `terrain_arena_at_capacity`, which is where the JVM asks whether this side is keeping up.
+    /// A refusal with the pool twenty per cent free is the case that made this necessary: an arena is a
+    /// pool of contiguous ranges, so one that has room in total and none in the size class being asked
+    /// for refuses exactly as a full one does, and `at_capacity` stays false through all of it.
+    pub fn refusals_waiting(&self) -> usize {
+        self.refused_pending.len()
+    }
+
     /// Drops every stored section, for a world the renderer is no longer drawing.
     ///
     /// The ranges go **straight back to the allocator**, which is the one free in this file that does
@@ -354,11 +442,20 @@ impl SectionStorage {
     /// frames would have the first of them refused, and a refusal now costs a section the JVM has to
     /// be told about and re-bake (see `refused_pending`) - for a frame that is already gone.
     pub fn forget(&mut self) {
+        // Collected first, because the loop borrows the storage and the frees borrow the arenas: the
+        // ranges carry `(buffer, range)` together, which is the whole reason a range can be given back
+        // to the right arena after the section that named it is gone.
+        let mut freed = Vec::new();
+
         for section in self.storage.values() {
             for ranges in section.layers.iter().flatten() {
-                self.allocator.free_range(ranges.vertex_range.clone());
-                self.allocator.free_range(ranges.index_range.clone());
+                freed.push((ranges.buffer, ranges.vertex_range.clone()));
+                freed.push((ranges.buffer, ranges.index_range.clone()));
             }
+        }
+
+        for (buffer, range) in freed {
+            self.free_in(buffer, range);
         }
 
         self.storage.clear();
@@ -384,7 +481,19 @@ impl SectionStorage {
     pub fn set_width(&mut self, w: i32) {
         self.width = w;
     }
-    pub fn trim(&mut self, pos: IVec2) {
+    /// Drops the sections beyond the view, and **hands their positions back to the caller**.
+    ///
+    /// The ranges go to the deferred free list as always, but the sections themselves have to be
+    /// reported: the JVM suppresses Minecraft's own mesh for every section it believes Rust holds, so a
+    /// section dropped here and not reported is one **neither renderer draws** - and it never comes back
+    /// either, because the JVM counts it as already sent and the next rebuild therefore carries nothing
+    /// for it. That is the same hole as a refusal, by a third route; see `refused_pending`, which is
+    /// where a refusal goes, and `RustChunkBake.forgetRefused`, which is what acts on it.
+    ///
+    /// Without this the trim was also invisible to the two sides' accounting: the arena's storage shrank
+    /// while `rustHas` did not, so the claim and the fact drifted apart by exactly what the player flew
+    /// past.
+    pub fn trim(&mut self, pos: IVec2) -> Vec<IVec3> {
         let mut to_remove = vec![];
         let mut deferred = Vec::new();
         for (k, section) in &self.storage {
@@ -397,8 +506,8 @@ impl SectionStorage {
                         // Deferred like every other free: walking away from a section removes it from
                         // the storage, but the frame already on the GPU may still be reading its
                         // ranges. See `allocate`.
-                        deferred.push(l.vertex_range.clone());
-                        deferred.push(l.index_range.clone());
+                        deferred.push((l.buffer, l.vertex_range.clone()));
+                        deferred.push((l.buffer, l.index_range.clone()));
                     }
                 }
             }
@@ -407,6 +516,8 @@ impl SectionStorage {
             self.storage.remove(pos);
         });
         self.defer_free(deferred);
+
+        to_remove
     }
     /// Allocates a section's ranges, and hands back the ones the section it replaces was using.
     ///
@@ -427,14 +538,16 @@ impl SectionStorage {
         &mut self,
         pos: IVec3,
         baked_layers: &[BakedLayer],
-    ) -> Option<(Section, Vec<Range<u32>>)> {
+    ) -> Option<(Section, Vec<ReleasedRange>)> {
         let mut freed = Vec::new();
 
         if let Some(previous_section) = self.storage.get(&pos) {
             for layer in &previous_section.layers {
                 if let Some(l) = layer.as_ref() {
-                    freed.push(l.vertex_range.clone());
-                    freed.push(l.index_range.clone());
+                    // With the arena they belong to: a range given back to the wrong pool is a range
+                    // that pool hands out while the buffer holding it still does.
+                    freed.push((l.buffer, l.vertex_range.clone()));
+                    freed.push((l.buffer, l.index_range.clone()));
                 }
             }
         }
@@ -462,12 +575,25 @@ impl SectionStorage {
         Some((section, freed))
     }
 
+    /// **Records that the trim dropped a section**, so the other side stops claiming it.
+    ///
+    /// The same channel a refusal goes down, and deliberately: both mean "this renderer is not drawing
+    /// this section any more", and the JVM's response to either is the same - drop it from `sent` and
+    /// `rustHas`, so Minecraft's mesh is the fallback again and the next rebuild carries its blocks.
+    ///
+    /// Sharing the channel is `mem::take`-shaped on the reading end, which is what makes it affordable
+    /// to report every section a long flight leaves behind. The alternative - leaving them claimed -
+    /// is what made the claim and the fact drift apart by exactly what the player flew past, and a
+    /// section claimed but not held is drawn by neither renderer.
+    pub fn forget_trimmed(&mut self, pos: IVec3) {
+        self.refused_pending.insert(pos);
+    }
+
     /// Hands over the sections an allocation was refused for, and forgets them.
     ///
     /// Called from the JVM once a tick: what it does with them is drop the record of having sent
     /// them, so the next rebuild of each carries its blocks again and the section gets another
     /// chance at the pool.
-    ///
     /// **A drain of the pending set rather than of a list that could overflow.** These are sections
     /// already in the storage - a refusal leaves its section exactly as it was - so the set of them is
     /// bounded by the arena's own size and cannot lose an entry the way the capped list this replaced
@@ -481,8 +607,19 @@ impl SectionStorage {
         refused
     }
 
+    /// Gives one range back to the arena it came from.
+    ///
+    /// The buffer index travels with the range everywhere for this reason: a range is an offset into
+    /// *one* arena, and giving it back to another is a range the allocator believes is free while the
+    /// buffer that holds it still does - which is a section overwritten by the next one that lands there.
+    fn free_in(&mut self, buffer: u32, range: Range<u32>) {
+        if let Some(arena) = self.arenas.get_mut(buffer as usize) {
+            arena.allocator.free_range(range);
+        }
+    }
+
     /// Queues ranges to be freed once the frames that may still draw them are done. See [`Self::allocate`].
-    pub fn defer_free(&mut self, ranges: Vec<Range<u32>>) {
+    pub fn defer_free(&mut self, ranges: Vec<ReleasedRange>) {
         if self.deferred.is_empty() {
             self.deferred.push(Vec::new());
             self.deferred_head = 0;
@@ -508,8 +645,8 @@ impl SectionStorage {
         }
 
         for bucket in std::mem::take(&mut self.deferred) {
-            for range in bucket {
-                self.allocator.free_range(range);
+            for (buffer, range) in bucket {
+                self.free_in(buffer, range);
             }
         }
 
@@ -529,8 +666,8 @@ impl SectionStorage {
 
         let bucket = std::mem::take(&mut self.deferred[self.deferred_head]);
 
-        for range in bucket {
-            self.allocator.free_range(range);
+        for (buffer, range) in bucket {
+            self.free_in(buffer, range);
         }
     }
 
@@ -555,6 +692,12 @@ impl SectionStorage {
 
         let mut layers: Vec<Option<SectionRanges>> = Vec::with_capacity(baked_layers.len());
 
+        // **Which arena a section goes in is decided once, for all its layers.** A layer is drawn with
+        // the arena its ranges name and the draw loop rebinds when that changes, so splitting one
+        // section's layers across two arenas would rebind between two draws of the same section for no
+        // reason. The arena that took the first layer is offered to the rest.
+        let mut chosen: Option<u32> = None;
+
         for layer in baked_layers {
             // An empty layer is one that draws nothing; `allocate_range(0)` is not a no-op either, it
             // is an assertion, so the two halves of a layer are checked together.
@@ -563,35 +706,51 @@ impl SectionStorage {
                 continue;
             }
 
-            let vertices = match self
-                .allocator
-                .allocate_range(layer.vertices.len() as u32 / 4)
-            {
-                Ok(range) => range,
-                Err(_) => {
-                    self.refuse(&mut layers);
-                    return Section { layers };
-                }
+            // The arenas to try, in order: the one this section is already in, then the one the last
+            // section went into, then the rest - so consecutive sections land together and the draw
+            // loop's rebinds stay few.
+            let first = chosen.unwrap_or(self.current_arena as u32) as usize;
+            let mut placed = None;
+
+            for step in 0..self.arenas.len() {
+                let arena_index = (first + step) % self.arenas.len();
+                let arena = &mut self.arenas[arena_index];
+
+                let Ok(vertices) = arena
+                    .allocator
+                    .allocate_range(layer.vertices.len() as u32 / 4)
+                else {
+                    continue;
+                };
+
+                let Ok(indices) = arena
+                    .allocator
+                    .allocate_range(layer.indices.len() as u32 / 4)
+                else {
+                    // Give the vertices back before trying the next arena: a range the allocator still
+                    // believes is handed out is a piece of that arena that never comes back.
+                    arena.allocator.free_range(vertices);
+                    continue;
+                };
+
+                placed = Some((arena_index as u32, vertices, indices));
+                break;
+            }
+
+            let Some((buffer, vertices, indices)) = placed else {
+                // Nowhere held it. `refuse` gives back everything this section already took.
+                self.refuse(&mut layers);
+                return Section { layers };
             };
 
-            let indices = match self
-                .allocator
-                .allocate_range(layer.indices.len() as u32 / 4)
-            {
-                Ok(range) => range,
-                Err(_) => {
-                    // Give the vertices back before the section is abandoned: they are part of what
-                    // `refuse` hands over, and a range the allocator still believes is handed out is
-                    // a piece of the pool that never comes back.
-                    self.allocator.free_range(vertices);
-                    self.refuse(&mut layers);
-                    return Section { layers };
-                }
-            };
+            // Sticky for the rest of this section, and a hint for the next one.
+            chosen = Some(buffer);
+            self.current_arena = buffer as usize;
 
             layers.push(Some(SectionRanges {
                 vertex_range: vertices,
                 index_range: indices,
+                buffer,
             }));
         }
 
@@ -625,15 +784,24 @@ impl SectionStorage {
     /// ended up refusing everything, which is exactly what a world whose terrain has stopped updating
     /// looks like from the player's side.
     fn refuse(&mut self, layers: &mut [Option<SectionRanges>]) {
+        // Collected first: the loop borrows the layers and the frees borrow the arenas, and the ranges
+        // carry the buffer they belong to - which is what makes this give each range back to the arena
+        // it actually came from rather than to a pool that never held it.
+        let mut freed = Vec::new();
+
         for layer in layers.iter_mut() {
             if let Some(ranges) = layer.take() {
-                self.allocator.free_range(ranges.vertex_range);
-                self.allocator.free_range(ranges.index_range);
+                freed.push((ranges.buffer, ranges.vertex_range));
+                freed.push((ranges.buffer, ranges.index_range));
             }
         }
 
+        for (buffer, range) in freed {
+            self.free_in(buffer, range);
+        }
+
         self.refused = true;
-        report_full_arena(self.pool, self.used_slots());
+        report_full_arena(self.pool_slots(), self.used_slots());
     }
     pub fn iter(&self) -> std::collections::hash_map::Iter<'_, IVec3, Section> {
         self.storage.iter()
@@ -4717,12 +4885,13 @@ mod arena_tests {
             "one quad of pool, one quad in it"
         );
 
-        assert!(storage.grow_pool(pool_for(4)));
-        assert_eq!(storage.pool_slots(), pool_for(4));
+        // Growth appends an arena of the size the caller names; the limit is how many there may be.
+        assert!(storage.grow_pool(2, pool_for(4)));
+        assert_eq!(storage.pool_slots(), pool_for(1) + pool_for(4));
 
         assert!(
-            !storage.grow_pool(pool_for(4)),
-            "a request that does not widen the pool is not a growth"
+            !storage.grow_pool(2, pool_for(4)),
+            "a request past the limit is not a growth"
         );
 
         let after = stored(&storage);
@@ -4733,6 +4902,61 @@ mod arena_tests {
         assert!(
             put(&mut storage, IVec3::new(1, 0, 0), 1),
             "and the section that did not fit now does"
+        );
+    }
+
+    /// **The trim has to report what it dropped**, and this is the test for the third route to a hole.
+    ///
+    /// A section removed from the arena is one this renderer no longer draws, and the JVM suppresses
+    /// Minecraft's mesh for every section it believes Rust holds - so a dropped section nobody is told
+    /// about is drawn by neither renderer. It does not come back either: the JVM counts it as sent, so
+    /// the next rebuild carries nothing for it. That is the same hole as a refusal and as a dropped
+    /// bake, arriving by the trim instead.
+    ///
+    /// The positions go down the same channel a refusal does, which is what this checks: they come out
+    /// of `refused()` and the JVM answers them the way it answers any other.
+    #[test]
+    fn the_trim_reports_every_section_it_drops() {
+        let mut storage = SectionStorage::new(pool_for(64));
+        let layers = [layer(1)];
+
+        // One section at the origin and one far away, with a width that puts the second outside it.
+        let near = IVec3::new(0, 0, 0);
+        let far = IVec3::new(64, 0, 64);
+
+        storage.set_width(8);
+
+        for pos in [near, far] {
+            let (section, _) = storage
+                .allocate(pos, &layers)
+                .unwrap_or_else(|| panic!("{pos:?} should fit"));
+
+            storage.insert(pos, section);
+        }
+
+        let dropped = storage.trim(IVec2::new(0, 0));
+
+        assert_eq!(
+            dropped,
+            vec![far],
+            "the section beyond the width is the one the trim drops, and it has to be named"
+        );
+
+        // And it is what the other side is handed, through the channel that exists for it.
+        for pos in dropped {
+            storage.forget_trimmed(pos);
+        }
+
+        assert_eq!(
+            storage.refused(),
+            vec![far],
+            "a trimmed section reaches the JVM the way a refused one does, so `rustHas` stops claiming it"
+        );
+
+        assert_eq!(
+            storage.len(),
+            1,
+            "and the near section is still held - the trim removed exactly the one it reported"
         );
     }
 
@@ -4861,8 +5085,8 @@ mod arena_tests {
         assert_eq!(storage.refused(), vec![pos], "so it is reported");
 
         // Room made the way the game makes it: the occupier is walked away from.
-        storage.allocator.free_range(held.vertex_range);
-        storage.allocator.free_range(held.index_range);
+        storage.free_in(held.buffer, held.vertex_range);
+        storage.free_in(held.buffer, held.index_range);
         storage.storage.remove(&occupier);
 
         assert!(

@@ -307,7 +307,7 @@ object RustChunkBake {
 			rustHas.remove(key)
 
 			if (pendingRedirty.size < PENDING_REDIRTY_LIMIT) {
-				pendingRedirty.add(key)
+				pendingRedirty[key] = System.nanoTime()
 				queued++
 			}
 		}
@@ -351,7 +351,10 @@ object RustChunkBake {
 	 * refusals of its own, so a queue that kept growing would hold entries for sections that were never
 	 * coming back.
 	 */
-	private val pendingRedirty = java.util.LinkedHashSet<Long>()
+	private val pendingRedirty = java.util.LinkedHashMap<Long, Long>()
+
+	/** The longest a section has waited for its rebuild, in nanoseconds. See [redirtyDue]. */
+	private var oldestRedirtyNanos = 0L
 
 	/**
 	 * How many refusals may wait for a rebuild at once.
@@ -406,7 +409,8 @@ object RustChunkBake {
 
 		WgpuMcMod.LOGGER.info(
 			"wgpu: this side claims Rust has {} section(s); the arena is drawing {}, with {} awaiting a " +
-				"rebuild and {} bake(s) queued",
+				"rebuild and {} bake(s) queued. Rebuilds: {} meshed by Rust's answer, {} refused by it, " +
+				"{} left to Minecraft because the arena is full, {} left to it because Rust was never told",
 			rustHas.size,
 			arena,
 			pendingRedirty.size,
@@ -415,11 +419,58 @@ object RustChunkBake {
 			} catch (error: Throwable) {
 				-1
 			},
+			suppressed,
+			refusedByRust,
+			refusedAtCapacity,
+			firstLookCount,
 		)
+
+		// **And how long a hole lasted**, which is the number a run that heals its own holes needs.
+		//
+		// A section that was refused, dropped or trimmed is not drawn until the rebuild asked for here
+		// reaches it, so the age of the oldest queued entry *is* how long that hole was on screen. It
+		// says whether the queue is keeping up - milliseconds, which nobody sees - or whether the player
+		// is looking at the holes for a second or more, which is a rate rather than a correctness
+		// problem, and a rate is a constant.
+		if (oldestRedirtyNanos > 0) {
+			WgpuMcMod.LOGGER.info(
+				"wgpu: the longest a section has waited for its rebuild is {} ms",
+				oldestRedirtyNanos / 1_000_000,
+			)
+		}
 	}
+
+	/** How many rebuilds were left to Minecraft because Rust refused the payload. See [bakeNow]. */
+	private var refusedByRust = 0L
+
+	/** The slot of the 27 the rebuild is about. Must match `CENTER` in `wgpu-mc-jni/src/section.rs`. */
+	private const val CENTER = 13
+
+	/**
+	 * What one `send` got back, which is two questions and not one.
+	 *
+	 * `resync` means Rust is missing part of the neighbourhood and the whole of it has to be sent again.
+	 * `centreTaken` means the record for the section this rebuild is *about* was accepted - the centre
+	 * slot, index [`CENTER`], whose refusal is the only one that leaves this section unbaked.
+	 *
+	 * They are separate because they were conflated: `send` returned the resync flag alone, so a payload
+	 * that was **refused** - the bake queue was full, or the records were written for a world Rust has
+	 * forgotten - looked like a successful send to everything downstream. `bakeNow` then answered "Rust
+	 * took it" and the mesh was dropped for a section Rust had not taken.
+	 */
+	private data class Answer(val resync: Boolean, val centreTaken: Boolean)
 
 	/** When [reportClaimAgainstArena] last wrote. */
 	private var claimReportedAt = 0L
+
+	/** Rebuilds whose mesh was dropped because Rust was believed to have the section. See [bakeNow]. */
+	private var suppressed = 0L
+
+	/** Rebuilds whose mesh was kept because the arena is at its limit. See [bakeNow]. */
+	private var refusedAtCapacity = 0L
+
+	/** Rebuilds whose mesh was kept because Rust had never been told about the section. See [bakeNow]. */
+	private var firstLookCount = 0L
 
 	/**
 	 * Asks the game to rebuild a few of the sections the arena refused, one frame at a time.
@@ -467,10 +518,11 @@ object RustChunkBake {
 		val budget = if (backedUp()) 1 else REDIRTY_PER_FRAME
 
 		var count = 0
-		val iterator = pendingRedirty.iterator()
+		val iterator = pendingRedirty.entries.iterator()
+		var oldest = 0L
 
 		while (iterator.hasNext() && count < budget) {
-			val key = iterator.next()
+			val (key, queuedAt) = iterator.next()
 			iterator.remove()
 
 			try {
@@ -479,11 +531,20 @@ object RustChunkBake {
 				// A nudge that does not land is not worth taking the game down for: the section keeps the
 				// geometry it had, which is where this path started. Put back, so the next frame tries it
 				// again rather than losing it the way the drain used to.
-				pendingRedirty.add(key)
+				pendingRedirty[key] = queuedAt
 				return count
 			}
 
+			// **How long this one waited**, which is how long a hole it made was visible. The queue is
+			// ordered, so what comes off first is what has been waiting longest - and the number that
+			// matters is not how many are waiting but how stale the oldest is. A few milliseconds is a
+			// queue doing its job; a second or more is a hole the player can see and walk towards.
+			oldest = maxOf(oldest, System.nanoTime() - queuedAt)
 			count++
+		}
+
+		if (oldest > oldestRedirtyNanos) {
+			oldestRedirtyNanos = oldest
 		}
 
 		return count
@@ -746,6 +807,17 @@ object RustChunkBake {
 		false
 	}
 
+	/**
+	 * Whether the arena is in a state where a section this side takes may not be drawable.
+	 *
+	 * The same question [atCapacity] answers, asked at the one place that wants it *as well as* the
+	 * decision: the decision has to be the narrow one - a refusal that is outstanding right now - while
+	 * the diagnostic wants to know about the run that refused a moment ago too, because the mesh it
+	 * dropped then is still dropped. Two questions, one native answer, and the difference is only which
+	 * side of the tick the refusal was drained on.
+	 */
+	private fun strained(): Boolean = atCapacity()
+
 	/** Records the answer of the bake that just ran on this thread. See [tookThisSection]. */
 	@JvmStatic
 	fun noteTookSection(took: Boolean) {
@@ -827,14 +899,22 @@ object RustChunkBake {
 		// the first time. See [rustHas].
 		val firstLook = BooleanArray(1)
 
-		if (send(region, minX, minY, minZ, targetX, targetY, targetZ, force = false, firstLook)) {
+		val first = send(region, minX, minY, minZ, targetX, targetY, targetZ, force = false, firstLook)
+
+		// `accepted` is what Rust took of the payload that decided *this* section, which is the centre
+		// slot. See [Answer]: a refusal and a resync are different answers and only one of them means
+		// "send everything again".
+		var accepted = first.centreTaken
+
+		if (first.resync) {
 			resyncs++
 			// Both tables go together: this side's bookkeeping is everything it has told Rust, and
 			// [rustHas] is the part of that Rust is drawing. A resync means Rust kept less than it was
 			// told, so what it is drawing is not known either.
 			sent.clear()
 			rustHas.clear()
-			send(region, minX, minY, minZ, targetX, targetY, targetZ, force = true, firstLook)
+			accepted = send(region, minX, minY, minZ, targetX, targetY, targetZ, force = true, firstLook)
+				.centreTaken
 		}
 
 		if (sent.size > SENT_LIMIT) {
@@ -844,20 +924,64 @@ object RustChunkBake {
 			rustHas.clear()
 		}
 
-		// The answer for this section: `true` only when every one of the 27 was already Rust's. It is
-		// read *after* the commit above, which is what makes the second rebuild of a section the one
-		// that stops meshing it.
+		// **The answer for this section: `true` only when Rust actually took what was sent.**
 		//
-		// **Unless the arena is full, in which case the answer is `false` whatever the tables say.** This
-		// is the hole that survived every other fix: `noteTookSection(true)` drops Minecraft's mesh for
-		// the section, and it is asked *before* the bake runs - the bake is queued here and allocates on
-		// a later frame, so a refusal arrives after the geometry is already gone and nothing puts it
-		// back. At the device's buffer limit those refusals are permanent, so every section that does not
-		// fit is drawn by neither renderer. The game has to keep its mesh for them, and this is the only
-		// place that can decide it.
-		noteTookSection(!firstLook[0] && !atCapacity())
+		// Three things have to hold, and each of them was a hole on its own at some point:
+		//
+		//  - the section was not being seen for the first time, which is what makes the *second* rebuild
+		//    of a section the one that stops meshing it;
+		//  - the arena has room, because a refusal with no room to grow is permanent;
+		//  - and the payload was accepted, because `send` can come back having taken nothing - the bake
+		//    queue was full and the task was dropped, or the records were refused. The decision was
+		//    `true` for all of those while `send` was already reporting them, so a section Rust refused
+		//    had Minecraft's mesh dropped too: drawn by neither renderer, and nothing asks for it back
+		//    because only an arena refusal reaches the re-offer drain.
+		//
+		// This is the same mistake as `bake` answering "did it not throw", one layer down. It is read
+		// *after* the commit above, which is what makes the tables agree with the answer it gives.
+		noteTookSection(!firstLook[0] && !atCapacity() && accepted)
+
+		// **Which of the answers this rebuild got, counted.** The decision has four inputs now and when a
+		// hole survives a fix the question is which one is still wrong; `suppressed` is the only one that
+		// can leave a hole, so a run where it climbs while holes appear is a run where the other three
+		// are not the explanation.
+		if (tookThisSection.get()) {
+			suppressed++
+		} else if (!accepted) {
+			refusedByRust++
+		} else if (atCapacity()) {
+			refusedAtCapacity++
+		} else {
+			firstLookCount++
+		}
 
 		bakes++
+
+		// **Sections whose mesh this side dropped, by position, while the arena is strained.**
+		//
+		// This is the data four rounds of reasoning went without. Every counter on the report line says
+		// *how often* something happened; none of them says *where*, so a hole could not be tied to a
+		// decision. This names the positions, so a hole can be stood next to and matched against a line.
+		//
+		// The condition is the one that can leave a hole rather than the one that decides it. The
+		// decision - `noteTookSection(!firstLook[0] && !atCapacity())` - is already false when the arena
+		// is strained at the moment of the rebuild, so `tookThisSection` is only true for a section whose
+		// decision was made while there was room. The arena can fill *after* that: the bake is queued
+		// here and allocates a frame later, so a section suppressed in good faith can be refused when it
+		// arrives - and then its mesh is gone and its geometry was never stored. That gap is what this
+		// reports, and it is the only remaining way a section ends up drawn by neither renderer.
+		//
+		// Only while logging is on, so a healthy run's log is unchanged.
+		if (Diagnostics.loggingEnabled() && tookThisSection.get() && strained()) {
+			WgpuMcMod.LOGGER.warn(
+				"wgpu: dropped Minecraft's mesh for section ({}, {}, {}) and the arena is strained now; if " +
+					"there is a hole at that position, this rebuild is the decision that made it",
+				targetX,
+				targetY,
+				targetZ,
+			)
+		}
+
 		if (Diagnostics.loggingEnabled() || bakes - reported >= REPORT_EVERY) {
 			reported = bakes
 			WgpuMcMod.LOGGER.info(
@@ -912,7 +1036,7 @@ object RustChunkBake {
 		targetZ: Int,
 		force: Boolean,
 		firstLook: BooleanArray,
-	): Boolean {
+	): Answer {
 		val lightEngine = region.lightEngine
 		val blockLayers = lightEngine.getLayerListener(LightLayer.BLOCK)
 		val skyLayers = lightEngine.getLayerListener(LightLayer.SKY)
@@ -1063,7 +1187,17 @@ object RustChunkBake {
 			}
 		}
 
-		return resync
+		// **What the other side actually took, which is a different question from "did the call
+		// return".** `resync` means it refused the whole payload; a `rejected` bit means the record for
+		// that slot was written against a world it has since forgotten. Either way Rust did not take
+		// what was sent, and the caller has to know: it is the caller that decides whether Minecraft's
+		// mesh is dropped, and a mesh dropped for a section Rust refused is drawn by neither renderer.
+		//
+		// The centre slot is the one that decides whether *this* section was taken, because the rebuild
+		// is about the centre and a neighbour's refusal only costs the next rebuild an extra payload.
+		val centreTaken = !resync && (rejected and (1 shl CENTER)) == 0
+
+		return Answer(resync, centreTaken)
 	}
 
 	/** The two light layers of a section, or `null` when neither is loaded. */

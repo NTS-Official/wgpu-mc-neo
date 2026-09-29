@@ -273,10 +273,22 @@ impl WmRenderer {
             *last = horizontal;
         }
 
-        scene
+        // **What the trim dropped, into the same channel a refusal goes down.** Both mean one thing to
+        // the other side: a section this renderer is no longer drawing, which Minecraft's mesh has to
+        // come back for - `rustHas` is a claim, and this is where the claim stops being true. It costs
+        // nothing when the trim removed nothing, which is most frames.
+        let trimmed = scene
             .section_storage
             .write()
             .trim(ivec2(camera.x, camera.z));
+
+        if !trimmed.is_empty() {
+            let mut storage = scene.section_storage.write();
+
+            for pos in trimmed {
+                storage.forget_trimmed(pos);
+            }
+        }
     }
 
     /// Uploads any sprite the atlas has gained since its texture was last written.
@@ -345,11 +357,11 @@ impl WmRenderer {
         // waited for. Doing it per update would free a range parked earlier in the *same* frame.
         scene.section_storage.write().free_deferred();
 
-        // The arena's buffer, held for the whole drain: it is replaced when the arena is resized, and
+        // The arena's buffers, held for the whole drain: the list is replaced when an arena is added, and
         // the ranges being written below were handed out by the pool that goes with the buffer that is
-        // loaded here. One load for all of them, so a resize cannot land between two writes of the
+        // loaded here. One load for all of them, so an addition cannot land between two writes of the
         // same frame.
-        let chunk_buffer = scene.chunk_buffer.load_full();
+        let chunk_buffers = scene.chunk_buffers.load_full();
 
         updates.for_each(|(pos, layers)| {
             moved += 1;
@@ -360,33 +372,42 @@ impl WmRenderer {
             // bytes are queued, so the frame that draws it draws what was written rather than whatever
             // the range held before; and the ranges it replaced are only reused a frame from now.
             //
-            // A full pool leaves the section exactly as it was: its ranges are not given back to the
-            // allocator and it is not replaced, so the world keeps drawing the geometry it has. A
+            // No arena with room leaves the section exactly as it was: its ranges are not given back to
+            // the allocator and it is not replaced, so the world keeps drawing the geometry it has. A
             // section that cannot be baked is stale ground, which is a wrong picture; replacing it
             // with nothing is a hole, which is not a picture at all.
             let Some((section, freed)) = storage.allocate(pos, &layers) else {
-                // Ask for a bigger arena rather than only counting the refusal. A fixed pool sized from
-                // a guess about what a section costs is a pool that a real world outgrows, and the
-                // failure mode of that is the worst one this path has: a section that is never replaced
-                // keeps the geometry it had, so the terrain it is part of stops changing - the player
-                // breaks a block and nothing happens. Doubling is the request; the next frame's drain
-                // applies it, and the JVM re-offers this section (see `RustChunkBake.forgetRefused`).
-                scene.pending_arena_growth.store(
-                    storage.pool_slots().saturating_mul(2),
-                    std::sync::atomic::Ordering::Relaxed,
-                );
+                // Ask for another arena rather than only counting the refusal. A fixed ceiling sized
+                // from a guess about what a section costs is one a real world outgrows, and the failure
+                // mode of that is the worst one this path has: a section that is never replaced keeps
+                // the geometry it had, so the terrain it is part of stops changing - the player breaks a
+                // block and nothing happens. The request is applied by the next frame's drain, and the
+                // JVM re-offers this section (see `RustChunkBake.forgetRefused`).
+                //
+                // A marker rather than a size: growth appends one arena at the device's own ceiling, so
+                // there is no size to ask for - see `grow_arena_if_asked`.
+                scene
+                    .pending_arena_growth
+                    .store(1, std::sync::atomic::Ordering::Relaxed);
                 return;
             };
 
             for (i, ranges) in section.layers.iter().enumerate() {
                 if let Some(ranges) = ranges {
+                    // **The arena this layer was handed out of, and not any other.** The write has to
+                    // land in the buffer whose offsets these are; with one arena that was a detail, and
+                    // with several it is the difference between a section and somebody else's geometry.
+                    let Some(buffer) = chunk_buffers.get(ranges.buffer as usize) else {
+                        continue;
+                    };
+
                     self.gpu.queue.write_buffer(
-                        &chunk_buffer.buffer,
+                        &buffer.buffer,
                         ranges.vertex_range.start as u64 * 4,
                         &layers[i].vertices,
                     );
                     self.gpu.queue.write_buffer(
-                        &chunk_buffer.buffer,
+                        &buffer.buffer,
                         ranges.index_range.start as u64 * 4,
                         &layers[i].indices,
                     );
@@ -438,57 +459,86 @@ impl WmRenderer {
             return;
         }
 
-        let wanted = asked.min(scene.arena_cap_slots);
-
-        // **Whether the request had to be clamped, which is the one place that knows.** A growth that
-        // came back smaller than it asked for is a growth that has run into the device's `max_buffer_size`
-        // - and from there every refusal is permanent, because there is no more arena to be had. The JVM
-        // needs that fact to stop dropping Minecraft's mesh for sections this side cannot draw; see
-        // `SectionStorage::at_capacity`.
+        // **Another arena, rather than a bigger one.** This used to allocate a larger buffer and copy
+        // the old one into it; appending costs one allocation and no copy, because every range already
+        // handed out names the buffer it was handed out in (`SectionRanges::buffer`). See
+        // `SectionStorage::grow_pool`.
         //
-        // Cleared rather than only ever set: a request that fits means there is room again, which happens
-        // when a smaller world is loaded or the render distance comes down.
-        scene
-            .section_storage
-            .write()
-            .set_at_capacity(wanted < asked);
+        // Each arena is created at the device's own ceiling, because there is no reason for one to be
+        // smaller: the limit that matters is how many of them there are, and that is `ARENA_BUFFERS`.
+        //
+        // **As many as the target asks for, in one go.** A world is entered at whatever render distance
+        // the server can serve, which is often far less than the view becomes: a run was measured sizing
+        // its arena to **192 MB for 12 chunks** and then being asked to draw 32. `set_arena_slots`
+        // cannot resize an arena that holds anything, so the only way up is by appending - and adding
+        // *one* arena per refusal made that a race against the burst of bakes that a growing view
+        // produces. The refusals in that window are sections Minecraft's mesh was already dropped for,
+        // which is the hole this file has spent several rounds on.
+        //
+        // `pending_arena_growth` is a marker rather than a size - the refusal that sets it only knows
+        // that something did not fit - so the target is read from the pool the world actually wants:
+        // `arena_slots` at the current width.
+        let slots = scene.arena_cap_slots;
+        let target = mc::chunk::arena_slots(scene.section_storage.read().width().max(0) as u32);
+        let mut at_limit = false;
 
-        let old = scene.chunk_buffer.load_full();
+        loop {
+            // **The byte budget, which is the bound that was missing.** A per-buffer limit is not a
+            // memory bound, and an arena that appends rather than refuses had no other one: a player
+            // flying forward grew it until the driver complained - which turned a bug about holes into
+            // one about memory. Past this the arena stops growing and `at_capacity` tells the JVM to
+            // keep Minecraft's mesh for whatever does not fit, the same answer as at the device's limit.
+            if scene.section_storage.read().pool_slots() as u64 * 4 >= mc::ARENA_MEMORY_BUDGET {
+                at_limit = true;
 
-        // The pool first: it is the thing that decides whether this helped, and a buffer without the
-        // pool would be memory reserved for ranges no one can be handed.
-        if !scene.section_storage.write().grow_pool(wanted) {
-            return;
+                break;
+            }
+
+            let added = scene
+                .section_storage
+                .write()
+                .grow_pool(mc::ARENA_BUFFERS, slots);
+
+            if !added {
+                // At the buffer limit: the other state where a refusal is permanent, and the JVM is told
+                // so that it keeps Minecraft's mesh for the sections this side cannot take.
+                at_limit = true;
+
+                break;
+            }
+
+            let added = Arc::new(BindableBuffer::new_deferred(
+                self,
+                slots as u64 * 4,
+                mc::ARENA_USAGE,
+                "ssbo",
+            ));
+
+            let mut buffers = scene.chunk_buffers.load().as_ref().clone();
+            buffers.push(added);
+            scene.chunk_buffers.store(Arc::new(buffers));
+
+            // Enough room for what the view asks for, or as many arenas as there may be.
+            if scene.section_storage.read().pool_slots() >= target {
+                break;
+            }
         }
 
-        let grown = Arc::new(BindableBuffer::new_deferred(
-            self,
-            wanted as u64 * 4,
-            mc::ARENA_USAGE,
-            "ssbo",
-        ));
-
-        // The whole old buffer, not the used prefix: the copy is a copy of a buffer, and what is in the
-        // tail is not this code's business - the pool is what says which offsets mean anything.
-        let mut encoder = self
-            .gpu
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        encoder.copy_buffer_to_buffer(&old.buffer, 0, &grown.buffer, 0, old.size);
-        self.gpu.queue.submit([encoder.finish()]);
-
-        scene.chunk_buffer.store(grown);
+        // Set from what happened rather than from the branch taken last: a growth that reached the
+        // target is room, and the only way this is true is that another arena was refused. It is what
+        // decides whether the JVM keeps Minecraft's mesh, so it is cleared as deliberately as it is set.
+        scene.section_storage.write().set_at_capacity(at_limit);
 
         let stored = scene.section_storage.read();
 
         log::warn!(
-            "wgpu-mc: the section arena was full, so it grew to {} slot(s), {} MB ({} slot(s) handed \
-             out, the largest section meshed so far {} slot(s), cap {} slot(s))",
-            wanted,
-            wanted as u64 * 4 / (1024 * 1024),
+            "wgpu-mc: the section arena was full, so it grew to {} arena(s) of {} slot(s), {} MB total \
+             ({} slot(s) handed out, the largest section meshed so far {} slot(s))",
+            stored.arena_count(),
+            slots,
+            stored.pool_slots() as u64 * 4 / (1024 * 1024),
             stored.used_slots(),
             mc::chunk::largest_section_slots(),
-            scene.arena_cap_slots,
         );
     }
 

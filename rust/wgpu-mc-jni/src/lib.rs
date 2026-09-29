@@ -848,6 +848,8 @@ pub fn bakeSections(
             // recorded as sent, the next rebuild would find nothing to say, and the hole would be
             // permanent. The 26 neighbours *were* applied, and they are still the newest version of
             // those sections, so the refusal is the one slot.
+            forget_one(target);
+
             return (rejected | (1 << CENTER)) as jint;
         }
     };
@@ -857,13 +859,40 @@ pub fn bakeSections(
     // crosses the thread boundary and what deliberately does not.
     match BakeTask::new(target, provider, jvm) {
         Some(task) => THREAD_POOL.spawn(move || task.run()),
-        // The queue is full, so this bake is dropped on the floor - the same hole as above, from the
-        // same cause: the section was applied here and nothing is going to bake it. The warning is
-        // inside `reserve_bake_slot`; this is the bit that makes the JVM offer it again.
-        None => return (rejected | (1 << CENTER)) as jint,
+        // The queue is full, so this bake is dropped on the floor.
+        //
+        // **The bit below is not enough on its own, and this comment used to claim it was.** It said a
+        // dropped offer "is not lost work - it comes back", which is true only if something rebuilds the
+        // section again, and nothing does: a rebuild happens when the game decides a section is out of
+        // date, and the section this call is about was just brought up to date. The bit makes the JVM
+        // forget it was sent, so the *next* rebuild carries its blocks - and the next rebuild is the
+        // thing that does not happen. Meanwhile the mesh for it was dropped when Rust was believed to
+        // have it, so it is drawn by neither renderer.
+        //
+        // So it is queued for a rebuild the way a refusal is, which is the only mechanism that actively
+        // asks the game for one. See `SectionStorage::forget_trimmed` and `RustChunkBake.redirtyDue`.
+        None => {
+            forget_one(target);
+
+            return (rejected | (1 << CENTER)) as jint;
+        }
     }
 
     rejected as jint
+}
+
+/// Records that this side is not going to draw one section, so the game is asked to draw it.
+///
+/// Through the same channel a refusal and a trim use, because all three mean one thing to the other
+/// side: a section this renderer does not hold. The JVM drops it from its "already sent" table and asks
+/// the game to rebuild it, and the rebuild that comes back has Minecraft's own mesh as its fallback if
+/// this side refuses it again. See `RustChunkBake.forgetRefused`.
+///
+/// Nothing happens without a renderer: a bake cannot have been dropped before there was one.
+fn forget_one(pos: IVec3) {
+    if let Some(scene) = RENDERER.get().and_then(|wm| wm.scene()) {
+        scene.section_storage.write().forget_trimmed(pos);
+    }
 }
 /// The pool the section bakes run on.
 ///
