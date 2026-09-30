@@ -194,6 +194,25 @@ object TerrainPass {
 		val client = Minecraft.getInstance()
 		val camera = client.gameRenderer.mainCamera
 
+		// **The game's `textureFiltering` option, pushed before the frame that will use it.**
+		//
+		// It is not a preference of this renderer's: it decides *how a surface is sampled*, and the three
+		// answers are three algorithms. `ANISOTROPIC` ("Fabulous") gives the sampler an `anisotropy_clamp`
+		// of the option's own value - `Options#maxAnisotropyValue`, `1 << maxAnisotropyBit`, 4 by default -
+		// which is exactly how `LevelRenderer` builds its own terrain sampler. `RGSS` ("Fancy") leaves the
+		// sampler isotropic and turns on the game's rotated-grid supersampling in the shader, which no
+		// sampler setting can express. `NONE` ("Fast") does neither.
+		//
+		// Every frame rather than on a change, for the reason the cardinal lighting table is sent on every
+		// bake: the value is read from an option object, and a cached copy would be one more thing to keep
+		// in step with a screen the player can move it on. One store per frame is nothing.
+		//
+		// `ordinal` and not the enum's own `id`, which is private. The two agree because the constants are
+		// declared `NONE(0, ..), RGSS(1, ..), ANISOTROPIC(2, ..)` in that order - and the native side
+		// asserts its own constants against the numbers that matter, so a reorder here would be a failing
+		// test there rather than a picture that quietly sampled differently.
+		WgpuNative.setTextureFiltering(client.options.textureFiltering().get().ordinal)
+
 		// The camera state of the frame being drawn, which `GameRenderer.renderLevel` filled in before
 		// it called into the level renderer this pass belongs to.
 		val cameraState = client.gameRenderer.gameRenderState.levelRenderState.cameraRenderState

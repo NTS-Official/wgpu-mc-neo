@@ -666,23 +666,26 @@ mod block_atlas_sampler_tests {
         assert_eq!(clamp.address_mode_w, wgpu::AddressMode::ClampToEdge);
     }
 
-    /// **Anisotropy above 1 needs linear magnification and minification, and getting that wrong is
-    /// fatal rather than ugly.**
+    /// **Anisotropy above 1 needs the min, mag *and* mipmap filters linear, and getting it wrong is fatal
+    /// rather than ugly.**
     ///
-    /// This is a regression test for a crash that reached a running client: the anisotropy was raised to 16
-    /// while magnification was `Nearest`, `create_sampler` returned `InvalidFilterModeWithAnisotropy`, and
-    /// on this path that is not a warning but the end of the process on the first frame.
+    /// A regression test for a crash that reached a running client **twice**, the second time because this
+    /// test had been "corrected" into agreeing with the mistake.
     ///
-    /// **The rule is asserted rather than the values, and the rule as wgpu states it is not the one this
-    /// test first carried.** It was written as "all three filters linear" because magnification happened to
-    /// be `Nearest` at the time - which made the mip filter a third requirement. wgpu's actual condition is
-    /// the min **and** mag filters (`wgpu-core`, `InvalidFilterModeWithAnisotropy`); a `Nearest` *mip*
-    /// filter is legal with anisotropy, which is why `game_atlas_blend_mips` can stay a free switch and
-    /// only the magnification is what the anisotropy has to be traded against.
+    /// The first time the anisotropy was raised to 16 while magnification was `Nearest`; the second, a
+    /// player turned `game_atlas_blend_mips` off, which makes the mip filter `Nearest` while the anisotropy
+    /// stayed 16. Both ended in `create_sampler` returning `Err`, which on this path runs the panic hook and
+    /// stops the process - the first on the first frame, the second two seconds after the option applied.
     ///
-    /// So the invariant is checked on the descriptor, because that is what a future edit is most likely to
-    /// break - the anisotropy lives in `block_atlas_sampler` and the mip filter in `game_atlas_sampler`, so
-    /// setting one without thinking about the other is an easy mistake to make twice.
+    /// **The rule is asserted rather than the values, and the rule is `wgpu-core`'s three separate checks**
+    /// (`device/resource.rs`): `InvalidFilterModeWithAnisotropy` for the min filter, the same for the mag
+    /// filter, and `InvalidMipmapFilterModeWithAnisotropy` for the mip filter. Reading two of those three
+    /// and concluding "a `Nearest` mip filter is legal with anisotropy" is how the second crash was written
+    /// down as a fix, and why the mip filter is asserted here beside the other two.
+    ///
+    /// Checked on the descriptor, because that is what a future edit is most likely to break: the anisotropy
+    /// lives in `block_atlas_sampler` and the mip filter in `game_atlas_sampler`, so setting one without
+    /// thinking about the other is an easy mistake to make - and now one that has been made twice.
     #[test]
     fn the_game_atlas_never_asks_for_anisotropy_without_linear_filters() {
         let assert_legal = |descriptor: &wgpu::SamplerDescriptor<'_>, blend: bool| {
@@ -699,10 +702,22 @@ mod block_atlas_sampler_tests {
                     wgpu::FilterMode::Linear,
                     "and the same for minification (blend switch {blend})"
                 );
+                assert_eq!(
+                    descriptor.mipmap_filter,
+                    wgpu::MipmapFilterMode::Linear,
+                    "and the mip filter is a third check, not an exemption: a `Nearest` one beside \
+                     anisotropy is `InvalidMipmapFilterModeWithAnisotropy` (blend switch {blend})"
+                );
             }
         };
 
         set_game_atlas_blend_mips(true);
+
+        // **The option is on, because the anisotropy is the game's own answer now and its default answer is
+        // 1.** See `terrain_anisotropy`: the clamp is `maxAnisotropyValue` under `ANISOTROPIC` and 1 under
+        // the other two, exactly as `LevelRenderer` builds its terrain sampler - so a test that never sets
+        // it is testing "Fast", whatever it says about blending.
+        set_texture_filtering(TEXTURE_FILTERING_ANISOTROPIC);
 
         let blended = game_atlas_sampler();
 
@@ -713,8 +728,9 @@ mod block_atlas_sampler_tests {
             "blending levels is what makes the mip filter linear"
         );
         assert_eq!(
-            blended.anisotropy_clamp, 16,
-            "and it is then what lets the game's own anisotropy through"
+            blended.anisotropy_clamp, GAME_ANISOTROPY,
+            "and it is then what lets the game's own anisotropy through - which is `1 << maxAnisotropyBit`, \
+             4 by default, rather than the 16 this renderer used to hardcode"
         );
 
         set_game_atlas_blend_mips(false);
@@ -728,10 +744,29 @@ mod block_atlas_sampler_tests {
             "the switch is still what picks the filter"
         );
         assert_eq!(
-            stepped.anisotropy_clamp, 16,
-            "and it leaves the anisotropy alone: a player who only asks for the stepped mip filter has not \
-             asked to lose anisotropic filtering, and the pair is legal while magnification is linear"
+            stepped.anisotropy_clamp, 1,
+            "and the anisotropy has to follow it down. A player who only asked for the stepped mip filter \
+             has not asked to lose anisotropic filtering, and it is a shame that this is the trade - but a \
+             `Nearest` mip filter beside an anisotropy above 1 is `InvalidMipmapFilterModeWithAnisotropy`, \
+             which ends the process rather than the filtering"
         );
+
+        // **And the other two answers give no anisotropy at all**, which is the half of the option that has
+        // nothing to do with the mip switch. `NONE` is the game's "Fast" and `RGSS` its "Fancy": the second
+        // gets its filtering from the shader's four taps instead, which is the whole reason it does not want
+        // a sampler that samples along the compressed axis.
+        for method in [0, TEXTURE_FILTERING_RGSS] {
+            set_texture_filtering(method);
+
+            assert_legal(&game_atlas_sampler(), true);
+            assert_eq!(
+                game_atlas_sampler().anisotropy_clamp,
+                1,
+                "texture filtering {method} asks the sampler for nothing; RGSS is the shader's job"
+            );
+        }
+
+        set_texture_filtering(TEXTURE_FILTERING_ANISOTROPIC);
 
         // Left on: it is the default, and a test that changed a global and left it changed would decide
         // the filters of whatever ran next.
@@ -932,6 +967,38 @@ fn halve(image: &ImageBuffer<Rgba<u8>, Vec<u8>>) -> ImageBuffer<Rgba<u8>, Vec<u8
 /// one call site only, so it clamped the game's atlas and left this renderer's at every level, which is the
 /// opposite of what its name and its own comment say. A sampler constructed twice can disagree; one
 /// constructed once cannot.
+/// **The sampler a *minified* animated face is drawn with: `Linear` magnification, no anisotropy.**
+///
+/// This is the third of the three, and it exists for the one combination the other two cannot express.
+///
+///  * the anisotropic sampler magnifies `Linear`, which is right for a minified surface and is why it is
+///    the obvious candidate - but `anisotropy_clamp` above 1 requires a `Linear` **mipmap** filter, which
+///    is the switch `game_atlas_blend_mips`, and a player who turns that off would get an
+///    `InvalidMipmapFilterModeWithAnisotropy` instead of a picture;
+///  * and the magnifying sampler is `Nearest` magnification, which is right for a *magnified* surface and
+///    actively wrong here: nearest magnification of a coarse level blows a single texel up over the whole
+///    face, and a coarse level of an animated sprite is the running average of its animation - so the face
+///    becomes one flat patch of that average, and the patch **steps** rather than fades as the frames
+///    advance. A player described exactly that: "the bright spots look magnified, so a distant stretch of
+///    lava reads as one big bright tile".
+///
+/// Linear magnification is what the game uses and what smooths those steps; giving up the anisotropy is
+/// what this pays, and it is the cheaper half here - a magnifying filter is about how a texel is stretched,
+/// and anisotropic filtering is about how several samples are taken along a *compressed* direction.
+///
+/// `mipmap_filter` stays `Linear` so that the mip switch does not have to be consulted: with an anisotropy
+/// of 1 any mip filter is legal, which is what keeps this sampler out of the coupling that has already cost
+/// two crashes.
+pub fn atlas_animated_minified_sampler(
+    address_mode: wgpu::AddressMode,
+) -> wgpu::SamplerDescriptor<'static> {
+    wgpu::SamplerDescriptor {
+        anisotropy_clamp: 1,
+        label: Some("wgpu-mc: a minified animated block atlas"),
+        ..block_atlas_sampler(address_mode)
+    }
+}
+
 /// **The sampler a magnified surface is drawn with: `Nearest`, with no anisotropic filtering.**
 ///
 /// This exists because one sampler cannot be both things the terrain needs, and the reason is wgpu's
@@ -1052,7 +1119,11 @@ pub fn block_atlas_sampler(address_mode: wgpu::AddressMode) -> wgpu::SamplerDesc
         // backend sees the value, so a larger number would be silently reduced. There is no query for what
         // the driver really supports, because `Limits` has no anisotropy field; the device this was measured
         // on does report `DownlevelFlags::ANISOTROPIC_FILTERING`, and the game asks for the same number.
-        anisotropy_clamp: 16,
+        // **`1` for this run: the anisotropy is the one thing that only touches the sides**, and a player
+        // traced the overexposure to the round the dual filter arrived in - which is also the round this
+        // became 16. A grazing-angle surface is the only place anisotropic filtering does anything, and the
+        // sides are exactly that, so it is the first candidate rather than a guess.
+        anisotropy_clamp: 1,
         compare: None,
         ..Default::default()
     }
@@ -1088,6 +1159,76 @@ pub fn set_atlas_lod_bias(bias: f32) {
     ATLAS_LOD_BIAS.store(bias.to_bits(), std::sync::atomic::Ordering::Relaxed);
 }
 
+/// **Which of the game's three texture-filtering methods is in force**, as `TextureFilteringMethod`'s own id:
+/// `0` is `NONE` (the game's "Fast"), `1` is `RGSS` ("Fancy") and `2` is `ANISOTROPIC` ("Fabulous").
+///
+/// The game's own enum, and its own numbering, rather than a switch of this side's: the value is read from
+/// the option every frame and written straight into an immediate, so a translation layer between the two
+/// would be one more thing that can disagree with the game about what a number means.
+///
+/// **This is the one input that decides how a surface is sampled**, and the three answers are genuinely three
+/// different algorithms rather than one with a knob:
+///
+///  * `ANISOTROPIC` gives the sampler an `anisotropy_clamp` of the *option's* value
+///    (`Options#maxAnisotropyValue`, `1 << maxAnisotropyBit`, so 4 by default) and leaves the ordinary
+///    graded fetch to the hardware;
+///  * `RGSS` leaves the sampler isotropic and puts the game's rotated-grid supersampling in the shader -
+///    four taps on a rotated grid at an explicitly computed level, which no sampler can be asked for;
+///  * `NONE` does neither, and is a plain fetch at whatever level the hardware picks.
+///
+/// See `wgpu_mc:shaders/terrain.wgsl`, whose `sampleNearest` and `sampleRGSS` are ports of the game's own
+/// `terrain.fsh`, and `LevelRenderer`'s `chunkLayerSampler` for the sampler half.
+static TEXTURE_FILTERING: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// See [`TEXTURE_FILTERING`].
+pub fn texture_filtering() -> u32 {
+    TEXTURE_FILTERING.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Sets [`TEXTURE_FILTERING`]. Pushed by the JVM, once per frame, from the game's own option.
+pub fn set_texture_filtering(method: u32) {
+    TEXTURE_FILTERING.store(method, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// **The game's `TextureFilteringMethod.RGSS` id**, which is what the shader's `use_rgss` is compared
+/// against. Named so the shader's immediate is not a bare `1` in this file.
+pub const TEXTURE_FILTERING_RGSS: u32 = 1;
+
+/// **The game's `TextureFilteringMethod.ANISOTROPIC` id**, which is the one that raises the sampler's
+/// anisotropy. See [`TEXTURE_FILTERING`].
+pub const TEXTURE_FILTERING_ANISOTROPIC: u32 = 2;
+
+/// **The `anisotropy_clamp` the game''s own terrain sampler would be built with**, which is the whole of
+/// what the `textureFiltering` option means to a sampler.
+///
+/// `LevelRenderer` builds it as
+///
+/// ```java
+/// int maxAnisotropy = this.optionsRenderState.textureFiltering == TextureFilteringMethod.ANISOTROPIC
+///     ? this.optionsRenderState.maxAnisotropyValue
+///     : 1;
+/// ```
+///
+/// and `Options#maxAnisotropyValue` is `1 << maxAnisotropyBit` clamped to what the device reports - **4 by
+/// default**, from a bit of 2. This renderer used a flat 16, which is the hardware's usual maximum and four
+/// times what the game asks for on its own highest setting.
+///
+/// **4 and not 16 has a consequence worth naming**: `anisotropy_clamp` above 1 requires the min, mag *and*
+/// mipmap filters to be `Linear` (`wgpu-core`'s three separate validations, see
+/// `the_game_atlas_never_asks_for_anisotropy_without_linear_filters`), and `game_atlas_blend_mips` is a
+/// player's switch that moves the mip filter. So the value is read per sampler creation rather than baked
+/// in, and the coupling is spelled out at each of the two places it is used.
+fn terrain_anisotropy() -> u16 {
+    if texture_filtering() == TEXTURE_FILTERING_ANISOTROPIC {
+        // The game's default bit is 2, so its own answer is 4. `wgpu` clamps to what the adapter supports.
+        GAME_ANISOTROPY
+    } else {
+        1
+    }
+}
+
+/// The game's own anisotropy, `Options#maxAnisotropyValue` at its default bit of 2: `1 << 2`.
+pub const GAME_ANISOTROPY: u16 = 4;
 /// **The sampler for the game's own block atlas**, which is the one every animation is drawn from.
 ///
 /// `block_atlas_sampler` with one field decided by a switch: whether mip levels are **blended**. On - the
@@ -1150,18 +1291,19 @@ pub fn set_atlas_lod_bias(bias: f32) {
 /// It remains reachable as the `atlas_base_mip_only` switch, honoured inside [`block_atlas_sampler`] for
 /// both atlases, because the case for it is a picture rather than an argument.
 pub fn game_atlas_sampler() -> wgpu::SamplerDescriptor<'static> {
-    // **Only the mip filter is overridden, and the anisotropy is deliberately left alone.**
+    // **The mip filter and the anisotropy travel together, and that is not tidiness - it is the difference
+    // between a sampler and a dead client.**
     //
-    // It has to be left alone rather than tied to the switch, which is the opposite of what a round of
-    // this did. The rule is that *any* `anisotropy_clamp` above 1 needs the min, mag **and** mipmap filters
-    // linear, and wgpu enforces it by returning an error from `create_sampler` - which on this path ends
-    // the process rather than warning. So the pair is only safe while magnification is `Linear`, and
-    // magnification *is* `Linear` (see `block_atlas_sampler`). Tying the anisotropy to this switch as well
-    // would take anisotropic filtering away from a player who only asked for the mip blend to be stepped.
+    // `wgpu-core` checks the min, mag **and** mipmap filters separately, three checks rather than one, and
+    // returns `InvalidMipmapFilterModeWithAnisotropy` for a `Nearest` mip filter beside an anisotropy above
+    // 1. `create_sampler` answering `Err` on this path runs the panic hook and ends the process - and that is
+    // exactly what a player saw the moment they turned `game_atlas_blend_mips` off: the option applied, and
+    // two seconds later the client died inside `create_sampler`.
     //
-    // The combination this rules out is worth naming, because it is the one that reached a running client
-    // once: a `Nearest` mip filter *and* a `Nearest` magnification *and* anisotropy 16 is three filters
-    // that cannot all be satisfied, and it is the magnification that has to give first.
+    // They were decoupled for a round on the reasoning that magnification was `Linear` by then and "a
+    // `Nearest` *mip* filter is legal with anisotropy" - which is false, and false in the direction that
+    // crashes. The test below pins **all three** filters now, because reading two of the three checks and
+    // concluding from them is precisely how this was got wrong twice.
     let blend = game_atlas_blend_mips();
 
     wgpu::SamplerDescriptor {
@@ -1170,6 +1312,18 @@ pub fn game_atlas_sampler() -> wgpu::SamplerDescriptor<'static> {
         } else {
             wgpu::MipmapFilterMode::Nearest
         },
+        // **And the anisotropy has to follow it down, which is not tidiness but the difference between a
+        // sampler and a crash.** `wgpu-core` checks the min, mag *and* mipmap filters separately - three
+        // checks, not one - and returns `InvalidMipmapFilterModeWithAnisotropy` for a `Nearest` mip filter
+        // beside an anisotropy above 1. `create_sampler` returning `Err` on this path runs the panic hook
+        // and ends the process, which is exactly what a player saw the moment they turned this switch off:
+        // the option applied, and the client died two seconds later in `create_sampler`.
+        //
+        // The pair was decoupled for a round on the reasoning that magnification was `Linear` by then and
+        // "a `Nearest` *mip* filter is legal with anisotropy" - which is false, and false in the direction
+        // that crashes. The test below pins all three filters now, because reading two of the three checks
+        // and concluding from them is how this was got wrong.
+        anisotropy_clamp: if blend { terrain_anisotropy() } else { 1 },
         label: Some("wgpu-mc: the game's block atlas"),
         ..block_atlas_sampler(wgpu::AddressMode::ClampToEdge)
     }

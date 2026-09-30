@@ -220,6 +220,7 @@ object Wgpu {
 		val r = color shr 16 and 0xFF
 		val g = color shr 8 and 0xFF
 		val b = color and 0xFF
+
 		return r or (g shl 8) or (b shl 16)
 	}
 

@@ -86,8 +86,7 @@ object BlockCache {
 
 	/** Ticks since the last reload, or -1 while none has happened. */
 	@Volatile
-	private var sinceReload = -1
-
+	var sinceReload = -1
 	/**
 	 * Called by the resource-reload listener, on every reload.
 	 *
@@ -100,7 +99,6 @@ object BlockCache {
 		sinceReload = 0
 		reloads.incrementAndGet()
 	}
-
 	/**
 	 * Why the block models are being baked.
 	 *
@@ -110,10 +108,8 @@ object BlockCache {
 	private enum class Bake {
 		/** The first one, at launch: the game's own registrations are already waiting on the native side. */
 		First,
-
 		/** A resource reload: the pack behind every model and every sprite changed. */
 		Reload,
-
 		/**
 		 * A setting that is written into the models changed - today the animated-texture switch. The
 		 * pack did not, so the atlas and the game's sprite rectangles stay exactly as they are.
@@ -123,7 +119,6 @@ object BlockCache {
 
 	/** Whether a setting that is baked into the block models has been applied. See [blockTexturesChanged]. */
 	private val pendingRebake = AtomicBoolean(false)
-
 	/**
 	 * The game's block atlas texture, when it is one this cache has not baked against yet.
 	 *
@@ -267,7 +262,7 @@ object BlockCache {
 	 * ```java
 	 * public TextureAtlas getAtlasOrThrow(Identifier atlasId) {
 	 *     AtlasEntry atlasEntry = this.atlasById.get(atlasId);
-	 *     if (atlasEntry == null) throw new IllegalArgumentException("Invalid atlas id: " + atlasId);
+	 *     if (atlasEntry == null) throw new IllegalArgumentException("Invalid atlas id: " + atlasId);}
 	 * ```
 	 *
 	 * so the texture id throws - and it threw for both callers below, which is why nothing animated and
@@ -355,12 +350,20 @@ object BlockCache {
 				// height over its width, and `SpriteContents.width()` already answers a single frame - so
 				// that arithmetic printed "1 frame" for a 32-frame sprite and looked like a measurement.
 				// The frame count is not readable from here (`getFrameCount` is private), so it is left off
-				// rather than guessed: what this line is for is the texel size, and that it does answer.
+				// rather than guessed.
+				//
+				// The **level cap** is printed with it because that is the number the native side actually
+				// uses, and it is the one thing a "the floor made no difference" report has to be checked
+				// against: a cap that arrives as zero is no floor at all, and no floor is exactly the
+				// shimmer, so the two are indistinguishable from the picture alone.
+				val texels = sprite.contents().width().coerceAtLeast(1)
+
 				WgpuMcMod.LOGGER.info(
-					"wgpu: {} is {}x{} texel(s) per frame in the game's atlas",
+					"wgpu: {} is {}x{} texel(s) per frame, so {} mip level(s) of its own detail",
 					name,
 					sprite.contents().width(),
 					sprite.contents().height(),
+					Integer.numberOfTrailingZeros(Integer.highestOneBit(texels)),
 				)
 			}
 		} catch (failure: Throwable) {
@@ -368,9 +371,10 @@ object BlockCache {
 		}
 	}
 
+
 	/**
 	 * Hands the native side the game's own block atlas texture: the half of an animated texture that
-	 * [`registerAtlasSprites`] is no use without.
+	 * [registerAtlasSprites] is no use without.
 	 *
 	 * The rectangles above say *where* each sprite is in the game's atlas; this says *which texture*
 	 * the terrain pass has to sample to see it. Both have to come from the same stitch - the game
@@ -445,6 +449,30 @@ object BlockCache {
 		// seconds; watching it for changes would mean a cached copy here to compare against, which is one
 		// more thing to keep in step. See [leavesChanged].
 		WgpuNative.setCutoutLeaves(Minecraft.getInstance().options.cutoutLeaves().get())
+
+		// **And the dimension's per-face brightness table**, for exactly the same reason: it is written into
+		// the geometry. See `setCardinalLighting` on both sides for what the six are.
+		//
+		// The mapping is the point of this block. `CardinalLighting` is
+		// `(down, up, north, south, west, east)` and the native side indexes its table with `Direction`,
+		// whose discriminants are west, east, down, up, north, south - so the six are **reordered here**
+		// rather than being passed through in the order they happen to be read in. Two orders that differ is
+		// how a nether ceiling would end up scaled by the east value, and nothing about the picture would
+		// say which of the six was wrong.
+		//
+		// The level's own table rather than a constant, because which of the game's two applies is
+		// `ClientLevel#cardinalLighting` and that is a property of the dimension. Null only between worlds,
+		// where nothing is being baked.
+		Minecraft.getInstance().level?.cardinalLighting()?.let { lighting ->
+			WgpuNative.setCardinalLighting(
+				lighting.west(),
+				lighting.east(),
+				lighting.down(),
+				lighting.up(),
+				lighting.north(),
+				lighting.south(),
+			)
+		}
 
 		WgpuNative.cacheBlockStates()
 

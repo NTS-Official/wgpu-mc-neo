@@ -49,6 +49,14 @@ struct ChunkOffset {
 // and for the two atlases to stay symmetric.
 @group(0) @binding(11) var t_sampler_magnify: sampler;
 
+// **A minified animated face gets its own sampler, because neither pair above is right for it.** The
+// anisotropic one cannot be used beside a `Nearest` mip filter (a validation error, and the mip filter is
+// a player's switch), and `Nearest` magnification of a coarse level is what turns a moving sprite into one
+// flat patch of its own running average - the "bright spots magnified into one big bright tile" a player
+// described. Same filters as `t_sampler` and `t_sampler_magnify` except for the anisotropy.
+@group(0) @binding(12) var t_game_sampler_animated: sampler;
+@group(0) @binding(13) var t_sampler_animated: sampler;
+
 // The game's **lightmap**, and the sampler the game samples it with (`Sampler2` for the terrain is
 // `getClampToEdge(LINEAR)`). This is the whole of the lighting: the game builds this 16x16 texture from
 // the light levels of the world, the gamma and brightness options, the time of day, night vision and
@@ -191,6 +199,16 @@ struct SectionPosition {
     // shader would call a surface magnified on one launch and minified on the next.
     texel_ours: f32,
     texel_game: f32,
+    // The game's TextureSize, per atlas: one texel as a fraction of it, which is the `pixel_size` the two
+    // sampling functions below are given.
+    //
+    // It is `texel_ours` and `texel_game` again, and it is sent a second time rather than read from those two
+    // because the pair has two different jobs - `is_magnified` compares a derivative against one texel, and a
+    // sampling function divides by it - and a field that meant two things would be the one place they could
+    // drift apart. Two `f32` written consecutively read as one `vec2`.
+    // The game's UseRgss: 1 when its textureFiltering option is RGSS, 0 otherwise. See `sample_rgss`.
+    use_rgss: u32,
+    // Padding, so the struct is a size WGSL accepts rather than one it rounds. Carries nothing.
 };
 
 /// Whether a fragment's coordinates are being **stretched** rather than squeezed - which is exactly
@@ -208,6 +226,141 @@ struct SectionPosition {
 fn is_magnified(coords: vec2<f32>, texel: f32) -> bool {
     let d = vec2<f32>(dpdx(coords).x, dpdy(coords).y);
     return abs(d.x) < texel && abs(d.y) < texel;
+}
+
+// **The game's own two sampling functions, ported.** See `assets/minecraft/shaders/core/terrain.fsh`,
+// whose `main` is `UseRgss == 1 ? sampleRGSS(...) : sampleNearest(...)`.
+//
+// They are here rather than expressed with a sampler because **neither can be**: a sampler has one
+// `anisotropy_clamp` and no way to say "four taps on a rotated grid at this exact level", and neither
+// exposes the level the hardware would otherwise pick.
+//
+// `pixel_size` is one texel of the atlas being sampled, as a fraction of it - `1.0 / TextureSize` in the
+// game, which is why the two numbers travel in the immediate instead of being written here.
+
+/// The game's `sampleNearest`: a fetch whose level the *hardware* picks, with the texel centres adjusted
+/// so that a surface being magnified does not drift off centre as it gets closer.
+///
+/// The adjustment is the part worth keeping. `uv / pixelSize` is texel coordinates, `round(..) - 0.5` the
+/// centre of the nearest texel, and the difference between the two is scaled down by how large a texel is
+/// on screen - so a magnified surface lands exactly on centres (where the answer is exact) and the
+/// correction fades out as the surface minifies (where the level is doing the filtering instead).
+///
+/// **The game's `textureGrad` becomes a `textureSampleLevel` at a level this side computes**, because
+/// `textureSampleGrad` has no bias and the two things this renderer adds to the game's fetch are both
+/// shifts: `atlas_lod_bias`, which is the setting a player moves, and the per-sprite floor. The level is
+/// taken from the same derivatives the game's `textureGrad` would have used, so the two agree at a bias of
+/// zero and a floor of none - which is the state the comparison runs in.
+fn sample_nearest(
+    source: texture_2d<f32>,
+    samp: sampler,
+    uv: vec2<f32>,
+    pixel_size: vec2<f32>,
+    bias: f32,
+) -> vec4<f32> {
+    let du = dpdx(uv);
+    let dv = dpdy(uv);
+    let texel_screen_size = sqrt(du * du + dv * dv);
+
+    let uv_texel = uv / pixel_size;
+    let texel_center = round(uv_texel) - 0.5;
+    var texel_offset = uv_texel - texel_center;
+
+    texel_offset = (texel_offset - 0.5) * pixel_size / texel_screen_size + 0.5;
+    texel_offset = clamp(texel_offset, vec2<f32>(0.0), vec2<f32>(1.0));
+
+    // The side's own level, which is the hardware's answer for these derivatives plus the bias.
+    let min_pixel_size = min(pixel_size.x, pixel_size.y);
+    let max_derivative = max(length(du), length(dv));
+    let level = max(0.0, log2(max_derivative / min_pixel_size) + bias);
+
+    return textureSampleLevel(source, samp, (texel_center + texel_offset) * pixel_size, level);
+}
+
+/// The game's `sampleRGSS`: rotated-grid supersampling, four taps per level with the two neighbouring
+/// levels blended by the fractional part.
+///
+/// **The level it picks is the whole point.** The hardware's implicit level is derived from the worst of the
+/// two derivatives, which at a grazing angle is the compressed one - so a surface seen edge-on is sampled
+/// from a level several steps coarser than its footprint needs, and a *moving* sprite's coarse levels are a
+/// running average of its animation rather than a smaller copy of it. That average is the fluid shimmer.
+/// The game takes the **geometric mean** of the two derivative lengths instead:
+///
+/// ```glsl
+/// float effectiveDerivative = sqrt(minDerivative * maxDerivative);
+/// ```
+///
+/// which is far finer than the maximum at a grazing angle - four levels is the order a player measured -
+/// and is exactly what a `-4` bias was standing in for.
+///
+/// The four offsets are the game's, and the blend to `sample_nearest` near the transition is its too: below
+/// about one texel per pixel the surface wants the sharpening RGSS would only blur.
+fn sample_rgss(
+    source: texture_2d<f32>,
+    samp: sampler,
+    uv: vec2<f32>,
+    pixel_size: vec2<f32>,
+    bias: f32,
+) -> vec4<f32> {
+    let du = dpdx(uv);
+    let dv = dpdy(uv);
+
+    let texel_screen_size = sqrt(du * du + dv * dv);
+    let max_texel_size = max(texel_screen_size.x, texel_screen_size.y);
+    let min_pixel_size = min(pixel_size.x, pixel_size.y);
+
+    let blend_factor = smoothstep(min_pixel_size, min_pixel_size * 2.0, max_texel_size);
+
+    let min_derivative = min(length(du), length(dv));
+    let max_derivative = max(length(du), length(dv));
+    let effective_derivative = sqrt(min_derivative * max_derivative);
+
+    // **The side's own two shifts on top of the game's level**: the `atlas_lod_bias` setting and the
+    // per-sprite floor. At zero and none this is the game's own `mipLevelExact`, which is what makes the
+    // port comparable with it.
+    let mip_exact = max(0.0, log2(effective_derivative / min_pixel_size) + bias);
+    let mip_low = floor(mip_exact);
+    let mip_high = mip_low + 1.0;
+    let mip_blend = fract(mip_exact);
+
+    // The game's own rotated grid: `vec2(0.125, 0.375)` and its three rotations.
+    var offsets = array<vec2<f32>, 4>(
+        vec2<f32>(0.125, 0.375),
+        vec2<f32>(-0.125, -0.375),
+        vec2<f32>(0.375, -0.125),
+        vec2<f32>(-0.375, 0.125),
+    );
+
+    var low = vec4<f32>(0.0);
+    var high = vec4<f32>(0.0);
+
+    for (var i = 0u; i < 4u; i = i + 1u) {
+        let tap = uv + offsets[i] * pixel_size;
+        low = low + textureSampleLevel(source, samp, tap, mip_low);
+        high = high + textureSampleLevel(source, samp, tap, mip_high);
+    }
+
+    let rgss = mix(low * 0.25, high * 0.25, mip_blend);
+    let plain = sample_nearest(source, samp, uv, pixel_size, bias);
+
+    return mix(plain, rgss, blend_factor);
+}
+
+/// One atlas fetch, by the game's own rule: RGSS when the option asks for it, the plain graded fetch
+/// otherwise.
+fn sample_atlas(
+    source: texture_2d<f32>,
+    samp: sampler,
+    uv: vec2<f32>,
+    pixel_size: vec2<f32>,
+    use_rgss: u32,
+    bias: f32,
+) -> vec4<f32> {
+    if use_rgss == 1u {
+        return sample_rgss(source, samp, uv, pixel_size, bias);
+    }
+
+    return sample_nearest(source, samp, uv, pixel_size, bias);
 }
 
 var<immediate> section_pos: SectionPosition;
@@ -523,23 +676,80 @@ fn frag(
     // whatever any of this says, so a floor is meaningless there and a bias was actively harmful - the
     // revision that applied one to every surface sharpened the distance into a moiré.
     //
+    // **`LOD_FLOOR_IS_LEVEL_ZERO` picks which floor, and the pair is a real comparison rather than a
+    // leftover.** Both say "do not go below this" and differ only in how deep they allow:
+    //
+    //  * `true` clamps every minified animated face at **level 0** - the full-resolution sprite, no mip
+    //    chain at all. **This is the one that was measured to remove the lava shimmer**, and it is the blunt
+    //    one: it also throws away the minification the chain exists for, so a distant animated sprite stops
+    //    getting smaller and starts aliasing instead.
+    //  * `false` uses the per-sprite floor the bake computed - `log2` of the sprite's own texels, less
+    //    `LEVELS_OF_DETAIL_KEPT` - the precise form of the same idea, and what the four vertex bits are for.
+    //    **It has still never been measured**, which is the surprising part of this whole search: in every
+    //    round it was tried in, fluids did not carry `UV_ANIMATED`, so this branch was false for them and
+    //    the change was inert. See `FluidSprite::flags`.
+    //
+    // Whichever of these removes the shimmer while keeping the other properties is the answer.
+    //
     // Four bits, so the field is what the bake wrote and nothing else has to agree with it.
+    const LOD_FLOOR_IS_LEVEL_ZERO: bool = false;
+
     let floor = select(
         0.0,
-        f32(in.lod_floor),
+        select(64.0, f32(in.lod_floor), !LOD_FLOOR_IS_LEVEL_ZERO),
         in.animated == 1u && !magnified,
     );
 
     let bias = section_pos.lod_bias - floor;
 
+    // **Which of the game's three sampling methods is in force**, read from the immediate the draw hands
+    // over. `sample_atlas` is the game's own pair of functions; see them above for why this is not a sampler
+    // setting - the level RGSS computes is one the hardware would not have picked, and no sampler exposes
+    // the level at all.
+    //
+    // The bias now sits at 0 for almost every surface, because what it was standing in for is *here*: the
+    // game's geometric-mean level. It is still applied, and still subtracts the floor, so the two ways of
+    // asking for a finer level compose rather than one silently winning.
+    // One texel of the atlas this face samples, as a fraction of it - the `TextureSize` the game's own two
+    // functions are given. Built from the fields that were already here rather than sent a second time: a
+    // duplicate of the same number is a second thing that can disagree, and it cost four bytes of padding in
+    // an immediate whose size has to match this struct exactly. **wgpu aborts the process when it does not**
+    // (`Not all immediate data required by the pipeline has been set ... missing byte ranges: 48..52`),
+    // which is how the duplicate was found.
+    let pixel_size = select(
+        vec2<f32>(section_pos.texel_ours, section_pos.texel_ours),
+        vec2<f32>(section_pos.texel_game, section_pos.texel_game),
+        in.game_atlas == 1u,
+    );
+
+    // **Three cases, not two.** A magnified surface wants the crisp `Nearest` magnification; a minified
+    // *static* one wants the anisotropic sampler; and a minified **animated** one wants neither, because
+    // nearest magnification of a coarse level stretches the running average of the animation over the whole
+    // face and steps it as the frames advance - the "bright spots magnified into one big bright tile" a
+    // player described. See `t_game_sampler_animated`.
+    //
+    // The inner `select` picks between the two minified samplers and the outer one overrides both when the
+    // surface is magnified, so the three cases are reached as: magnified, animated-and-minified, rest.
+    //
+    // Every branch is evaluated and selected between rather than branched on, which is the same rule the
+    // two-texture choice below follows: an implicit derivative under non-uniform control flow is undefined,
+    // and `in.game_atlas` is per vertex.
     let texel_from_game = select(
-        textureSampleBias(t_game_atlas, t_game_sampler, in.tex_coords, bias),
-        textureSampleBias(t_game_atlas, t_game_sampler_magnify, in.tex_coords, bias),
+        select(
+            sample_atlas(t_game_atlas, t_game_sampler, in.tex_coords, pixel_size, section_pos.use_rgss, bias),
+            sample_atlas(t_game_atlas, t_game_sampler_animated, in.tex_coords, pixel_size, section_pos.use_rgss, bias),
+            in.animated == 1u,
+        ),
+        sample_atlas(t_game_atlas, t_game_sampler_magnify, in.tex_coords, pixel_size, section_pos.use_rgss, bias),
         magnified,
     );
     let texel_from_ours = select(
-        textureSampleBias(t_texture, t_sampler, in.tex_coords, bias),
-        textureSampleBias(t_texture, t_sampler_magnify, in.tex_coords, bias),
+        select(
+            sample_atlas(t_texture, t_sampler, in.tex_coords, pixel_size, section_pos.use_rgss, bias),
+            sample_atlas(t_texture, t_sampler_animated, in.tex_coords, pixel_size, section_pos.use_rgss, bias),
+            in.animated == 1u,
+        ),
+        sample_atlas(t_texture, t_sampler_magnify, in.tex_coords, pixel_size, section_pos.use_rgss, bias),
         magnified,
     );
     let texel = select(texel_from_ours, texel_from_game, in.game_atlas == 1u);

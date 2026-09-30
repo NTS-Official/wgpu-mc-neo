@@ -1139,6 +1139,29 @@ impl RenderGraph {
             ))),
         );
 
+        // **The third pair: a minified *animated* face.**
+        //
+        // Its magnification is `Linear` rather than `Nearest`, because nearest magnification of a coarse
+        // level is what turns a moving sprite into one flat patch of its own running average - stepping as
+        // the frames advance rather than fading - and it has no anisotropy, because a `Nearest` mip filter
+        // beside one is a validation error rather than a picture. See
+        // `atlas_animated_minified_sampler` for why neither existing pair could express this.
+        graph.resources.insert(
+            "@sampler_mc_block_atlas_animated".into(),
+            ResourceBacking::Sampler(Arc::new(wm.gpu.device.create_sampler(
+                &crate::render::atlas::atlas_animated_minified_sampler(
+                    wgpu::AddressMode::ClampToEdge,
+                ),
+            ))),
+        );
+
+        graph.resources.insert(
+            "@sampler_block_atlas_animated".into(),
+            ResourceBacking::Sampler(Arc::new(wm.gpu.device.create_sampler(
+                &crate::render::atlas::atlas_animated_minified_sampler(wgpu::AddressMode::Repeat),
+            ))),
+        );
+
         let game_atlas = game_block_atlas();
 
         match &game_atlas {
@@ -1802,25 +1825,28 @@ impl RenderGraph {
                     // draw: twenty-eight bytes in the layout the shader's `SectionPosition` spells out -
                     // the three integers, the layer's alpha cutoff, the atlas level-of-detail bias, and
                     // the half-texel shift for the atlas being sampled. See `set_immediates`.
-                    let mut constants = [0u8; 36];
+                    let mut constants = [0u8; 40];
 
                     // Half a texel for this side's own atlas, which is a fixed size, and for the game's,
                     // which is not - see the write below for why the two cannot share a number.
                     //
-                    // **The shift, in texels of the atlas the face samples.**
+                    // **The half-texel shift, and it is zero - the experiment is over and it lost.**
                     //
-                    // `0.5` is the value that puts a sample on a texel centre rather than on the edge
-                    // between two, and it is what belongs here. **`40.0` was a plumbing test and it has
-                    // served its purpose**: a shift of half a texel had produced no visible change, and "the
-                    // shift is not what is wrong" and "the shift never reached the shader" look exactly the
-                    // same on screen. Forty texels is far too much to be a fix and far too much to be
-                    // invisible, and it did move the picture - so the plumbing is sound and the half-texel
-                    // reading was real.
+                    // It was tried because a face's coordinates run edge to edge, so a sample lands on the
+                    // boundary between two texels rather than on one, and two texels at every point would be
+                    // softer than one. **It does not make the picture any crisper** - a bilinear filter
+                    // interpolates between texel centres wherever it is asked, and half a texel only moves
+                    // which of the two a sample is nearer.
                     //
-                    // **Which means the softness is not a texel-alignment fault.** A face's samples *are* on
-                    // texel centres with this value and the picture is no crisper than with zero, so nothing
-                    // between the vertex and the sampler is left to blame for it.
-                    const HALF_TEXEL_TEXELS: f32 = 0.5;
+                    // It was left in the tree anyway while the search went on, and a player then reported the
+                    // thing it *does* do: **a visible half-texel offset in the block textures**. Which it
+                    // should be - half a texel is half a texel, and moving every sample by that much is a
+                    // picture shifted by that much. So it goes back to zero, and the two fields stay because
+                    // the shader still reads them and a constant of zero is the honest way to say "no shift".
+                    //
+                    // The plumbing test that proved these values reach the shader is worth keeping in mind:
+                    // forty texels moved the terrain visibly, so a shift written here is a shift applied.
+                    const HALF_TEXEL_TEXELS: f32 = 0.0;
 
                     let our_half_texel =
                         HALF_TEXEL_TEXELS / crate::render::atlas::ATLAS_DIMENSIONS as f32;
@@ -1929,6 +1955,21 @@ impl RenderGraph {
                             // the atlas the sample actually comes from.
                             constants[28..32].copy_from_slice(&our_texel.to_ne_bytes());
                             constants[32..36].copy_from_slice(&game_texel.to_ne_bytes());
+                            // **The two numbers the game's own terrain shader is handed**: the size of the
+                            // atlas it samples, and whether the `textureFiltering` option has RGSS on. See
+                            // the shader's `TexelSize` and `use_rgss` for what they do - `sampleNearest` and
+                            // `sampleRGSS` are ports of the game's, and neither can be expressed with a
+                            // sampler.
+                            //
+                            // Read per draw for the same reason the bias above is: it is the game's
+                            // option, and a value cached for the pass would follow the options screen by a
+                            // frame. `GameRenderer` writes exactly this comparison into its own
+                            // `GlobalSettingsUniform`.
+                            let use_rgss = u32::from(
+                                crate::render::atlas::texture_filtering()
+                                    == crate::render::atlas::TEXTURE_FILTERING_RGSS,
+                            );
+                            constants[36..40].copy_from_slice(&use_rgss.to_ne_bytes());
 
                             set_immediates(
                                 &bound_pipeline.immediates,
@@ -2218,7 +2259,7 @@ fn immediate_size_of(name: &str) -> u32 {
         // **Five four-byte members, and the fifth is why this is not sixteen.** `SectionPosition` is
         // three integers, the layer's alpha cutoff and the atlas level-of-detail bias; see the struct in
         // `terrain.wgsl` for what the bias is for and why it had to stop being a `const`.
-        "@pc_section_position" => 36,
+        "@pc_section_position" => 40,
         "@pc_total_sections" => 4,
         "@pc_parts_per_entity" => 4,
         "@pc_electrum_color" => 16,
@@ -2682,22 +2723,24 @@ mod texture_sample_uniformity_tests {
             let module = naga::front::wgsl::parse_str(&source).expect("the terrain shader parses");
             let auto = total_auto_samples(&module);
 
-            // **Four, and the number is two textures times two samplers rather than a threshold.**
+            // **Zero, and the zero is the finding rather than a shader that lost its samples.**
             //
-            // It was two while each atlas had one sampler. There are two per atlas now - a `Nearest` one
-            // for magnification and an anisotropic one for minification, because wgpu will not put both
-            // behaviours in one sampler - and the fragment stage samples with both and `select`s, for the
-            // same reason it has always sampled both *textures* and selected: a fetch under a branch is
-            // undefined behaviour. See `atlas_magnify_sampler`.
+            // It was six: two atlases times three samplers, each fetched with `textureSampleBias` so the
+            // level came from the hardware and from the bias together. **The level no longer comes from the
+            // hardware at all** - the fragment stage ports the game's own `sampleNearest` and `sampleRGSS`,
+            // which fetch with `textureSampleGrad` and `textureSampleLevel` - so there is no auto-level fetch
+            // left to count, and the count is asserted at zero so that one *reappearing* is the failure.
             //
-            // So the count is asserted rather than bounded, and adding a sampler means moving it by hand.
-            // What makes it worth asserting is that a fetch which *disappeared* is a texture the shader
-            // stopped drawing with, which is a silently different picture rather than an error.
+            // The invariant below is what actually matters and it is now stronger than it was: a
+            // `textureSampleGrad` still computes its level from derivatives, and the derivatives of a
+            // `sample_nearest` are of the *unshifted* coordinates, so the same rule applies - every fetch
+            // happens in uniform control flow and the choice is a `select`. See the sampling note in
+            // `terrain.wgsl`.
             assert_eq!(
-                auto, 4,
-                "{name}.wgsl has {auto} auto-level texture fetch(es); it is expected to have exactly the \
-                 four the fragment stage selects between - two atlases, each fetched with the magnifying \
-                 sampler and the minifying one"
+                auto, 0,
+                "{name}.wgsl has {auto} auto-level texture fetch(es); the game's own sampling functions take \
+                 the level explicitly, so every fetch here should be a `textureSampleGrad` or a \
+                 `textureSampleLevel` - an `Auto` or `Bias` sample means one was written the old way"
             );
 
             let found = samples_inside_branches(&source);
@@ -2826,6 +2869,50 @@ mod binding_visibility_tests {
         Validator::new(ValidationFlags::all(), Capabilities::all())
             .validate(&module)
             .expect("the solid terrain shader validates");
+    }
+
+    /// **The size the shader says `SectionPosition` is, and the size this side declares for it, are the
+    /// same number - and getting it wrong aborts the process rather than the draw.**
+    ///
+    /// wgpu computes the immediate's required size from the shader's struct and refuses to draw unless
+    /// every byte of it was set:
+    ///
+    /// ```text
+    /// wgpu error: Validation Error
+    /// Not all immediate data required by the pipeline has been set via set_immediates
+    /// (missing byte ranges: 48..52)
+    /// thread caused non-unwinding panic. aborting.
+    /// ```
+    ///
+    /// That is a client that dies on the first frame of the world, and the four missing bytes were a
+    /// duplicate field this side was sending and the shader was not reading the way it was written - so the
+    /// failure mode of a layout change here is not a wrong colour, it is a process that stops. `naga` gives
+    /// the same number the device would, which is what makes this a test.
+    ///
+    /// Both terrain shaders, because a layout that agreed with one of them and not the other would abort on
+    /// whichever layer drew first.
+    #[test]
+    fn the_shaders_section_position_is_the_size_the_immediate_declares() {
+        for (name, source) in [("terrain", TERRAIN), ("terrain_solid", TERRAIN_SOLID)] {
+            let module = naga::front::wgsl::parse_str(source).expect("the terrain shader parses");
+
+            let structure = module
+                .types
+                .iter()
+                .find(|(_, ty)| ty.name.as_deref() == Some("SectionPosition"))
+                .map(|(handle, _)| handle)
+                .unwrap_or_else(|| panic!("{name}.wgsl declares no `SectionPosition`"));
+
+            let size = module.types[structure].inner.size(module.to_ctx());
+
+            assert_eq!(
+                size,
+                immediate_size_of("@pc_section_position"),
+                "{name}.wgsl's `SectionPosition` is {size} bytes and the immediate is declared {} - wgpu \
+                 aborts the process when the shader asks for more than was set",
+                immediate_size_of("@pc_section_position")
+            );
+        }
     }
 
     /// Which global bindings each stage of every entry point of the shader reaches for, and what the

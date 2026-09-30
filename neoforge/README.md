@@ -5907,7 +5907,144 @@ half the sprite, in **texel coordinates the vertex buffer actually holds**, rath
 `ElementBounds` is what carries the element's `from`/`to` into `face_data` in the sixteen units a model
 file writes them in, because that is the space the game's six lines are written in.
 
+### A bare texture name in a face is a variable, and the model schema did not know it
+
+`block/heavy_core` names its texture with **no `#`**:
+
+```json
+"textures": { "all": "block/heavy_core", "particle": "block/heavy_core" },
+"faces": { "north": { "uv": [0, 8, 8, 16], "texture": "all" }, ... }
+```
+
+The game resolves both spellings, and `minecraft_assets::api::resolve::ModelResolver` only answered for a
+`#reference` - so the bare `all` was taken for a sprite *called* `all`, `ResourcePath::from("all")` became
+`minecraft:all`, the atlas had no such sprite, and all six faces were dropped. `unresolved_texture` could
+not catch it either, because `Texture::reference()` is `None` for a name with no `#`.
+
+The symptom was a block that is baked, keyed, culled against its neighbours and drawn - and invisible, with
+the only trace a line in the missing-sprite report that reads `6 face(s) were dropped for a sprite the atlas
+does not have: minecraft:all`. **It is the worst shape a failure can have here**, which is why the fix is in
+the vendored copy rather than worked around: `resolve_element_textures` now looks a bare name up in the
+`textures` map, and **leaves it alone when it is not a key** - which is what the game does, since it is then
+a sprite path and an absent sprite path is dropped exactly as before. Two tests, one for each half.
+
+That report is now empty. What remains beside it is `3 texture(s) a model names could not be read`, which is
+`minecraft:textures/missingno.png` - the game's own deliberate placeholder - and the list of states that bake
+to no faces at all, which is `air`, the fluids, the beds and the signs and is not a fault.
+
+### Two crashes, and both were a number that had to agree with the shader
+
+- **`SectionPosition` and its immediate had different sizes, and wgpu aborts rather than drawing.** An
+  `our_pixel_size: vec2<f32>` was added to the struct for the game's own sampling functions and the Rust
+  side was left writing 48 bytes where the shader declared 52:
+
+  ```text
+  wgpu error: Validation Error
+  Not all immediate data required by the pipeline has been set via set_immediates
+  (missing byte ranges: 48..52)
+  thread caused non-unwinding panic. aborting.
+  ```
+
+  The field turned out to be redundant - it is `texel_ours`/`texel_game`, which were already there - so it
+  was removed and the shader builds `pixel_size` from those. **And the size is now asserted**:
+  `the_shaders_section_position_is_the_size_the_immediate_declares` asks `naga` for the struct's own byte
+  count and compares it with `immediate_size_of("@pc_section_position")`, for both terrain shaders. That
+  invariant had never been checked, and its failure mode is a process that stops on the first frame rather
+  than a colour that is wrong - it caught the *second* wrong value within a minute of being written.
+
+- **A fluid face's level-of-detail floor was always zero, and the field that would have carried it did not
+  exist.** `FluidSprite` had `atlas`, `game` and `animated`; the block-model path takes `rect`, `animated`
+  *and* `level_cap` out of `SpriteInAtlas` in one go. So `sprite_level_floor(None, true)` answered zero, the
+  shader's bias stayed at the setting's own value, and a fluid face went back to the sampler's automatic
+  level choice - which is what the old `-4` offset had been standing in for.
+
+  The order of events is the part worth keeping: setting `UV_ANIMATED` on fluid faces is what *enabled* the
+  shader's floor branch for them, so it also enabled the branch that reads that missing field. Before it the
+  branch was dead and the field cost nothing; after it, the field was the whole difference between a floor
+  and none. Reported by counters that did not exist either - `FLUID_FACES_ANIMATED` read as healthy for
+  every fluid in the world while the floor was zero, so a second pair was added beside it
+  (`FLUID_FACES_FLOORED` / `FLUID_FACES_UNFLOORED`) and the reading is now `0` unfloored out of hundreds of
+  thousands.
+
+### The game's own terrain sampling, ported
+
+`GameRenderer` sets one flag - `options.textureFiltering == TextureFilteringMethod.RGSS` - and the game's
+`terrain.fsh` is `UseRgss == 1 ? sampleRGSS(...) : sampleNearest(...)`. **Neither can be expressed with a
+sampler**, so both are ported into `terrain.wgsl` and `terrain_solid.wgsl`, and the three settings are three
+algorithms rather than one with a knob:
+
+| setting | the game | this side now |
+| --- | --- | --- |
+| `NONE` ("Fast") | isotropic, hardware level | the same |
+| `RGSS` ("Fancy") | four taps on the game's rotated grid, at a level from **`sqrt(min * max)`** of the two derivative lengths | the same, ported |
+| `ANISOTROPIC` ("Fabulous") | `anisotropy_clamp = Options#maxAnisotropyValue`, which is `1 << maxAnisotropyBit` - **4 by default** | the same; it used to be a flat 16 |
+
+The geometric mean is the part that matters and the reason a bias never fixed anything permanently: the
+hardware's implicit level comes from the *worst* of the two derivatives, which at a grazing angle is the
+compressed one, so a surface seen edge-on is sampled several levels coarser than its footprint needs - and a
+moving sprite's coarse levels are a running average of its animation. A player measured four levels' worth
+of it, twice, on two builds.
+
+The port also made the uniformity test stronger: the shaders now take every level explicitly
+(`textureSampleGrad` and `textureSampleLevel`), so
+`the_terrain_shaders_never_sample_a_texture_under_a_branch` asserts **zero** auto-level fetches where it used
+to assert exactly six.
+
+### A model face can turn shading off, and the schema had no such field
+
+`BlockModelLighter` is
+
+```java
+outputInstance.scaleColor(quad.materialInfo().shade()
+    ? cardinalLighting.byFace(direction)
+    : cardinalLighting.up());
+```
+
+and this side only had the first branch. The flag was added to the vendored `minecraft-assets` (the second
+reason that copy exists), carried on `FaceData` and `BlockModelFace`, and consumed by
+`face_brightness(dir, shade)`. **51 models in the shipped assets say `"shade": false`** - `cross`, `crop`,
+`vine_*`, `template_torch`, `template_fire_*`, `template_lantern`, `coral_fan`, `sea_pickle`,
+`redstone_dust_*`, `tripwire_*`, `bamboo_*`, `ladder`, `chain` - and every one of them was being multiplied
+by its direction's brightness where the game multiplies by 1.
+
+`CardinalLighting` came with it: it is a **dimension** property and not a biome one
+(`ClientLevel#cardinalLighting`), there are exactly two tables, and they differ **only at up and down**
+(`0.5/1.0` against `0.9/0.9`). The six numbers travel from the JVM as six floats on every bake, in
+`Direction`'s own order rather than the record's - which is not the same order, and the mapping is spelled
+out at the call site.
+
 ### Known gaps
+
+- **A grass block's side reads brighter than the game's, and it is not the tint, the light, the sprite
+  rectangle or the sampling - twelve candidates were each measured and each came back correct.** The
+  measurements, so nobody repeats them:
+
+  - **The tint is right, end to end.** The bake was made to report a tinted face's whole colour chain:
+    `tint #91BD59`, brightness `0.6`, vertex `(87, 113, 53)` - and `0.6 * (145, 189, 89)` is exactly
+    `(87, 113, 53)`, channel for channel. The tint that arrives equals the biome's
+    `BiomeColors#getAverageGrassColor` at that position, and equals that biome's base colour (the position
+    was a taiga, whose `GrassColorModifier` is `NONE`; the only two that change anything are
+    `DARK_FOREST`, which halves, and `SWAMP`, which returns a constant).
+  - **The light is right.** The *dirt* of the same side is pixel-identical in both renderers
+    (`4a4a4a`), and the non-tint path - atlas contents, sampling, colour pipeline - is what that
+    traverses.
+  - **The sprite rectangle is right.** `TextureAtlasSprite#u0` is `(x + padding) / atlasWidth`, so the
+    rectangle is the content and not the padding, and this side sends those four numbers verbatim.
+  - **The sampling is right, or at least is not the difference.** An `atlas_lod_bias` of `-4` and of `0`,
+    the per-sprite floor on and off, the game's own RGSS with its geometric-mean level, the anisotropic
+    sampler, the half-texel shift, the mip chain, and the colours at two distances all produced the same
+    side.
+  - **And the overlay quad is not the answer, which is the part that cost the most time.** The side looks
+    *unchanged* when that quad is dropped at bake time (16 faces, counted) and unchanged when `TINT` is
+    switched off - because `grass_block_side_overlay.png` has content in **one or two rows at the top and
+    is fully transparent below**, so its visible contribution is a couple of pixels of fringe. The green on
+    a grass side comes from `grass_block_side.png` itself, which has a green edge painted into it.
+    Measured directly: the base sprite's `y=1` is `(108, 172, 66)` and `y=4` down is dirt, while the
+    overlay's `y=1` is grey `(140, 140, 140)` at `a=255` and **everything from `y=4` is `a=0`**.
+
+  So the difference is in the *texture read* of `grass_block_side` itself, and a player's test against an
+  older build shows it is not new: **it has been in this pipeline throughout**. What would settle it is a
+  way to read back the texel a fragment actually fetched, which this side has no path for.
 
 - **Fluids animate, stand at the right height, and turn their surface with the flow; it is still not the
   game's surface.** See "The fluid faces" above: a fluid's faces sample the game's atlas like everything

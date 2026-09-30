@@ -255,11 +255,17 @@ mod tests {
                 // minification per fragment, because wgpu will not put both behaviours in one sampler. See
                 // `atlas_magnify_sampler` in `wgpu-mc`.
                 "@sampler_mc_block_atlas_magnify",
-                "@sampler_block_atlas_magnify"
+                "@sampler_block_atlas_magnify",
+                // And the third pair: a minified *animated* face, which wants neither of the others - see
+                // `atlas_animated_minified_sampler`. The list is exact and in order because the keys are the
+                // shader's own binding slots, so a new sampler has to be added here deliberately.
+                "@sampler_mc_block_atlas_animated",
+                "@sampler_block_atlas_animated"
             ],
             "the shader's own binding numbers are the keys of this map: the two atlases with their \
-             samplers, the same two with the magnifying samplers, the game's lightmap - which is the whole \
-             of the terrain's lighting - and the fog block the game's fog is written into"
+             samplers, the same two with the magnifying samplers, the same two again with the sampler a \
+             minified animated face needs, the game's lightmap - which is the whole of the terrain's \
+             lighting - and the fog block the game's fog is written into"
         );
 
         assert!(

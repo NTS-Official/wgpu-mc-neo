@@ -442,6 +442,25 @@ object WgpuNative {
 	external fun setCutoutLeaves(cutout: Boolean)
 
 	/**
+	 * The game's `textureFiltering` option, as `TextureFilteringMethod`'s own id: `NONE` 0, `RGSS` 1,
+	 * `ANISOTROPIC` 2. It decides the sampler's anisotropy and whether the shader runs the game's
+	 * rotated-grid supersampling, so it is pushed every frame rather than watched for changes.
+	 */
+	@JvmStatic
+	external fun setTextureFiltering(method: Int)
+
+	/**
+	 * The dimension's `CardinalLighting`: six per-face brightness multipliers, in `Direction`'s own order -
+	 * west, east, down, up, north, south.
+	 *
+	 * **That is not the order the game's record lists them in** (`down, up, north, south, west, east`), so
+	 * the caller does the mapping. See [dev.birb.wgpu.BlockCache] and `setCardinalLighting` on the Rust
+	 * side for what the six are for and why the sides are the same in both tables.
+	 */
+	@JvmStatic
+	external fun setCardinalLighting(west: Float, east: Float, down: Float, up: Float, north: Float, south: Float)
+
+	/**
 	 * The window mode the renderer's setting names, as the index of its variant - `0` exclusive
 	 * fullscreen, `1` borderless, `2` off.
 	 *

@@ -89,6 +89,68 @@ public final class AnimationSprites {
         );
     }
 
+    /**
+     * The lava sprites, named as literals because unlike the fire there is no constant to point at.
+     *
+     * <p><b>A diagnostic, and it exists to answer one question</b>: whether the lava shimmer is the
+     * animation advancing, or something that survives it. Every level-of-detail explanation has been
+     * measured and eliminated - an offset of {@code -5}, a per-sprite floor, and a bias that clamps every
+     * animated face at level 0 all reached these faces (counters, not reasoning) and the lava pulsed
+     * through all three. Level 0 is full resolution and holds no average at all, so either the fault is not
+     * the mip chain, or the clamp is not reaching the lava after all.
+     *
+     * <p>Holding the animation still separates those two. A still lava that pulses is not the animation; a
+     * still lava that stops has been the animation all along.
+     *
+     * <p>Read only while {@link #lavaIsHeld} is on, which is off unless a player turns it on.
+     */
+    private static final class Fluids {
+        private static final Set<Identifier> SPRITES = Set.of(
+            Identifier.withDefaultNamespace("block/lava_flow"),
+            Identifier.withDefaultNamespace("block/lava_still")
+        );
+    }
+
+    /** Whether a sprite is one of the two the lava is made of. See {@link #Fluids}. */
+    public static boolean isLava(SpriteContents sprite) {
+        return sprite != null && Fluids.SPRITES.contains(sprite.name());
+    }
+
+    /**
+     * Whether the lava animation is being held still, which is the `WGPU_MC_HOLD_LAVA_STILL` environment
+     * variable.
+     *
+     * <p>An environment variable rather than one of the renderer's own settings because this is a
+     * one-answer diagnostic: it is switched on for a single run, that run says whether the shimmer is the
+     * animation, and it is never switched on again. A setting would put it in front of every player and into
+     * the config schema for the life of the project, which is the wrong weight for a question asked once.
+     * The environment is also what a launch configuration can set without a code change, and it reaches the
+     * client through Gradle's own process.
+     *
+     * <p>Read at the atlas tick with the other freeze answer, so both are asked at the same moment and
+     * neither is cached.
+     */
+    public static boolean lavaIsHeld() {
+        boolean held = System.getenv("WGPU_MC_HOLD_LAVA_STILL") != null;
+
+        // **Said once, because a diagnostic that silently fails to engage is worse than none**: the run
+        // would show a still-shimmering lava and the reading would be "not the animation", when the truth
+        // was that the variable never reached the client process. Gradle starts the game in a child, so
+        // whether the environment arrives is a real question and not an assumption.
+        if (!REPORTED.getAndSet(true)) {
+            LOGGER.info("wgpu: the lava animation is {}", held ? "held still (diagnostic on)" : "running (diagnostic off)");
+        }
+
+        return held;
+    }
+
+    /** Whether {@link #lavaIsHeld} has said which way it answered. */
+    private static final java.util.concurrent.atomic.AtomicBoolean REPORTED =
+        new java.util.concurrent.atomic.AtomicBoolean();
+
+    private static final org.slf4j.Logger LOGGER =
+        org.slf4j.LoggerFactory.getLogger("wgpu-mc/lava-diagnostic");
+
     private AnimationSprites() {
     }
 

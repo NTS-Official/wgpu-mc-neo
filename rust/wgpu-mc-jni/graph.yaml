@@ -51,6 +51,8 @@ pipelines:
         9: "@fog_environment"
         10: "@sampler_mc_block_atlas_magnify"
         11: "@sampler_block_atlas_magnify"
+        12: "@sampler_mc_block_atlas_animated"
+        13: "@sampler_block_atlas_animated"
       1: "@bg_ssbo_chunks"
     immediates:
       0: "@pc_section_position"
@@ -81,6 +83,8 @@ pipelines:
         9: "@fog_environment"
         10: "@sampler_mc_block_atlas_magnify"
         11: "@sampler_block_atlas_magnify"
+        12: "@sampler_mc_block_atlas_animated"
+        13: "@sampler_block_atlas_animated"
       1: "@bg_ssbo_chunks"
     immediates:
       0: "@pc_section_position"
@@ -124,6 +128,8 @@ pipelines:
         9: "@fog_environment"
         10: "@sampler_mc_block_atlas_magnify"
         11: "@sampler_block_atlas_magnify"
+        12: "@sampler_mc_block_atlas_animated"
+        13: "@sampler_block_atlas_animated"
       1: "@bg_ssbo_chunks"
     immediates:
       0: "@pc_section_position"

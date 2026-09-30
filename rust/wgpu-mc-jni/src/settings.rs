@@ -216,26 +216,23 @@ fn no_lod_bias() -> FloatSetting {
         min: -4.0,
         max: 4.0,
         step: 0.5,
-        // **0.0, the neutral value, and it is back to being the default because the thing `-4` was
-        // calibrated against no longer exists.**
+        // **0.0, the neutral value, and the reading of `-4` has since been repeated and still holds.**
         //
-        // The history is worth keeping because it is the reason this setting is under suspicion rather than
-        // settled. A player's runs reported that at `-4` the fluid shimmer was gone and at `0` it was there,
-        // and that is a *level* the sampler is choosing wrongly with a bias cancelling it - not a preference
-        // about sharpness. But `-4` was measured with the sampler this renderer happened to have at the
-        // time: `Nearest` magnification and, because wgpu will not have both, no anisotropic filtering. That
-        // sampler is gone - the terrain now takes the game's own, all three filters linear and anisotropy
-        // 16 - so the number is a measurement of one configuration being used to describe another.
+        // It was reset to zero on the argument that `-4` had been calibrated against a sampler this
+        // renderer no longer has - `Nearest` magnification and, because wgpu will not have both, no
+        // anisotropic filtering, since replaced by the game's own sampler, all three filters linear and
+        // anisotropy 16. On that argument the number was a measurement of one configuration being used to
+        // describe another. **The argument was reasonable and is now settled the other way: a player moved
+        // this setting between `-4` and `0` in one session, on the current build, and reported the fluid
+        // shimmer gone at `-4` and present at `0`.** The sampler changed and the answer did not.
         //
-        // **What it was compensating for was never found**, and two things make a global shift the wrong
-        // shape of answer whatever it was. It moves every surface, including the ones that are already
-        // correct - which is what a distant moire is. And the atlas it applies to is not a fixed size: the
-        // game's stitcher packs `blocks.png` at 2048x2048 with 5 mip levels in one run and 1024x1024 with 3
-        // in the next, so one constant cannot even mean the same thing twice.
-        //
-        // So this stays a diagnostic: it is the instrument that showed the level is being chosen too
-        // coarse, and the fix belongs per-sprite, where the sprite's own texel size is known. See
-        // `registerSprite`.
+        // So the level the sampler picks **is** too coarse for a moving sprite by about four steps, and the
+        // two objections above still stand: a global shift moves surfaces that were already correct - which
+        // is the distant moire - and the atlas it applies to is not a fixed size between runs. The fix
+        // belongs per-sprite, where the sprite's own texel size is known; see
+        // `wgpu_mc::mc::block::sprite_level_floor` and `LEVELS_OF_DETAIL_KEPT`, which is four for exactly
+        // that reason. This stays the instrument that showed it, and it also stays a working answer for
+        // anyone who wants it: `-4` is reachable and does what it says.
         value: 0.0,
     }
 }

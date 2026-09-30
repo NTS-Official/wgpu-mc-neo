@@ -71,6 +71,10 @@ pub struct BlockModelFace {
     pub vertices: [BlockMeshVertex; 4],
     pub normal: Vec3,
     pub tint_index: i32,
+    /// **Whether the game shades this face by its direction.** See [`FaceData::shade`] - this is the same
+    /// flag carried to the baker, which is where it becomes a brightness: a face with it off is drawn at
+    /// `cardinalLighting.up()` rather than at its own direction's value.
+    pub shade: bool,
     /// The ten bits the vertex format reserves per vertex for an animated texture. See
     /// [`crate::render::pipeline::UV_GAME_ATLAS`]: the one bit that carries anything says this face's
     /// UVs are in the game's own atlas rather than in this side's copy of its sprite.
@@ -513,6 +517,17 @@ pub static FACES_FORCED_OPAQUE: std::sync::atomic::AtomicU64 = std::sync::atomic
 /// fluids and the fire, or half the game's sprites.
 pub static FACES_ANIMATED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// **How many faces got a non-zero level-of-detail floor**: the animated ones whose sprite reported a size
+/// deep enough to floor at all.
+///
+/// Read against [`FACES_ANIMATED`] because a floor of zero is not a weaker floor - it is *no* floor, and no
+/// floor is exactly the shimmer this exists to remove. The two are indistinguishable from the picture, so
+/// the pair is what tells them apart: **animated faces with none floored here means the sprite size never
+/// arrived**, and the two numbers being equal means it arrived and the floor is simply not what helps.
+///
+/// That distinction is the whole reason this is a second counter rather than a line of reasoning.
+pub static FACES_LOD_FLOORED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// The two counts of [`FACES_GAME_ATLAS`], read and not reset - they are a running total for the
 /// session, because "how many" is the question and a per-second rate would need a reader to integrate
 /// it in their head.
@@ -603,6 +618,13 @@ struct FaceData {
     uv: UV,
     uv_flags: u32,
     tint_index: i32,
+    /// **Whether the game shades this face by its direction**, which is `quad.materialInfo().shade()`.
+    ///
+    /// The game's lighter is `scaleColor(shade ? cardinalLighting.byFace(direction) : cardinalLighting.up())`
+    /// and this side had only the first branch: the fold here is the model's own flag, read from the face's
+    /// `"shade"` key, and it is `true` unless the model says otherwise. `BlockModelLighter` is where it is
+    /// read; see `face_brightness` for what it decides.
+    shade: bool,
     layer: RenderLayer,
     cull: Option<Direction>,
 }
@@ -640,7 +662,19 @@ struct FaceData {
 ///
 /// `None` means nothing was registered for the sprite - including every sprite this side draws from its own
 /// atlas - and that answers zero, which is no floor.
-fn sprite_level_floor(level_cap: Option<u32>, animated: bool) -> u32 {
+pub fn sprite_level_floor_for(level_cap: Option<u32>, animated: bool) -> u32 {
+    if !crate::mc::chunk::LOD_FLOOR {
+        return 0;
+    }
+
+    sprite_level_floor(level_cap, animated)
+}
+
+/// The arithmetic itself, which [`sprite_level_floor_for`] gates behind `LOD_FLOOR`.
+///
+/// `pub(crate)` so a test can ask it directly: whether the floor is *applied* is a flag, and whether the
+/// arithmetic is right is a separate question that should not change with it.
+pub(crate) fn sprite_level_floor(level_cap: Option<u32>, animated: bool) -> u32 {
     // Only an animated sprite has anything to lose by being sampled too coarsely: a still sprite's levels
     // are a consistent pyramid, and flooring those would be sharpening nobody asked for - the moiré this
     // whole thing was scoped down from once already.
@@ -657,7 +691,21 @@ fn sprite_level_floor(level_cap: Option<u32>, animated: bool) -> u32 {
 
 /// How many levels above the end of its chain a sprite is still recognisably itself. See
 /// [`sprite_level_floor`].
-const LEVELS_OF_DETAIL_KEPT: u32 = 2;
+///
+/// **Four, and the number is a measurement rather than a derivation.** It was two - a 32-texel sprite
+/// flooring at level 3, a 4x4 image - and a player reported the lava's bright spots still stretched, which
+/// is what a coarse level does to a moving sprite. The setting that had already answered this question was
+/// an `atlas_lod_bias` of `-4`: four levels finer, which on a chain as short as a sprite's own reaches
+/// **level 0** for almost every surface. That same player confirmed the shimmer gone at `-4` and present at
+/// `0` in one session, so four is the depth that was measured to work - and this puts that depth where it
+/// belongs, per sprite, rather than shifting the whole world.
+///
+/// What it costs is sharpening on a *distant* animated sprite: a 32-texel sprite drawn small is sampled
+/// from level 1 rather than from the level that matches its footprint. That is the trade that was chosen,
+/// and it is bounded - a still sprite keeps a floor of zero, because `sprite_level_floor` answers zero for
+/// anything the game does not animate. So terrain does not sharpen and the moire a global `-4` caused
+/// cannot come back this way.
+const LEVELS_OF_DETAIL_KEPT: u32 = 4;
 
 fn face_data(
     tex: &schemas::models::ElementFace,
@@ -697,7 +745,22 @@ fn face_data(
             // **How far this face may be pushed down the chain**, which is the floor the level-of-detail
             // offset was standing in for. See `UV_LOD_FLOOR_SHIFT` for why it is a floor and not an offset,
             // and `sprite_level_floor` for the arithmetic.
-            flags |= lod_floor_bits(sprite_level_floor(level_cap, animated));
+            //
+            // `LOD_FLOOR` off writes a zero instead, which is the state before the floor existed: every one
+            // of these faces then samples at whatever level the sampler picks for itself. It is the
+            // comparison that says whether the floor is the wrong depth or never arrives - and it is the only
+            // way to put `atlas_lod_bias` back in sole charge, which is the run that first answered this.
+            let floor = if crate::mc::chunk::LOD_FLOOR {
+                sprite_level_floor(level_cap, animated)
+            } else {
+                0
+            };
+
+            if floor != 0 {
+                FACES_LOD_FLOORED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+
+            flags |= lod_floor_bits(floor);
 
             (get_game_atlas_uv(uv, tex.rotation, rect), flags)
         }
@@ -738,6 +801,7 @@ fn face_data(
         uv,
         uv_flags,
         tint_index: tex.tint_index,
+        shade: tex.shade,
         layer: atlas.sprite_layer(&texture).unwrap_or(RenderLayer::Solid),
         // Rotated as Minecraft rotates it, so the direction that comes out is the neighbour this face
         // now touches rather than the one the model file was written against. The culling loop tests
@@ -1440,6 +1504,60 @@ impl ModelMesh {
                 // nothing about.
                 let model_layer = layer.unwrap_or(RenderLayer::Solid);
 
+                // **The whole resolved grass model, dumped once per file.**
+                //
+                // This is the last piece of authoritative data in a long search that was never actually
+                // read: every reading of the grass model came from the *demo* asset directory, while the
+                // runtime resolves whatever the resource provider has - and Minecraft 26.1 *generates* its
+                // block models in code (`BlockModelGenerators#createGrassBlocks`), so a shipped
+                // `grass_block.json` is not evidence about what is loaded here.
+                //
+                // What it has to settle is one fact the face report raised and could not answer: a grass
+                // block's *top* resolves to two quads for one sprite, one with `tintindex` and one without.
+                // A player's `TINT` diagnostic showed that pair is real (`the top went grey`), so something
+                // in the chain produces both - this prints every element, every face, every tint index and
+                // the whole `textures` map, which is more than enough to say what.
+                if model_resource_path.0.contains("grass_block") {
+                    let mut dump = format!("wgpu-mc: resolved {model_resource_path}:");
+
+                    if let Some(textures) = model.textures.as_ref() {
+                        let mut named = textures
+                            .iter()
+                            .map(|(key, value)| format!("{key}={}", value.0))
+                            .collect::<Vec<_>>();
+                        named.sort();
+                        dump.push_str(&format!(" textures [{}]", named.join(", ")));
+                    }
+
+                    match model.elements.as_ref() {
+                        Some(elements) => {
+                            for (index, element) in elements.iter().enumerate() {
+                                let mut faces = element
+                                    .faces
+                                    .iter()
+                                    .map(|(direction, face)| {
+                                        format!(
+                                            "{direction:?}({} tint={})",
+                                            face.texture.0, face.tint_index
+                                        )
+                                    })
+                                    .collect::<Vec<_>>();
+                                faces.sort();
+
+                                dump.push_str(&format!(
+                                    " | element {index} {:?}->{:?}: {}",
+                                    element.from,
+                                    element.to,
+                                    faces.join(" ")
+                                ));
+                            }
+                        }
+                        None => dump.push_str(" | no elements of its own (all inherited)"),
+                    }
+
+                    log::info!("{dump}");
+                }
+
                 // The variant's own rotation and its `uvlock`, which belong to *this* model property
                 // and are applied to its faces before they are merged with the others'. A multipart
                 // model is several properties, each with its own rotation - and the mesh of a state
@@ -1455,6 +1573,40 @@ impl ModelMesh {
                 // `resolve_model` for how a model gets here resolved at all.
                 if let Some(reference) = unresolved_texture(&model) {
                     return Err(MeshBakeError::UnresolvedTextureReference(reference));
+                }
+
+                // **A reference that got past the check above and will be dropped as a sprite later.**
+                //
+                // It should not happen - `unresolved_texture` walks the `textures` map and every face of
+                // every element - and the run that found this reported `6 face(s) were dropped for a sprite
+                // the atlas does not have: minecraft:all`, which is exactly the shape of it: a `#reference`
+                // reached the atlas as a sprite *named* `#reference` and was dropped there, one layer below
+                // the guard written to catch it.
+                //
+                // The guard is checked here rather than in `face_data` because this is the last place the
+                // model's own name is known: `face_data` is handed a face and nothing else, so a log from
+                // there could say `#all` and not which file left it unresolved.
+                if let Some(textures) = model.textures.as_ref() {
+                    for (key, value) in textures.iter() {
+                        if value.reference().is_some() {
+                            log::warn!(
+                                "wgpu-mc: {model_resource_path} still names the texture {key} as {value:?} \
+                                 after resolution; faces sampling it will be dropped as a sprite called that"
+                            );
+                        }
+                    }
+                }
+
+                for element in model.elements.iter().flatten() {
+                    for (direction, face) in element.faces.iter() {
+                        if face.texture.reference().is_some() {
+                            log::warn!(
+                                "wgpu-mc: {model_resource_path}'s {direction:?} face still samples {} after \
+                                 resolution; it will be dropped as a sprite called that",
+                                face.texture.0
+                            );
+                        }
+                    }
                 }
 
                 if let Some(textures) = model.textures {
@@ -1611,6 +1763,7 @@ impl ModelMesh {
                                 vertices: sprite_vertices(direction, &p, face.uv),
                                 normal: rotation.direction(direction.normal()),
                                 tint_index: face.tint_index,
+                                shade: face.shade,
                                 uv_flags: face.uv_flags,
                                 layer: model_layer.stronger(face.layer),
                                 cull: face.cull,
@@ -2493,6 +2646,71 @@ mod texture_resolution_tests {
             .expect("the face the fixture wrote")
     }
 
+    /// **A face that says nothing about `shade` is shaded**, which is the game's own default and the
+    /// assumption every vanilla model relaxes only when it means to.
+    ///
+    /// The flag decides whether the face is drawn at its direction's `CardinalLighting` value or at `up`,
+    /// so getting the default backwards would brighten every side in the world - which is the shape of a
+    /// report this search started from, and the reason the default is worth pinning rather than assuming.
+    #[test]
+    fn a_face_that_does_not_mention_shade_is_shaded() {
+        let model = parse_model(one_face_model("minecraft:block/stone")).expect("a readable model");
+
+        assert!(
+            north_face(&model).shade,
+            "an absent `shade` key is `true`: the game shades such a face by its direction"
+        );
+    }
+
+    /// And a model that turns it off is read as off, which is the half that did not exist before the
+    /// schema gained the field - every face used to be shaded whatever the file said.
+    #[test]
+    fn a_face_that_turns_shading_off_is_read_as_off() {
+        let json = Box::leak(
+            r##"{
+                "textures": { "all": "minecraft:block/stone" },
+                "elements": [
+                    {
+                        "from": [0, 0, 0],
+                        "to": [16, 16, 16],
+                        "faces": { "north": { "texture": "#all", "shade": false } }
+                    }
+                ]
+            }"##
+            .to_string()
+            .into_boxed_str(),
+        );
+
+        let model = parse_model(json).expect("a readable model");
+        assert!(!north_face(&model).shade, "the model wrote `shade: false`");
+    }
+
+    /// **And the flag reaches the brightness**, which is the whole point of reading it: a north face with
+    /// shading off is drawn at `up` and not at north's own value.
+    ///
+    /// Parsing the key correctly and then not using it is the failure this catches, and it is a real shape
+    /// of one - the flag is read here, carried on `FaceData` and `BlockModelFace`, and consumed three
+    /// hundred lines away in another file.
+    #[test]
+    fn the_parsed_flag_is_what_the_baker_brightens_by() {
+        let north = Direction::North;
+        let shaded = crate::mc::block::face_brightness(north, true);
+        let unshaded = crate::mc::block::face_brightness(north, false);
+
+        assert!(
+            (shaded - CARDINAL_LIGHTING_DEFAULT[north as usize]).abs() < 1.0 / 1000.0,
+            "a shaded face takes its own direction's value"
+        );
+        assert!(
+            (unshaded - CARDINAL_LIGHTING_DEFAULT[UP]).abs() < 1.0 / 1000.0,
+            "and an unshaded one takes up's, which is the game's own fallback"
+        );
+        assert_ne!(
+            shaded, unshaded,
+            "the two have to differ or the flag does nothing on a north face"
+        );
+    }
+
     /// A model with **no parent** still goes through the resolver, which is what rewrites the `#all`
     /// in its faces. Skipping that - which is what the early return did - left the face sampling a
     /// sprite called `#all`: not in the atlas, so the face was dropped and the block was drawn with
@@ -2693,6 +2911,148 @@ pub fn cutout_leaves() -> bool {
 /// settings path, and the re-bake is asked for separately. See `WgpuNative.setCutoutLeaves`.
 pub fn set_cutout_leaves(cutout: bool) {
     CUTOUT_LEAVES.store(cutout, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// **The game's `CardinalLighting` for the dimension being baked: six per-face brightness multipliers.**
+///
+/// `CardinalLighting` is a record of six floats - down, up, north, south, west, east - and the game keeps
+/// two of them: `DEFAULT` (`0.5, 1.0, 0.8, 0.8, 0.6, 0.6`) and `NETHER` (`0.9, 0.9, 0.8, 0.8, 0.6, 0.6`).
+/// Which one applies is `ClientLevel#cardinalLighting`, so it is a property of the **dimension** - a *biome*
+/// has no say in it, and there are only these two tables in the game.
+///
+/// This side used the overworld's six hardcoded, which is right in the overworld and wrong in the nether:
+/// the two differ **only** at up and down (1.0/0.5 against 0.9/0.9), so a nether ceiling came out twice as
+/// dark as it should and a nether floor half as dark. The sides are the same six in both tables, which is
+/// why nothing about a side ever looked wrong.
+///
+/// **One `AtomicU64` rather than six atomics**, so a bake reads a whole table and cannot catch it half
+/// replaced. Each field is ten bits of `1/1024`, which is far finer than the eight bits of colour these end
+/// up scaling - `1/64` was tried and rounded `0.8` to `0.796875`, which the test beside this caught.
+///
+/// **Zero means "the JVM has not said", and that is why the initialiser is not the overworld's table.**
+///
+/// The obvious design is to initialise this to the packed default and let a bake read it unconditionally.
+/// That was tried and it does not work: `pack_cardinal_lighting` cannot be evaluated in a `static`
+/// initialiser here - the const evaluator refused the floating-point arithmetic, the word stayed zero, and
+/// the only symptom was that every face came out black, which is the *same* symptom as a wrong bit layout.
+///
+/// So the packing stays a runtime function and zero is a sentinel, which costs nothing: **no real table can
+/// pack to zero**, because every entry of every table the game has is well above `1/1024` and a field of
+/// zeroes is a brightness of zero. [`cardinal_lighting`] therefore reads a zero word as "nothing has been
+/// pushed" and answers the overworld's table, which is exactly what this renderer drew before the nether's
+/// existed.
+static CARDINAL_LIGHTING: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The overworld's six multipliers, **in `Direction`'s own order** - west, east, down, up, north, south,
+/// which is the order the enum's discriminants use, so [`face_brightness`] can index the table with the
+/// direction directly. The mapping from the game's reading order is spelled out in the comments, because
+/// the two orders are not the same and an enum-indexed table is exactly where that would go unnoticed.
+pub const CARDINAL_LIGHTING_DEFAULT: [f32; 6] = [
+    0.6, // west
+    0.6, // east
+    0.5, // down
+    1.0, // up
+    0.8, // north
+    0.8, // south
+];
+
+/// The nether's six, in the same order. `CardinalLighting.NETHER`, which differs from the overworld's **only
+/// at up and down** - see [`CARDINAL_LIGHTING`].
+pub const CARDINAL_LIGHTING_NETHER: [f32; 6] = [
+    0.6, // west
+    0.6, // east
+    0.9, // down
+    0.9, // up
+    0.8, // north
+    0.8, // south
+];
+
+/// The index of `up` in a packed table, which is what a face with shading turned off is drawn at.
+const UP: usize = 3;
+
+/// Packs six multipliers into the word [`CARDINAL_LIGHTING`] holds. See there for the encoding.
+///
+/// A runtime function rather than a `const fn`, because a `const` version could not be evaluated in
+/// [`CARDINAL_LIGHTING`]'s initialiser at all - see there. The round-trip test beside this pins the
+/// encoding, which is the part a hand-written bit layout gets wrong.
+///
+/// **`as u64` truncates, so the `+ 0.5` is rounding rather than decoration** - `0.6 * 1000.0` is not exact in
+/// binary floating point and would otherwise step down to `599`. The width is the other half, and it is the
+/// half that caught this out twice.
+/// **`1/1000`, and the round number is the point: `1.0` has to fit in ten bits.**
+///
+/// This started at `1/1024` because a power of two felt right for a bit field, and it is the one scale that
+/// *cannot* work: `1.0 * 1024` is `1024`, which is `2^10` and needs **eleven** bits, so the top entry of the
+/// table overflowed its field. The overflow did not corrupt that field - it landed one field up, where the
+/// `|=` for the *next* multiplier wrote over it - so the visible symptom was a single field reading zero,
+/// which is a face at full brightness drawn black and nothing else wrong anywhere.
+///
+/// `1/1000` keeps every value the game has (and every value up to one) inside ten bits, with a hundredth of
+/// the precision of the eight-bit colour these end up scaling. `0.6`, `0.8` and `1.0` all land exactly.
+///
+/// The `+ 0.5` is rounding rather than decoration: `as u64` truncates, so `0.6 * 1000.0` - which is not exact
+/// in binary floating point - would otherwise step down to `599`.
+fn pack_cardinal_lighting(values: [f32; 6]) -> u64 {
+    let mut packed = 0u64;
+    let mut index = 0;
+
+    while index < 6 {
+        let value = if values[index] > 1.0 {
+            1.0
+        } else {
+            values[index]
+        };
+
+        packed |= ((value * 1000.0 + 0.5) as u64) << (index * 10);
+        index += 1;
+    }
+
+    packed
+}
+
+/// The six multipliers [`CARDINAL_LIGHTING`] currently holds, or the overworld's when the JVM has not pushed
+/// a table. See there for why zero is the sentinel.
+pub fn cardinal_lighting() -> [f32; 6] {
+    let packed = CARDINAL_LIGHTING.load(std::sync::atomic::Ordering::Relaxed);
+
+    if packed == 0 {
+        return CARDINAL_LIGHTING_DEFAULT;
+    }
+
+    std::array::from_fn(|index| ((packed >> (index * 10)) & 0x3ff) as f32 / 1000.0)
+}
+
+/// Sets [`CARDINAL_LIGHTING`]. Called by the JVM once per bake, with the dimension's own table.
+///
+/// Read while a face is baked, so a dimension change has to reach a re-bake - which it does: the bake
+/// happens when the block states are cached, and that is per reload, and a dimension change re-offers the
+/// sections anyway.
+pub fn set_cardinal_lighting(values: [f32; 6]) {
+    CARDINAL_LIGHTING.store(
+        pack_cardinal_lighting(values),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// **The brightness multiplier for one face**, which is the game's own choice:
+/// `quad.materialInfo().shade() ? cardinalLighting.byFace(direction) : cardinalLighting.up()`.
+///
+/// [`face_shade`] is the overworld half of this and stays as the fallback and as the table of record; this
+/// is what a bake calls, because it is the one that knows about the dimension.
+///
+/// `shade` is the model's per-face material flag. **This side has no way to read it**: it lives in
+/// `BakedQuad#materialInfo`, and the model schema this renderer parses (`minecraft-assets`) has no such
+/// field - see the README's known gaps. Every vanilla baked model answers `true`, so the missing half only
+/// affects a model that turns shading off, and it does so in the *dark* direction: such a face is drawn at
+/// `up()` rather than at its direction's value.
+pub fn face_brightness(dir: Direction, shade: bool) -> f32 {
+    let table = cardinal_lighting();
+
+    if shade {
+        table[dir as usize]
+    } else {
+        table[UP]
+    }
 }
 
 /// Which atlas a face belongs to: the game's own rectangle for its sprite, or `None` for this side's.
@@ -3169,5 +3529,94 @@ mod rotation_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod cardinal_lighting_tests {
+    use super::*;
+
+    /// The index of `down` in a packed table, which only a test needs: nothing in the bake reaches for a
+    /// direction by index except `up`. Kept beside the test that uses it rather than beside `UP`, because a
+    /// constant only a test reads is dead code everywhere else and `-D warnings` says so.
+    const DOWN: usize = 2;
+
+    /// The precision of the packed table: one step of `1/1000` is the finest a field can hold, so this is
+    /// the tolerance a round trip can be asserted to. A named constant rather than the division it stands
+    /// for, because `1.0 / 1000.0` as a literal expression is a *compile-time* division by an integer that
+    /// the compiler reads as zero.
+    const TOLERANCE: f32 = 0.001;
+
+    /// **The six values survive the packing**, which is the part a hand-written bit layout can get wrong.
+    ///
+    /// This is the test that should have existed before the table did: a packing bug shows as a face
+    /// brightness of zero or of the wrong direction's value, and the picture says "dark" or "slightly off"
+    /// rather than naming the field.
+    #[test]
+    fn the_six_multipliers_round_trip() {
+        for table in [CARDINAL_LIGHTING_DEFAULT, CARDINAL_LIGHTING_NETHER] {
+            let packed = pack_cardinal_lighting(table);
+
+            let read_back: [f32; 6] =
+                std::array::from_fn(|i| ((packed >> (i * 10)) & 0x3ff) as f32 / 1000.0);
+
+            for (index, (asked, got)) in table.iter().zip(read_back.iter()).enumerate() {
+                assert!(
+                    (asked - got).abs() < TOLERANCE,
+                    "field {index}: packed {asked} and read back {got}"
+                );
+            }
+        }
+    }
+
+    /// And the per-direction answer is the one the game gives, in `Direction`'s own order.
+    #[test]
+    fn each_direction_gets_its_own_multiplier() {
+        set_cardinal_lighting(CARDINAL_LIGHTING_DEFAULT);
+
+        for (direction, expected) in [
+            (Direction::West, 0.6),
+            (Direction::East, 0.6),
+            (Direction::Down, 0.5),
+            (Direction::Up, 1.0),
+            (Direction::North, 0.8),
+            (Direction::South, 0.8),
+        ] {
+            assert!(
+                (face_brightness(direction, true) - expected).abs() < TOLERANCE,
+                "{direction:?} is {} and the game says {expected}",
+                face_brightness(direction, true)
+            );
+        }
+    }
+
+    /// **The nether's table differs from the overworld's only at up and down**, which is why no *side* ever
+    /// looked wrong in either dimension and why a nether ceiling and floor did.
+    #[test]
+    fn only_the_vertical_faces_differ_between_the_dimensions() {
+        assert_eq!(CARDINAL_LIGHTING_DEFAULT[DOWN], 0.5);
+        assert_eq!(CARDINAL_LIGHTING_NETHER[DOWN], 0.9);
+        assert_eq!(CARDINAL_LIGHTING_DEFAULT[UP], 1.0);
+        assert_eq!(CARDINAL_LIGHTING_NETHER[UP], 0.9);
+
+        for face in [0, 1, 4, 5] {
+            assert_eq!(
+                CARDINAL_LIGHTING_DEFAULT[face], CARDINAL_LIGHTING_NETHER[face],
+                "the sides are the same in both tables, which is why this took so long to notice"
+            );
+        }
+    }
+
+    /// A face with shading turned off is drawn at `up`, which is the game's own fallback.
+    #[test]
+    fn an_unshaded_face_uses_up() {
+        set_cardinal_lighting(CARDINAL_LIGHTING_NETHER);
+
+        // The nether is the table that makes this visible: `up` is 0.9 there and the sides are 0.6.
+        assert!((face_brightness(Direction::West, false) - 0.9).abs() < TOLERANCE);
+        assert!((face_brightness(Direction::West, true) - 0.6).abs() < TOLERANCE);
+
+        // Left as the overworld for whatever runs next.
+        set_cardinal_lighting(CARDINAL_LIGHTING_DEFAULT);
     }
 }

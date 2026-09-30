@@ -63,22 +63,32 @@ public abstract class TextureAtlasMixin {
         )
     )
     private void wgpu_mc$tickUnlessFrozen(SpriteContents.AnimationState state) {
-        if (!wgpu_mc$firesAreFrozen(state)) {
+        if (!wgpu_mc$spriteIsFrozen(state)) {
             state.tick();
         }
     }
 
-    /** Whether this animation belongs to a fire sprite, and is to be held still. */
+    /**
+     * Whether this animation belongs to a fire sprite or a lava sprite, and is to be held still.
+     *
+     * <p>Two questions with two switches, and they are not the same kind of switch. The fire one is a
+     * player's option - the fire animates in three places and only one of them is this renderer's, so the
+     * atlas is what has to stop. The lava one is a diagnostic: it answers whether the shimmer on flowing
+     * lava is the animation advancing. See {@link AnimationSprites#lavaIsHeld}.
+     *
+     * <p>A state this side never saw created answers `null` rather than a guess, in both cases: freezing the
+     * wrong sprite would be a still picture somewhere in the world that nothing explains.
+     */
     @Unique
-    private static boolean wgpu_mc$firesAreFrozen(SpriteContents.AnimationState state) {
+    private static boolean wgpu_mc$spriteIsFrozen(SpriteContents.AnimationState state) {
         try {
-            if (!FireAnimation.firesAreFrozen()) {
-                return false;
+            SpriteContents sprite = AnimationSprites.spriteOf(state);
+
+            if (FireAnimation.firesAreFrozen() && AnimationSprites.isFire(sprite)) {
+                return true;
             }
 
-            // A state this side never saw created answers `null` rather than a guess: freezing the wrong
-            // sprite would be a still picture somewhere in the world that nothing explains.
-            return AnimationSprites.isFire(AnimationSprites.spriteOf(state));
+            return AnimationSprites.lavaIsHeld() && AnimationSprites.isLava(sprite);
         } catch (Throwable failure) {
             if (!wgpu_mc$reportedTraceFailure) {
                 wgpu_mc$reportedTraceFailure = true;

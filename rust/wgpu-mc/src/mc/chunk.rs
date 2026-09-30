@@ -20,7 +20,7 @@ use crate::mc::block::{BlockModelFace, ChunkBlockState, FaceFlags, ModelMesh, ga
 use crate::mc::direction::Direction;
 use crate::mc::resource::ResourcePath;
 use crate::render::atlas::Atlas;
-use crate::render::pipeline::{BLOCK_ATLAS, UV_GAME_ATLAS, Vertex};
+use crate::render::pipeline::{BLOCK_ATLAS, UV_ANIMATED, UV_GAME_ATLAS, Vertex};
 use crate::texture::UV;
 
 pub const CHUNK_WIDTH: usize = 16;
@@ -1266,6 +1266,42 @@ fn read_vertex(bytes: &[u8]) -> Option<(glam::Vec3, glam::Vec3)> {
     Some((position, normal))
 }
 
+/// **Whether a block's biome tint is multiplied in: `false` is a diagnostic, not a setting.**
+///
+/// A grass block's side is `texture * tint * light`, and the tint is the biome's colour - so the side of one
+/// grass block is the one place all three are visible at once, and a player measured it in both renderers.
+/// The three channels of the difference were **not proportional** (`R 1.43, G 1.65, B 0.93`), which rules out
+/// any single brightness: a shade, an ambient-occlusion term or a lightmap value moves all three together.
+///
+/// That leaves the tint and the texture sample, and this constant is how the first is switched off. With it
+/// `false` every face is baked untinted - so a grass side comes out the grey-green of the texture itself, and
+/// comparing *that* against the game answers the question the arithmetic could not: if the two agree, the
+/// tint is what differs; if they still do not, the texture being sampled is.
+///
+/// The tint is not simply dropped: `scale_rgb(color, color)` is the square, which is what doubling the tint
+/// would be - that was the first guess and the numbers do not support it, so this is written as a plain
+/// replacement with white and the original colour is left in the log by `helperGetBlockColor`.
+///
+/// `true` is the only correct value for a release.
+pub const TINT: bool = true;
+/// Whether a sprite's level-of-detail floor is applied, or the sampler's own choice is left alone.
+///
+/// **`false` is the state that existed before the floor and it is a *comparison*, not a leftover.**
+///
+/// The history is the reason it exists. A player's runs found the fluid shimmer gone at an `atlas_lod_bias`
+/// of `-4` and present at `0` - which says the sampler is choosing a level that is wrong for a moving
+/// sprite, and that a four-level shift cancels it. That bias was then reset to `0` for a reason that has
+/// since been fixed, and this side replaced it with a per-sprite floor: `bias = lod_bias - floor`, where
+/// `floor` is `log2(sprite texels) - 2` - also a negative shift, also large, but **not the same number**.
+///
+/// A player reported the shimmer's return, and the two candidates are "the floor is the right idea with the
+/// wrong depth" and "the floor does not reach the face at all". Turning it off separates them without a
+/// rebuild, and it also restores the `-4` setting to being the only bias in play - so the one run that
+/// answered this question the first time can be repeated.
+///
+/// `true` is the intended behaviour; see `vertex::uv_flags`' floor field for what it is for.
+pub const LOD_FLOOR: bool = false; // THE COMPARISON: sampling with no offset of ours at all
+
 /// The brightness vanilla bakes into a face's vertex colour, per direction.
 ///
 /// This is `CardinalLighting.DEFAULT` (`net.minecraft.world.level.CardinalLighting`): down 0.5, up
@@ -1275,16 +1311,15 @@ fn read_vertex(bytes: &[u8]) -> Option<(glam::Vec3, glam::Vec3)> {
 /// reaches the shader. A baker that leaves it out draws every side face at the brightness of a top
 /// one - the world reads as overexposed from the side, and nothing about the geometry says why.
 ///
-/// The game has a second table for the nether (`CardinalLighting.NETHER`, 0.9 for up *and* down);
-/// this path does not know which dimension it is baking for, so it uses the overworld's - see the
-/// README's known gaps.
+/// **This is the fluid path's half of it, and the block path no longer calls it**: a model face carries its
+/// own `shade` flag now (see [`crate::mc::block::BlockModelFace::shade`]) and goes through
+/// `face_brightness`, which reads the dimension's table and honours the flag. A fluid face has no model and
+/// no flag, so it keeps the shaded answer - which is what the game's own `FluidRenderer` does.
 fn face_shade(dir: Direction) -> f32 {
-    match dir {
-        Direction::Down => 0.5,
-        Direction::Up => 1.0,
-        Direction::North | Direction::South => 0.8,
-        Direction::West | Direction::East => 0.6,
-    }
+    // **The table, not the six numbers.** This used to be a `match` over the overworld's values, and the
+    // dimension's table now lives behind `face_brightness` - so a copy of the six here would be a second
+    // place the brightness could be wrong, which is exactly what the table was introduced to remove.
+    crate::mc::block::face_brightness(dir, true)
 }
 
 /// A face's colour with its red, green and blue bytes scaled by `factor`.
@@ -1583,10 +1618,25 @@ fn bake_layers<Provider: BlockStateProvider>(
                                 dir: Direction,
                                 color: u32| {
                 // The face's own share of the light, which is a property of the direction and not
-                // of where the block is: see `face_shade`. A face in the `any` bucket arrives with
-                // `Direction::Up` and is left at full brightness, which is what the game does for a
-                // model that turns shading off.
-                let color = scale_rgb(color, face_shade(dir));
+                // of where the block is: see `face_shade`.
+                //
+                // **And the model's own `shade` flag, which is the game's other branch.** `BlockModelLighter`
+                // is `scaleColor(quad.materialInfo().shade() ? cardinalLighting.byFace(direction) :
+                // cardinalLighting.up())`, and this side had only the first half until the flag was added to
+                // the vendored model schema: a face the model turns shading off for is drawn at `up`, not at
+                // its direction's value. `BlockModelFace::shade` is that flag, and `false` is the usual case
+                // for a cross-shaped plant.
+                //
+                // A face in the `any` bucket is the *other* way a model turns shading off - its variant has
+                // no direction to speak of - and it arrives here with `Direction::Up`, which is already the
+                // same answer, so the two agree rather than doubling up.
+                //
+                // `TINT` off replaces every block's biome tint with white. A player measured a grass block's
+                // side and the three channels of the difference were not proportional - which no single
+                // brightness can produce - so the two candidates are the tint and the texture sample, and
+                // only one of them can be switched off. See [`TINT`].
+                let color = if TINT { color } else { 0xffff_ffff };
+                let color = scale_rgb(color, crate::mc::block::face_brightness(dir, face.shade));
 
                 let baked_layer = &mut layers[if opaque_leaves {
                     crate::mc::block::FACES_FORCED_OPAQUE
@@ -2395,6 +2445,23 @@ struct FluidSprite {
     /// Where the game put the sprite - one frame of it - when the game animates it and the terrain pass
     /// has its atlas bound. Faces baked with those coordinates animate for free. See [`UV_GAME_ATLAS`].
     game: Option<[f32; 4]>,
+    /// Whether the game animates this sprite, which is what the shader's level-of-detail handling is scoped
+    /// to. Read from the sprite's `.mcmeta` alongside the rectangle, in the same call. See [`Self::flags`].
+    animated: bool,
+    /// **The coarsest level of the game's chain this sprite may be sampled from**, which is the floor the
+    /// shader applies and the reason the lava stops shimmering.
+    ///
+    /// **This field did not exist, and that is why the shimmer came back after it had been fixed.** The
+    /// block-model path takes all three answers out of `SpriteInAtlas` at once; the fluid path took two of
+    /// them - `rect` and `animated` - so `sprite_level_floor(None, true)` answered **zero**, the shader's
+    /// `bias` stayed at the setting's own value, and a fluid face returned to the sampler's automatic level
+    /// choice. Which is exactly what the `-4` offset used to stand in for.
+    ///
+    /// The order of events is worth keeping, because it is why the omission survived a fix that was measured
+    /// as working: setting `UV_ANIMATED` is what *enabled* the shader's floor branch for fluids, so it also
+    /// enabled the branch that reads this field. Before it the branch was dead and the missing field cost
+    /// nothing; after it, the field was the whole difference between a floor and none.
+    level_cap: Option<u32>,
 }
 
 impl FluidSprite {
@@ -2437,15 +2504,74 @@ impl FluidSprite {
         }
     }
 
-    /// Which atlas a face of this sprite is baked for. See [`UV_GAME_ATLAS`].
+    /// Which atlas a face of this sprite is baked for, and whether it moves. See [`UV_GAME_ATLAS`] and
+    /// `Vertex::uv_flags`' `UV_ANIMATED`.
+    ///
+    /// **`UV_ANIMATED` was missing here and that is the whole of a long search.** The block-model path sets
+    /// it from the sprite's `.mcmeta` (`face_data`), and the shader's level-of-detail floor, its
+    /// animated-minified sampler and its offset are all gated on `in.animated == 1u` - so every one of them
+    /// was inert for the fluids. Five separate changes to how a minified animated face is sampled were
+    /// measured as reaching the faces they were written for (counters, not reasoning) and none of them was
+    /// on the fluid path at all: this function answered `UV_GAME_ATLAS` alone, and a fluid with a game
+    /// rectangle was therefore indistinguishable from a *static* sprite on the game's atlas.
+    ///
+    /// The two are separate flags rather than one because they answer different questions - which texture,
+    /// and does it move - and the fluid case is the one where they come apart: a fluid with no game
+    /// rectangle is this side's frozen copy and does not move either.
     fn flags(&self) -> u32 {
-        if self.game.is_some() {
-            UV_GAME_ATLAS
-        } else {
-            0
+        let flags = match (self.game.is_some(), self.animated) {
+            (true, true) => UV_GAME_ATLAS | UV_ANIMATED,
+            (true, false) => UV_GAME_ATLAS,
+            _ => 0,
+        };
+
+        // **Counted here because nothing else counts these, and a player reported the lava shimmering
+        // again.** `FACES_ANIMATED` and `FACES_LOD_FLOORED` are the block-model path's counters and a fluid
+        // face never touches them, so "did the fluid get the animated flag" - the one fact the entire fluid
+        // shimmer fix rests on - was invisible in every log this renderer produces. A shader that is gated
+        // on `in.animated == 1u` and a bake that may or may not set it is a pair that has to be measured
+        // rather than reasoned about; this is the measurement.
+        if self.animated && self.game.is_some() {
+            FLUID_FACES_ANIMATED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+            // **And whether this face got a floor at all, which is the number that was silently zero.**
+            // `sprite_level_floor` answers zero for a sprite nothing registered a cap for, and a zero floor
+            // *is* no floor - so "the flag arrived" and "the floor arrived" are two separate facts and the
+            // shimmer needed both. See the `level_cap` field for how long the second was missing while the
+            // first was reported as present.
+            match crate::mc::block::sprite_level_floor_for(self.level_cap, true) {
+                0 => FLUID_FACES_UNFLOORED.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                _ => FLUID_FACES_FLOORED.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            };
+        } else if self.game.is_some() {
+            FLUID_FACES_STATIC.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
+
+        flags
     }
 }
+
+/// **How many fluid faces were baked with `UV_ANIMATED`, and how many without.** See [`FluidSprite::flags`].
+///
+/// The pair rather than one number, because the question is which of the two a fluid landed in: all-static
+/// is the shimmer, all-animated is the fix, and either is a fact a picture cannot be asked about.
+pub static FLUID_FACES_ANIMATED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// How many fluid faces were baked from a game rectangle **without** the animated flag. See
+/// [`FLUID_FACES_ANIMATED`].
+pub static FLUID_FACES_STATIC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// **How many animated fluid faces got a non-zero level-of-detail floor**, and how many got zero.
+///
+/// The second of these is the regression counter: a zero floor is no floor, and it is what the missing
+/// `level_cap` field produced for every fluid face in the world while `FLUID_FACES_ANIMATED` read as
+/// healthy. Reported beside it so the two cannot be confused again. See [`FluidSprite::flags`].
+pub static FLUID_FACES_FLOORED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many animated fluid faces were baked with **no** floor. See [`FLUID_FACES_FLOORED`].
+pub static FLUID_FACES_UNFLOORED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// How short of a whole block a fluid is drawn when it is falling: the game's `0.8888889F`, which is
 /// `8/9` - the height of a source block. See [`fluid_flow`], the one place it is used.
@@ -2962,6 +3088,8 @@ mod fluid_geometry_tests {
         let sprite = FluidSprite {
             atlas: ((0, 0), (16, 16)),
             game: None,
+            animated: false,
+            level_cap: None,
         };
 
         let both = || FluidSprites {
@@ -3641,14 +3769,22 @@ fn fluid_sprites(atlas: &Atlas, kind: u8, name: &str) -> Option<(RenderLayer, Fl
         // switch, the handed-over atlas, and whether the game animates this sprite. Read here, while
         // the name is in hand, because the face baker is handed the sprite and not its name.
         //
-        // The animation flag `game_atlas_rect` also answers with is dropped here rather than carried: this
-        // is the fluid baker, and a fluid sprite is animated by definition - `lava_flow.png.mcmeta` and
-        // `water_flow.png.mcmeta` are what make it a strip. The flag is for the *block model* path, where
-        // a sprite may or may not move and the shader's level-of-detail bias is scoped by it. See
-        // `Vertex::uv_flags`' `UV_ANIMATED`.
-        rect.map(|atlas_rect| FluidSprite {
-            atlas: atlas_rect,
-            game: atlas.game_atlas_rect(&path).map(|sprite| sprite.rect),
+        // **The animation flag comes along, and dropping it here was a longstanding mistake.**
+        //
+        // A fluid sprite is normally animated - `lava_flow.png.mcmeta` and `water_flow.png.mcmeta` are what
+        // make it a strip - but "normally" is not "always", and far more to the point the shader's whole
+        // level-of-detail handling is gated on the flag this used to throw away. See `FluidSprite::flags`
+        // for what that cost.
+        rect.map(|atlas_rect| {
+            let game = atlas.game_atlas_rect(&path);
+
+            FluidSprite {
+                atlas: atlas_rect,
+                game: game.map(|sprite| sprite.rect),
+                animated: game.is_some_and(|sprite| sprite.animated),
+                // **Taken here, and its absence is why the shimmer returned.** See the field.**
+                level_cap: game.and_then(|sprite| sprite.level_cap),
+            }
         })
     };
 
@@ -3663,6 +3799,8 @@ fn fluid_sprites(atlas: &Atlas, kind: u8, name: &str) -> Option<(RenderLayer, Fl
     let flow = sprite("flow", 1 << (kind + 2)).unwrap_or(FluidSprite {
         atlas: still.atlas,
         game: still.game,
+        animated: still.animated,
+        level_cap: still.level_cap,
     });
 
     Some((layer, FluidSprites { still, flow }))
@@ -4258,15 +4396,73 @@ mod fluid_sprite_tests {
         FluidSprite {
             atlas: ((u0, v0), (u1, v1)),
             game: None,
+            animated: false,
+            level_cap: None,
         }
     }
 
     /// A sprite the game animates, at the given rectangle of the game's own atlas.
+    ///
+    /// `animated` is true because that is what the name says and because the fixture exists to test the
+    /// animated case: it asserted `flags() == UV_GAME_ATLAS` for a long time, which is the assertion that let
+    /// the fluid path forget the flag while every test stayed green.
+    /// `level_cap` is `Some`, because a sprite the game animates is exactly the sprite whose chain the
+    /// game built extra levels for - and the fluid path reading two of these three fields and not the third
+    /// is what let the shimmer come back. A fixture that leaves it `None` cannot catch that.
     fn in_the_games_atlas(rect: [f32; 4]) -> FluidSprite {
         FluidSprite {
             atlas: ((0, 0), (16, 16)),
             game: Some(rect),
+            animated: true,
+            level_cap: Some(5),
         }
+    }
+
+    /// **A fluid sprite carries `UV_ANIMATED` *and* a floor, and the second is the one that went missing.**
+    ///
+    /// This is the regression test for a fix that was measured as working and then came back, and the shape
+    /// of the mistake is worth stating because no counter could see it: `UV_ANIMATED` is what makes the
+    /// shader *read* the level-of-detail floor, and the floor is zero unless the sprite's `level_cap`
+    /// reached `sprite_level_floor`. Both facts were required and only the first was counted -
+    /// `FLUID_FACES_ANIMATED` read as healthy for every fluid face in the world while the floor was zero,
+    /// and the shimmer the `-4` offset used to hide came straight back.
+    ///
+    /// A 32-texel `lava_flow` is five levels of its own detail and keeps four of them, so its floor is one.
+    #[test]
+    fn an_animated_fluid_gets_a_floor_and_not_merely_the_flag() {
+        let lava = in_the_games_atlas([0.25, 0.5, 0.5, 0.75]);
+
+        assert_eq!(
+            lava.flags(),
+            UV_GAME_ATLAS | UV_ANIMATED,
+            "the flag is the half that was already there"
+        );
+
+        assert_eq!(
+            crate::mc::block::sprite_level_floor(lava.level_cap, lava.animated),
+            1,
+            "a 32-texel sprite has five levels and keeps four, so nothing coarser than level 1 - and the \
+             depth is the variable: at two kept the floor was 3, which a player measured as not enough, and \
+             the `-4` bias that did work reaches level 0 on a chain this short"
+        );
+
+        // **And whether it is applied at all is a separate question, which is `LOD_FLOOR`.** The arithmetic
+        // is right either way; the flag is what says whether the shader is handed it, and it is off while the
+        // two candidate explanations for the shimmer are told apart. See that constant.
+        assert_eq!(
+            crate::mc::block::sprite_level_floor_for(lava.level_cap, lava.animated),
+            if LOD_FLOOR { 1 } else { 0 },
+            "the accessor the bake calls follows `LOD_FLOOR`, and the arithmetic above does not"
+        );
+
+        // And the same sprite with nothing registered for it, which is what the fluid path used to build:
+        // the flag set, and a floor of zero. Named so the difference is visible in the test as well as in
+        // the field's docs.
+        assert_eq!(
+            crate::mc::block::sprite_level_floor(None, true),
+            0,
+            "no cap is no floor, which is the state every fluid face was in"
+        );
     }
 
     /// An animated sprite is packed as a strip of square frames, and every offset a fluid face uses is
@@ -4330,7 +4526,12 @@ mod fluid_sprite_tests {
     fn an_animated_sprite_is_baked_for_the_games_atlas() {
         let still = in_the_games_atlas([0.25, 0.5, 0.5, 0.75]);
 
-        assert_eq!(still.flags(), UV_GAME_ATLAS);
+        assert_eq!(
+            still.flags(),
+            UV_GAME_ATLAS | UV_ANIMATED,
+            "a fluid the game animates is **both** of the flags: on the game's atlas, and moving - and this \
+             assertion used to read `UV_GAME_ATLAS` alone, which is how the flag went missing for fluids"
+        );
         assert_eq!(still.at(0.0, 0.0), [16384, 32768], "the game's own corner");
         assert_eq!(still.at(1.0, 1.0), [32768, 49151], "and its opposite one");
 
@@ -5093,6 +5294,7 @@ mod face_culling_tests {
             }; 4],
             normal: glam::Vec3::Y,
             tint_index: -1,
+            shade: true,
             uv_flags: 0,
             cull: None,
             layer: RenderLayer::Solid,
@@ -5135,6 +5337,7 @@ mod face_culling_tests {
             }; 4],
             normal: glam::Vec3::Y,
             tint_index: -1,
+            shade: true,
             uv_flags: 0,
             cull: Some(Direction::Up),
             layer: RenderLayer::Solid,

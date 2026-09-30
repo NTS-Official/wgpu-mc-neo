@@ -37,12 +37,113 @@ struct ChunkOffset {
 @group(0) @binding(10) var t_game_sampler_magnify: sampler;
 @group(0) @binding(11) var t_sampler_magnify: sampler;
 
+// **A minified animated face gets its own sampler, because neither pair above is right for it.** The
+// anisotropic one cannot be used beside a `Nearest` mip filter (a validation error, and the mip filter is
+// a player's switch), and `Nearest` magnification of a coarse level is what turns a moving sprite into one
+// flat patch of its own running average - the "bright spots magnified into one big bright tile" a player
+// described. Same filters as `t_sampler` and `t_sampler_magnify` except for the anisotropy.
+@group(0) @binding(12) var t_game_sampler_animated: sampler;
+@group(0) @binding(13) var t_sampler_animated: sampler;
+
 /// Whether a fragment's coordinates are being **stretched** rather than squeezed. The two derivatives are
 /// compared separately rather than through `fwidth`, which is their sum and would move the switch to half a
 /// texel; see `terrain.wgsl` for the whole of why that matters.
 fn is_magnified(coords: vec2<f32>, texel: f32) -> bool {
     let d = vec2<f32>(dpdx(coords).x, dpdy(coords).y);
     return abs(d.x) < texel && abs(d.y) < texel;
+}
+
+// The game's own two sampling functions, ported. **The full note is in `terrain.wgsl`** - this is a copy
+// because the two shaders draw one world and an immediate or a shader that differed between the layers
+// would be a seam down the middle of it. What they do, in one line each: `sample_nearest` fetches with the
+// hardware's level and nudges the texel centres so a magnified surface does not drift, and `sample_rgss`
+// takes the level from the **geometric mean** of the two derivative lengths - four levels finer than the
+// maximum at a grazing angle, which is what the fluid shimmer was about - and taps four points on the
+// game's own rotated grid.
+fn sample_nearest(
+    source: texture_2d<f32>,
+    samp: sampler,
+    uv: vec2<f32>,
+    pixel_size: vec2<f32>,
+    bias: f32,
+) -> vec4<f32> {
+    let du = dpdx(uv);
+    let dv = dpdy(uv);
+    let texel_screen_size = sqrt(du * du + dv * dv);
+
+    let uv_texel = uv / pixel_size;
+    let texel_center = round(uv_texel) - 0.5;
+    var texel_offset = uv_texel - texel_center;
+
+    texel_offset = (texel_offset - 0.5) * pixel_size / texel_screen_size + 0.5;
+    texel_offset = clamp(texel_offset, vec2<f32>(0.0), vec2<f32>(1.0));
+
+    return textureSampleGrad(source, samp, (texel_center + texel_offset) * pixel_size, du, dv);
+}
+
+fn sample_rgss(
+    source: texture_2d<f32>,
+    samp: sampler,
+    uv: vec2<f32>,
+    pixel_size: vec2<f32>,
+    bias: f32,
+) -> vec4<f32> {
+    let du = dpdx(uv);
+    let dv = dpdy(uv);
+
+    let texel_screen_size = sqrt(du * du + dv * dv);
+    let max_texel_size = max(texel_screen_size.x, texel_screen_size.y);
+    let min_pixel_size = min(pixel_size.x, pixel_size.y);
+
+    let blend_factor = smoothstep(min_pixel_size, min_pixel_size * 2.0, max_texel_size);
+
+    let min_derivative = min(length(du), length(dv));
+    let max_derivative = max(length(du), length(dv));
+    let effective_derivative = sqrt(min_derivative * max_derivative);
+
+    // **The side's own two shifts on top of the game's level**: the `atlas_lod_bias` setting and the
+    // per-sprite floor. At zero and none this is the game's own `mipLevelExact`, which is what makes the
+    // port comparable with it.
+    let mip_exact = max(0.0, log2(effective_derivative / min_pixel_size) + bias);
+    let mip_low = floor(mip_exact);
+    let mip_high = mip_low + 1.0;
+    let mip_blend = fract(mip_exact);
+
+    var offsets = array<vec2<f32>, 4>(
+        vec2<f32>(0.125, 0.375),
+        vec2<f32>(-0.125, -0.375),
+        vec2<f32>(0.375, -0.125),
+        vec2<f32>(-0.375, 0.125),
+    );
+
+    var low = vec4<f32>(0.0);
+    var high = vec4<f32>(0.0);
+
+    for (var i = 0u; i < 4u; i = i + 1u) {
+        let tap = uv + offsets[i] * pixel_size;
+        low = low + textureSampleLevel(source, samp, tap, mip_low);
+        high = high + textureSampleLevel(source, samp, tap, mip_high);
+    }
+
+    let rgss = mix(low * 0.25, high * 0.25, mip_blend);
+    let plain = sample_nearest(source, samp, uv, pixel_size, bias);
+
+    return mix(plain, rgss, blend_factor);
+}
+
+fn sample_atlas(
+    source: texture_2d<f32>,
+    samp: sampler,
+    uv: vec2<f32>,
+    pixel_size: vec2<f32>,
+    use_rgss: u32,
+    bias: f32,
+) -> vec4<f32> {
+    if use_rgss == 1u {
+        return sample_rgss(source, samp, uv, pixel_size, bias);
+    }
+
+    return sample_nearest(source, samp, uv, pixel_size, bias);
 }
 
 // The game's **lightmap**, and the sampler the game samples it with (`Sampler2` for the terrain is
@@ -165,6 +266,11 @@ struct SectionPosition {
     // game's atlas is whatever its stitcher packed and this side's is `ATLAS_DIMENSIONS`; see `terrain.wgsl`.
     texel_ours: f32,
     texel_game: f32,
+    // The game's TextureSize, per atlas, and its UseRgss flag. The two sampling functions these feed are in
+    // `terrain.wgsl`, which carries the full note; this file has the same struct because the two shaders
+    // draw one world, and an immediate of a different size would be a validation error rather than a bug in
+    // either of them.
+    use_rgss: u32,
 };
 
 var<immediate> section_pos: SectionPosition;
@@ -447,22 +553,61 @@ fn frag(
     // Four bits at bit 18 of `v3`, which is `UV_LOD_FLOOR_SHIFT` in `pipeline.rs` - also where the reason a
     // *floor* replaced the bias is written down: a bias counts levels, and the level at which a sprite stops
     // being itself is a property of the sprite rather than of the count.
+    // The floor is real and it is *correct* - a moving sprite's coarse levels really are a running average of
+    // its animation - but it is not the fix for the shimmer: `64.0` in its place (level 0 for every animated
+    // face, no mip chain at all) left the lava shimmering, as had an offset of `-5` and a three-level floor
+    // before it. Three fixes, all confirmed to reach these faces, none of them the answer. See `terrain.wgsl`.
+    // **`LOD_FLOOR_IS_LEVEL_ZERO` picks which floor, and the pair is a real comparison rather than a
+    // leftover.** Both say "do not go below this" and differ only in how deep they allow:
+    //
+    //  * `true` clamps every minified animated face at **level 0** - the full-resolution sprite, no mip
+    //    chain at all. **This is the one measured to remove the lava shimmer**, and it is the blunt one: it
+    //    also throws away the minification the chain exists for, so a distant animated sprite stops getting
+    //    smaller and starts aliasing instead.
+    //  * `false` uses the per-sprite floor the bake computed - `log2` of the sprite's own texels, less
+    //    `LEVELS_OF_DETAIL_KEPT` - the precise form of the same idea, and what the four vertex bits are for.
+    //    **It has still never been measured**, which is the surprising part of this whole search: in every
+    //    round it was tried in, fluids did not carry `UV_ANIMATED`, so this branch was false for them and
+    //    the change was inert. See `FluidSprite::flags`.
+    //
+    // The full note is in `terrain.wgsl`, and the value has to match it: these two shaders draw one world.
+    const LOD_FLOOR_IS_LEVEL_ZERO: bool = false;
+
     let floor = select(
         0.0,
-        f32(in.lod_floor),
+        select(64.0, f32(in.lod_floor), !LOD_FLOOR_IS_LEVEL_ZERO),
         in.animated == 1u && !magnified,
     );
 
     let bias = section_pos.lod_bias - floor;
 
+    // The atlas the sample comes from, and with it the size of one of its texels - which the game's own
+    // sampling functions divide by. See `pixel_size` in `terrain.wgsl`.
+    let pixel_size = select(
+        vec2<f32>(section_pos.texel_ours, section_pos.texel_ours),
+        vec2<f32>(section_pos.texel_game, section_pos.texel_game),
+        in.game_atlas == 1u,
+    );
+
+    // Three cases rather than two - magnified, animated-and-minified, and the rest - which is what the
+    // nested `select`s express. The full note is in `terrain.wgsl`, and the samplers have to match it: these
+    // two shaders draw one world.
     let texel_from_game = select(
-        textureSampleBias(t_game_atlas, t_game_sampler, in.tex_coords, bias),
-        textureSampleBias(t_game_atlas, t_game_sampler_magnify, in.tex_coords, bias),
+        select(
+            sample_atlas(t_game_atlas, t_game_sampler, in.tex_coords, pixel_size, section_pos.use_rgss, bias),
+            sample_atlas(t_game_atlas, t_game_sampler_animated, in.tex_coords, pixel_size, section_pos.use_rgss, bias),
+            in.animated == 1u,
+        ),
+        sample_atlas(t_game_atlas, t_game_sampler_magnify, in.tex_coords, pixel_size, section_pos.use_rgss, bias),
         magnified,
     );
     let texel_from_ours = select(
-        textureSampleBias(t_texture, t_sampler, in.tex_coords, bias),
-        textureSampleBias(t_texture, t_sampler_magnify, in.tex_coords, bias),
+        select(
+            sample_atlas(t_texture, t_sampler, in.tex_coords, pixel_size, section_pos.use_rgss, bias),
+            sample_atlas(t_texture, t_sampler_animated, in.tex_coords, pixel_size, section_pos.use_rgss, bias),
+            in.animated == 1u,
+        ),
+        sample_atlas(t_texture, t_sampler_magnify, in.tex_coords, pixel_size, section_pos.use_rgss, bias),
         magnified,
     );
     let texel = select(texel_from_ours, texel_from_game, in.game_atlas == 1u);

@@ -1799,9 +1799,36 @@ pub fn atlasFaceCounts(env: JNIEnv, _class: JClass) -> jstring {
     // `wgpu_mc::mc::block::FACES_ANIMATED`.
     let animated = wgpu_mc::mc::block::FACES_ANIMATED.swap(0, std::sync::atomic::Ordering::Relaxed);
 
+    // **And how many of those got a floor at all**, which is the pair that a "the floor changed nothing"
+    // report has to be read against: a floor of zero is *no* floor, and no floor is the shimmer - so the
+    // picture cannot tell "the size never arrived" from "the floor is not what helps". The numbers can. See
+    // `wgpu_mc::mc::block::FACES_LOD_FLOORED`.
+    let floored =
+        wgpu_mc::mc::block::FACES_LOD_FLOORED.swap(0, std::sync::atomic::Ordering::Relaxed);
+
+    // **And the fluids, which the two counters above do not cover at all.** They are the block-model path;
+    // a fluid face sets its own flags in `FluidSprite::flags`, so `animated` above has never counted one.
+    // A player reported the lava shimmering again, and this pair is what says whether the faces still carry
+    // the flag the whole fix rests on. See `FLUID_FACES_ANIMATED`.
+    let moved =
+        wgpu_mc::mc::chunk::FLUID_FACES_ANIMATED.swap(0, std::sync::atomic::Ordering::Relaxed);
+    let still =
+        wgpu_mc::mc::chunk::FLUID_FACES_STATIC.swap(0, std::sync::atomic::Ordering::Relaxed);
+
+    // **And of the ones that carried the flag, how many got a floor** - the pair nobody was asking, and the
+    // reason a fix that had been measured as working came back. A fluid face with the flag and a floor of
+    // zero is a fluid face that shimmers, and that combination is what a missing `level_cap` field produced
+    // for every fluid in the world while the flag count above read as healthy. See `FLUID_FACES_FLOORED`.
+    let floored_fluid =
+        wgpu_mc::mc::chunk::FLUID_FACES_FLOORED.swap(0, std::sync::atomic::Ordering::Relaxed);
+    let unfloored_fluid =
+        wgpu_mc::mc::chunk::FLUID_FACES_UNFLOORED.swap(0, std::sync::atomic::Ordering::Relaxed);
+
     let text = format!(
-        "{game} game-atlas, {own} own-atlas, {animated} of them animated, {forced} leaf face(s) forced \
-         opaque, {tints} fluid tint(s) read from the game"
+        "{game} game-atlas, {own} own-atlas, {animated} of them animated ({floored} floored), {forced} leaf \
+         face(s) forced opaque, {tints} fluid tint(s) read from the game, {moved} fluid face(s) with the \
+         animated flag ({floored_fluid} of them floored) and {still} without (and {unfloored_fluid} \
+         animated with no floor)"
     );
 
     env.new_string(text)
@@ -1825,6 +1852,58 @@ pub fn atlasFaceCounts(env: JNIEnv, _class: JClass) -> jstring {
 #[jni_fn("dev.birb.wgpu.rust.WgpuNative")]
 pub fn setCutoutLeaves(_env: JNIEnv, _class: JClass, cutout: jboolean) {
     wgpu_mc::mc::block::set_cutout_leaves(cutout != 0);
+}
+
+/// **The game's `textureFiltering` option, pushed every frame, because it decides how a surface is
+/// sampled.**
+///
+/// `TextureFilteringMethod`'s own ids - `NONE` is 0, `RGSS` is 1, `ANISOTROPIC` is 2 - and the game's own
+/// numbering rather than a switch of this side's, for the same reason the cardinal lighting table travels as
+/// six floats: this side has no business knowing what a "Fabulous" is, and the value is written straight
+/// into an immediate and compared against `1`.
+///
+/// It changes two things, and they are different algorithms rather than two settings of one:
+///
+///  * **the sampler's `anisotropy_clamp`**, which is the option's own
+///    `Options#maxAnisotropyValue` when this is `ANISOTROPIC` and 1 otherwise - `LevelRenderer` builds its
+///    terrain sampler exactly that way, and the default bit is 2, so the game's own answer is 4 rather
+///    than the 16 this renderer hardcoded;
+///  * **whether the shader runs the game's rotated-grid supersampling**, which no sampler can be asked
+///    for. See the port in `terrain.wgsl`.
+#[jni_fn("dev.birb.wgpu.rust.WgpuNative")]
+pub fn setTextureFiltering(_env: JNIEnv, _class: JClass, method: jint) {
+    wgpu_mc::render::atlas::set_texture_filtering(method.max(0) as u32);
+}
+
+/// **The dimension's `CardinalLighting`, pushed before a bake because it is written into the geometry.**
+///
+/// The game keeps two tables and picks between them with `ClientLevel#cardinalLighting`: `DEFAULT`
+/// (`0.5, 1.0, 0.8, 0.8, 0.6, 0.6`) and `NETHER` (`0.9, 0.9, 0.8, 0.8, 0.6, 0.6`). They differ **only at up
+/// and down**, which is why no side ever looked wrong in either dimension and why the nether's ceiling and
+/// floor did: this side used the overworld's six everywhere.
+///
+/// Six floats rather than a dimension id, because the tables are data the game owns - a mod's dimension can
+/// carry its own - and this side has no business knowing what a "nether" is. It only has to scale a colour
+/// by what it is told.
+///
+/// Sent on every bake rather than watched for changes, for the same reason [`setCutoutLeaves`] is: the value
+/// lives on an object read from another thread, and a cached copy would be one more thing to keep in step.
+/// The bake is seconds long; six stores are nothing.
+///
+/// **The order is `Direction`'s own** - west, east, down, up, north, south - which is *not* the order the
+/// game's record lists them in. The JVM side does that mapping; see `BlockCache`.
+#[jni_fn("dev.birb.wgpu.rust.WgpuNative")]
+pub fn setCardinalLighting(
+    _env: JNIEnv,
+    _class: JClass,
+    west: jfloat,
+    east: jfloat,
+    down: jfloat,
+    up: jfloat,
+    north: jfloat,
+    south: jfloat,
+) {
+    wgpu_mc::mc::block::set_cardinal_lighting([west, east, down, up, north, south]);
 }
 
 #[jni_fn("dev.birb.wgpu.rust.WgpuNative")]

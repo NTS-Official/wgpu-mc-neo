@@ -5,7 +5,13 @@ resolver = "2"
 members = [
     "wgpu-mc",
     "wgpu-mc-jni",
-    "wgpu-mc-demo"
+    "wgpu-mc-demo",
+    # **Vendored rather than taken from git, because one field had to be added to it**: a model face's
+    # `shade` flag, which the game reads as `quad.materialInfo().shade()` and which decides whether the
+    # face is drawn at its direction's brightness or at `up`. Upstream has no such field, and the crate is
+    # 136 KB of serde types, so a copy that can be edited is cheaper than a fork that has to be published
+    # before this renderer can use it.
+    "minecraft-assets"
 ]
 
 # The vendored GLSL preprocessor is a workspace of its own with its own lock file, reached only
