@@ -29,6 +29,26 @@ struct ChunkOffset {
 @group(0) @binding(5) var t_game_atlas: texture_2d<f32>;
 @group(0) @binding(6) var t_game_sampler: sampler;
 
+// **The magnification pair, which is how the game's own crispness comes back without giving up
+// anisotropic filtering.**
+//
+// The game magnifies with `GL_NEAREST` and minifies with `GL_LINEAR_MIPMAP_LINEAR`, and GL lets it choose
+// those independently. wgpu does not: any `anisotropy_clamp` above 1 requires the min, mag *and* mipmap
+// filters to be linear, so one sampler cannot both magnify the way the game does and filter
+// anisotropically. `t_sampler` and `t_game_sampler` are the anisotropic ones, for surfaces being
+// *minified*; these two are `Nearest` magnification with no anisotropy, for surfaces being *magnified*.
+//
+// The split is not a compromise, because the two ranges do not overlap: anisotropic filtering is a
+// minification technique, and a magnified surface is at level 0 by definition and has nothing to
+// compress. See the fragment stage for the test that picks between them, and `atlas_magnify_sampler` in
+// `atlas.rs` for the whole of why there are two of each.
+@group(0) @binding(10) var t_game_sampler_magnify: sampler;
+
+// The same-side pair: `t_sampler` is anisotropic, this one magnifies with `Nearest`. Nothing samples this
+// side's atlas in a normal session - every sprite is on the game's - so it is here for the fallback path
+// and for the two atlases to stay symmetric.
+@group(0) @binding(11) var t_sampler_magnify: sampler;
+
 // The game's **lightmap**, and the sampler the game samples it with (`Sampler2` for the terrain is
 // `getClampToEdge(LINEAR)`). This is the whole of the lighting: the game builds this 16x16 texture from
 // the light levels of the world, the gamma and brightness options, the time of day, night vision and
@@ -98,7 +118,18 @@ struct VertexResult {
     // quad carries the same answer, and the fragment stage selects between the two atlases with it.
     // It is **not** branched on - see the sampling note in the fragment stage, where a `textureSample`
     // under an `if` would be undefined behaviour whatever this varying says.
-    @interpolate(flat) @location(19) game_atlas: u32
+    @interpolate(flat) @location(19) game_atlas: u32,
+    // Whether the game animates this face's sprite: bit 1 of the same ten, `UV_ANIMATED`. Flat for the
+    // same reason - it is the face's property and every corner carries it - and it is what scopes the
+    // level-of-detail offset in the fragment stage, because a coarse mip of a *moving* sprite is a moving
+    // average and a still one's is a fixed pyramid. See the level-of-detail floor in the fragment stage.
+    //
+    // **21 and not 20**: 20 is `fog_distances` above. This list is not in order, and a location named
+    // twice is a shader that fails to compile rather than one that silently picks a winner.
+    @interpolate(flat) @location(21) animated: u32,
+    // How many levels this face may be pushed down the chain, decoded in the vertex stage because the
+    // bits live in `v3` and `v3` is a vertex-local. Flat for the same reason the two above are.
+    @interpolate(flat) @location(22) lod_floor: u32
 };
 
 // What one terrain draw is told about itself: the section it draws, and the alpha cutoff its layer
@@ -140,7 +171,44 @@ struct SectionPosition {
     // which is how the two readings are told apart: blur that clears with a negative bias means the
     // chosen level was too coarse, and blur unchanged by any bias means the level was never the problem.
     lod_bias: f32,
+    // **Half a texel of this side's own atlas, and half a texel of the game's, under test.**
+    //
+    // Two fields and not one, because the two atlases are not the same size and the shift has to be
+    // measured against the one the sample is going to come out of: the game's stitcher packed
+    // `blocks.png` at 2048x2048 on some of the launches this was written against and 1024x1024 on others,
+    // while `ATLAS_DIMENSIONS` is fixed. A single number would be half a texel on one of them and a
+    // quarter on the other.
+    //
+    // Zero disables it. See the note at the decode for what it is for and what it cannot do from here.
+    half_texel_ours: f32,
+    half_texel_game: f32,
+    // **One texel of each atlas, as a fraction of it**, which is what the magnification test compares the
+    // coordinates' screen-space derivative against.
+    //
+    // Sent rather than written here for the reason everything else about the atlases is: this side's is
+    // `ATLAS_DIMENSIONS` and never moves, while the game's is whatever its stitcher packed - 2048x2048 on
+    // some of the launches this was written against and 1024x1024 on others. `1 / 2048` written into a
+    // shader would call a surface magnified on one launch and minified on the next.
+    texel_ours: f32,
+    texel_game: f32,
 };
+
+/// Whether a fragment's coordinates are being **stretched** rather than squeezed - which is exactly
+/// "magnification", and is the test that picks between the two samplers.
+///
+/// The two derivatives are compared **separately**, and that is not a detail: `fwidth` is their *sum*, so
+/// testing `fwidth < texel` asks for each of them to be under half a texel, not under one - which moves the
+/// switch to where an isotropically-magnified surface is already half minified and puts the seam between
+/// the two samplers where it is most visible. This test asserts what magnification actually is: neither
+/// direction covers a whole texel in one pixel.
+///
+/// The result is flat across a primitive - a derivative is, because it is computed per 2x2 quad - so this is
+/// uniform control flow by construction rather than by luck, and both fetches may be evaluated and selected
+/// between.
+fn is_magnified(coords: vec2<f32>, texel: f32) -> bool {
+    let d = vec2<f32>(dpdx(coords).x, dpdy(coords).y);
+    return abs(d.x) < texel && abs(d.y) < texel;
+}
 
 var<immediate> section_pos: SectionPosition;
 
@@ -220,10 +288,32 @@ fn vert(
     // `Atlas::sprite_rects` measured them in. A face is baked for one of the two and says which, so
     // the scale is picked here by the same flag rather than being one number for both.
     let game_atlas = (v3 >> 16u) & 1u;
+    // Bit 1 of the same ten: whether the game animates this face's sprite. See `UV_ANIMATED`.
+    let animated = (v3 >> 17u) & 1u;
+    // The level-of-detail floor: four bits at bit 18, written by the bake. See `UV_LOD_FLOOR_SHIFT`.
+    let lod_floor = (v3 >> 18u) & 0xfu;
     let uv_scale = select(0.00048828125, 1.0 / 65535.0, game_atlas == 1u);
 
-    var u: f32 = f32((v2 >> 16u) & 0xffffu) * uv_scale;
-    var v: f32 = f32(v3 & 0xffffu) * uv_scale;
+    // **A half-texel shift, under test.** Both are sent from the renderer rather than written here,
+    // because a shift is half a texel only once the atlas size is known and the game's atlas is not a
+    // fixed size: the stitcher packed `blocks.png` at 2048x2048 on some launches of the runs this was
+    // written against and 1024x1024 on others, while this side's own atlas is always 2048.
+    //
+    // What it is for: a face's coordinates run from one edge of its sprite to the other, so a sample lands
+    // *between* texels rather than on one, and at magnification that is two texels blended at every point.
+    // Half a texel would put the samples on texel centres instead.
+    //
+    // **The shift the two atlases need is selected with the same flag that selects the atlas**, and it has
+    // to be: the coordinates are normalised by then, so the only thing that says how big a texel is is the
+    // atlas the sample is going to come out of.
+    let half_texel = select(
+        section_pos.half_texel_ours,
+        section_pos.half_texel_game,
+        game_atlas == 1u,
+    );
+
+    var u: f32 = f32((v2 >> 16u) & 0xffffu) * uv_scale + half_texel;
+    var v: f32 = f32(v3 & 0xffffu) * uv_scale + half_texel;
 
     if(((v3 >> 29u) & 1u) == 1u) {
         x = 16.0;
@@ -257,6 +347,8 @@ fn vert(
 
     vr.tex_coords = vec2<f32>(u, v);
     vr.game_atlas = game_atlas;
+    vr.animated = animated;
+    vr.lod_floor = lod_floor;
 
     // The lighting, fetched the way the game's own terrain shader fetches it: one lightmap texel per
     // vertex, and the rasterizer interpolates the *colour*, which is what `vertexColor = Color *
@@ -394,8 +486,62 @@ fn frag(
     // `textureSampleBias` rather than `textureSample`, with the immediate bias - zero unless a
     // diagnostic run moved it, and the two behave identically at zero. See the constant for what moving
     // it is for.
-    let texel_from_game = textureSampleBias(t_game_atlas, t_game_sampler, in.tex_coords, section_pos.lod_bias);
-    let texel_from_ours = textureSampleBias(t_texture, t_sampler, in.tex_coords, section_pos.lod_bias);
+    //
+    // **And each of the four fetches picks a sampler rather than being given one.** The pair is
+    // magnification and minification, and which one applies is decided per fragment by the test below -
+    // see `t_game_sampler_magnify` for why one sampler cannot do both jobs. The magnifying fetches use
+    // plain `textureSampleBias` on a sampler whose magnification is `Nearest`; the bias is harmless there
+    // because a magnified surface is at level 0 whatever the bias says (the sampler clamps at 0), and it
+    // is meaningless to a `Nearest` filter anyway.
+    let magnified = is_magnified(
+        in.tex_coords,
+        select(section_pos.texel_ours, section_pos.texel_game, in.game_atlas == 1u),
+    );
+
+    // **The level-of-detail floor, which is what a bias could not express.**
+    //
+    // A face's coordinates span its sprite's content - sixteen or thirty-two texels for a block - while the
+    // mip chain under the atlas is built once for the whole session and runs down to the atlas' own width.
+    // So a sprite stops being itself *in the atlas* long before the chain ends, and what is left below that
+    // point is not the sprite at a smaller size but a running average of it. For a **scrolling,
+    // frame-interpolated** sprite - water and lava are both - that average *moves* as the frames advance,
+    // so the same pixel changes over time with nothing moving. That is the fluid shimmer, and it is why the
+    // fluids shimmer and a static sprite never does: a still sprite's coarse levels are a consistent pyramid.
+    //
+    // **This began as a bias and the bias could not work.** `-4` was measured against the water: the water
+    // shimmer went and the lava's stayed. Both flow sprites are 32x32 texels - measured, not assumed, after
+    // an assumption that they differed was wrong - so one offset lands them at the same level, and what
+    // differs is what is *in* those levels: `lava_flow` animates at `frametime 3` against a much slower
+    // water and its frames differ far more. `-5` left the lava shimmering too.
+    //
+    // The reason is that a bias is a count of *levels*, and the level at which a sprite stops being itself
+    // is a property of the *sprite* - so one number cannot serve two sprites of different sizes, and no
+    // number at all can express "do not go past here". So the floor is computed where the sprite's size is
+    // known, at bake time, and carried in the vertex: see `UV_LOD_FLOOR_SHIFT` and `sprite_level_floor`.
+    //
+    // **Magnification keeps its own zero, and the near field is why.** A magnified surface is at level 0
+    // whatever any of this says, so a floor is meaningless there and a bias was actively harmful - the
+    // revision that applied one to every surface sharpened the distance into a moiré.
+    //
+    // Four bits, so the field is what the bake wrote and nothing else has to agree with it.
+    let floor = select(
+        0.0,
+        f32(in.lod_floor),
+        in.animated == 1u && !magnified,
+    );
+
+    let bias = section_pos.lod_bias - floor;
+
+    let texel_from_game = select(
+        textureSampleBias(t_game_atlas, t_game_sampler, in.tex_coords, bias),
+        textureSampleBias(t_game_atlas, t_game_sampler_magnify, in.tex_coords, bias),
+        magnified,
+    );
+    let texel_from_ours = select(
+        textureSampleBias(t_texture, t_sampler, in.tex_coords, bias),
+        textureSampleBias(t_texture, t_sampler_magnify, in.tex_coords, bias),
+        magnified,
+    );
     let texel = select(texel_from_ours, texel_from_game, in.game_atlas == 1u);
 
     // The light is a colour now, not a number: the game's lightmap has a colour in it (the sky light

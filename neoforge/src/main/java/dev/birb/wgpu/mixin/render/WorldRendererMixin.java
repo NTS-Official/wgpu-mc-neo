@@ -30,4 +30,39 @@ public abstract class WorldRendererMixin {
     private void wgpuMc$forgetTheSectionBake(ClientLevel level, CallbackInfo ci) {
         RustChunkBake.forgetAll(WgpuNative.clearSections());
     }
+
+    /**
+     * Waits for the block registry before a world is meshed, so Rust bakes every section on its first
+     * build instead of Minecraft meshing the world and Rust replacing it a few seconds later.
+     *
+     * <p><b>The problem this closes.</b> {@code RustChunkBake#bake} refuses to take a section while the
+     * native registry is empty - {@code BLOCKS_CACHED} - and answers that way so that Minecraft meshes the
+     * section rather than nothing drawing it. The registry is built by {@code BlockCache} as soon as the
+     * block atlas is stitched, but the atlas lands only a few seconds before a world is entered and the
+     * registry itself takes about four: so the first seconds of every world are sections Minecraft meshed
+     * because Rust could not yet take them. Those sections are then meshed a second time - the cache's own
+     * {@code allChanged} at the end of the bake - and the player watches the ground swap over.
+     *
+     * <p><b>What is waited for is the registry, not a fixed time.</b> {@code BlockCache.awaitCached}
+     * returns as soon as the bake that builds it has finished, and gives up after a bounded wait so a bake
+     * that fails cannot hang the client. A world drawn on Minecraft's own meshes is the picture this
+     * renderer drew before any of this existed, and it is the direction to fail in.
+     *
+     * <p><b>The wait is on the render thread, which is the thread that meshes.</b> {@code setLevel} runs
+     * there and the sections are built from it, so blocking here is what makes the registry ready in time;
+     * anywhere later would be a world already meshed. Nothing the cache needs is owned by this thread - it
+     * reads the atlas and the block registry and does its work on its own - so this cannot deadlock
+     * against it.
+     *
+     * <p>{@code setLevel(null)} is the way back to the title screen and has no world to mesh, so it is
+     * skipped and pays nothing.
+     */
+    @Inject(method = "setLevel", at = @At("HEAD"))
+    private void wgpuMc$waitForTheBlockRegistry(ClientLevel level, CallbackInfo ci) {
+        if (level == null) {
+            return;
+        }
+
+        dev.birb.wgpu.BlockCache.awaitCached();
+    }
 }

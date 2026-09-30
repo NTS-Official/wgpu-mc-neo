@@ -267,7 +267,7 @@ object WgpuNative {
 	 * and samples the game's atlas, and it moves with the game instead of being frozen at whatever was
 	 * copied. See `Atlas::register_sprite`.
 	 */
-	external fun registerSprite(name: String, u0: Float, v0: Float, u1: Float, v1: Float, layer: Int)
+	external fun registerSprite(name: String, u0: Float, v0: Float, u1: Float, v1: Float, layer: Int, levelCap: Int)
 
 	/**
 	 * The layer numbers [registerSprite] carries: the Rust side's three, by name.

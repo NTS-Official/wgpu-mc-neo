@@ -216,18 +216,27 @@ fn no_lod_bias() -> FloatSetting {
         min: -4.0,
         max: 4.0,
         step: 0.5,
-        // **-4, and it is a calibration rather than a taste.** A player's runs settled it: at `-4` the
-        // fluid shimmer is gone, at `0` it is there. That is a *level* the sampler is choosing wrongly and
-        // a bias that cancels it, not a preference about sharpness.
+        // **0.0, the neutral value, and it is back to being the default because the thing `-4` was
+        // calibrated against no longer exists.**
         //
-        // **What it is compensating for is not known**, and that is worth stating plainly rather than
-        // dressed up. Every reading of the coordinate path says the level should already be right - the
-        // sprite's UVs span its own texels, `atlas_base_mip_only` proves the sampler honours a clamp, and
-        // the bias itself moves the picture - so the fault is somewhere between the coordinates and the
-        // derivative that has not been found. A global shift is the *wrong* shape of fix either way,
-        // because it moves every surface including the ones that are already correct, which is why the
-        // default is a calibration to be replaced by a per-sprite clamp rather than the answer.
-        value: -4.0,
+        // The history is worth keeping because it is the reason this setting is under suspicion rather than
+        // settled. A player's runs reported that at `-4` the fluid shimmer was gone and at `0` it was there,
+        // and that is a *level* the sampler is choosing wrongly with a bias cancelling it - not a preference
+        // about sharpness. But `-4` was measured with the sampler this renderer happened to have at the
+        // time: `Nearest` magnification and, because wgpu will not have both, no anisotropic filtering. That
+        // sampler is gone - the terrain now takes the game's own, all three filters linear and anisotropy
+        // 16 - so the number is a measurement of one configuration being used to describe another.
+        //
+        // **What it was compensating for was never found**, and two things make a global shift the wrong
+        // shape of answer whatever it was. It moves every surface, including the ones that are already
+        // correct - which is what a distant moire is. And the atlas it applies to is not a fixed size: the
+        // game's stitcher packs `blocks.png` at 2048x2048 with 5 mip levels in one run and 1024x1024 with 3
+        // in the next, so one constant cannot even mean the same thing twice.
+        //
+        // So this stays a diagnostic: it is the instrument that showed the level is being chosen too
+        // coarse, and the fix belongs per-sprite, where the sprite's own texel size is known. See
+        // `registerSprite`.
+        value: 0.0,
     }
 }
 
@@ -1742,16 +1751,28 @@ mod tests {
 
         // A queue, and the drain adds to it rather than acting on the batch directly.
         assert!(
-            source.contains("pendingRedirty[key] = System.nanoTime()"),
+            source.contains("pendingRedirty.put(key, System.nanoTime())"),
             "the refusal drain has to remember the sections it could not act on; without this a refusal \
              past the per-frame budget is a section nothing will ever rebuild"
         );
 
         assert!(
-            source.contains("private val pendingRedirty = java.util.LinkedHashMap<Long, Long>()"),
-            "a map keyed by position, because a section refused twice before it was retried is one \
-             rebuild and not two - and because *when* it was queued is what says how long the hole it \
-             made was on screen"
+            source.contains("private val pendingRedirty = OrderedWorkQueue<Long>()"),
+            "a queue keyed by position, because a section refused twice before it was retried is one \
+             rebuild and not two - and because *when* it was queued is what says how long the hole it made \
+             was on screen"
+        );
+
+        // **And it is not a `LinkedHashMap`, which is the crash this replaced.** The drain walks the queue
+        // on the render thread while chunk-build workers insert into it from `bakeNow`, and a
+        // `LinkedHashMap` fails its iterator the moment its structure changes underneath it - which it did,
+        // on a client that had been up for a minute. `ConcurrentHashMap` would fix that and lose the order
+        // the paragraph above says the queue is for, so the type is asserted rather than merely its shape.
+        assert!(
+            !source.contains("java.util.LinkedHashMap"),
+            "the refused-section queue is read on the render thread and written on chunk-build workers, so \
+             it cannot be a `LinkedHashMap`: its iterator is invalidated by a concurrent insert, and the \
+             drain is an iterator"
         );
 
         // **Single-section dirty, never the neighbours variant.** `setSectionDirtyWithNeighbors` dirties
@@ -1832,7 +1853,7 @@ mod tests {
             .nth(1)
             .expect("`forgetRefused` is still there");
         let before_queue = forget
-            .split("pendingRedirty[key] = System.nanoTime()")
+            .split("pendingRedirty.put(key, System.nanoTime())")
             .next()
             .expect("the refusal still queues a rebuild");
 
@@ -1859,9 +1880,34 @@ mod tests {
         // Minecraft's mesh dropped too, and nothing asks for it back: only an *arena* refusal reaches
         // the re-offer drain, not a dropped task.
         assert!(
-            source.contains("noteTookSection(!firstLook[0] && !atCapacity() && accepted)"),
+            source.contains("noteTookSection(!firstLook[0] && !atCapacity && accepted)"),
             "the decision to drop Minecraft's mesh must require that Rust accepted the payload; \
              otherwise a refused section is drawn by neither renderer"
+        );
+
+        // **And the arena's refusals have to be asked for again, which is the one refusal that is not
+        // permanent.** Every other answer here is either a section Rust has (nothing to do) or one whose
+        // neighbourhood is not known yet (resolved by the second rebuild every section gets anyway). The
+        // arena's answer is about the view *as it stands* - sections the player walks away from are trimmed
+        // - so a section refused for want of room can be taken a moment later, and the only thing that makes
+        // the game offer a section again is something marking it stale.
+        //
+        // Until this reached the queue, it was the case the comment at the top of this test describes but
+        // for a different reason: a world under arena pressure kept whichever sections were refused for the
+        // session, drawn by Minecraft at full cost beside terrain Rust was drawing.
+        assert!(
+            source.contains(
+                "if ((!accepted || atCapacity) && pendingRedirty.size < PENDING_REDIRTY_LIMIT)"
+            ),
+            "an at-capacity refusal has to reach the re-offer drain as well as a dropped payload: the arena \
+             frees room as the view moves, and nothing else marks a section stale"
+        );
+
+        assert!(
+            !source.contains("&& !atCapacity()"),
+            "`atCapacity()` is a native call whose answer changes within one rebuild, so sampling it twice \
+             lets the decision and the report disagree about which answer a section got - and the queueing \
+             above reads the same value the decision did"
         );
 
         assert!(
@@ -1872,7 +1918,7 @@ mod tests {
 
         // And the capacity check itself, which is the part only the native side can answer.
         assert!(
-            source.contains("!atCapacity()"),
+            source.contains("!atCapacity && accepted"),
             "the decision to drop Minecraft's mesh has to account for an arena that cannot grow: at the \
              device's buffer limit a refusal is permanent, so the game keeps its mesh for those sections"
         );

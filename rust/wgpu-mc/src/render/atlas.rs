@@ -64,6 +64,23 @@ pub const ATLAS_MIP_LEVELS: u32 = 4;
 ///
 /// atlas.upload(&wm_renderer);
 /// ```
+/// One sprite as the game's atlas holds it: where it is, whether it moves, and how deep its chain goes.
+///
+/// A struct rather than a tuple because the three are read together and mean different things, and because
+/// a fourth would otherwise be added to every `Some((rect, animated))` in the tree - see
+/// [`Atlas::game_atlas_rect`] for what each is for.
+#[derive(Copy, Clone, Debug)]
+pub struct SpriteInAtlas {
+    /// Where the sprite sits in the game's atlas, `0..1` over it.
+    pub rect: [f32; 4],
+    /// Whether the game animates it, which is what scopes the shader's level-of-detail offset. See
+    /// `Vertex::uv_flags`' `UV_ANIMATED`.
+    pub animated: bool,
+    /// The coarsest level of the game's chain this sprite should be sampled from, or `None` when nothing
+    /// said. See [`Atlas::sprite_level_caps`].
+    pub level_cap: Option<u32>,
+}
+
 pub struct Atlas {
     /// The image allocator which decides where images should go in the atlas texture
     pub allocator: RwLock<AtlasAllocator>,
@@ -102,6 +119,23 @@ pub struct Atlas {
     ///
     /// Filled by `WgpuNative.registerSprite`, one call per sprite, before the block states are cached.
     pub sprite_rects: RwLock<HashMap<ResourcePath, [f32; 4]>>,
+    /// **How deep each sprite's mip chain goes, as the coarsest level a face should sample.**
+    ///
+    /// Sent with the rectangle because it is the other thing only the registration knows: a sprite whose
+    /// chain is built for the *atlas* has levels far past the point where its own detail is gone, and what
+    /// is left there is not the sprite at a smaller size but a running average of it. For a scrolling,
+    /// frame-interpolated sprite - the fluids - that average *moves*, which is the fluid shimmer: the level
+    /// is not too coarse, it is past the end of the animation.
+    ///
+    /// **An offset cannot express this and that is why it is here.** A bias is a count of levels, so the
+    /// same number lands a 16-texel sprite and a 32-texel one at different points of their own detail;
+    /// `-4` was measured against the water and left the lava, and `-5` left it too. What the two need is a
+    /// *floor*, and a floor is a property of the sprite - so it is registered beside the rectangle rather
+    /// than guessed at in a shader.
+    ///
+    /// `None` for a sprite nothing was registered for, which is also the answer for every sprite this side
+    /// draws from its own atlas.
+    pub sprite_level_caps: RwLock<HashMap<ResourcePath, u32>>,
     /// How many sprites have been added to the image since the texture on the GPU was last written.
     ///
     /// The one thing that makes [`Atlas::allocate`] and [`Atlas::upload`] two calls rather than one:
@@ -145,6 +179,7 @@ impl Atlas {
             animated_textures: RwLock::new(HashMap::new()),
             sprite_layers: Default::default(),
             sprite_rects: Default::default(),
+            sprite_level_caps: Default::default(),
             sprites_since_upload: std::sync::atomic::AtomicU64::new(0),
             size: ATLAS_DIMENSIONS,
         }
@@ -166,9 +201,19 @@ impl Atlas {
     /// game's own layout (this side packs its sprites somewhere else entirely), and the layer is the
     /// game's reading of the sprite's transparency, which this side otherwise guesses from the pixels -
     /// and a guess is why a sprite that is part opaque and part cutout is classified as one of them.
-    pub fn register_sprite(&self, path: &ResourcePath, rect: [f32; 4], layer: RenderLayer) {
+    pub fn register_sprite(
+        &self,
+        path: &ResourcePath,
+        rect: [f32; 4],
+        layer: RenderLayer,
+        level_cap: Option<u32>,
+    ) {
         self.sprite_rects.write().insert(path.clone(), rect);
         self.sprite_layers.write().insert(path.clone(), layer);
+
+        if let Some(cap) = level_cap {
+            self.sprite_level_caps.write().insert(path.clone(), cap);
+        }
     }
 
     /// Whether the game animates this sprite. See [`Atlas::animated_textures`].
@@ -176,26 +221,44 @@ impl Atlas {
         self.animated_textures.read().contains_key(path)
     }
 
+    /// How many sprites the game animates, which is **how many sprites carry `UV_ANIMATED`** and so how
+    /// many get the level-of-detail offset that cancels the fluid shimmer.
+    ///
+    /// Reported because that offset compensates for a level chosen too coarse, and the set it applies to is
+    /// the whole of how narrow the compensation is. It *should* be small - the fluids, the fire, a handful
+    /// of others - and if it ever is not, the effect is a bias nobody asked for on sprites that were already
+    /// right, which is the exact shape of the moiré this scoping was written to remove. A number in the log
+    /// is what turns "should be small" into something that was checked.
+    pub fn animated_sprite_count(&self) -> usize {
+        self.animated_textures.read().len()
+    }
+
     /// Where this sprite sits in the game's own atlas. See [`Atlas::sprite_rects`].
     pub fn sprite_rect(&self, path: &ResourcePath) -> Option<[f32; 4]> {
         self.sprite_rects.read().get(path).copied()
     }
 
-    /// Where an **animated** sprite sits in the game's atlas, or `None` for every other sprite - and
-    /// for every sprite at all while the animated-texture switch is off or the game's atlas has not
-    /// been handed over to the pass that draws the terrain.
+    /// Where a sprite sits in the game's atlas, **whether the game animates it, and how deep its mip chain
+    /// goes** - or `None` for every sprite at all while the animated-texture switch is off or the game's
+    /// atlas has not been handed over to the pass that draws the terrain.
     ///
     /// One question rather than four because the answers are one decision, and it is
-    /// [`crate::mc::block::face_uses_game_atlas`] that makes it: this only supplies the two the atlas
-    /// owns. A face that gets this wrong keeps its own coordinates rather than being drawn from the
-    /// wrong place, which is the direction to fail in - a "no" is the frozen fire the renderer has
-    /// always had, while a "yes" that should have been a "no" is a face with the wrong texture on it.
-    /// See `Vertex::uv_flags`' `UV_GAME_ATLAS` for the whole of it.
-    pub fn game_atlas_rect(&self, path: &ResourcePath) -> Option<[f32; 4]> {
+    /// [`crate::mc::block::face_uses_game_atlas`] that makes it: this only supplies the answers the atlas
+    /// owns. A face that gets this wrong keeps its own coordinates rather than being drawn from the wrong
+    /// place, which is the direction to fail in - a "no" is the frozen fire the renderer has always had,
+    /// while a "yes" that should have been a "no" is a face with the wrong texture on it.
+    pub fn game_atlas_rect(&self, path: &ResourcePath) -> Option<SpriteInAtlas> {
+        let animated = self.sprite_is_animated(path);
+
         crate::mc::block::face_uses_game_atlas(
-            self.sprite_is_animated(path),
+            animated,
             self.sprite_rects.read().get(path).copied(),
         )
+        .map(|rect| SpriteInAtlas {
+            rect,
+            animated,
+            level_cap: self.sprite_level_caps.read().get(path).copied(),
+        })
     }
 
     pub fn sprite_layer(&self, path: &ResourcePath) -> Option<RenderLayer> {
@@ -452,6 +515,7 @@ impl Atlas {
         self.animated_textures.write().clear();
         self.sprite_layers.write().clear();
         self.sprite_rects.write().clear();
+        self.sprite_level_caps.write().clear();
         *self.image.write() = ImageBuffer::new(self.size, self.size);
 
         // One, not zero: the count is what `upload_if_dirty` reads, and what has changed is the atlas
@@ -553,13 +617,12 @@ mod block_atlas_sampler_tests {
     /// is the only reason this can be a test at all: the two sites that create the samplers are deep in
     /// `RenderGraph::new` and `TextureManager::new`, both of which want a `Gpu`.
     ///
-    /// What is asserted is the **agreement**, not the filter. `Nearest` is where this stands after the
-    /// bilinear revision was rolled back - see the function's own note, and the distant-lava flicker
-    /// that rollback is waiting on - and the failure this test is here to catch is not "it is nearest"
-    /// but "the two atlases disagree". That is what produced "these are all blurry, there is none of the
-    /// game's crisp pixels left" about the fire, the lava and every other animated sprite, while the
-    /// blocks around them were clean. Written against the function's own answer, so it holds for either
-    /// filter and only fires when the two stop matching.
+    /// What is asserted is the **agreement**, not the filter. The filter itself has been moved three times
+    /// and is the game's for now - all three linear, anisotropy 16, which is what `LevelRenderer` builds -
+    /// so a test that pinned it would have had to be rewritten at each of those moves. The failure this is
+    /// here to catch is not "it is linear" but "the two atlases disagree", which is what produced "these
+    /// are all blurry, there is none of the game's crisp pixels left" about the fire, the lava and every
+    /// other animated sprite while the blocks around them were clean.
     ///
     /// The address mode is the thing that *does* differ, so both are checked: this side's atlas is
     /// `Repeat`, because its coordinates come from this side's own packing, and the game's is
@@ -581,6 +644,10 @@ mod block_atlas_sampler_tests {
             repeat.mipmap_filter, clamp.mipmap_filter,
             "and the same between mip levels"
         );
+        assert_eq!(
+            repeat.anisotropy_clamp, clamp.anisotropy_clamp,
+            "and the same anisotropy, which is the filter that decides how a grazing angle is sampled"
+        );
 
         // Whichever filter the two agree on, the mip chain has to be read, or the levels above zero are
         // never sampled at all.
@@ -597,6 +664,132 @@ mod block_atlas_sampler_tests {
         assert_eq!(clamp.address_mode_u, wgpu::AddressMode::ClampToEdge);
         assert_eq!(clamp.address_mode_v, wgpu::AddressMode::ClampToEdge);
         assert_eq!(clamp.address_mode_w, wgpu::AddressMode::ClampToEdge);
+    }
+
+    /// **Anisotropy above 1 needs linear magnification and minification, and getting that wrong is
+    /// fatal rather than ugly.**
+    ///
+    /// This is a regression test for a crash that reached a running client: the anisotropy was raised to 16
+    /// while magnification was `Nearest`, `create_sampler` returned `InvalidFilterModeWithAnisotropy`, and
+    /// on this path that is not a warning but the end of the process on the first frame.
+    ///
+    /// **The rule is asserted rather than the values, and the rule as wgpu states it is not the one this
+    /// test first carried.** It was written as "all three filters linear" because magnification happened to
+    /// be `Nearest` at the time - which made the mip filter a third requirement. wgpu's actual condition is
+    /// the min **and** mag filters (`wgpu-core`, `InvalidFilterModeWithAnisotropy`); a `Nearest` *mip*
+    /// filter is legal with anisotropy, which is why `game_atlas_blend_mips` can stay a free switch and
+    /// only the magnification is what the anisotropy has to be traded against.
+    ///
+    /// So the invariant is checked on the descriptor, because that is what a future edit is most likely to
+    /// break - the anisotropy lives in `block_atlas_sampler` and the mip filter in `game_atlas_sampler`, so
+    /// setting one without thinking about the other is an easy mistake to make twice.
+    #[test]
+    fn the_game_atlas_never_asks_for_anisotropy_without_linear_filters() {
+        let assert_legal = |descriptor: &wgpu::SamplerDescriptor<'_>, blend: bool| {
+            if descriptor.anisotropy_clamp > 1 {
+                assert_eq!(
+                    descriptor.mag_filter,
+                    wgpu::FilterMode::Linear,
+                    "anisotropy {} with a non-linear magnification filter is \
+                     `InvalidFilterModeWithAnisotropy` (blend switch {blend})",
+                    descriptor.anisotropy_clamp
+                );
+                assert_eq!(
+                    descriptor.min_filter,
+                    wgpu::FilterMode::Linear,
+                    "and the same for minification (blend switch {blend})"
+                );
+            }
+        };
+
+        set_game_atlas_blend_mips(true);
+
+        let blended = game_atlas_sampler();
+
+        assert_legal(&blended, true);
+        assert_eq!(
+            blended.mipmap_filter,
+            wgpu::MipmapFilterMode::Linear,
+            "blending levels is what makes the mip filter linear"
+        );
+        assert_eq!(
+            blended.anisotropy_clamp, 16,
+            "and it is then what lets the game's own anisotropy through"
+        );
+
+        set_game_atlas_blend_mips(false);
+
+        let stepped = game_atlas_sampler();
+
+        assert_legal(&stepped, false);
+        assert_eq!(
+            stepped.mipmap_filter,
+            wgpu::MipmapFilterMode::Nearest,
+            "the switch is still what picks the filter"
+        );
+        assert_eq!(
+            stepped.anisotropy_clamp, 16,
+            "and it leaves the anisotropy alone: a player who only asks for the stepped mip filter has not \
+             asked to lose anisotropic filtering, and the pair is legal while magnification is linear"
+        );
+
+        // Left on: it is the default, and a test that changed a global and left it changed would decide
+        // the filters of whatever ran next.
+        set_game_atlas_blend_mips(true);
+    }
+}
+
+#[cfg(test)]
+mod atlas_magnify_sampler_tests {
+    use super::*;
+
+    /// **The magnifying sampler is `Nearest` magnification, and the anisotropy is what it gives up.**
+    ///
+    /// This is the pair the shader picks between, so the thing worth pinning is that they really are two
+    /// different samplers rather than two names for one: a `magnify` sampler that slowly acquired the
+    /// anisotropic one's filters would leave the fragment stage selecting between identical fetches, which
+    /// is the softness this exists to remove - and it would look exactly like the change not working.
+    #[test]
+    fn the_magnifying_sampler_is_nearest_and_the_minifying_one_is_not() {
+        let magnify = atlas_magnify_sampler(wgpu::AddressMode::ClampToEdge);
+        let minify = block_atlas_sampler(wgpu::AddressMode::ClampToEdge);
+
+        assert_eq!(
+            magnify.mag_filter,
+            wgpu::FilterMode::Nearest,
+            "`Nearest` magnification is the whole point: it is how the game magnifies, and a bilinear \
+             filter at the magnification a block texture sees is what makes the near blocks soft"
+        );
+        assert_ne!(
+            magnify.mag_filter, minify.mag_filter,
+            "the two samplers are the two behaviours, so they cannot agree on magnification"
+        );
+
+        // **The constraint that forced two samplers to exist**, asserted on the descriptor rather than
+        // left to `create_sampler`: wgpu refuses anisotropy above 1 without linear magnification and
+        // minification, and on this path that refusal ends the process on the first frame.
+        assert_eq!(
+            magnify.anisotropy_clamp, 1,
+            "anisotropy above 1 beside `Nearest` magnification is `InvalidFilterModeWithAnisotropy`"
+        );
+
+        // What it does *not* give up, because a magnified surface can still be squeezed by perspective and
+        // the shader may hand this sampler either: the levels of the chain are still blended and the
+        // coordinates are still clamped the way the game clamps them.
+        assert_eq!(
+            magnify.mipmap_filter,
+            wgpu::MipmapFilterMode::Linear,
+            "the mip chain is not this sampler's business to change"
+        );
+        assert_eq!(magnify.min_filter, wgpu::FilterMode::Linear);
+        assert_eq!(magnify.address_mode_u, wgpu::AddressMode::ClampToEdge);
+        assert_eq!(magnify.address_mode_v, wgpu::AddressMode::ClampToEdge);
+
+        // And the address mode is the caller's, so the two atlases keep their own: this side's is packed
+        // by this side and needs `Repeat`, the game's asks for `ClampToEdge`.
+        let repeat = atlas_magnify_sampler(wgpu::AddressMode::Repeat);
+        assert_eq!(repeat.address_mode_u, wgpu::AddressMode::Repeat);
+        assert_eq!(repeat.mag_filter, wgpu::FilterMode::Nearest);
     }
 }
 
@@ -712,16 +905,23 @@ fn halve(image: &ImageBuffer<Rgba<u8>, Vec<u8>>) -> ImageBuffer<Rgba<u8>, Vec<u8
 /// underneath is the game's - built per sprite, padded by `1 << mipLevel`, alpha coverage held across
 /// levels - and the reason for `Nearest` went with it.
 ///
-/// The second is the one worth keeping: **turning anisotropic filtering off to *allow* `Nearest`
-/// magnification is what caused the fluid shimmer.** A large flat surface seen at a grazing angle has
-/// wildly unequal screen-space derivatives in its two directions, and with no anisotropy the level of
-/// detail is chosen from the *larger* one - so the level is too coarse and jumps as the view shifts. A
-/// player's run with a `-4` bias stopped the shimmer, which is what a finer level looks like, and that is
-/// the measurement this rests on.
+/// The second was tried next, and **the explanation that went with it was wrong.** With all three
+/// filters linear and anisotropy on, the softness up close came back and so did nothing else that was
+/// wanted - and the reason this function's note blamed for the shimmer turned out not to be it. The test
+/// that settled it is the bias: a `-4` level-of-detail bias removes the shimmer and a `0` has it, and
+/// **anisotropy does not move the chosen level at all** (it takes more samples *within* whichever level
+/// the derivative names). A symptom that answers to the level cannot have anisotropy as its cause.
 ///
 /// **wgpu will not have both.** `wgpu-core` refuses any `anisotropy_clamp` above 1 unless the min, mag
-/// *and* mipmap filters are all `Linear` (`InvalidFilterModeWithAnisotropy`), so "crisp up close" and
-/// "stable at a distance" are a choice rather than a combination - and this picks the one the game makes.
+/// *and* mipmap filters are all `Linear` (`InvalidFilterModeWithAnisotropy`), and a validation error on
+/// this path ends the process. So "crisp up close" and "anisotropic" really are a choice here - this is
+/// the one trade in this sampler that is a property of the API rather than of the picture.
+///
+/// **What the shimmer is remains open**, and the honest state of it is this: the level is being chosen
+/// too coarse for at least some surfaces, a bias cancels it, and a bias is the wrong shape of fix because
+/// it moves every surface including the ones that are already right. That is why the filters are now the
+/// game's and the bias is back at its neutral zero - so that the next measurement is of the level rather
+/// than of a calibration standing in for it.
 ///
 /// `address_mode` is `Repeat` for this side's atlas, whose coordinates come from its own packing, and
 /// `ClampToEdge` for the game's, which is what the game asks for.
@@ -732,27 +932,92 @@ fn halve(image: &ImageBuffer<Rgba<u8>, Vec<u8>>) -> ImageBuffer<Rgba<u8>, Vec<u8
 /// one call site only, so it clamped the game's atlas and left this renderer's at every level, which is the
 /// opposite of what its name and its own comment say. A sampler constructed twice can disagree; one
 /// constructed once cannot.
+/// **The sampler a magnified surface is drawn with: `Nearest`, with no anisotropic filtering.**
+///
+/// This exists because one sampler cannot be both things the terrain needs, and the reason is wgpu's
+/// rather than the picture's: any `anisotropy_clamp` above 1 requires the min, mag *and* mipmap filters
+/// to be linear (`wgpu-core`, `InvalidFilterModeWithAnisotropy`), so a sampler that filters
+/// anisotropically cannot magnify the way the game does. The game has no such rule - its magnification is
+/// `GL_NEAREST` and its minification is `GL_LINEAR_MIPMAP_LINEAR`, chosen independently - which is why
+/// vanilla's blocks are crisp up close *and* stable at a grazing angle.
+///
+/// **Two samplers over two ranges is not a compromise, because the ranges do not overlap.** Anisotropic
+/// filtering is a minification technique: it takes several samples along the direction a surface is
+/// compressed and uses the derivative of the *other* direction to pick the level. A magnified surface has
+/// nothing to compress - it is at level 0 by definition - so it needs none of that, and the anisotropy it
+/// would be given is thrown away. Conversely `Nearest` magnification says nothing about a surface being
+/// minified.
+///
+/// The shader decides between the two per fragment, on whether the coordinates' screen-space derivative is
+/// larger than a texel. That test is exact rather than a heuristic: a derivative below one texel per pixel
+/// *is* magnification, and that is the definition of it.
+///
+/// `min_filter` and `mipmap_filter` stay linear so that a surface right at the boundary has a sane answer
+/// either way; `anisotropy_clamp` is 1 because wgpu would refuse anything else beside `Nearest`.
+pub fn atlas_magnify_sampler(address_mode: wgpu::AddressMode) -> wgpu::SamplerDescriptor<'static> {
+    wgpu::SamplerDescriptor {
+        mag_filter: wgpu::FilterMode::Nearest,
+        // **Set here and not inherited, which is not a tidiness.** `..block_atlas_sampler(..)` below copies
+        // every field this does not name, and the base carries `anisotropy_clamp: 16` - so a version of
+        // this function that named only `mag_filter` asked wgpu for `Nearest` magnification *with* an
+        // anisotropy of 16, which is `InvalidFilterModeWithAnisotropy`, which on this path ends the
+        // process on the first frame. That is the same trap `game_atlas_sampler` fell into one round
+        // earlier by overriding a mip filter and not the anisotropy beside it, and the test below is what
+        // caught it both times.
+        anisotropy_clamp: 1,
+        label: Some("wgpu-mc: a magnified block atlas"),
+        ..block_atlas_sampler(address_mode)
+    }
+}
+
 pub fn block_atlas_sampler(address_mode: wgpu::AddressMode) -> wgpu::SamplerDescriptor<'static> {
     wgpu::SamplerDescriptor {
         address_mode_u: address_mode,
         address_mode_v: address_mode,
         address_mode_w: address_mode,
-        // **`Nearest` magnification, `Linear` minification, and the two were separated by measurement
-        // rather than chosen together.**
+        // **All three filters linear, plus anisotropic filtering: the game's own sampler.**
         //
-        // A player's report of the previous revision settled both halves at once: with `Linear`
-        // magnification "the near blocks are all blurry", and with a `-4` level-of-detail bias the fluid
-        // shimmer went away while at `0` it stayed. Those are two different faults with two different
-        // causes, and the revision they were reported against had **both** changed at the same time -
-        // which is why it took a round to tell them apart.
+        // `LevelRenderer` builds `CLAMP_TO_EDGE, FilterMode.LINEAR, FilterMode.LINEAR, maxAnisotropy` and
+        // hands it to both chunk groups, and the texture-filtering option only ever moves the anisotropy.
+        // So this is what the game's terrain is drawn with, and matching it is the default position: every
+        // deviation has to be paid for somewhere, and the two that were tried here both were.
         //
-        //   * **magnification is `Nearest`.** A 16-texel block texture seen close up is magnified by
-        //     something like twenty to a hundred times, and `Linear` turns every texel boundary into a
-        //     ramp. That is the whole of "the near blocks are all blurry", and it is magnification only;
-        //   * **the level of detail is chosen too coarse**, which is minification and is the shimmer. A
-        //     global bias is not the fix for it - it moves every surface, including the ones that are
-        //     already right - so what replaces it is a per-sprite clamp.
-        mag_filter: wgpu::FilterMode::Nearest,
+        //   * `Nearest` magnification was tried twice. The first time it was hiding a broken mip chain of
+        //     this side's own making; the second time it was kept deliberately, because magnifying a
+        //     16-texel block texture by a hundred is what `Linear` makes soft - and it *is* soft, which is
+        //     the trade rather than a fault. What it costs on the other side is that anisotropic filtering
+        //     becomes unreachable (see `anisotropy_clamp`);
+        //   * a `Nearest` mip filter was tried as a fix for the fluid shimmer and did not fix it, which is
+        //     how the shimmer was traced to the level of detail rather than to the blend between levels.
+        //
+        // **What the shimmer's real cause turned out to be is still open**, and it is worth saying here
+        // because it is the reason this sampler keeps being revisited: a `-4` level-of-detail bias removes
+        // it, and a bias cannot be the answer because the atlas is not a fixed size - the game's stitcher
+        // packs `blocks.png` at 2048x2048 with 5 mip levels in one run and 1024x1024 with 3 in the next, so
+        // one constant cannot mean the same thing in both. Until that is understood the filters are the
+        // game's and the bias is the thing under suspicion.
+        // **`Linear` magnification: the game's own answer, and the softness is its cost rather than a
+        // fault.**
+        //
+        // What it produces is a bilinear ramp between neighbouring texels, and at the magnification a block
+        // texture actually sees - a 16-texel sprite across a hundred or more screen pixels, so each texel is
+        // twelve to twenty-five of them - that ramp is most of the picture. There is no filter setting that
+        // makes it crisp while it stays bilinear, so this stays soft on purpose for now: the fix is not
+        // known, and `Nearest` was measured to be the wrong shape of answer.
+        //
+        // **The hypothesis that it was a texel-alignment fault was tested and is false.** The reasoning was
+        // that a face's coordinates run edge to edge, so a sample lands on the boundary between two texels
+        // rather than on one, and two texels at every point would be softer than one. So the coordinates
+        // were shifted by half a texel, per atlas, from the renderer - and the picture did not change. Which
+        // is what the arithmetic says it should do: half a texel moves *where* inside a texel the sample
+        // lands, and magnification interpolates between texel centres either way. A bilinear filter is soft
+        // because it interpolates, not because of where it is asked.
+        //
+        // `Nearest` was tried here twice before this. Each time it was crisp and each time the thing it
+        // costs came back: wgpu refuses anisotropy unless all three filters are linear (see below), so a
+        // `Nearest` magnification means no anisotropic filtering, and the fluid shimmer lives on the
+        // minification side that anisotropy is what fixes.
+        mag_filter: wgpu::FilterMode::Linear,
         min_filter: wgpu::FilterMode::Linear,
         // A blend between the two levels it lands between, so a surface crossing a level boundary does
         // not snap. The game's own choice: `OptionalDouble.empty()` for the maximum level is "every
@@ -772,17 +1037,22 @@ pub fn block_atlas_sampler(address_mode: wgpu::AddressMode) -> wgpu::SamplerDesc
         } else {
             u32::MAX as f32
         },
-        // **1, because wgpu refuses anything else with a `Nearest` filter.** Any `anisotropy_clamp` above
-        // 1 requires the min, mag *and* mipmap filters to all be linear - `wgpu-core` returns
-        // `InvalidFilterModeWithAnisotropy` otherwise, and a validation error on this path ends the
-        // process rather than warning. Magnification is `Nearest` now, so 1 is the only legal value.
+        // **16, the game's own value, which all three linear filters make legal.** Any `anisotropy_clamp`
+        // above 1 requires exactly that - `wgpu-core` returns `InvalidFilterModeWithAnisotropy` otherwise,
+        // and a validation error on this path ends the process rather than warning - so the anisotropic
+        // filtering the game asks for and a `Nearest` magnification are a choice in wgpu rather than a
+        // combination. Magnification is `Linear`, so there is nothing to trade and this is what stops a
+        // floor seen at a grazing angle from being sampled at the coarse level its worst derivative names.
         //
-        // 16 was written here when all three filters were linear, and the ceiling is worth knowing even
-        // so: `wgpu-hal`'s `MAX_ANISOTROPY` is 16, wgpu-core clamps to `[1, 16]`, and there is no query
-        // for what the driver really supports - `Limits` has no anisotropy field. The device this was
-        // measured on does report `DownlevelFlags::ANISOTROPIC_FILTERING`, so the value would be honoured
-        // if the filters allowed it; they do not, and magnification is what the player is looking at.
-        anisotropy_clamp: 1,
+        // **It is the thing `game_atlas_sampler` has to keep in step**, because that function overrides the
+        // mip filter: anisotropy above 1 with a `Nearest` mip filter is the same fatal error, and it reached
+        // a running client once for exactly that reason. See there.
+        //
+        // The ceiling: `wgpu-hal`'s `MAX_ANISOTROPY` is 16 and wgpu-core clamps to `[1, 16]` before the
+        // backend sees the value, so a larger number would be silently reduced. There is no query for what
+        // the driver really supports, because `Limits` has no anisotropy field; the device this was measured
+        // on does report `DownlevelFlags::ANISOTROPIC_FILTERING`, and the game asks for the same number.
+        anisotropy_clamp: 16,
         compare: None,
         ..Default::default()
     }
@@ -880,10 +1150,22 @@ pub fn set_atlas_lod_bias(bias: f32) {
 /// It remains reachable as the `atlas_base_mip_only` switch, honoured inside [`block_atlas_sampler`] for
 /// both atlases, because the case for it is a picture rather than an argument.
 pub fn game_atlas_sampler() -> wgpu::SamplerDescriptor<'static> {
+    // **Only the mip filter is overridden, and the anisotropy is deliberately left alone.**
+    //
+    // It has to be left alone rather than tied to the switch, which is the opposite of what a round of
+    // this did. The rule is that *any* `anisotropy_clamp` above 1 needs the min, mag **and** mipmap filters
+    // linear, and wgpu enforces it by returning an error from `create_sampler` - which on this path ends
+    // the process rather than warning. So the pair is only safe while magnification is `Linear`, and
+    // magnification *is* `Linear` (see `block_atlas_sampler`). Tying the anisotropy to this switch as well
+    // would take anisotropic filtering away from a player who only asked for the mip blend to be stepped.
+    //
+    // The combination this rules out is worth naming, because it is the one that reached a running client
+    // once: a `Nearest` mip filter *and* a `Nearest` magnification *and* anisotropy 16 is three filters
+    // that cannot all be satisfied, and it is the magnification that has to give first.
+    let blend = game_atlas_blend_mips();
+
     wgpu::SamplerDescriptor {
-        // Anisotropy requires this to be Linear too, so the blend switch is what decides whether the
-        // game atlas gets anisotropic filtering at all - see game_atlas_blend_mips.
-        mipmap_filter: if game_atlas_blend_mips() {
+        mipmap_filter: if blend {
             wgpu::MipmapFilterMode::Linear
         } else {
             wgpu::MipmapFilterMode::Nearest

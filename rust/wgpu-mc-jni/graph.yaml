@@ -49,6 +49,8 @@ pipelines:
         7: "@texture_game_lightmap"
         8: "@sampler_game_lightmap"
         9: "@fog_environment"
+        10: "@sampler_mc_block_atlas_magnify"
+        11: "@sampler_block_atlas_magnify"
       1: "@bg_ssbo_chunks"
     immediates:
       0: "@pc_section_position"
@@ -77,6 +79,8 @@ pipelines:
         7: "@texture_game_lightmap"
         8: "@sampler_game_lightmap"
         9: "@fog_environment"
+        10: "@sampler_mc_block_atlas_magnify"
+        11: "@sampler_block_atlas_magnify"
       1: "@bg_ssbo_chunks"
     immediates:
       0: "@pc_section_position"
@@ -118,6 +122,8 @@ pipelines:
         7: "@texture_game_lightmap"
         8: "@sampler_game_lightmap"
         9: "@fog_environment"
+        10: "@sampler_mc_block_atlas_magnify"
+        11: "@sampler_block_atlas_magnify"
       1: "@bg_ssbo_chunks"
     immediates:
       0: "@pc_section_position"

@@ -98,11 +98,11 @@ object TaaJitter {
 
     /** 本帧渲染目标的宽度（像素），抖动的分母。 */
     @JvmStatic
-    fun renderWidth(): Int = Minecraft.getInstance()?.window?.width ?: 0
+    fun renderWidth(): Int = Minecraft.getInstance().window.width ?: 0
 
     /** 本帧渲染目标的高度（像素）。见 [renderWidth]。 */
     @JvmStatic
-    fun renderHeight(): Int = Minecraft.getInstance()?.window?.height ?: 0
+    fun renderHeight(): Int = Minecraft.getInstance().window.height ?: 0
 
     /** [index] 在 [base] 进制下的 Halton 值，落在 [0, 1)。 */
     private fun halton(index: Int, base: Int): Float {

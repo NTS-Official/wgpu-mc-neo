@@ -1451,6 +1451,7 @@ pub extern "C" fn bind_game_block_atlas(_wm: &WmRenderer, texture: &wgpu::Textur
 
     wgpu_mc::render::graph::set_game_block_atlas(
         texture.create_view(&wgpu::TextureViewDescriptor::default()),
+        (texture.width(), texture.height()),
     );
 
     crate::debug::mark_pipelines_stale();

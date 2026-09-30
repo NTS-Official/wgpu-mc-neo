@@ -307,7 +307,7 @@ object RustChunkBake {
 			rustHas.remove(key)
 
 			if (pendingRedirty.size < PENDING_REDIRTY_LIMIT) {
-				pendingRedirty[key] = System.nanoTime()
+				pendingRedirty.put(key, System.nanoTime())
 				queued++
 			}
 		}
@@ -351,7 +351,21 @@ object RustChunkBake {
 	 * refusals of its own, so a queue that kept growing would hold entries for sections that were never
 	 * coming back.
 	 */
-	private val pendingRedirty = java.util.LinkedHashMap<Long, Long>()
+	/**
+	 * The sections waiting for a rebuild, as `SectionPos.asLong` keys.
+	 *
+	 * A [OrderedWorkQueue] rather than the `LinkedHashMap` this was, and the reason is a crash: the map
+	 * was walked with an iterator on the **render thread** (`redirtyDue`, once a frame) while chunk-build
+	 * workers inserted into it (`bakeNow`, on a refused payload), and a `LinkedHashMap` fails its iterator
+	 * the moment its structure changes underneath it. `ConcurrentModificationException`, from a frame, on a
+	 * client that had only been up for a minute.
+	 *
+	 * A `ConcurrentHashMap` would fix the crash and lose the thing this queue is *for*: what the drain
+	 * reports is not how many sections are waiting but how long the **oldest** has waited, because a key is
+	 * only ever in here because a section is not being drawn and its age is how long a hole has been on
+	 * screen. See [OrderedWorkQueue] for how the three properties are kept at once.
+	 */
+	private val pendingRedirty = OrderedWorkQueue<Long>()
 
 	/** The longest a section has waited for its rebuild, in nanoseconds. See [redirtyDue]. */
 	private var oldestRedirtyNanos = 0L
@@ -431,6 +445,18 @@ object RustChunkBake {
 			firstLookCount,
 		)
 
+		// **And whether the arena's refusals are coming back**, which is the one refusal that is not
+		// permanent and therefore the one that has to be retried. `capacityReoffers` climbing with
+		// `capacityRecovered` at zero is the arena never freeing the room the retry was for; both climbing
+		// together is the retry working; neither is an arena that never filled.
+		WgpuMcMod.LOGGER.info(
+			"wgpu: the arena refused {} section(s) that were offered again, and {} of them were taken once " +
+				"there was room; {} still waiting for room",
+			capacityReoffers,
+			capacityRecovered,
+			awaitingCapacity.size,
+		)
+
 		// **Which atlas the faces baked in the last second went to**, which is the one thing about the
 		// atlas routing that cannot be seen: both atlases are 2048x2048 and answer to the same filters, so
 		// a face on the wrong one is not drawn differently - it samples a mip chain built from the whole
@@ -495,6 +521,30 @@ object RustChunkBake {
 	private var firstLookCount = 0L
 
 	/**
+	 * **How often the re-offer drain has asked for a section the arena had no room for, and how often one
+	 * of those was then taken.**
+	 *
+	 * The pair is the whole of whether the at-capacity re-offer works: the first number climbing means the
+	 * drain is doing its job, and the second staying at zero means the arena never freed the room the retry
+	 * was for - which puts the fault in the arena's trimming rather than in this queue.
+	 */
+	private var capacityReoffers = 0L
+	private var capacityRecovered = 0L
+
+	/**
+	 * The sections waiting in [pendingRedirty] because the **arena** was full when they were offered.
+	 *
+	 * A set apart from the queue because the queue forgets a key the moment it is taken, and the question
+	 * this answers is about what happens *after* that: whether a section re-offered for want of room was
+	 * taken once there was room. Bounded by the same [PENDING_REDIRTY_LIMIT] the queue is, and pruned on the
+	 * recovery rather than left to grow - a section that is taken is taken once.
+	 *
+	 * Concurrent because the offers arrive on chunk-build workers while the recovery is recorded there too,
+	 * but the reads are the report's and those are on the render thread.
+	 */
+	private val awaitingCapacity = java.util.concurrent.ConcurrentHashMap.newKeySet<Long>()
+
+	/**
 	 * Asks the game to rebuild a few of the sections the arena refused, one frame at a time.
 	 *
 	 * Called every frame rather than every tick, because the two things it is throttled by are both
@@ -517,7 +567,7 @@ object RustChunkBake {
 	 */
 	@JvmStatic
 	fun redirtyDue(): Int {
-		if (pendingRedirty.isEmpty()) {
+		if (pendingRedirty.isEmpty) {
 			return 0
 		}
 
@@ -525,7 +575,7 @@ object RustChunkBake {
 
 		// Only with a world loaded: `setSectionDirty` walks the view area, which is not there on the
 		// title screen - and after leaving a world the queue can still hold refusals from the one before.
-		val renderer = client.levelRenderer ?: return 0
+		val renderer = client.levelRenderer
 
 		// **The budget shrinks under backoff, and it never reaches zero.** That distinction is the whole
 		// of this function's safety: the queue being fed here is also fed by nothing else, so a backoff
@@ -540,20 +590,21 @@ object RustChunkBake {
 		val budget = if (backedUp()) 1 else REDIRTY_PER_FRAME
 
 		var count = 0
-		val iterator = pendingRedirty.entries.iterator()
 		var oldest = 0L
 
-		while (iterator.hasNext() && count < budget) {
-			val (key, queuedAt) = iterator.next()
-			iterator.remove()
+		while (count < budget) {
+			// **Taken one at a time rather than through an iterator**, which is the whole reason this queue
+			// is not a `LinkedHashMap` any more: an iterator over one is invalidated by another thread's
+			// insert, and chunk-build workers insert while this runs. See [OrderedWorkQueue].
+			val (key, queuedAt) = pendingRedirty.pollOldest() ?: break
 
 			try {
 				renderer.setSectionDirty(SectionPos.x(key), SectionPos.y(key), SectionPos.z(key))
 			} catch (error: Throwable) {
 				// A nudge that does not land is not worth taking the game down for: the section keeps the
-				// geometry it had, which is where this path started. Put back, so the next frame tries it
-				// again rather than losing it the way the drain used to.
-				pendingRedirty[key] = queuedAt
+				// geometry it had, which is where this path started. Put back **at the front**, so the next
+				// frame tries it again rather than losing it the way the drain used to.
+				pendingRedirty.putFirst(key, queuedAt)
 				return count
 			}
 
@@ -961,7 +1012,14 @@ object RustChunkBake {
 		//
 		// This is the same mistake as `bake` answering "did it not throw", one layer down. It is read
 		// *after* the commit above, which is what makes the tables agree with the answer it gives.
-		noteTookSection(!firstLook[0] && !atCapacity() && accepted)
+		//
+		// **Sampled once, because it is not a property of the section - it can change between two reads.**
+		// The arena is a live thing: sections are trimmed as the view list changes, so the same section can
+		// be at capacity on one read and have room on the next. Reading it twice made the decision and the
+		// report disagree about which answer a rebuild got, and both of them pay for it below.
+		val atCapacity = atCapacity()
+
+		noteTookSection(!firstLook[0] && !atCapacity && accepted)
 
 		// **Which of the answers this rebuild got, counted.** The decision has four inputs now and when a
 		// hole survives a fix the question is which one is still wrong; `suppressed` is the only one that
@@ -969,12 +1027,57 @@ object RustChunkBake {
 		// are not the explanation.
 		if (tookThisSection.get()) {
 			suppressed++
+
+			// A section that was waiting for arena room and has now been taken. The set is what makes this
+			// a count of *recoveries* rather than of retries: a section that had to be re-offered twice is
+			// one recovery, and one that never had room is none.
+			if (awaitingCapacity.remove(SectionPos.asLong(targetX, targetY, targetZ))) {
+				capacityRecovered++
+			}
 		} else if (!accepted) {
 			refusedByRust++
-		} else if (atCapacity()) {
+		} else if (atCapacity) {
 			refusedAtCapacity++
 		} else {
 			firstLookCount++
+		}
+
+		// **A refusal that is not the arena's has to reach the re-offer drain too.** The arena's
+		// refusals get there through `forgetRefused`, and until this existed nothing else did - which is
+		// what the comment above `noteTookSection` says in as many words: "only an arena refusal reaches
+		// the re-offer drain". A payload the bake queue was full for, or one `resync` threw away, left
+		// that section with Minecraft's mesh and with **no one asking for it again**.
+		//
+		// That is a hole the moment the terrain pass is this side's: a mesh the game still holds is a
+		// mesh the game no longer draws, and the game only offers a section again when something makes
+		// it stale. It is also the reason a world could be drawn by both renderers at once - the
+		// sections Rust refused for want of queue room stayed Minecraft's for the session.
+		//
+		// The rate is `redirtyDue`'s and the bound is the same 4096 the arena's refusals use. Only the
+		// centre is queued: a neighbour's refusal costs the next rebuild one more payload and nothing
+		// else, while the centre is what decides whether *this* section was taken.
+		//
+		// **And `atCapacity` reaches it here, which is the part that was missing.** It is the one refusal
+		// that is *not* permanent, and nothing was asking again. The arena's answer is about the view as it
+		// stands: sections the player has walked away from are trimmed, and a section refused while there
+		// was no room can be taken a moment later - but the game only offers a section again when something
+		// makes it stale, and nothing did. So a world under arena pressure kept whichever sections were
+		// refused for good, drawn by Minecraft at full cost beside terrain Rust was drawing.
+		//
+		// The other two are deliberately not queued. `firstLook` is not a refusal at all - it is "the
+		// neighbourhood was not known yet", it is resolved by the *second* rebuild that every section gets
+		// anyway (the payload this one carried is what tells Rust about it), and queuing it would rebuild
+		// the whole world twice on purpose. `!accepted` is already here because it has no such second
+		// chance.
+		if ((!accepted || atCapacity) && pendingRedirty.size < PENDING_REDIRTY_LIMIT) {
+			val key = SectionPos.asLong(targetX, targetY, targetZ)
+
+			if (atCapacity) {
+				capacityReoffers++
+				awaitingCapacity.add(key)
+			}
+
+			pendingRedirty.put(key, System.nanoTime())
 		}
 
 		bakes++
@@ -986,9 +1089,9 @@ object RustChunkBake {
 		// decision. This names the positions, so a hole can be stood next to and matched against a line.
 		//
 		// The condition is the one that can leave a hole rather than the one that decides it. The
-		// decision - `noteTookSection(!firstLook[0] && !atCapacity())` - is already false when the arena
-		// is strained at the moment of the rebuild, so `tookThisSection` is only true for a section whose
-		// decision was made while there was room. The arena can fill *after* that: the bake is queued
+		// decision - `noteTookSection(!firstLook[0] && !atCapacity && accepted)` - is already false when the
+		// arena is strained at the moment of the rebuild, so `tookThisSection` is only true for a section
+		// whose decision was made while there was room. The arena can fill *after* that: the bake is queued
 		// here and allocates a frame later, so a section suppressed in good faith can be refused when it
 		// arrives - and then its mesh is gone and its geometry was never stored. That gap is what this
 		// reports, and it is the only remaining way a section ends up drawn by neither renderer.
@@ -1633,6 +1736,97 @@ object RustChunkBake {
 			private val perThread = ThreadLocal.withInitial { Payload() }
 
 			fun ofThread(): Payload = perThread.get()
+		}
+	}
+}
+
+/**
+ * A queue of section keys waiting to be asked for again: **thread-safe, de-duplicated, and ordered.**
+ *
+ * It replaces a plain `LinkedHashMap` that was read on one thread and written on another, which is what a
+ * `ConcurrentModificationException` on the render thread came from. A `LinkedHashMap` counts its structural
+ * changes and fails an iterator the moment one happens underneath it, so a map can be walked and mutated
+ * by one thread, or mutated by several threads, but not both - and this one is drained on the render thread
+ * while chunk-build workers insert into it.
+ *
+ * **All three properties are needed, which is why this is not simply a `ConcurrentHashMap`.**
+ *
+ *  * **thread-safe**, for the reason above;
+ *  * **de-duplicated**, because the same section refusing twice before it is retried is one rebuild and not
+ *    two. The insert is where that is decided, and it used to be the map's own keying;
+ *  * **ordered**, because what the drain reports is not how many are waiting but *how long the oldest has
+ *    waited*: a key is only ever queued because a section is not being drawn, so the age of the front of
+ *    the queue is how long a hole has been on screen. A `ConcurrentHashMap` alone throws that away.
+ *
+ * `queued` is the de-duplication and the drain's way back to the value; `order` is the order and the
+ * drain's way to find what to take next. An entry is only ever in both or neither, because [put] adds to
+ * the map first and pushes to the deque only when it was the call that inserted.
+ */
+private class OrderedWorkQueue<V> {
+	/** Key to value, for de-duplication and for reading a value back by key. Never iterated. */
+	private val queued = ConcurrentHashMap<Long, V>()
+
+	/**
+	 * The keys, oldest first. Each key is in here at most once, which the insert is what guarantees: a
+	 * second [put] of a key already waiting returns without touching this, so nothing ever has to be removed
+	 * from the middle of a concurrent deque.
+	 */
+	private val order = java.util.concurrent.ConcurrentLinkedDeque<Long>()
+
+	/** How many keys are waiting. The map's own count, which is cheaper than walking the deque. */
+	val size: Int
+		get() = queued.size
+
+	val isEmpty: Boolean
+		get() = queued.isEmpty()
+
+	/**
+	 * Queues [key] with [value], or leaves the entry that is already there alone.
+	 *
+	 * **`putIfAbsent` and not `put`.** A key that is already waiting keeps the value it was first queued
+	 * with, which is the whole point of that value being a timestamp: re-stamping it on every refusal would
+	 * report a section as newly waited-for however long it had actually been waiting. It is also what makes
+	 * the deque correct - the return value says whether *this* call is the one that has to add the order
+	 * entry, so a key cannot be in the map twice or in the deque without being in the map.
+	 */
+	fun put(key: Long, value: V) {
+		if (queued.putIfAbsent(key, value) == null) {
+			order.addLast(key)
+		}
+	}
+
+	/**
+	 * The oldest key still waiting and the value it was queued with, or `null` if the queue is empty.
+	 *
+	 * Both together rather than the key alone, because the value is what the caller measures the wait with -
+	 * and reading it back with a second lookup would be a race against the workers that are still inserting.
+	 *
+	 * A key polled from the deque that is no longer in the map is skipped rather than trusted. The two
+	 * structures are only taken apart here, so it should not happen - but this is a loop over a concurrent
+	 * structure, and a mismatched entry turning into an infinite one is a worse failure than a wasted
+	 * iteration.
+	 */
+	fun pollOldest(): Pair<Long, V>? {
+		while (true) {
+			val key = order.pollFirst() ?: return null
+			val value = queued.remove(key) ?: continue
+			return key to value
+		}
+	}
+
+	/**
+	 * Puts a key back at the **front**, where it was taken from.
+	 *
+	 * The drain's failure path does this: a nudge that did not land has to be tried again, and it has to be
+	 * tried *next* rather than at the back, or a section that keeps failing is re-queued behind everything
+	 * that arrived meanwhile and can starve. The old map needed no method for this, and what it did is worth
+	 * knowing: re-inserting a removed key into a `LinkedHashMap` puts it at the *end*. So the ordering it
+	 * gave a failing key was the back of the queue, and this is deliberately the other end - the direction
+	 * that makes the retry happen rather than the one that was cheapest to write.
+	 */
+	fun putFirst(key: Long, value: V) {
+		if (queued.putIfAbsent(key, value) == null) {
+			order.addFirst(key)
 		}
 	}
 }

@@ -80,6 +80,17 @@ object TerrainPass {
 	 * over while the arena is empty is a frame with no ground in it - the same trade [ready] makes
 	 * about the pipeline, for the same reason. Asked per frame, because the answer changes as the world
 	 * is meshed; the call is one lock and a length.
+	 *
+	 * **Deliberately not a coverage test against `LevelRenderer#visibleSections`**, which looks like the
+	 * obvious way to avoid taking the pass over with one section in the arena. That list is the
+	 * occlusion graph's answer and it holds sections with nothing in them - an air section is visible
+	 * and contributes no draw - so "the arena covers most of it" is a condition open ground can never
+	 * meet, and a pass that never meets it is a pass that is never taken over at all.
+	 *
+	 * What makes the early takeover safe instead is that **every refusal is retried**: a section the
+	 * baker could not take keeps Minecraft's mesh for the moment the pass changes hands, and
+	 * `RustChunkBake`'s refusal/redirty path asks the game for it again. See `RustChunkBake.bake`, which
+	 * answers "not taken" rather than claiming a section it did not bake.
 	 */
 	fun hasGeometry(renderer: MemorySegment): Boolean =
 		(WmNative.terrainArenaSections.invokeExact(renderer) as Int) > 0
@@ -180,8 +191,8 @@ object TerrainPass {
 	 * it has to agree with.
 	 */
 	fun sendCameraMatrices() {
-		val client = Minecraft.getInstance() ?: return
-		val camera = client.gameRenderer.mainCamera ?: return
+		val client = Minecraft.getInstance()
+		val camera = client.gameRenderer.mainCamera
 
 		// The camera state of the frame being drawn, which `GameRenderer.renderLevel` filled in before
 		// it called into the level renderer this pass belongs to.
@@ -356,7 +367,7 @@ object TerrainPass {
 	 * the list only changes when the camera's view does, and the native side keeps the last one.
 	 */
 	private fun sendVisibleSections() {
-		val levelRenderer = Minecraft.getInstance().levelRenderer ?: return
+		val levelRenderer = Minecraft.getInstance().levelRenderer
 
 		val visible = (levelRenderer as VisibleSectionsAccessor).`wgpu_mc$visibleSections`()
 		val keys = LongArray(visible.size)
@@ -438,7 +449,14 @@ object TerrainPass {
 	 * case [levelBob] falls back to the copy of their arithmetic.
 	 */
 	private val gameBob: Map<String, java.lang.invoke.MethodHandle> by lazy {
-		listOf("bobHurt", "bobView").mapNotNull { name ->
+		listOf("bobHurt", "bobView").associateWith { name ->
+			// **A miss throws rather than being dropped.** The two lookups used to be a `mapNotNull` that
+			// skipped whatever it could not find, so a rename or a signature change in the game would leave
+			// this map one entry short and nothing would say so - `callGameBob` would answer `false` and the
+			// pass would quietly draw with the replica below. That is the failure mode this whole function
+			// exists to prevent, and it is worse than a copy that is merely stale: the replica is only
+			// *probably* the same arithmetic, so a drift shows up as terrain that bobs slightly differently
+			// from the world around it, which is a split render rather than a wrong picture.
 			try {
 				val method = net.minecraft.client.renderer.GameRenderer::class.java.getDeclaredMethod(
 					name,
@@ -448,29 +466,51 @@ object TerrainPass {
 
 				method.isAccessible = true
 
-				name to java.lang.invoke.MethodHandles.lookup().unreflect(method)
+				java.lang.invoke.MethodHandles.lookup().unreflect(method)
 			} catch (error: Throwable) {
-				null
+				throw IllegalStateException(
+					"wgpu: the terrain pass cannot bob like the world does - GameRenderer.$name" +
+						"(CameraRenderState, PoseStack) could not be reached reflectively, and this pass " +
+						"has to run the game's own bob rather than a copy of it. A copy that has drifted " +
+						"draws the terrain bobbing differently from everything else in the frame.",
+					error,
+				)
 			}
-		}.toMap()
+		}
 	}
 
 	/** Whether the bob source has been reported this run. See [reportBobSource]. */
 	private val bobSourceReported = java.util.concurrent.atomic.AtomicBoolean()
 
+	/**
+	 * Runs one of the game's two bob methods, or throws.
+	 *
+	 * **It does not answer `false`.** A boolean let the caller fall back to the replica, and the replica is
+	 * a second implementation of arithmetic that has to agree with the game's frame for frame - the shake
+	 * this pass was built to remove was still there while the replica was what ran. A miss here is a build
+	 * to fix, not a state to draw in: the terrain and the rest of the world would bob differently, which is
+	 * the split render the reflection exists to avoid.
+	 *
+	 * The two failure points are separate and say so: [gameBob] building the handle (a lookup failure,
+	 * which throws there) and the call itself (an invocation failure, which throws here).
+	 */
 	private fun callGameBob(
 		name: String,
 		renderer: net.minecraft.client.renderer.GameRenderer,
 		state: CameraRenderState,
 		pose: PoseStack,
-	): Boolean {
-		val handle = gameBob[name] ?: return false
+	) {
+		val handle = gameBob.getValue(name)
 
-		return try {
+		try {
 			handle.invokeWithArguments(renderer, state, pose)
-			true
 		} catch (error: Throwable) {
-			false
+			throw IllegalStateException(
+				"wgpu: the terrain pass cannot bob like the world does - GameRenderer.$name threw when " +
+					"this pass called it. See the cause; the alternative is a copy of the game's arithmetic, " +
+					"which is not what this pass is drawn with.",
+				error,
+			)
 		}
 	}
 
@@ -493,18 +533,19 @@ object TerrainPass {
 	 */
 	private fun describeCamera(): String {
 		val client = Minecraft.getInstance()
-		val live = client.gameRenderer.mainCamera?.position()
+		val live = client.gameRenderer.mainCamera.position()
 		val state = client.gameRenderer.gameRenderState.levelRenderState.cameraRenderState.pos
 
-		val liveSection = live?.let {
-			"${SectionPos.blockToSectionCoord(it.x)}, ${SectionPos.blockToSectionCoord(it.z)}"
-		} ?: "none"
+		// `position()` answers a vector rather than a nullable, so the `?: "none"` that used to be here was
+		// unreachable and Kotlin said so every build. "none" is not a state this camera has.
+		val liveSection =
+			"${SectionPos.blockToSectionCoord(live.x)}, ${SectionPos.blockToSectionCoord(live.z)}"
 
 		return ("cam live=(%.2f, %.2f, %.2f) state=(%.2f, %.2f, %.2f) model=(%.2f, %.2f, %.2f) " +
 			"sec(live)=[$liveSection] sec(model)=[$lastSectionX, $lastSectionZ]").format(
-			live?.x ?: 0.0,
-			live?.y ?: 0.0,
-			live?.z ?: 0.0,
+            live.x,
+            live.y,
+            live.z,
 			state.x,
 			state.y,
 			state.z,
@@ -683,79 +724,38 @@ object TerrainPass {
 	 * The damage tilt and the view bob, which `GameRenderer.renderLevel` multiplies into the level
 	 * projection - `bobHurt` first, then `bobView` when the option is on.
 	 *
-	 * Copied from those two methods as they read in 26.1 rather than called: both are private, and the
-	 * access transformer is applied by NeoForge when the game loads, not to the jar the Kotlin
-	 * compiler sees, so a call to either does not compile. It is a handful of lines of arithmetic over
-	 * the frame's camera state; the day it drifts from the game is the day the world and this pass bob
-	 * differently again, which is the bug this exists to fix.
+	 * The game's own two methods, reached reflectively: both are private, and the access transformer is
+	 * applied by NeoForge when the game loads, not to the jar the Kotlin compiler sees, so a call to either
+	 * does not compile. Reflection is the only way to run the arithmetic the world is already drawn with.
+	 *
+	 * **There is no fallback.** This used to fall back to a copy of the two methods when the lookup or the
+	 * call failed, and that copy is exactly what the pass was built to stop using: the shake this function
+	 * removes was still there while the copy was what ran, because a copy can drift where a call cannot.
+	 * Both failure points throw now - see [gameBob] and [callGameBob] - so a game that renames or reshapes
+	 * either method stops the client at the first frame instead of drawing a frame whose terrain bobs by
+	 * different arithmetic than everything else in it.
 	 */
 	private fun levelBob(state: CameraRenderState, client: Minecraft): PoseStack {
 		val bob = PoseStack()
 
-		// Minecraft's own two methods first, reflectively: the access transformer widens them for the
-		// game at load time but not for this compiler, and a *replica* of them is a second place the bob
-		// can be got wrong - the shake this is here to remove was still there with the replica. If the
-		// lookup fails the replica below is used, and which one ran is logged once.
-		if (callGameBob("bobHurt", client.gameRenderer, state, bob) &&
-			(!client.options.bobView().get() || callGameBob("bobView", client.gameRenderer, state, bob))
-		) {
-			reportBobSource("the game's own bobHurt/bobView")
-			return bob
+		// **The game's own two methods, reflectively, and nothing else.**
+		//
+		// The access transformer widens them for the game at load time but not for this compiler, so they
+		// cannot be called directly. Reflection is therefore the only way to run the *same* arithmetic the
+		// world is drawn with, and it is the whole reason this function is shaped like this: a replica is a
+		// second implementation, and the shake this pass exists to remove was still there while the replica
+		// was what ran.
+		//
+		// There is no fallback. Both halves throw - see `gameBob` and `callGameBob` - because the states a
+		// fallback would cover are states where the terrain bobs differently from everything else in the
+		// frame, and a wrong picture that survives is worse to find than a client that stops.
+		callGameBob("bobHurt", client.gameRenderer, state, bob)
+
+		if (client.options.bobView().get()) {
+			callGameBob("bobView", client.gameRenderer, state, bob)
 		}
 
-		reportBobSource("a copy of the game's arithmetic")
-
-		val entity = state.entityRenderState
-
-		if (entity.isLiving) {
-			var hurt = entity.hurtTime
-
-			if (entity.isDeadOrDying) {
-				val death = minOf(entity.deathTime, 20.0f)
-				bob.mulPose(Axis.ZP.rotationDegrees(40.0f - 8000.0f / (death + 200.0f)))
-			}
-
-			// A damage type marked "no_flinch" does not shake the screen (Neo), and a hit that has not
-			// been rendered yet has a hurt time below zero.
-			if (hurt >= 0.0f && !entity.preventFlinch) {
-				hurt /= entity.hurtDuration
-				hurt = Math.sin(hurt * hurt * hurt * hurt * Math.PI).toFloat()
-				val direction = entity.hurtDir
-				bob.mulPose(Axis.YP.rotationDegrees(-direction))
-				bob.mulPose(
-					Axis.ZP.rotationDegrees(
-						// The tilt strength is a double in the options state, which is why the game
-						// narrows this product itself.
-						(
-							-hurt * 14.0 *
-								client.gameRenderer.gameRenderState.optionsRenderState.damageTiltStrength
-							).toFloat()
-					)
-				)
-				bob.mulPose(Axis.YP.rotationDegrees(direction))
-			}
-		}
-
-		if (entity.isPlayer && client.options.bobView().get()) {
-			// `Mth.sin`/`Mth.cos` take and return a double in 26.1 - the game's own calls widen a float
-			// into them silently, Kotlin will not - so the angle stays a double and the results are
-			// narrowed back to the floats the pose stack wants.
-			val walk = entity.backwardsInterpolatedWalkDistance.toDouble() * Math.PI
-			val amount = entity.bob
-			val turn = Math.sin(walk).toFloat()
-
-			bob.translate(
-				turn * amount * 0.5f,
-				-Math.abs(Math.cos(walk) * amount.toDouble()).toFloat(),
-				0.0f,
-			)
-			bob.mulPose(Axis.ZP.rotationDegrees(turn * amount * 3.0f))
-			bob.mulPose(
-				Axis.XP.rotationDegrees(
-					Math.abs(Math.cos(walk - 0.2) * amount.toDouble()).toFloat() * 5.0f
-				)
-			)
-		}
+		reportBobSource("the game's own bobHurt/bobView")
 
 		return bob
 	}

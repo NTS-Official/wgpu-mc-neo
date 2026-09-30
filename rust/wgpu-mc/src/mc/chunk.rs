@@ -3640,9 +3640,15 @@ fn fluid_sprites(atlas: &Atlas, kind: u8, name: &str) -> Option<(RenderLayer, Fl
         // fluid animate, and it is the same decision a block model's face makes - the animated-texture
         // switch, the handed-over atlas, and whether the game animates this sprite. Read here, while
         // the name is in hand, because the face baker is handed the sprite and not its name.
+        //
+        // The animation flag `game_atlas_rect` also answers with is dropped here rather than carried: this
+        // is the fluid baker, and a fluid sprite is animated by definition - `lava_flow.png.mcmeta` and
+        // `water_flow.png.mcmeta` are what make it a strip. The flag is for the *block model* path, where
+        // a sprite may or may not move and the shader's level-of-detail bias is scoped by it. See
+        // `Vertex::uv_flags`' `UV_ANIMATED`.
         rect.map(|atlas_rect| FluidSprite {
             atlas: atlas_rect,
-            game: atlas.game_atlas_rect(&path),
+            game: atlas.game_atlas_rect(&path).map(|sprite| sprite.rect),
         })
     };
 

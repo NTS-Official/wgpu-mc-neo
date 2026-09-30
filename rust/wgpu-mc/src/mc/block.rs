@@ -10,7 +10,8 @@ use serde_derive::{Deserialize, Serialize};
 use crate::mc::direction::Direction;
 use crate::mc::resource::{ResourcePath, ResourceProvider};
 use crate::render::atlas::Atlas;
-use crate::render::pipeline::{UV_GAME_ATLAS, UV_GAME_SCALE};
+use crate::render::atlas::SpriteInAtlas;
+use crate::render::pipeline::{UV_ANIMATED, UV_GAME_ATLAS, UV_GAME_SCALE, lod_floor_bits};
 use crate::texture::UV;
 
 /// A block position: x, y, z
@@ -500,6 +501,18 @@ pub static FACES_OWN_ATLAS: std::sync::atomic::AtomicU64 = std::sync::atomic::At
 /// the symptom was that `Fast` and `Fancy` drew identical leaves.
 pub static FACES_FORCED_OPAQUE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// **How many faces were baked with `UV_ANIMATED`, which is how many get the level-of-detail offset.**
+///
+/// The offset compensates for a mip level chosen too coarse, and it is only legitimate on a sprite whose
+/// coarse levels *move* - a scrolling, frame-interpolated one. On anything else it is a sharpening nobody
+/// asked for, which is exactly the moiré that scoping it to animated sprites was written to remove. So the
+/// set it applies to is the whole of how narrow the compensation is, and "it should be small" is the kind
+/// of claim this number exists to check.
+///
+/// Read against [`FACES_GAME_ATLAS`] on the same line: the ratio is what says whether the scope is the
+/// fluids and the fire, or half the game's sprites.
+pub static FACES_ANIMATED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// The two counts of [`FACES_GAME_ATLAS`], read and not reset - they are a running total for the
 /// session, because "how many" is the question and a per-second rate would need a reader to integrate
 /// it in their head.
@@ -611,6 +624,41 @@ struct FaceData {
 /// sample is baked with the game's coordinates and flagged for it, and every other face keeps the
 /// coordinates this side packed. The two are not interchangeable - the scales differ, and so do the
 /// atlases - which is why the flag and the coordinates are written together, here, and never apart.
+/// **How many levels a face may be pushed down the chain, which is the floor the old offset stood in for.**
+///
+/// A moving sprite's coarse levels are a running average of its animation rather than a smaller copy of it,
+/// so past a certain level there is no animation left - only an average that moves. That is the fluid
+/// shimmer, and the level it starts at is a property of the sprite's own texel size: a 32-texel sprite has
+/// four levels of real detail above a 2x2 one, a 16-texel sprite three.
+///
+/// The arithmetic is deliberately blunt, because the alternative is a number per sprite and there is no
+/// measurement behind one. **A sprite keeps its top [`LEVELS_OF_DETAIL_KEPT`] levels above the end of its
+/// chain** - so a 32-texel flow sprite floors at `log2(32) - 2`, which is level 3, a 4x4 image in which the
+/// scrolling pattern is still a pattern. That constant is a choice rather than a derivation and is named so
+/// it can be moved; what is *not* a choice is that a floor exists at all, because a bias provably could not
+/// express one - two of them were tried and each time the lava went on shimmering while the water stopped.
+///
+/// `None` means nothing was registered for the sprite - including every sprite this side draws from its own
+/// atlas - and that answers zero, which is no floor.
+fn sprite_level_floor(level_cap: Option<u32>, animated: bool) -> u32 {
+    // Only an animated sprite has anything to lose by being sampled too coarsely: a still sprite's levels
+    // are a consistent pyramid, and flooring those would be sharpening nobody asked for - the moiré this
+    // whole thing was scoped down from once already.
+    if !animated {
+        return 0;
+    }
+
+    let Some(cap) = level_cap else {
+        return 0;
+    };
+
+    cap.saturating_sub(LEVELS_OF_DETAIL_KEPT)
+}
+
+/// How many levels above the end of its chain a sprite is still recognisably itself. See
+/// [`sprite_level_floor`].
+const LEVELS_OF_DETAIL_KEPT: u32 = 2;
+
 fn face_data(
     tex: &schemas::models::ElementFace,
     bounds: ElementBounds,
@@ -625,15 +673,33 @@ fn face_data(
     // named here is a concrete one - or one the atlas does not have, which `get_atlas_uv` reports.
     let uv = tex.uv.unwrap_or_else(|| default_face_uv(bounds, declared));
 
-    // `Some` only for a sprite the game animates in an atlas the built pass samples: see
-    // `Atlas::game_atlas_rect`, which is the whole of the decision.
+    // `Some` only for a sprite with a rectangle in an atlas the built pass samples: see
+    // `Atlas::game_atlas_rect`, which is the whole of the decision. The `bool` is whether the game
+    // animates that sprite, which the shader needs for its level-of-detail bias - a coarse mip of a
+    // moving sprite is a moving average, and that is the fluid shimmer.
     let game_rect = atlas.game_atlas_rect(&texture);
 
     let (uv, uv_flags) = match game_rect {
-        Some(rect) => {
+        Some(SpriteInAtlas {
+            rect,
+            animated,
+            level_cap,
+        }) => {
             FACES_GAME_ATLAS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-            (get_game_atlas_uv(uv, tex.rotation, rect), UV_GAME_ATLAS)
+            let mut flags = UV_GAME_ATLAS;
+
+            if animated {
+                FACES_ANIMATED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                flags |= UV_ANIMATED;
+            }
+
+            // **How far this face may be pushed down the chain**, which is the floor the level-of-detail
+            // offset was standing in for. See `UV_LOD_FLOOR_SHIFT` for why it is a floor and not an offset,
+            // and `sprite_level_floor` for the arithmetic.
+            flags |= lod_floor_bits(sprite_level_floor(level_cap, animated));
+
+            (get_game_atlas_uv(uv, tex.rotation, rect), flags)
         }
         None => {
             let Some(uv) = get_atlas_uv(uv, tex.rotation, atlas, &texture) else {
@@ -656,7 +722,7 @@ fn face_data(
         // to be in the same units as the corners it is given: this side's atlas pixels, or the game's
         // own coordinates at the same scale the corners went through (`GAME_UV_SCALE`).
         let sprite = match game_rect {
-            Some(rect) => game_rect_to_bits(rect),
+            Some(SpriteInAtlas { rect, .. }) => game_rect_to_bits(rect),
             // `get_atlas_uv` above already found this sprite in the same map under the same key, so
             // this cannot be what makes a locked face disappear - it is here so that the sprite's
             // rectangle is read from one place rather than threaded through.

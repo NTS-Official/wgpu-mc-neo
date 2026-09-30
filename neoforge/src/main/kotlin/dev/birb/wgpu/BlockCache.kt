@@ -51,13 +51,23 @@ import java.util.concurrent.atomic.AtomicInteger
 @EventBusSubscriber(modid = WgpuMcMod.MOD_ID)
 object BlockCache {
 	/**
-	 * How long to wait after a reload before asking for the registry.
+	 * The atlas texture the cache has already baked against, which is what says a new stitch has landed.
 	 *
-	 * The atlas is stitched by a reload listener of the game's, and this mod's listener may run
-	 * before it; five seconds is far longer than the stitch takes and costs nothing, since the work
-	 * happens on its own thread either way.
+	 * This replaced a fixed hundred-tick wait, and that wait was the whole of "the Rust terrain takes
+	 * over a few seconds after the world appears". Our own reload listener may run before the game's
+	 * atlas listener, so the atlas cannot be read at the moment the reload is announced - but waiting
+	 * five seconds and hoping also meant the registry was never built before a world was entered, so
+	 * the sections the world offered first were meshed without it and had to be meshed a second time
+	 * (`cacheAndRebuild`) before the arena held anything.
+	 *
+	 * The game **creates a new GPU texture** for the atlas on every stitch (`TextureAtlas`:
+	 * `this.texture = device.createTexture(...)`), so the texture's identity is the signal that does
+	 * not have to be guessed: a different one than the last bake used means the new atlas is there and
+	 * the sprite rectangles can be read. It is the same identity trick the lightmap handover uses in
+	 * `TerrainPass.bindLightmap`. See [stitchedAtlas].
 	 */
-	private const val TICKS_AFTER_RELOAD = 100
+	@Volatile
+	private var bakedAgainst: Any? = null
 
 	/** How many reloads the game has announced, from the resource-reload listener. */
 	private val reloads = AtomicInteger(0)
@@ -115,6 +125,31 @@ object BlockCache {
 	private val pendingRebake = AtomicBoolean(false)
 
 	/**
+	 * The game's block atlas texture, when it is one this cache has not baked against yet.
+	 *
+	 * `null` while the stitch is still in flight, while the atlas the manager holds is still the
+	 * previous pack's, and once the texture it produced has been closed - all three of which are
+	 * "reading it now would register the wrong rectangles". A reload that kept the same texture cannot
+	 * happen: the stitch builds a new one every time. See [bakedAgainst].
+	 */
+	private fun stitchedAtlas(): Any? {
+		return try {
+			val atlas = Minecraft.getInstance().atlasManager.getAtlasOrThrow(BLOCKS_ATLAS)
+			if (atlas.textures.isEmpty()) return null
+
+			val texture = atlas.texture
+			if (texture.isClosed) return null
+			if (texture === bakedAgainst) return null
+
+			texture
+		} catch (failure: Throwable) {
+			// Mid-reload the manager can answer with an atlas that has no texture yet, and the atlas
+			// before the first stitch of a launch has no sprites: both are "ask again next tick".
+			null
+		}
+	}
+
+	/**
 	 * Catches the cache up with the newest reload, once everything it needs is there.
 	 *
 	 * Safe to call from anywhere, as often as anything likes: the work happens on its own thread, one
@@ -122,17 +157,24 @@ object BlockCache {
 	 *
 	 * The wait is for the *game's* atlas, not this side's: a reload stitches it on a background thread
 	 * and this mod's listener may run before that listener does, so reading it immediately is reading
-	 * the previous pack's - or a closed texture. Five seconds is far longer than the stitch takes and
-	 * costs nothing, since the work happens on its own thread either way.
+	 * the previous pack's - or a closed texture. What the wait is *for* is the stitch, so what it is
+	 * measured by is the atlas itself ([stitchedAtlas]) rather than a tick count: the atlas normally
+	 * lands within a tick or two of the reload, while the game is still on the loading screen - which
+	 * is what leaves the registry built before any world is entered.
 	 */
 	@JvmStatic
 	fun start() {
 		if (!Wgpu.isRendererLive()) return
-		if (sinceReload < TICKS_AFTER_RELOAD) return
 
 		val reload = reloads.get()
 		if (reload == 0) return
 		if (handled.get() == reload) return
+
+		// The one thing the reload does not tell us: whether the game's atlas has been stitched for
+		// the pack that was just read. See `bakedAgainst` for why the texture's identity answers that
+		// and a tick count does not - and note that this is what lets the registry be built on the
+		// loading screen, before any world exists, instead of seconds after one has been entered.
+		val atlas = stitchedAtlas() ?: return
 
 		// The claim comes first, and `handled` is moved only by the caller that gets it: a reload that
 		// arrives while the previous one is still baking has to be *left* for the next tick, and a
@@ -140,6 +182,12 @@ object BlockCache {
 		if (!baking.compareAndSet(false, true)) return
 
 		handled.set(reload)
+		bakedAgainst = atlas
+
+		WgpuMcMod.LOGGER.info(
+			"wgpu: the block atlas's stitch was seen {} tick(s) after the reload",
+			sinceReload,
+		)
 
 		// The first reload is the one that builds the block registry out of the registrations the game
 		// made while it was starting. Every reload after it *rebuilds* that registry against the pack
@@ -268,11 +316,53 @@ object BlockCache {
 					sprite.u1,
 					sprite.v1,
 					layer,
+					// **The coarsest mip level this sprite has any detail at**, which is what the native side
+					// turns into a floor: a moving sprite's levels past that are a running average of its
+					// animation rather than a smaller copy of it, and an average that moves is the fluid
+					// shimmer. `log2` of the frame's size, because each level halves it and the last one is
+					// a single texel.
+					//
+					// `width` and not the strip's height: the frame is what a face samples. Floored at 0 for
+					// a 1-texel sprite, where `log2` is already 0 and there is nothing coarser to allow.
+					Integer.numberOfTrailingZeros(Integer.highestOneBit(
+						sprite.contents().width().coerceAtLeast(1)
+					)).coerceAtLeast(0),
 				)
 				registered++
 			}
 
 			WgpuMcMod.LOGGER.info("wgpu: registered {} sprite(s) of the block atlas", registered)
+
+			// **The sprites' own texel sizes, for the two the level-of-detail offset is calibrated on.**
+			//
+			// That offset is a count of *levels*, so the same number lands a 16-texel sprite and a 32-texel
+			// one at different levels of their own detail - and one of them is where the shimmer stopped and
+			// the other is not. What the offset should be depends on the sprite's size, so the sizes have to
+			// be known rather than assumed: `lava_flow` being twice `water_flow` is the whole hypothesis,
+			// and a hypothesis about a number is what a measurement is for.
+			for (name in listOf(
+				"minecraft:block/water_flow",
+				"minecraft:block/water_still",
+				"minecraft:block/lava_flow",
+				"minecraft:block/lava_still",
+				"minecraft:block/fire_0",
+				"minecraft:block/fire_1",
+			)) {
+				val sprite = atlas.textures[net.minecraft.resources.Identifier.parse(name)] ?: continue
+
+				// **`width()`/`height()` are one *frame*, not the strip**, which is worth saying because the
+				// first version of this line assumed otherwise: the frame count is taken as the strip's
+				// height over its width, and `SpriteContents.width()` already answers a single frame - so
+				// that arithmetic printed "1 frame" for a 32-frame sprite and looked like a measurement.
+				// The frame count is not readable from here (`getFrameCount` is private), so it is left off
+				// rather than guessed: what this line is for is the texel size, and that it does answer.
+				WgpuMcMod.LOGGER.info(
+					"wgpu: {} is {}x{} texel(s) per frame in the game's atlas",
+					name,
+					sprite.contents().width(),
+					sprite.contents().height(),
+				)
+			}
 		} catch (failure: Throwable) {
 			WgpuMcMod.LOGGER.warn("wgpu: the block atlas's sprites were not registered: {}", failure.toString())
 		}
@@ -395,10 +485,89 @@ object BlockCache {
 			},
 		)
 
+		// A bake that lands **before any level exists** - the launch path, now that the trigger waits
+		// for the atlas instead of for five seconds - has nothing to mesh again, and this is what keeps
+		// that path from paying for one. The sections a world offers are then captured on their own
+		// first build, because the registry is already there.
+		//
+		// A bake that lands with a level loaded still re-meshes: a reload, or a launch whose world beat
+		// the registry. Those sections were built without a registry, `RustChunkBake.bake` left them to
+		// Minecraft, and the game only offers a section again when something makes it stale.
+		if (client.level == null) {
+			WgpuMcMod.LOGGER.info("wgpu: no level is loaded yet, so there is nothing to mesh again")
+			return
+		}
+
 		client.execute {
 			client.levelRenderer.allChanged()
 		}
 	}
+
+	/**
+	 * Waits until the native block registry has been built, and gives up after a bounded time.
+	 *
+	 * **Called from the render thread, before a world is meshed** - `LevelRenderer#setLevel`, through
+	 * `WorldRendererMixin`. That is the one moment where waiting buys something: sections are meshed from
+	 * that call, `RustChunkBake.bake` refuses every one of them while the registry is empty, and a section
+	 * Minecraft meshed for that reason is meshed *again* once the registry lands. Waiting here is the
+	 * difference between a world Rust bakes on its first build and a world that visibly swaps over a few
+	 * seconds in.
+	 *
+	 * **It does not start the bake** - it waits for one already under way, and asks for one if the tick
+	 * that would have started it has not run yet. That matters because the atlas is stitched on a
+	 * background thread and `start` is driven from the client tick: a launch that enters a world before the
+	 * next tick would otherwise find nothing running and give up immediately, which is the very case this
+	 * exists for.
+	 *
+	 * The cap is on time, not on iterations, and it is deliberately generous: the bake reads every
+	 * blockstate in the game and takes about four seconds. A wait longer than this means something is
+	 * wrong with the bake, and a client that hangs forever is far worse than a world drawn on Minecraft's
+	 * meshes - which is exactly what the fallback is.
+	 */
+	@JvmStatic
+	fun awaitCached() {
+		if (WgpuNative.blocksCached()) {
+			return
+		}
+
+		// A bake that has not been claimed yet is claimed here, so the wait is for work that exists.
+		start()
+
+		val deadline = System.nanoTime() + AWAIT_CACHED_NANOS
+		var asked = false
+
+		while (System.nanoTime() < deadline) {
+			if (WgpuNative.blocksCached()) {
+				WgpuMcMod.LOGGER.info(
+					"wgpu: waited for the block registry before meshing the world; it is ready, so Rust " +
+						"bakes every section on its first build",
+				)
+				return
+			}
+
+			// The bake can still be unclaimed - the tick that claims it may not have run - so it is asked
+			// for again while it is not in flight. `start` is safe to call repeatedly: it claims, and a
+			// claim that does not get taken leaves the reload for the next caller.
+			if (!asked && !baking.get()) {
+				asked = true
+				start()
+			}
+
+			Thread.sleep(AWAIT_CACHED_POLL_MILLIS)
+		}
+
+		WgpuMcMod.LOGGER.warn(
+			"wgpu: the block registry was not ready after {} ms, so this world is meshed by Minecraft " +
+				"where Rust cannot take a section yet - the terrain will swap over as the registry lands",
+			AWAIT_CACHED_NANOS / 1_000_000,
+		)
+	}
+
+	/** How long {@link #awaitCached} waits. See there for why it is bounded at all. */
+	private const val AWAIT_CACHED_NANOS = 30_000_000_000L
+
+	/** How often {@link #awaitCached} looks. */
+	private const val AWAIT_CACHED_POLL_MILLIS = 10L
 
 	/**
 	 * Asks for the block models to be baked again, because a setting that is written into them moved.

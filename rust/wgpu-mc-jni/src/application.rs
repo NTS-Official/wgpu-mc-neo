@@ -249,11 +249,17 @@ mod tests {
                 "@sampler_mc_block_atlas",
                 "@texture_game_lightmap",
                 "@sampler_game_lightmap",
-                "@fog_environment"
+                "@fog_environment",
+                // **Two more samplers over the same two textures**, and they are the magnification half of
+                // the pair: the shader picks between a `Nearest` magnification and an anisotropic
+                // minification per fragment, because wgpu will not put both behaviours in one sampler. See
+                // `atlas_magnify_sampler` in `wgpu-mc`.
+                "@sampler_mc_block_atlas_magnify",
+                "@sampler_block_atlas_magnify"
             ],
             "the shader's own binding numbers are the keys of this map: the two atlases with their \
-             samplers, the game's lightmap - which is the whole of the terrain's lighting - and the fog \
-             block the game's fog is written into"
+             samplers, the same two with the magnifying samplers, the game's lightmap - which is the whole \
+             of the terrain's lighting - and the fog block the game's fog is written into"
         );
 
         assert!(

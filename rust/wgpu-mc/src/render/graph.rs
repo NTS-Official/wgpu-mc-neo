@@ -309,10 +309,30 @@ static GAME_BLOCK_ATLAS: parking_lot::RwLock<Option<Arc<wgpu::TextureView>>> =
 /// renderer did before any of this existed. See `Vertex::uv_flags`' `UV_GAME_ATLAS`.
 static GAME_ATLAS_BOUND: AtomicBool = AtomicBool::new(false);
 
+/// How wide and tall the game's block atlas is in texels, or `None` before it is handed over.
+///
+/// **Kept because "half a texel" is not a number without it.** The game's stitcher packs `blocks.png`
+/// at whatever size the sprites need and the answer changes between runs - 2048x2048 with five mip
+/// levels one launch, 1024x1024 with three the next - so a shift expressed as a fraction of the atlas
+/// is a different shift each time. Anything that wants to move a coordinate by a texel has to ask here
+/// rather than assume a size.
+///
+/// Also the sampler's own answer for our atlas, which is always [`crate::render::atlas::ATLAS_DIMENSIONS`]
+/// square, so the two are deliberately not mixed: a shift meant for one atlas must be built from that
+/// atlas' size.
+static GAME_ATLAS_SIZE: parking_lot::RwLock<Option<(u32, u32)>> = parking_lot::RwLock::new(None);
+
+/// The game's block atlas size in texels, or `None` if it has not been handed over. See
+/// [`GAME_ATLAS_SIZE`].
+pub fn game_atlas_size() -> Option<(u32, u32)> {
+    *GAME_ATLAS_SIZE.read()
+}
+
 /// Hands over the game's block atlas. See [`GAME_BLOCK_ATLAS`] and [`GAME_ATLAS_BOUND`]. Called from
 /// the JVM.
-pub fn set_game_block_atlas(view: wgpu::TextureView) {
+pub fn set_game_block_atlas(view: wgpu::TextureView, size: (u32, u32)) {
     *GAME_BLOCK_ATLAS.write() = Some(Arc::new(view));
+    *GAME_ATLAS_SIZE.write() = Some(size);
     GAME_ATLAS_BOUND.store(true, Ordering::Relaxed);
 }
 
@@ -1088,6 +1108,37 @@ impl RenderGraph {
             )),
         );
 
+        // **The magnification pair, which is the only way to get the game's own crispness back.**
+        //
+        // The game magnifies with `GL_NEAREST` and minifies with `GL_LINEAR_MIPMAP_LINEAR`, and in GL
+        // those are independent. wgpu is not: any `anisotropy_clamp` above 1 requires the min, mag *and*
+        // mipmap filters to be linear, and it enforces that by returning an error from `create_sampler`.
+        // So one sampler cannot be both crisp up close and anisotropic at distance, and a `Nearest` one
+        // pays for its crispness with the fluid shimmer.
+        //
+        // Two samplers is the way out, and it is not a compromise: **anisotropic filtering only means
+        // anything on the minification side**, where a surface is sampled at several points and the
+        // derivative is a lie in one direction. A magnified surface needs none of it, so these two are
+        // each used over exactly the range it is for. The shader picks between them per fragment on
+        // whether the coordinates are being stretched or squeezed - see the terrain shaders.
+        //
+        // Registered here, beside the anisotropic one, so the three cannot drift apart, and always
+        // registered for the same reason that one is: a named resource that is missing is a pipeline the
+        // graph skips, which would cost the whole terrain pass.
+        graph.resources.insert(
+            "@sampler_mc_block_atlas_magnify".into(),
+            ResourceBacking::Sampler(Arc::new(wm.gpu.device.create_sampler(
+                &crate::render::atlas::atlas_magnify_sampler(wgpu::AddressMode::ClampToEdge),
+            ))),
+        );
+
+        graph.resources.insert(
+            "@sampler_block_atlas_magnify".into(),
+            ResourceBacking::Sampler(Arc::new(wm.gpu.device.create_sampler(
+                &crate::render::atlas::atlas_magnify_sampler(wgpu::AddressMode::Repeat),
+            ))),
+        );
+
         let game_atlas = game_block_atlas();
 
         match &game_atlas {
@@ -1748,10 +1799,60 @@ impl RenderGraph {
                     Self::sort_for_drawing(out, Self::terrain_layers(pipeline_name));
 
                     // The section position, written into a fixed-size array on this stack once per
-                    // draw: twenty bytes in the layout the shader's `SectionPosition` spells out - the
-                    // three integers, the layer's alpha cutoff, and the atlas level-of-detail bias.
-                    // See `set_immediates`.
-                    let mut constants = [0u8; 20];
+                    // draw: twenty-eight bytes in the layout the shader's `SectionPosition` spells out -
+                    // the three integers, the layer's alpha cutoff, the atlas level-of-detail bias, and
+                    // the half-texel shift for the atlas being sampled. See `set_immediates`.
+                    let mut constants = [0u8; 36];
+
+                    // Half a texel for this side's own atlas, which is a fixed size, and for the game's,
+                    // which is not - see the write below for why the two cannot share a number.
+                    //
+                    // **The shift, in texels of the atlas the face samples.**
+                    //
+                    // `0.5` is the value that puts a sample on a texel centre rather than on the edge
+                    // between two, and it is what belongs here. **`40.0` was a plumbing test and it has
+                    // served its purpose**: a shift of half a texel had produced no visible change, and "the
+                    // shift is not what is wrong" and "the shift never reached the shader" look exactly the
+                    // same on screen. Forty texels is far too much to be a fix and far too much to be
+                    // invisible, and it did move the picture - so the plumbing is sound and the half-texel
+                    // reading was real.
+                    //
+                    // **Which means the softness is not a texel-alignment fault.** A face's samples *are* on
+                    // texel centres with this value and the picture is no crisper than with zero, so nothing
+                    // between the vertex and the sampler is left to blame for it.
+                    const HALF_TEXEL_TEXELS: f32 = 0.5;
+
+                    let our_half_texel =
+                        HALF_TEXEL_TEXELS / crate::render::atlas::ATLAS_DIMENSIONS as f32;
+
+                    // Asked for once rather than per draw, because the answer is a lock and it changes
+                    // only when the game re-stitches its atlas - and because the pair is what the shader
+                    // needs: it picks between them with the same flag it picks the atlas with.
+                    //
+                    // The two are genuinely different numbers rather than one rounded value, and the runs
+                    // this was written against are why: the game's stitcher produced 2048x2048 on three
+                    // launches and 1024x1024 on the next two, while this side's atlas is always
+                    // `ATLAS_DIMENSIONS`. A single "half texel" would be half on one of them and a quarter
+                    // on the other.
+                    let game_half_texel = game_atlas_size()
+                        .map_or(0.0, |(width, _)| HALF_TEXEL_TEXELS / width as f32);
+
+                    // **One texel of each atlas, which is what the magnification test compares the
+                    // coordinates' screen-space derivative against.**
+                    //
+                    // Per atlas, for the reason everything else here is: this side's is
+                    // `ATLAS_DIMENSIONS` and never moves, the game's is whatever its stitcher packed - and
+                    // a test that called a surface magnified on a 2048 atlas and minified on a 1024 one
+                    // would pick the `Nearest` sampler for one and the anisotropic one for the other, on
+                    // the same picture.
+                    //
+                    // The game's falls back to this side's rather than to zero: zero would make the test
+                    // "is the derivative below zero", which nothing is, so every face would take the
+                    // anisotropic sampler - the picture before any of this, which is the direction to fail
+                    // in.
+                    let our_texel = 1.0 / crate::render::atlas::ATLAS_DIMENSIONS as f32;
+                    let game_texel =
+                        game_atlas_size().map_or(our_texel, |(width, _)| 1.0 / width as f32);
 
                     for (layer_index, alpha_cutout) in Self::terrain_layers(pipeline_name) {
                         let layer_index = *layer_index as usize;
@@ -1803,9 +1904,31 @@ impl RenderGraph {
                             // setting: a value cached for the pass would be a frame behind the options
                             // screen, and the whole point of moving this out of the shader was that
                             // moving it takes effect.
-                            constants[16..].copy_from_slice(
+                            constants[16..20].copy_from_slice(
                                 &crate::render::atlas::atlas_lod_bias().to_ne_bytes(),
                             );
+                            // **Half a texel of the atlas these faces are drawn from**, which is a
+                            // different number for each of the two and is the whole reason it is sent
+                            // rather than written into the shader as a constant.
+                            //
+                            // The game's stitcher packs `blocks.png` at whatever size the sprites need
+                            // and that changes between runs - 2048x2048 one launch, 1024x1024 the next -
+                            // so `0.5 / 2048` in a shader is half a texel on one launch and a quarter of
+                            // one on the other. The size is asked for here, once per frame, from the
+                            // handover that knows it.
+                            //
+                            // The two half-texel shifts, in the order the shader's `SectionPosition`
+                            // declares them, and the shader picks the one belonging to the atlas the face
+                            // samples. Not conditional here: the flag that says which atlas a face uses
+                            // is per vertex, and a layer can hold faces of both kinds, so there is no
+                            // answer at this level to write.
+                            constants[20..24].copy_from_slice(&our_half_texel.to_ne_bytes());
+                            constants[24..28].copy_from_slice(&game_half_texel.to_ne_bytes());
+                            // One texel of each atlas: the magnification test compares the
+                            // coordinates' derivative against this, so it has to be the size of
+                            // the atlas the sample actually comes from.
+                            constants[28..32].copy_from_slice(&our_texel.to_ne_bytes());
+                            constants[32..36].copy_from_slice(&game_texel.to_ne_bytes());
 
                             set_immediates(
                                 &bound_pipeline.immediates,
@@ -2095,7 +2218,7 @@ fn immediate_size_of(name: &str) -> u32 {
         // **Five four-byte members, and the fifth is why this is not sixteen.** `SectionPosition` is
         // three integers, the layer's alpha cutoff and the atlas level-of-detail bias; see the struct in
         // `terrain.wgsl` for what the bias is for and why it had to stop being a `const`.
-        "@pc_section_position" => 20,
+        "@pc_section_position" => 36,
         "@pc_total_sections" => 4,
         "@pc_parts_per_entity" => 4,
         "@pc_electrum_color" => 16,
@@ -2559,10 +2682,22 @@ mod texture_sample_uniformity_tests {
             let module = naga::front::wgsl::parse_str(&source).expect("the terrain shader parses");
             let auto = total_auto_samples(&module);
 
+            // **Four, and the number is two textures times two samplers rather than a threshold.**
+            //
+            // It was two while each atlas had one sampler. There are two per atlas now - a `Nearest` one
+            // for magnification and an anisotropic one for minification, because wgpu will not put both
+            // behaviours in one sampler - and the fragment stage samples with both and `select`s, for the
+            // same reason it has always sampled both *textures* and selected: a fetch under a branch is
+            // undefined behaviour. See `atlas_magnify_sampler`.
+            //
+            // So the count is asserted rather than bounded, and adding a sampler means moving it by hand.
+            // What makes it worth asserting is that a fetch which *disappeared* is a texture the shader
+            // stopped drawing with, which is a silently different picture rather than an error.
             assert_eq!(
-                auto, 2,
+                auto, 4,
                 "{name}.wgsl has {auto} auto-level texture fetch(es); it is expected to have exactly the \
-                 two the fragment stage selects between"
+                 four the fragment stage selects between - two atlases, each fetched with the magnifying \
+                 sampler and the minifying one"
             );
 
             let found = samples_inside_branches(&source);

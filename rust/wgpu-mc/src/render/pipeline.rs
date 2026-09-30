@@ -42,6 +42,58 @@ pub struct Vertex {
 /// [`WgpuNative.registerSprite`]: ../../../../wgpu_mc_jni/index.html
 pub const UV_GAME_ATLAS: u32 = 1 << 0;
 
+/// The bit in [`Vertex::uv_flags`] that says **the game animates this face's sprite** - it is a frame of a
+/// moving texture, not a still one.
+///
+/// It exists for the level-of-detail bias, and for the one thing that separates an animated sprite from
+/// every other: **a coarse mip level of a moving sprite is a moving average.** A still sprite's levels are
+/// a consistent pyramid and do not change from frame to frame; a scrolling, frame-interpolated one's
+/// coarsest levels are a running mean of the animation, so their value swings as the frames advance. That
+/// is the fluid shimmer - temporal, on a stationary camera, and the fluids' alone.
+///
+/// So the bias that cancels it belongs on these faces and nowhere else. It was applied to every minified
+/// surface for a round, which removed the shimmer and sharpened every distant *static* surface past what
+/// the mip chain is for - a moiré on far terrain, reported as soon as it shipped. The two are the same
+/// mechanism pointed at different sprites, so which sprites is the whole of the fix.
+///
+/// Read from the sprite's `.mcmeta` (see `Atlas::sprite_is_animated`), which is the game's own answer to
+/// "does this move" rather than a list this side keeps. **Every sprite is on the game's atlas** - see
+/// [`UV_GAME_ATLAS`] - so this cannot be inferred from that flag, and it is written beside it instead.
+pub const UV_ANIMATED: u32 = 1 << 1;
+
+/// Where in [`Vertex::uv_flags`] the **level-of-detail floor** is packed, and how wide it is.
+///
+/// A moving sprite's coarse mip levels are a running average of its animation rather than a smaller copy of
+/// it, and past some level there is no animation left to see - only that average, which moves. That is the
+/// fluid shimmer, and **no offset can express the fix**: an offset is a count of levels, so one number lands
+/// a 16-texel sprite and a 32-texel one at different points of their own detail. `-4` was measured against
+/// the water and left the lava; `-5` left it too. What the two need is a **floor**, and a floor is a
+/// property of the sprite - so it is computed at bake time, where the sprite's size is known, and carried
+/// in the vertex rather than guessed at in a shader.
+///
+/// The value is **how many levels to take off**, and the shader subtracts it in place of the constant that
+/// used to stand there. `0` means no floor, which is every static sprite and every face drawn from this
+/// side's own atlas.
+///
+/// **Four bits at bit 2, because only the low ten bits of this field reach the vertex at all**:
+/// `compressed` writes bits 0..8 into `array[10]` and bits 8..10 into the bottom of `array[11]`, so a flag
+/// above bit 9 is dropped in silence. Bits 2..6 are the field; bit 6 upward is free.
+pub const UV_LOD_FLOOR_SHIFT: u32 = 2;
+
+/// The width of the [`UV_LOD_FLOOR_SHIFT`] field, as a mask. See there.
+pub const UV_LOD_FLOOR_MASK: u32 = 0xF;
+
+/// Packs a level-of-detail floor into the bits [`UV_LOD_FLOOR_SHIFT`] describes, saturating rather than
+/// wrapping.
+///
+/// Saturating because the field is four bits and a floor is not: a sprite deep enough to need sixteen
+/// levels is a sprite whose whole chain is within the animation, and clamping it to fifteen costs a fraction
+/// of one level of detail while wrapping it would put the floor back at *no* floor - which is the shimmer,
+/// at the far end of the range where it is worst.
+pub fn lod_floor_bits(levels: u32) -> u32 {
+    levels.min(UV_LOD_FLOOR_MASK) << UV_LOD_FLOOR_SHIFT
+}
+
 /// What a game-atlas UV is multiplied by on the way into the sixteen bits the vertex has for it.
 ///
 /// The coordinates are the game's own - `0..1` over the game's atlas - so this is what fills the
@@ -437,6 +489,109 @@ mod tests {
             lightmap_coords: 0,
             ao: 0,
         }
+    }
+
+    /// **A face's flags survive the packing, at the bit positions the shader reads them from.**
+    ///
+    /// The failure this is here for is silent in the worst way: a flag written into the wrong bit, or one
+    /// that never reaches `compressed()` at all, produces a shader that reads a constant zero. For
+    /// [`UV_GAME_ATLAS`] that is every face drawn from this side's frozen copy of its sprite - the still
+    /// fire - and for [`UV_ANIMATED`] it is the level-of-detail offset silently not applying, which is the
+    /// fluid shimmer coming back with nothing in any log to say why.
+    ///
+    /// The bits are checked **in `v3`** rather than through `uv_flags`, because `v3` is the word the shader
+    /// is actually handed and the packing between the two is the part that can be wrong. `array[10] =
+    /// uv_flags as u8` and `array[11] = (uv_flags >> 8) & 0b11 | ...` put the low ten bits at `v3 >> 16`,
+    /// which is where both of these live.
+    #[test]
+    fn a_faces_flags_survive_the_packing() {
+        let v3_of = |flags: u32| {
+            let bytes = Vertex {
+                uv_flags: flags,
+                ..vertex_at([0.0, 0.0, 0.0])
+            }
+            .compressed();
+
+            u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]])
+        };
+
+        for (flags, game_atlas, animated) in [
+            (0u32, 0u32, 0u32),
+            (UV_GAME_ATLAS, 1, 0),
+            (UV_ANIMATED, 0, 1),
+            (UV_GAME_ATLAS | UV_ANIMATED, 1, 1),
+        ] {
+            let v3 = v3_of(flags);
+
+            assert_eq!(
+                (v3 >> 16) & 1,
+                game_atlas,
+                "`UV_GAME_ATLAS` (flags {flags:#b}) is bit 16 of v3, which is what the shader tests"
+            );
+            assert_eq!(
+                (v3 >> 17) & 1,
+                animated,
+                "`UV_ANIMATED` (flags {flags:#b}) is bit 17 of v3, which is what the shader tests - and a \
+                 flag that does not arrive is a shader reading zero, not an error"
+            );
+            // And the floor field must not be disturbed by them, or the two features would share bits and
+            // whichever was set last would win.
+            assert_eq!(
+                (v3 >> 18) & 0xf,
+                0,
+                "the floor field has to stay clear for flags that carry no floor"
+            );
+        }
+    }
+
+    /// **The level-of-detail floor survives the packing at the bits the shader reads it from.**
+    ///
+    /// The same silent-failure argument as the flags above, and worse: a floor that arrives as zero is not
+    /// a wrong picture, it is *the fluid shimmer coming back* - the exact symptom this whole mechanism
+    /// exists to remove - with nothing in any log to say the field was dropped. Only the low ten bits of
+    /// `uv_flags` reach the vertex at all, so a floor packed above bit 9 would vanish without a warning from
+    /// anything.
+    ///
+    /// The shader's side is spelled out here as a literal rather than through the constants, because the
+    /// point is to catch the constants and the shader drifting apart: `terrain.wgsl` reads
+    /// `(v3 >> 18u) & 0xfu`, and that expression is what this asserts against.
+    #[test]
+    fn a_level_floor_survives_the_packing() {
+        let v3_of = |flags: u32| {
+            let bytes = Vertex {
+                uv_flags: flags,
+                ..vertex_at([0.0, 0.0, 0.0])
+            }
+            .compressed();
+
+            u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]])
+        };
+
+        // The whole field, at its ends and one past each, so a shift that is off by one shows up as a
+        // factor of two rather than as a rounded value that happens to match.
+        for levels in [0u32, 1, 2, 3, 4, 5, 7, 15] {
+            let v3 = v3_of(lod_floor_bits(levels));
+
+            assert_eq!(
+                (v3 >> 18) & 0xf,
+                levels,
+                "a floor of {levels} level(s) came back as {} from the bits the shader reads",
+                (v3 >> 18) & 0xf
+            );
+        }
+
+        // And a floor wider than the field saturates rather than wrapping. Wrapping would answer *no* floor
+        // at the top of the range, which is the shimmer at its worst rather than a half level of detail.
+        assert_eq!(
+            (v3_of(lod_floor_bits(16)) >> 18) & 0xf,
+            15,
+            "sixteen levels is more than four bits; it has to clamp, not wrap to zero"
+        );
+        assert_eq!(
+            (v3_of(lod_floor_bits(999)) >> 18) & 0xf,
+            15,
+            "and so has anything above it"
+        );
     }
 
     /// A baked vertex decodes to the position it was baked at, on every axis and at both edges.

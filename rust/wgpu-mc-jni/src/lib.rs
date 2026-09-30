@@ -563,10 +563,15 @@ pub fn registerBlockState(
 /// One sprite's place in the game's atlas and the layer the game files it under, on the way from
 /// [`registerSprite`] to the atlas this side packs.
 ///
+/// One queued sprite: its name, where it sits in the game's atlas, its layer, and how many levels deep its
+/// own detail goes. Named rather than a bare tuple because four fields of four different kinds is where a
+/// swap stops being visible at the call site.
+type SpriteRegistration = (String, [f32; 4], u8, u32);
+
 /// A queue rather than a direct write, because of when the call arrives: the game registers its sprites
 /// before [`cacheBlockStates`], and the atlas this side packs does not exist until that bake runs. See
 /// [`wgpu_mc::render::atlas::Atlas::register_sprite`].
-static SPRITE_REGISTRATIONS: Mutex<Vec<(String, [f32; 4], u8)>> = Mutex::new(Vec::new());
+static SPRITE_REGISTRATIONS: Mutex<Vec<SpriteRegistration>> = Mutex::new(Vec::new());
 
 /// Whether anything is waiting in that queue.
 ///
@@ -600,6 +605,7 @@ pub fn registerSprite(
     u1: jfloat,
     v1: jfloat,
     layer: jint,
+    level_cap: jint,
 ) {
     let Ok(name) = env.get_string(&name) else {
         // A name that is not readable UTF-8 is a sprite this side cannot look up by anything, and
@@ -610,9 +616,15 @@ pub fn registerSprite(
 
     SPRITE_REGISTRATIONS_PENDING.store(true, std::sync::atomic::Ordering::Relaxed);
 
-    SPRITE_REGISTRATIONS
-        .lock()
-        .push((name.into(), [u0, v0, u1, v1], layer as u8 & 0b0000_0011));
+    SPRITE_REGISTRATIONS.lock().push((
+        name.into(),
+        [u0, v0, u1, v1],
+        layer as u8 & 0b0000_0011,
+        // The coarsest level this sprite has any detail at, from the JVM: `log2` of its frame in texels. A
+        // negative answer is refused rather than wrapped, because "no floor" is the state this renderer was
+        // in before any of it and the direction a nonsense number should fail in.
+        level_cap.max(0) as u32,
+    ));
 }
 
 /// The layer a registered sprite is filed under. See [`registerSprite`] for the numbers.
@@ -1440,11 +1452,12 @@ pub fn cacheBlockStates(mut env: JNIEnv, _class: JClass) {
             Some(atlas) => {
                 let registrations = std::mem::take(&mut *SPRITE_REGISTRATIONS.lock());
 
-                for (name, rect, layer) in registrations {
+                for (name, rect, layer, level_cap) in registrations {
                     atlas.register_sprite(
                         &ResourcePath::from(&name[..]),
                         rect,
                         registered_layer(layer),
+                        Some(level_cap),
                     );
                 }
             }
@@ -1779,9 +1792,16 @@ pub fn atlasFaceCounts(env: JNIEnv, _class: JClass) -> jstring {
     // must not be zero. See `FLUID_TINTS`.
     let tints = FLUID_TINTS.swap(0, Ordering::Relaxed);
 
+    // **And the animated faces, which are the ones the level-of-detail offset applies to.** Read beside the
+    // game-atlas count because the ratio is the question: that offset is a compensation for a level chosen
+    // too coarse, it is only legitimate on a sprite whose coarse levels move, and on anything else it is a
+    // sharpening nobody asked for - the moiré that scoping it was written to remove. See
+    // `wgpu_mc::mc::block::FACES_ANIMATED`.
+    let animated = wgpu_mc::mc::block::FACES_ANIMATED.swap(0, std::sync::atomic::Ordering::Relaxed);
+
     let text = format!(
-        "{game} game-atlas, {own} own-atlas, {forced} leaf face(s) forced opaque, {tints} fluid tint(s) \
-         read from the game"
+        "{game} game-atlas, {own} own-atlas, {animated} of them animated, {forced} leaf face(s) forced \
+         opaque, {tints} fluid tint(s) read from the game"
     );
 
     env.new_string(text)
