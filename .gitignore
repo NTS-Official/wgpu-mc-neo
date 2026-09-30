@@ -19,6 +19,7 @@ bin/
 
 # Project
 run/
+references/
 # NeoGradle writes per-run directories for the generated run configs
 neoforge/runs/
 rust/wgpu-mc-demo/tmp
