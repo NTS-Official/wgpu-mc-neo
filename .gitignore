@@ -19,18 +19,18 @@ bin/
 
 # Project
 run/
+
+# Project references, including VulkanMod, Radiance(and its MCVR)
 references/
+
 # NeoGradle writes per-run directories for the generated run configs
 neoforge/runs/
 rust/wgpu-mc-demo/tmp
 rust/wgpu-mc-demo/res/assets
-
 fabric/src/main/wgpu-mc.h
 
 # Ignore Gradle project-specific cache directory
 .gradle
-
-# Workspace-local GRADLE_USER_HOME used when the sandbox cannot write to ~/.gradle
 .gradle-home/
 
 # Ignore Gradle build output directory
@@ -48,7 +48,7 @@ target/
 # nix
 result
 
-# harness
+# DeepSeek Harness
 /.dsh-tmp/
 
 # throwaway 26.1 bytecode-inspection helpers
