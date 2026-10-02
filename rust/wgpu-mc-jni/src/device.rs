@@ -1,7 +1,8 @@
 use crate::blaze::{
     BindGroupPlan, BlazeDepthStencilState, BlazeRenderPass, BlazeRenderPassDescriptor, DrawCall,
-    FfiStr, GpuFormat, PrimitiveTopology, RenderPipeline,
+    FfiStr, GpuFormat, PrimitiveTopology, RawArray, RenderPipeline,
 };
+use crate::indirect::BatchRecord;
 use crate::preprocessing::{ProcessedShaderResult, process_shaders};
 use crate::settings::{GraphicsBackend, Settings};
 use crate::{MinecraftResourceManagerAdapter, RENDERER};
@@ -894,28 +895,30 @@ fn try_create_renderer(
         std::sync::atomic::Ordering::Relaxed,
     );
 
-    // **What the terrain pass may do with all of that**, resolved here because this is where the
-    // device is - and recorded in the renderer's own crate rather than tested where the setting is
-    // read. The setting is read from the mod constructor, which is before any adapter exists, so a test
-    // made there answers "no" on every launch; the first run of the batched path printed all three bits
-    // as `yes` and then drew one section at a time.
+    // **DirectX 12 gets no batching, and the reason is not multi-draw: it is the per-draw channel.**
     //
-    // **DirectX 12 gets no batching at all, and it is the one exclusion in this file that is a defect
-    // rather than a missing capability: `multi_draw_indexed_indirect` is broken in wgpu's DX12 backend.**
-    // The bug is in wgpu's implementation of that call on that backend - not in D3D12, which offers a
-    // perfectly good `ExecuteIndirect`, and not in the driver - which is exactly why no feature test can
-    // find it: the adapter on DX12 reports `INDIRECT_EXECUTION`, `INDIRECT_FIRST_INSTANCE` *and*
-    // `MULTI_DRAW_INDIRECT_COUNT` (wgpu enables the last one unconditionally there,
-    // `dx12/adapter.rs`), and the call underneath really is one `ExecuteIndirect` with
-    // `MaxCommandCount`. **Every question this side can ask says yes and the answer is still no, so do
-    // not delete this test on the strength of those bits.**
+    // MDI itself works there, and the first version of this comment was wrong about that: `wgpu-hal`'s
+    // DX12 backend hands `draw_count` straight to `ExecuteIndirect` with `MaxCommandCount`
+    // (`dx12/command.rs`, `unsafe fn draw_indexed_indirect`), over a command signature whose `ByteStride`
+    // is `size_of::<wgpu::DrawIndexedIndirectArgs>()` - twenty bytes, field for field what `indirect.rs`
+    // writes. A run with the exclusion removed batched 257,880 of 262,863 draws a second with no error.
     //
-    // The failure is also the worst shape for a renderer to ship: it is a picture, not an error, so
-    // nothing in a log would say it happened. The way back is a wgpu release that fixes the call on that
-    // backend, and this is the line to revisit when one lands.
+    // What does not work is what the batching *carries*. A batched run has exactly one channel for
+    // per-draw data - a record's `first_instance` - and the terrain shader reads the section's block at
+    // `instance_index`. On Vulkan that is `InstanceIndex`, which is `firstInstance + instance`; **on
+    // DX12 naga emits `SV_InstanceID` for it** (`naga-30.0.1/src/back/hlsl/conv.rs`), and D3D12's
+    // `SV_InstanceID` does **not** include `StartInstanceLocation`. Every record carries one instance,
+    // so the shader sees 0 for all of them: every section is drawn with the first record's
+    // `ChunkPosition`, which is a screen full of every block in the world piled into one section. That
+    // is the picture a DX12 run showed, and it is why this exclusion is back.
+    //
+    // A DX12 batching path needs a per-draw channel D3D12 actually honours - `first_instance` *does*
+    // offset instance-step vertex buffer reads there, so an instance-step attribute carrying the record
+    // number is the shape that would work - and that is a change to the vertex layout and the shader,
+    // not a line here.
     //
     // The terrain is drawn either way, one `draw_indexed` per section - the same records, the same
-    // order, the same shader. What DX12 loses is the batching, not the terrain.
+    // order, the same shader, and the uniform block this side has always bound per draw.
     wgpu_mc::render::graph::set_terrain_batching_possible(
         backend != GraphicsBackend::DirectX12 && can_batch_terrain_draws(),
     );
@@ -1251,6 +1254,12 @@ fn flush_shared_encoder(wm: &WmRenderer) {
     // Everything that was staged is in the stream that just went out, so the ring can hand those
     // buffers out again - once that submission has completed, which is what the callback says.
     finish_staging(wm, submission);
+
+    // **The same boundary for the batched draws' record buffer.** A batch's records are written with
+    // `Queue::write_buffer`, which is applied ahead of this submission's commands and after the last
+    // one's - so everything that named those bytes has gone out, and the buffer may be written from
+    // the front again. See `crate::indirect`, where the cursor lives.
+    crate::indirect::begin_submission();
 }
 
 /// A ring of staging buffers that uploads travel through instead of the queue.
@@ -1717,6 +1726,43 @@ pub extern "C" fn draw_call(wm: &WmRenderer, pass: &mut BlazeRenderPass, call: &
     crate::blaze::draw_call(wm, pass, call)
 }
 
+/// Records a run of draws that differ only in their parameters as one `multi_draw_indexed_indirect`.
+///
+/// The JVM reaches here from `WgpuRenderPass.drawMultipleIndexed`: one call of that carries a whole
+/// layer's sections, and what it sends is one [`DrawCall`] for the run plus a [`BatchRecord`] per draw.
+/// Everything in the template has to be true of every draw of the run - the pipeline, the vertex
+/// buffers, the index buffer and every binding - which is what the JVM checks before it asks.
+///
+/// The answer is how many draws were recorded, and **zero means "not as a batch"**: the run is drawn
+/// one draw at a time by the caller, which is the path a device with no real multi-draw takes, and the
+/// path the whole feature falls back to. Nothing here retries a refusal, because the caller's fallback
+/// is the retry.
+#[unsafe(no_mangle)]
+pub extern "C" fn draw_call_batch(
+    wm: &WmRenderer,
+    pass: &mut BlazeRenderPass,
+    template: &DrawCall,
+    records: &RawArray<BatchRecord>,
+) -> u32 {
+    crate::blaze::draw_call_batch(wm, pass, template, records)
+}
+
+/// Whether this device and this backend can run batched draws at all, which the JVM has to know
+/// **before** it compiles a pipeline.
+///
+/// The per-draw block a terrain shader reads is declared a storage buffer only where batching can
+/// actually happen (see `perDrawStorageNames` in `WgpuCompiledRenderPipeline.kt`): the arrangement costs
+/// a whole-buffer storage binding per draw and buys nothing on a backend whose multi-draw is switched
+/// off, and DirectX 12 is exactly that backend - wgpu's `multi_draw_indexed_indirect` is broken there,
+/// so this answers no and the terrain keeps the uniform block it always had.
+///
+/// The answer is the one [`wgpu_mc::render::graph::terrain_batching_possible`] holds: the device's own
+/// feature bits and the backend exclusion, resolved where the adapter was.
+#[unsafe(no_mangle)]
+pub extern "C" fn batching_possible() -> bool {
+    wgpu_mc::render::graph::terrain_batching_possible()
+}
+
 /// The wgpu usage flags a Blaze3D usage mask asks for.
 ///
 /// Every buffer this side creates goes through here, because a usage that only one entry point
@@ -1739,6 +1785,18 @@ pub extern "C" fn draw_call(wm: &WmRenderer, pass: &mut BlazeRenderPass, call: &
 ///   anywhere else.
 /// - `USAGE_UNIFORM_TEXEL_BUFFER` becomes `STORAGE`: the shaders that read a texel buffer go through
 ///   the SSBO shim in `preprocessing.rs`, so that is the usage the bind group asks for.
+/// - `USAGE_UNIFORM` becomes `UNIFORM | STORAGE` **where a per-draw block is read as a storage buffer**,
+///   which is the one bit that is added rather than translated. The terrain pass' per-section block
+///   lives in a dynamic uniform ring (`DynamicUniformStorage`'s `blockSize` stride) and every draw of a
+///   batched run reads its own record out of it at the index its `first_instance` carries - a storage
+///   binding, so the buffer underneath has to allow one, and Blaze3D has no storage usage bit to ask for
+///   it with (`GpuBuffer` stops at `USAGE_UNIFORM_TEXEL_BUFFER`).
+///
+///   **It is conditional on the storage form being in use at all**, which is the same answer the layout
+///   and the shader are built from (`terrain_batching_possible`). A backend that cannot batch - DirectX
+///   12, whose `SV_InstanceID` does not carry the record number - binds those blocks as uniforms and
+///   never needs the bit, and a buffer that can be a UAV is not free to keep that way: the flag decides
+///   which heap and which resource state the buffer lives in.
 pub fn wgpu_buffer_usages(usage: u32) -> wgpu::BufferUsages {
     let mut flags = wgpu::BufferUsages::empty();
     flags.set(wgpu::BufferUsages::MAP_READ, usage & 1 != 0);
@@ -1751,7 +1809,11 @@ pub fn wgpu_buffer_usages(usage: u32) -> wgpu::BufferUsages {
     flags.set(wgpu::BufferUsages::VERTEX, usage & 32 != 0);
     flags.set(wgpu::BufferUsages::INDEX, usage & 64 != 0);
     flags.set(wgpu::BufferUsages::UNIFORM, usage & 128 != 0);
-    flags.set(wgpu::BufferUsages::STORAGE, usage & 256 != 0);
+    flags.set(
+        wgpu::BufferUsages::STORAGE,
+        usage & 256 != 0
+            || (usage & 128 != 0 && wgpu_mc::render::graph::terrain_batching_possible()),
+    );
 
     // Readable back for diagnostics, the same way `create_texture` always is. Only for buffers that
     // cannot be mapped: wgpu rejects `MAP_READ | COPY_SRC` outright, and a mappable buffer needs no
@@ -3246,6 +3308,18 @@ pub(crate) fn count_draw() {
     });
 }
 
+/// Counts `draws` draws at once, for the batched path.
+///
+/// The same counter as [`count_draw`], once, because the batched path exists to take work off the
+/// per-draw route: a loop of atomic increments over three thousand draws would be that work coming
+/// back in through the statistics.
+pub(crate) fn count_draws(draws: u64) {
+    with_counters(|c| {
+        c.draws.set(c.draws.get() + draws);
+        c.current_pass_draws.set(c.current_pass_draws.get() + draws);
+    });
+}
+
 pub(crate) fn count_vertices(vertices: u64) {
     with_counters(|c| c.vertices.set(c.vertices.get() + vertices));
 }
@@ -3396,12 +3470,17 @@ pub extern "C" fn log_render_stats() {
         count => count.to_string(),
     };
 
+    // The batched draws, read and cleared here rather than counted per draw: they are one number for
+    // the same reason the batched path exists at all - see `crate::indirect`.
+    let (batched, refused_a_batch) = crate::indirect::take_counts();
+
     info!(
         "wgpu-mc: render stats: {passes} render passes ({empty} of them empty, last had {last} \
-         draws), {pipelines} pipeline binds, {draws} draws ({bind_groups} bind groups built, \
-         {hits} cache hits and {misses} misses), {vertices} vertices, {submissions} submissions for \
-         {presents} presented frame(s); {numbered} of the draws came numbered ({tableless} of them \
-         without a binding table); uploads: {} staged ({} MB), {} fell back to queue writes",
+         draws), {pipelines} pipeline binds, {draws} draws ({batched} in batches, {refused_a_batch} \
+         refused one; {bind_groups} bind groups built, {hits} cache hits and {misses} misses), \
+         {vertices} vertices, {submissions} submissions for {presents} presented frame(s); {numbered} \
+         of the draws came numbered ({tableless} of them without a binding table); uploads: {} staged \
+         ({} MB), {} fell back to queue writes",
         STAGED_UPLOADS.swap(0, Ordering::Relaxed),
         STAGED_BYTES.swap(0, Ordering::Relaxed) / (1024 * 1024),
         STAGING_FALLBACKS.swap(0, Ordering::Relaxed),
@@ -3760,6 +3839,18 @@ pub unsafe extern "C" fn compile_render_pipeline(
                 .iter()
                 .map(|(name, location)| (name.clone(), *location)),
         ),
+        // **Which blocks are read as storage is part of the translation, not just of the layout.** A
+        // block the plan declares this way is rewritten from a uniform block into the storage array the
+        // stage indexes by record number, and that decision changes between backends - DirectX 12 gets
+        // no batching, so it keeps the uniform block. Leaving this out of the key is not a cache miss:
+        // it is a pipeline that cannot be built, because the cached translation's shader declares a
+        // storage buffer while the layout the same run builds declares a uniform. wgpu says exactly
+        // that - "Storage class Uniform doesn't match the shader Storage" - and ends the process.
+        &crate::shader_cache::canonical(
+            plan.per_draw_storage()
+                .into_iter()
+                .map(|name| (name, String::from("storage"))),
+        ),
         // The backend is part of the key even though the translation is backend-independent today:
         // what comes out of it is GLSL for naga, and a future shim that emits something else - HLSL,
         // or a different set of workarounds - must not be answered with this build's entry. The cost
@@ -3840,6 +3931,10 @@ pub unsafe extern "C" fn compile_render_pipeline(
                     &directives,
                     &shader_locations,
                     vertex_stage_input_layout.iter().cloned().collect(),
+                    // Which blocks this pipeline reads per draw, straight off the plan: the descriptor
+                    // said so (see `UniformType::StorageBuffer`), and the shader has to be rewritten to
+                    // match it before anything is annotated. See `rewrite_per_draw_blocks`.
+                    &plan.per_draw_storage(),
                 );
 
                 // The reflection pass parses both shaders again, through naga this time, so it is the

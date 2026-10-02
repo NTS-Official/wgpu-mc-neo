@@ -1222,25 +1222,28 @@ fn get_block(
 fn face_flags(block_manager: &BlockManager, state: ChunkBlockState) -> FaceFlags {
     match state {
         ChunkBlockState::Air => FaceFlags::default(),
-        ChunkBlockState::State(key) => block_manager
-            .face_flags
-            .get(&key.pack())
-            .copied()
-            .unwrap_or_default(),
-    }
-}
+        ChunkBlockState::State(key) => match block_manager.face_flags.get(&key.pack()) {
+            Some(flags) => {
+                if phases_on() {
+                    phase_flags_hit.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
 
-/// Whether this state is a `LeavesBlock`, which is the game's own `instanceof LeavesBlock`.
-///
-/// Read from the per-state table the JVM fills (`FaceFlags::leaves`), and not from the block's name:
-/// a mod's leaves are leaves, and the game's own test is a class check. A state with no table entry -
-/// which cannot happen for a state the JVM described, and is the common case for the stand-in keys
-/// tests build - answers `false`, which is the safe direction: it leaves the face in whatever layer its
-/// sprite asked for rather than forcing it opaque.
-///
-/// The one reader is [`bake_layers`], for `ModelBlockRenderer#forceOpaque`.
-fn state_is_leaves(block_manager: &BlockManager, state: ChunkBlockState) -> bool {
-    face_flags(block_manager, state).leaves
+                *flags
+            }
+            None => {
+                // **Counted, and the count is the answer to a whole class of "nothing is culled".** The
+                // table is filled by the JVM (`cacheBlockStates`), so a run that never got one - a test,
+                // the offline bench, a world entered before the block cache finished - has an empty table,
+                // every state falls back to "occludes nothing", and the picture is a section drawn in full
+                // with `phase_face_hidden` at zero and no clue which of the two it was.
+                if phases_on() {
+                    phase_flags_miss.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+
+                FaceFlags::default()
+            }
+        },
+    }
 }
 
 /// **The game's `ModelBlockRenderer#forceOpaque`**, which is the whole of what the leaves switch does:
@@ -1310,8 +1313,14 @@ fn face_is_hidden(
     neighbour: ChunkBlockState,
     dir: Direction,
 ) -> bool {
+    let phases = phases_on();
+
     if neighbour.is_air() {
         return false;
+    }
+
+    if phases {
+        phase_neighbour_state.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     // No model is a neighbour drawn as something else - the fallback block - so the geometry test
@@ -1332,10 +1341,20 @@ fn face_is_hidden(
 
     let flags = face_flags(block_manager, neighbour);
 
+    if phases {
+        phase_face_flags.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
     if flags.occludes(dir.opposite()) {
         return true;
     }
 
+    // **The second lookup is real and it is the one this path is made of.** `state` and `neighbour` are
+    // different states - the `state == neighbour` test on this line is what says so - so the `&&`
+    // short-circuits exactly when the first lookup has already answered `false` for occlusion, which is
+    // the common case for a full cube against a full cube of another kind. Both tables it reads are the
+    // same `HashMap<u32, FaceFlags>`; see [`BAKE_PHASES`] for what that costs, because "the hash is the
+    // hot part" was a guess until the counters were put in and it is worth knowing either way.
     state == neighbour && face_flags(block_manager, state).hides_same_state(dir)
 }
 
@@ -1353,6 +1372,15 @@ fn face_is_culled<Provider: BlockStateProvider>(
     pos: IVec3,
 ) -> bool {
     let Some(declared) = face.cull else {
+        // **Counted, because "no `cullface`" and "a `cullface` and a neighbour that does not hide it"
+        // are the same picture and different bugs.** The first is a model that was read without its
+        // `cullface`, which is every face of every cube - and it reads as a section that is drawn in
+        // full, at the cost of a neighbour lookup per face, with `phase_face_hidden` at zero and
+        // nothing to say which of the two it was. See [`BAKE_PHASES`].
+        if phases_on() {
+            phase_face_no_cullface.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+
         return false;
     };
 
@@ -1801,6 +1829,93 @@ pub fn take_tint_face_counts() -> (u64, u64) {
     )
 }
 
+/// **Where a bake's time actually goes, counted and - for two of the columns - timed.**
+///
+/// The benchmark in `examples/mesher_bench.rs` measures a whole section and can say *that* it is slow.
+/// It cannot say which part is slow, and the three candidates are all plausible from the outside: the
+/// 4096-block loop, the model lookup and the face-flag lookup it does per block, the cull test it does
+/// per face, and the vertex emission it does for the faces that survive. This is the same measurement
+/// at a finer grain, so that a change can be aimed rather than guessed at.
+///
+/// # Why it is off by default, and why the switch is a bool rather than a level
+///
+/// A counter is `fetch_add(1, Relaxed)` on a shared cache line, which is free on one thread and a
+/// contended read-modify-write on the bake pool. **The two timed columns are the reason it cannot just
+/// be left on**: an `Instant::now()` pair is a clock read, and at one pair per face it is a measurable
+/// share of the thing it is measuring - a profiler that changes the answer is worse than none.
+///
+/// So the switch is one `bool`, read once per call rather than per counter, and a bake with it off pays
+/// a predictable branch and nothing else. It is set by the benchmark rather than by a setting: this is a
+/// development instrument, and the run that wants it knows which scenario it is running.
+pub static BAKE_PHASES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the phase counters are on. See [`BAKE_PHASES`].
+#[inline]
+fn phases_on() -> bool {
+    BAKE_PHASES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+macro_rules! phase_counters {
+    ($($name:ident => $doc:literal,)*) => {
+        $(
+            #[doc = $doc]
+            // **`static` and lowercase on purpose.** Every other counter in this file is
+            // `SCREAMING_CASE`, but these are named after the `BakePhases` fields they back - so that
+            // the macro writes one name rather than two, and a reader can go from a column in the
+            // benchmark's output to the line that fills it without a second lookup. The lint is
+            // suppressed here rather than at each of the fourteen.
+            #[allow(non_upper_case_globals)]
+            static $name: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        )*
+
+        /// One bake's worth of [`BAKE_PHASES`], as the benchmark and the log line read it.
+        #[derive(Clone, Copy, Debug, Default)]
+        pub struct BakePhases {
+            $(
+                #[doc = $doc]
+                pub $name: u64,
+            )*
+        }
+
+        impl BakePhases {
+            /// Reads every counter and zeroes it, so two calls measure two windows rather than one
+            /// running total.
+            ///
+            /// **A window is what this gives, and a bake is not the only thing in one.** The counters
+            /// are process-wide rather than per bake, so the caller brackets what it wants: the
+            /// benchmark takes once after a whole repeat, which is what makes its per-section figures
+            /// averages over that repeat. The first version of this cleared them at the top of every
+            /// bake instead, which is the same thing read one section too late - every bake wiped what
+            /// the section before it had counted, and a run reported all zeroes.
+            pub fn take() -> Self {
+                Self {
+                    $($name: $name.swap(0, std::sync::atomic::Ordering::Relaxed),)*
+                }
+            }
+        }
+    };
+}
+
+phase_counters! {
+    phase_cull_calls => "Every `face_is_culled` call, which is the population the cull time is over.",
+    phase_face_hidden => "Of those, the ones the neighbour hid.",
+    phase_face_no_cullface => "Of those, the ones whose model declared no `cullface` at all - the answer is `false` before the world is looked at.",
+    phase_face_emitted => "Faces that survived the cull and were written out.",
+    phase_fluid_face => "Faces the fluid mesher emitted.",
+    phase_block_loop => "Blocks the 4096-block loop actually examined.",
+    phase_blocks_with_a_model => "Blocks that resolved to a model, which is the model lookup.",
+    phase_model_cull_bit => "Blocks whose model declared at least one `cullface`.",
+    phase_neighbour_state => "Neighbour states read, which is one provider call per culled face.",
+    phase_face_flags => "Face-flag table lookups, the `HashMap<u32, FaceFlags>` probe.",
+    phase_flags_hit => "Face-flag lookups that found a row, so the state's masks were used.",
+    phase_flags_miss => "Face-flag lookups that found nothing, so the state occludes and hides nothing.",
+    phase_vertices_written => "Vertices pushed into a layer, four per emitted face.",
+    phase_quad_sort => "Quads the translucent sort looked at.",
+    phase_quads_moved => "Quads the translucent sort actually moved.",
+    phase_nanos_in_cull => "Nanoseconds in `face_is_culled`, **only while the switch is on**.",
+    phase_nanos_in_emit => "Nanoseconds in the emission of a surviving face, same caveat.",
+}
+
 /// Whether the renderer's diagnostic log lines are on.
 ///
 /// Set from the JVM side when the settings are applied - see `wgpu_mc_jni::debug` - because the
@@ -1861,20 +1976,23 @@ fn bake_layers<Provider: BlockStateProvider>(
         // The hash takes the **world** coordinates - a section knows its own origin and not the
         // block's, so the section offset is added back here, and the `y` it is hashed with is zero
         // whatever the block's height is. See [`block_seed`].
-        let offset = {
-            let flags = face_flags(block_manager, block_state);
+        let flags = face_flags(block_manager, block_state);
 
-            if flags.has_offset() {
-                let world = ivec3(
-                    section_offset.x + pos.x,
-                    section_offset.y + pos.y,
-                    section_offset.z + pos.z,
-                );
+        if phases_on() {
+            phase_block_loop.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            phase_face_flags.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
 
-                flags.block_offset(world.x, world.z)
-            } else {
-                Vec3::ZERO
-            }
+        let offset = if flags.has_offset() {
+            let world = ivec3(
+                section_offset.x + pos.x,
+                section_offset.y + pos.y,
+                section_offset.z + pos.z,
+            );
+
+            flags.block_offset(world.x, world.z)
+        } else {
+            Vec3::ZERO
         };
 
         // Which watched block this is, if any: counted per block rather than per face, so the cost is
@@ -1889,6 +2007,13 @@ fn bake_layers<Provider: BlockStateProvider>(
         let variant = state_provider.get_model_variant(pos);
 
         if let Some(model_mesh) = get_block(block_manager, block_state, variant) {
+            if phases_on() {
+                phase_blocks_with_a_model.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+                if model_mesh.cull != 0 {
+                    phase_model_cull_bit.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
             // **`ModelBlockRenderer#forceOpaque`, on this side of the fence.** The game sends a leaf
             // block's faces to the *solid* layer when the player has leaves cut out turned off
             // (`GraphicsPreset`'s `Fast`, `Options#cutoutLeaves`), whatever the leaf sprite says - and the
@@ -1900,10 +2025,12 @@ fn bake_layers<Provider: BlockStateProvider>(
             // and `Fast` and `Fancy` drew exactly the same leaves.
             //
             // Resolved once per block rather than once per face, because it is a property of the state.
-            let opaque_leaves = force_opaque(
-                crate::mc::block::cutout_leaves(),
-                state_is_leaves(block_manager, block_state),
-            );
+            //
+            // **And from the `flags` already read above, not from a second lookup.** The old call was
+            // `state_is_leaves(block_manager, block_state)`, which is `face_flags(...).leaves` - the same
+            // table, the same key, one line after the first read of it. Unconditional, so it was one
+            // extra hash per block in the whole section whether the block had leaves or not.
+            let opaque_leaves = force_opaque(crate::mc::block::cutout_leaves(), flags.leaves);
             // The winding, and the one thing about a baked quad that nothing else can tell you is
             // wrong: the pass culls back faces with a front face of counter-clockwise, and this backend
             // gives Minecraft's shaders OpenGL's clip space (`preprocessing.rs`) - which *mirrors* the
@@ -2008,6 +2135,11 @@ fn bake_layers<Provider: BlockStateProvider>(
                                     // brightness is `1 - 0.2 * count`, which is the same average, and
                                     // counting it here keeps the curve in one place - the shader -
                                     // where a wrong number is one line rather than a re-bake.
+                                    // **Four state reads and four table lookups, and this is where the
+                                    // ambient-occlusion corner is actually paid for** - it is the one
+                                    // part of emission that reaches back into the world. `phase_face_flags`
+                                    // says what it costs, which is why the counter is worth having: on a
+                                    // solid section none of this runs at all, because no face survives.
                                     let b1 =
                                         shades_corners(block_manager, state_provider.get_state(p1))
                                             as u8;
@@ -2021,6 +2153,13 @@ fn bake_layers<Provider: BlockStateProvider>(
                                         block_manager,
                                         state_provider.get_state(pos + dir_vec),
                                     ) as u8;
+
+                                    if phases_on() {
+                                        phase_face_flags
+                                            .fetch_add(4, std::sync::atomic::Ordering::Relaxed);
+                                        phase_neighbour_state
+                                            .fetch_add(4, std::sync::atomic::Ordering::Relaxed);
+                                    }
 
                                     let l1 = state_provider.get_light_level(p1);
                                     let l2 = state_provider.get_light_level(p2);
@@ -2061,6 +2200,10 @@ fn bake_layers<Provider: BlockStateProvider>(
                         })
                         .flat_map(Vertex::compressed),
                 );
+
+                if phases_on() {
+                    phase_vertices_written.fetch_add(4, std::sync::atomic::Ordering::Relaxed);
+                }
                 baked_layer.indices.extend(
                     INDICES
                         .iter()
@@ -2095,8 +2238,36 @@ fn bake_layers<Provider: BlockStateProvider>(
                 // was then found to be culled - so every hidden face in a section paid for a colour nobody
                 // would ever see. The two questions are independent: `face_is_culled` reads the model's own
                 // `cullface` and the neighbour's state, and a colour cannot change either.
-                if face_is_culled(face, block_manager, block_state, state_provider, pos) {
+                //
+                // The clock read below is why [`BAKE_PHASES`] is a switch: it costs a real share of the
+                // thing it times, so a run that wants the split asks for it and a run that does not pays
+                // one predictable branch.
+                let phases = phases_on();
+                let cull_started = phases.then(std::time::Instant::now);
+
+                let culled = face_is_culled(face, block_manager, block_state, state_provider, pos);
+
+                // **Counted whether it culled or not**, because the counter's job is to be the
+                // denominator of the two `ns/` figures below it - and a count of the faces that *were*
+                // hidden is not the population the cull time was spent on. Counted inside the `if
+                // phases` for the reason everything else here is: a shared atomic per face is not free.
+                if phases {
+                    if let Some(started) = cull_started {
+                        phase_nanos_in_cull.fetch_add(
+                            started.elapsed().as_nanos() as u64,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                    }
+
+                    phase_cull_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+
+                if culled {
                     faces_culled += 1;
+
+                    if phases {
+                        phase_face_hidden.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
 
                     if face.tint_index != -1 {
                         TINTED_FACES_CULLED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2107,13 +2278,26 @@ fn bake_layers<Provider: BlockStateProvider>(
 
                 faces_drawn += 1;
 
+                if phases {
+                    phase_face_emitted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+
                 let color = tint_of(face.tint_index);
 
                 // The light comes from the plane the face is *on*, which is what the bucket direction
                 // is for; it is not a culling question.
                 let light_level: LightLevel = state_provider.get_light_level(pos + dir.to_vec());
 
+                let emit_started = phases.then(std::time::Instant::now);
+
                 add_quad(face, light_level, dir, color);
+
+                if let Some(started) = emit_started {
+                    phase_nanos_in_emit.fetch_add(
+                        started.elapsed().as_nanos() as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                }
             };
 
             model_mesh.west.iter().for_each(|face| {
@@ -2225,7 +2409,7 @@ fn sort_translucent_quads(layer: &mut BakedLayer) {
     // axis at 1/2048 of a block**, x and y in the halves of the first word and z in the low half of the
     // second. See `Vertex::compressed`. The scale is not applied because this is only ever compared with
     // itself - the order of two quads is the same in steps as in blocks - and the integers stay exact.
-    let centroid = |quad: usize| -> (i32, i32, i32) {
+    let centroid = |quad: usize| -> i32 {
         let first = quad * quad_bytes;
         // The third vertex is two vertices further on, which is the pair the game averages.
         let third = first + VERTEX_LENGTH * 2;
@@ -2240,31 +2424,60 @@ fn sort_translucent_quads(layer: &mut BakedLayer) {
             (at(first) + at(third)) / 2
         };
 
-        (axis(0), axis(2), axis(4))
+        let (x, y, z) = (axis(0), axis(2), axis(4));
+
+        x * x + y * y + z * z
     };
 
-    let mut order: Vec<usize> = (0..quads).collect();
+    // **One decode per quad, not one per comparison.**
+    //
+    // The comparator used to call `centroid` on both of its arguments, so every comparison decoded four
+    // vertices' worth of bytes - and a comparison happens `O(quads log quads)` times, which for the
+    // 1,504 quads a solid ice section emits is seventeen thousand comparisons against fifteen hundred
+    // quads. The keys are the same values either way and the order is the same on them, so this is a
+    // change of *how often the work is done* and not of what the answer is.
+    //
+    // `clone` of the index list is not needed here because the sort now reorders a key vector rather
+    // than the indices themselves; the move loop below still needs the original order to read from, so
+    // `source` stays.
+    let mut keyed: Vec<(i32, usize)> = (0..quads).map(|quad| (centroid(quad), quad)).collect();
 
-    order.sort_by(|a, b| {
-        let (ax, ay, az) = centroid(*a);
-        let (bx, by, bz) = centroid(*b);
+    // **Counted, because this sort is the one part of baking whose cost is not linear in the faces.**
+    // `phase_quads_moved` is what says whether it is worth doing at all: a layer that is already in
+    // order pays for the sort and moves nothing.
+    let phases = phases_on();
 
-        let a2 = ax * ax + ay * ay + az * az;
-        let b2 = bx * bx + by * by + bz * bz;
+    if phases {
+        phase_quad_sort.fetch_add(quads as u64, std::sync::atomic::Ordering::Relaxed);
+    }
 
+    keyed.sort_by(|(a, _), (b, _)| {
         // Descending, so the farthest quad is drawn first. `cmp` rather than `partial_cmp` because these
         // are integers with a total order, and a comparator that is not total is a sort whose result is
         // not reproducible - the game is explicit about wanting a total one too (`Floats.compare`).
-        b2.cmp(&a2)
+        //
+        // `sort_by` is stable, so two quads at the same distance keep the order they were baked in -
+        // which is the game's own behaviour too, and it is why the key is compared and not the pair.
+        b.cmp(a)
     });
 
     let source = layer.indices.clone();
 
-    for (position, quad) in order.iter().enumerate() {
+    let mut moved = 0u64;
+
+    for (position, (_, quad)) in keyed.iter().enumerate() {
+        if *quad != position {
+            moved += 1;
+        }
+
         let from = quad * index_bytes;
         let to = position * index_bytes;
 
         layer.indices[to..to + index_bytes].copy_from_slice(&source[from..from + index_bytes]);
+    }
+
+    if phases {
+        phase_quads_moved.fetch_add(moved, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -4297,6 +4510,10 @@ fn bake_fluid_faces_with<Provider: BlockStateProvider>(
                         corners: [(glam::Vec3, [u16; 2]); 4],
                         back_face: bool| {
         FLUID_QUADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        if phases_on() {
+            phase_fluid_face.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
 
         // A fluid face is shaded by its direction exactly as a block face is - the game's `FluidRenderer`
         // writes `tint * up * (north | west)` for a side, `tint * up` for a top and `tint * down` for a

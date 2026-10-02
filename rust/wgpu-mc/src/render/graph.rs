@@ -737,6 +737,19 @@ pub fn terrain_batches_draws() -> bool {
     terrain_indirect_requested() && TERRAIN_BATCHING_POSSIBLE.load(Ordering::Relaxed)
 }
 
+/// Whether this device and this backend may batch draws with `multi_draw_indexed_indirect` at all:
+/// **the device answer without the setting**.
+///
+/// The three indirect feature bits and the DX12 exclusion, resolved where the adapter is - see
+/// [`TERRAIN_BATCHING_POSSIBLE`]. This is the second reader of that answer, and it is read per batch
+/// rather than per pass: [`terrain_batches_draws`] is about the terrain pass this renderer draws
+/// itself, and this is about Minecraft's own repeated draws, which the JNI side batches through the
+/// same call. A device whose multi-draw is emulated, or whose backend's is broken, gets one draw at a
+/// time there too - so the two readers cannot disagree about what the hardware can do.
+pub fn terrain_batching_possible() -> bool {
+    TERRAIN_BATCHING_POSSIBLE.load(Ordering::Relaxed)
+}
+
 /// Whether the game's block atlas is sampled from its base mip level only.
 ///
 /// **Off, and the argument for leaving it off is in the sampler's own comment** - the game animates

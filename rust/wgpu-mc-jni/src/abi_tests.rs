@@ -237,16 +237,24 @@ fn rust_enum_variants(source: &str, name: &str) -> Vec<(String, u64)> {
         + needle.len();
     let end = source[start..].find('}').expect("unterminated enum") + start;
 
+    // **Comments come out before the split on commas, not after it.** Each variant here is a bare name
+    // and a discriminant, so a line's comment is never anything else - and dropping comments *after*
+    // the split is what let a doc comment on a variant be torn in half by a comma of its own prose:
+    // the tail of the sentence then arrived as a variant name ("and this is"), and the test reported
+    // it as a missing Kotlin constant, which names the wrong thing entirely.
+    let body: String = source[start..end]
+        .lines()
+        .map(|line| match line.find("//") {
+            Some(comment) => &line[..comment],
+            None => line,
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+
     let mut variants = Vec::new();
     let mut next = 0u64;
 
-    for entry in source[start..end].split(',') {
-        // Doc comments on variants carry commas of their own.
-        let entry: String = entry
-            .lines()
-            .filter(|line| !line.trim_start().starts_with("//"))
-            .collect::<Vec<_>>()
-            .join(" ");
+    for entry in body.split(',') {
         let entry = entry.trim();
         if entry.is_empty() {
             continue;
@@ -777,6 +785,11 @@ fn every_struct_the_jvm_reads_by_offset_still_has_that_layout() {
         &constants,
         "DRAW_CALL_BINDINGS_PRESENT",
         offset_of!(DrawCall, bindings_present),
+    );
+    check_offset(
+        &constants,
+        "DRAW_CALL_FIRST_INSTANCE",
+        offset_of!(DrawCall, first_instance),
     );
     check_offset(
         &constants,

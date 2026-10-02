@@ -51,6 +51,7 @@ mod debug;
 mod device;
 pub mod entity;
 mod gl;
+mod indirect;
 mod lighting;
 mod palette;
 mod pia;

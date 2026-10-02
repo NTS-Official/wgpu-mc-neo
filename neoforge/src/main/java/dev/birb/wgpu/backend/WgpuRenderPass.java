@@ -10,6 +10,7 @@ import com.mojang.blaze3d.textures.GpuTextureView;
 import com.mojang.blaze3d.vertex.VertexFormat;
 import dev.birb.wgpu.render.TerrainPass;
 import dev.birb.wgpu.rust.NativeNames;
+import dev.birb.wgpu.rust.RendererSettings;
 import dev.birb.wgpu.rust.WmNative;
 import net.minecraft.util.ARGB;
 import org.jspecify.annotations.NonNull;
@@ -20,9 +21,11 @@ import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.lang.invoke.MethodHandle;
 import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.OptionalDouble;
 import java.util.OptionalInt;
@@ -1336,28 +1339,7 @@ public class WgpuRenderPass implements RenderPassBackend {
             return;
         }
 
-        drawCall.set(WmNative.ADDRESS, WmNative.DRAW_CALL_PIPELINE, activePipeline);
-        drawCall.set(WmNative.INT, WmNative.DRAW_CALL_FIRST, first);
-        drawCall.set(WmNative.INT, WmNative.DRAW_CALL_COUNT, count);
-        drawCall.set(WmNative.INT, WmNative.DRAW_CALL_BASE_VERTEX, baseVertex);
-        drawCall.set(WmNative.INT, WmNative.DRAW_CALL_INSTANCE_COUNT, instanceCount);
-        drawCall.set(WmNative.INT, WmNative.DRAW_CALL_INDEXED, indexed ? 1 : 0);
-        drawCall.set(WmNative.INT, WmNative.DRAW_CALL_BINDINGS_LEN, bindings.getCount());
-
-        // The combination this draw's bindings make up, and whether the table in the buffer carries
-        // what it left out. The number is the identity of the bind groups - it is what the native
-        // side keys them by - so it is minted from the slots as they are bound, and a draw whose
-        // slots are the ones the last draw of this pass had reuses its number without a lookup. Zero
-        // means "work the identity out from the table", which is what the native side did before
-        // combinations existed; numbering them is what turns that per-draw walk into one integer
-        // comparison, and it is done where the bindings are known - here.
-        drawCall.set(WmNative.INT, WmNative.DRAW_CALL_COMBO, combination());
-
-        // The table is always the one the number was built from - the slots are written as they are
-        // bound - so what this really says is whether the number is the *whole* identity: a plan whose
-        // bindings all bake their offsets has none that travels with the draw, and its draws are then
-        // answered without the table being read at all.
-        drawCall.set(WmNative.INT, WmNative.DRAW_CALL_BINDINGS_PRESENT, planHasDynamic ? 1 : 0);
+        writeTemplate(first, count, baseVertex, instanceCount, indexed, firstInstance);
 
         reportCloudDraw(first, count, baseVertex, indexed);
         checkTexelReadRange(count, indexed);
@@ -1391,6 +1373,47 @@ public class WgpuRenderPass implements RenderPassBackend {
                     "wgpu: the native side refused a draw of {} that carried its bindings",
                     activePipelineName);
         }
+    }
+
+    /**
+     * Writes the state a draw is recorded with into the reused draw call, without recording a draw.
+     *
+     * <p>It exists for {@link #batch}. A batched call carries **one** draw call for a whole run, and it
+     * has to carry that run's *current* state: the pipeline, the buffers, the bindings, and the number
+     * the native side keys their bind groups by. That number is minted from the slots as they are bound
+     * and only a recorded draw used to mint it - so a batch that left the field where the last recorded
+     * draw put it handed the native side the identity of somebody else's bindings, and the native side
+     * answers that by refusing the draw. It is why one terrain layer batched and the others did not,
+     * until this was written: a refusal there costs the batching and never the picture.
+     */
+    private void writeTemplate(
+            int first, int count, int baseVertex, int instanceCount, boolean indexed, int instance) {
+        drawCall.set(WmNative.ADDRESS, WmNative.DRAW_CALL_PIPELINE, activePipeline);
+        drawCall.set(WmNative.INT, WmNative.DRAW_CALL_FIRST, first);
+        drawCall.set(WmNative.INT, WmNative.DRAW_CALL_COUNT, count);
+        drawCall.set(WmNative.INT, WmNative.DRAW_CALL_BASE_VERTEX, baseVertex);
+        drawCall.set(WmNative.INT, WmNative.DRAW_CALL_INSTANCE_COUNT, instanceCount);
+        // The draw's own record number, which is what a shader with per-draw data reads its block at.
+        // Zero for every pipeline whose draws carry none, and set by `replay`, because Blaze3D's draw
+        // calls have no such parameter. See `DRAW_CALL_FIRST_INSTANCE`.
+        drawCall.set(WmNative.INT, WmNative.DRAW_CALL_FIRST_INSTANCE, instance);
+        drawCall.set(WmNative.INT, WmNative.DRAW_CALL_INDEXED, indexed ? 1 : 0);
+        drawCall.set(WmNative.INT, WmNative.DRAW_CALL_BINDINGS_LEN, bindings.getCount());
+
+        // The combination this draw's bindings make up, and whether the table in the buffer carries
+        // what it left out. The number is the identity of the bind groups - it is what the native
+        // side keys them by - so it is minted from the slots as they are bound, and a draw whose
+        // slots are the ones the last draw of this pass had reuses its number without a lookup. Zero
+        // means "work the identity out from the table", which is what the native side did before
+        // combinations existed; numbering them is what turns that per-draw walk into one integer
+        // comparison, and it is done where the bindings are known - here.
+        drawCall.set(WmNative.INT, WmNative.DRAW_CALL_COMBO, combination());
+
+        // The table is always the one the number was built from - the slots are written as they are
+        // bound - so what this really says is whether the number is the *whole* identity: a plan whose
+        // bindings all bake their offsets has none that travels with the draw, and its draws are then
+        // answered without the table being read at all.
+        drawCall.set(WmNative.INT, WmNative.DRAW_CALL_BINDINGS_PRESENT, planHasDynamic ? 1 : 0);
     }
 
     /** Refused draws already reported by [reportRefusedDraw], by pipeline. */
@@ -1472,11 +1495,21 @@ public class WgpuRenderPass implements RenderPassBackend {
     private static volatile long lastCloudDraw = 0L;
 
     /**
-     * Replays a multi-draw one draw at a time.
+     * Draws a multi-draw: the runs that can be one indirect call are, and everything else is replayed
+     * one draw at a time.
      *
-     * <p>Batching would need the indirect/instanced path, which the Rust ABI does not expose yet;
-     * replaying keeps rendering correct, only less batched. Per-draw uniform uploads are honoured
-     * so annotated draws still see their own uniforms.
+     * <p>Minecraft hands a whole layer's sections to one call of this - thousands of draws a frame in a
+     * handful of calls, all of them the same setup with different indices - so a run of them becomes
+     * one `multi_draw_indexed_indirect`. See {@link #batch} for what a run is, and {@link #replay} for
+     * the draws that are still one call each.
+     *
+     * <p>**The per-draw uniform is what makes this more than bookkeeping.** A draw's own block - the
+     * terrain pass' `ChunkSection`: the section's position, its fade and the atlas size - arrives as a
+     * slice of a uniform ring buffer, one slice per section, and an indirect record has no room for a
+     * per-draw binding offset. So a slot the plan marks as per-draw storage is bound *whole* and the
+     * number of the slice the draw named travels as its first instance, which is where the shader
+     * reads the block: see {@link #captureUniformUploads}. A draw that uploads anything else has no
+     * per-draw channel and is replayed.
      */
     @Override
     public <T> void drawMultipleIndexed(
@@ -1485,26 +1518,419 @@ public class WgpuRenderPass implements RenderPassBackend {
             VertexFormat.IndexType defaultIndexType,
             @NonNull Collection<String> dynamicUniforms,
             @NonNull T uniformArgument) {
+        if (Diagnostics.loggingEnabled()) {
+            countMultiDraw(draws, defaultIndexBuffer, defaultIndexType);
+        }
+
+        // **The run being collected for one batched call**, if any draw of this call can be batched at
+        // all. A local rather than a field because `T` is the caller's: a `Draw<T>`'s uniform uploader
+        // takes a `T`, and only this method knows what that is. [runInstances] is its parallel array,
+        // because a boxed number per section per frame is an allocation this path exists to remove.
+        List<RenderPass.Draw<T>> run = null;
+        GpuBuffer runVertex = null;
+        GpuBuffer runIndex = null;
+        VertexFormat.IndexType runType = null;
+        int runSlot = -1;
+        boolean runInstanced = false;
+
+        // **Read once per call, and never inside the loop below.** The switch is the renderer's own
+        // `section_indirect` setting rather than a marker file now, but the loop still runs thousands of
+        // times a frame and all that has to be true is that the answer does not change within one call.
+        boolean batching = batching();
+
         for (RenderPass.Draw<T> draw : draws) {
             GpuBuffer indexBuffer = draw.indexBuffer() != null ? draw.indexBuffer() : defaultIndexBuffer;
-            if (indexBuffer == null) {
-                continue;
-            }
             VertexFormat.IndexType indexType =
                     draw.indexType() != null ? draw.indexType() : defaultIndexType;
             if (indexType == null) {
                 indexType = VertexFormat.IndexType.SHORT;
             }
 
-            if (draw.uniformUploaderConsumer() != null) {
-                draw.uniformUploaderConsumer()
-                        .accept(uniformArgument, this::setUniform);
+            // The draw's own uploads, taken here: they are the one thing a caller can change between
+            // the draws of one call, so they decide both what the run is and whether it can be one.
+            captureUniformUploads(draw, uniformArgument);
+
+            boolean batchable =
+                    batching && indexBuffer != null && draw.indexCount() > 0 && !capturedForeign;
+            boolean sameRun = run != null
+                    && runVertex == draw.vertexBuffer()
+                    && runIndex == indexBuffer
+                    && runType == indexType
+                    && runSlot == draw.slot()
+                    && runInstanced == (capturedInstance != NO_INSTANCE);
+
+            if (batchable && sameRun) {
+                run.add(draw);
+                addRunInstance(capturedInstance);
+                continue;
             }
 
-            setVertexBuffer(draw.slot(), draw.vertexBuffer());
-            setIndexBuffer(indexBuffer, indexType);
-            drawIndexed(draw.baseVertex(), draw.firstIndex(), draw.indexCount(), 1);
+            if (run != null) {
+                replayRun(run, runIndex, runType);
+                run = null;
+            }
+
+            if (batchable) {
+                run = new ArrayList<>();
+                run.add(draw);
+                runSize = 0;
+                addRunInstance(capturedInstance);
+                runVertex = draw.vertexBuffer();
+                runIndex = indexBuffer;
+                runType = indexType;
+                runSlot = draw.slot();
+                runInstanced = capturedInstance != NO_INSTANCE;
+            } else if (indexBuffer != null) {
+                replay(draw, indexBuffer, indexType, capturedInstance);
+            }
         }
+
+        if (run != null) {
+            replayRun(run, runIndex, runType);
+        }
+    }
+
+    /** The record number of the draw being captured, or [NO_INSTANCE] when it reads no per-draw data. */
+    private int capturedInstance;
+    /** Whether the draw being captured uploaded anything that is not per-draw storage data. */
+    private boolean capturedForeign;
+
+    /** What [capturedInstance] holds for a draw whose pipeline reads no per-draw data. */
+    private static final int NO_INSTANCE = -1;
+
+    /** The record numbers of the run being collected, parallel to its list of draws. */
+    private int[] runInstances = new int[64];
+
+    /** How many of [runInstances] the run being collected has filled. */
+    private int runSize;
+
+    private void addRunInstance(int instance) {
+        if (runSize == runInstances.length) {
+            runInstances = Arrays.copyOf(runInstances, runSize * 2);
+        }
+
+        runInstances[runSize++] = instance;
+    }
+
+    /** The setting that turns the batched draw path off, for a run that wants the other path. */
+    private static final String SECTION_INDIRECT = "section_indirect";
+
+    /**
+     * Whether the batched draw path may be used, which is the renderer's own `section_indirect` switch.
+     *
+     * <p>**A setting, not a marker file** - and the marker this replaced was the wrong shape for two
+     * reasons that are worth keeping written down. A setting is the switch a player can find: it is in
+     * the schema, on the options screen under Debug, persisted in `config/wgpu-mc-renderer.json`, and
+     * it costs a hash lookup to read. A marker file is a filesystem call, and reading it *per draw* is
+     * what took a frame from 120 fps to 6.5 on a machine whose antivirus filters every open (measured:
+     * `Files.exists` on an absent marker, 32.6 µs).
+     *
+     * <p>The other half of the comparison this exists for - the camera - is `pin_camera`, which is the
+     * setting next to it. Two runs with the same pinned camera and this switch set either way give the
+     * A/B; nothing has to be created while the game runs.
+     */
+    private static boolean batching() {
+        Boolean asked = RendererSettings.bool(SECTION_INDIRECT);
+
+        // The renderer answers for its own schema; before it has said anything - the first frames of a
+        // launch - the path that has been measured is the one to take.
+        return asked == null || asked;
+    }
+
+    /** Whether a marker file of this name exists in the run directory or the one above it. */
+    private static boolean markerPresent(String name) {
+        return java.nio.file.Files.exists(java.nio.file.Path.of(name))
+                || java.nio.file.Files.exists(java.nio.file.Path.of("..", name));
+    }
+
+    /**
+     * Runs one draw's own uniform uploads, and sorts what they bind into the two things the draw path
+     * needs: the bindings themselves, and - for a slot the plan marks as per-draw storage - the record
+     * number the draw reads.
+     *
+     * <p>This is where a per-draw uniform stops being a per-draw *binding*. A storage slot is bound
+     * whole, at offset zero, so that every draw of a batched run shares one bind group; the slice
+     * Minecraft named for this draw becomes its first instance instead, which is what
+     * {@link #captureUniform} works out.
+     *
+     * <p>Anything else the draw uploads is bound exactly as it always was, and sets {@link
+     * #capturedForeign}: its offset travels with the draw, an indirect record has nowhere to put it,
+     * and so the run it lands in is replayed one draw at a time. The uploader runs here and once - a
+     * fallback must not run it a second time, because nothing promises it is idempotent.
+     */
+    private <T> void captureUniformUploads(RenderPass.Draw<T> draw, T uniformArgument) {
+        capturedInstance = NO_INSTANCE;
+        capturedForeign = false;
+
+        if (draw.uniformUploaderConsumer() != null) {
+            draw.uniformUploaderConsumer().accept(uniformArgument, this::captureUniform);
+        }
+    }
+
+    /** One uniform a draw uploaded. See [captureUniformUploads]. */
+    private void captureUniform(String name, GpuBufferSlice value) {
+        int slot = perDrawStorageSlot(name);
+
+        if (slot < 0) {
+            setUniform(name, value);
+            capturedForeign = true;
+            return;
+        }
+
+        // **The whole buffer, once per draw** - the offsets are all zero, so every draw of a run binds
+        // the same thing and the one bind group serves them all. The number of the slice this draw
+        // named is what the shader will index it by: the ring those blocks come from advances by one
+        // whole block per record, so the slice's offset over its own length is the record it is, and
+        // nothing here has to ask a device for a stride.
+        GpuBuffer buffer = value.buffer();
+        boundBindings.put(name, Bound.buffer(((WgpuBuffer) buffer).nativeBuffer(), 0L, buffer.size()));
+        writeSlot(slot, boundBindings.get(name));
+
+        capturedInstance = value.length() > 0L ? (int) (value.offset() / value.length()) : 0;
+    }
+
+    /** The slot `name` is, when the plan marks it as per-draw storage, or -1 when it is anything else. */
+    private int perDrawStorageSlot(String name) {
+        int[] slots = bindings == null ? null : bindings.of(name);
+        if (slots == null || slots.length != 1) {
+            return -1;
+        }
+
+        int slot = slots[0];
+
+        return slot >= 0 && slot < bindings.storageSlots.length && bindings.storageSlots[slot] ? slot : -1;
+    }
+
+    /** Draws a collected run: as one batch when it is worth one, and one draw at a time when it is not. */
+    private <T> void replayRun(
+            List<RenderPass.Draw<T>> run, GpuBuffer indexBuffer, VertexFormat.IndexType indexType) {
+        // One draw is not a batch: the indirect call it would take is more work than the draw itself.
+        int drawn = run.size() > 1 ? batch(run, indexBuffer, indexType) : 0;
+
+        for (int index = drawn; index < run.size(); index++) {
+            replay(run.get(index), indexBuffer, indexType, runInstances[index]);
+        }
+    }
+
+    /**
+     * Records `run` as indirect records and issues them as one `multi_draw_indexed_indirect` per chunk,
+     * answering how many of the run's draws were drawn.
+     *
+     * <p>The run has already been checked to be one run - one pipeline, one vertex buffer, one index
+     * buffer, one set of bindings, all of them carrying or not carrying a per-draw record - so this
+     * sets them once, and that is the whole saving: what used to be a call across the ABI per draw,
+     * with the bind group key and the offsets worked out per draw, is now one call per run.
+     *
+     * <p>A short answer is not an error. The native side refuses a batch it cannot issue as one call -
+     * a device whose multi-draw is emulated, a backend whose implementation of it is broken, a
+     * submission that has run out of record space - and the caller draws the rest of the run one draw
+     * at a time. The picture is the same either way, which is why this is allowed to be opportunistic.
+     */
+    private <T> int batch(
+            List<RenderPass.Draw<T>> run, GpuBuffer indexBuffer, VertexFormat.IndexType indexType) {
+        RenderPass.Draw<T> first = run.get(0);
+        setVertexBuffer(first.slot(), first.vertexBuffer());
+        setIndexBuffer(indexBuffer, indexType);
+
+        // **The template the native side records the whole run with.** Its parameters are the first
+        // draw's and are not what the batch draws with - the records carry those - but the run's state
+        // has to be in it, the combination above all. See [writeTemplate].
+        writeTemplate(first.firstIndex(), first.indexCount(), first.baseVertex(), 1, true, 0);
+
+        int drawn = 0;
+
+        while (drawn < run.size()) {
+            int count = Math.min(BATCH_CHUNK, run.size() - drawn);
+
+            try (Arena chunk = Arena.ofConfined()) {
+                MemorySegment records = chunk.allocate(WmNative.BATCH_RECORD, count);
+
+                for (int index = 0; index < count; index++) {
+                    RenderPass.Draw<T> draw = run.get(drawn + index);
+                    long base = WmNative.elementOffset(WmNative.BATCH_RECORD, index);
+                    records.set(WmNative.INT, base + WmNative.BATCH_RECORD_FIRST, draw.firstIndex());
+                    records.set(WmNative.INT, base + WmNative.BATCH_RECORD_COUNT, draw.indexCount());
+                    records.set(WmNative.INT, base + WmNative.BATCH_RECORD_BASE_VERTEX, draw.baseVertex());
+                    records.set(
+                            WmNative.INT,
+                            base + WmNative.BATCH_RECORD_INSTANCE,
+                            Math.max(runInstances[drawn + index], 0));
+                }
+
+                MemorySegment array = chunk.allocate(WmNative.RAW_ARRAY);
+                WmNative.writeRawArray(array, 0L, records, count);
+
+                int answer = (int) invoke(
+                        WmNative.drawCallBatch, device.renderer(), nativePass, drawCall, array);
+
+                if (answer < count) {
+                    return drawn + Math.max(answer, 0);
+                }
+            }
+
+            drawn += count;
+        }
+
+        return drawn;
+    }
+
+    /**
+     * Draws one draw from the state {@link #captureUniformUploads} already put in place.
+     *
+     * <p>Its own upload has run, so this is the draw itself: the buffers it reads and the record number
+     * its vertex stage is to read its per-draw block at. That number goes into the draw call rather
+     * than into the call's arguments because Blaze3D's `drawIndexed` has no such parameter - see
+     * [WmNative.DRAW_CALL_FIRST_INSTANCE] - and it has to be the same number a batched call would have
+     * written into an indirect record, which is what makes the two paths draw the same picture.
+     */
+    private <T> void replay(
+            RenderPass.Draw<T> draw,
+            GpuBuffer indexBuffer,
+            VertexFormat.IndexType indexType,
+            int instance) {
+        setVertexBuffer(draw.slot(), draw.vertexBuffer());
+        setIndexBuffer(indexBuffer, indexType);
+
+        firstInstance = instance == NO_INSTANCE ? 0 : instance;
+        drawIndexed(draw.baseVertex(), draw.firstIndex(), draw.indexCount(), 1);
+        firstInstance = 0;
+    }
+
+    /**
+     * The first instance of the draw being recorded.
+     *
+     * <p>Blaze3D's draw calls have no such parameter, so it travels beside them: [replay] sets it for
+     * one draw and clears it, and [record] writes it into the call. See
+     * [WmNative.DRAW_CALL_FIRST_INSTANCE].
+     */
+    private int firstInstance = 0;
+
+    /**
+     * How many draws one batched call carries at most.
+     *
+     * <p>The array of records is written into a confined arena per call, so this is what bounds that
+     * allocation: 4096 records is 64 KiB, and a run longer than this becomes several calls - which is
+     * still a handful of calls per run rather than one per draw. The native side has a record buffer of
+     * its own and refuses what does not fit in it, so this number only has to be reasonable, not exact.
+     */
+    private static final int BATCH_CHUNK = 4096;
+
+    /**
+     * Diagnostics: what the multi-draw calls carry, and how many draws a batched path would issue.
+     *
+     * <p>Minecraft hands the whole list of a layer's sections to one call of {@link
+     * #drawMultipleIndexed}, and the renderer replays it one draw at a time. This counts both
+     * numbers, because they are the whole case for batching: "draws" is what the game asked for, and
+     * "runs" is what {@code multi_draw_indexed_indirect} would issue - one call per run of
+     * consecutive draws that share a vertex buffer, an index buffer and an index format, which is the
+     * one thing an indirect record cannot change per draw.
+     *
+     * <p>A batch is only worth issuing if the draws in it also agree about everything else the draw
+     * carries - the pipeline, the bind groups, the offsets that travel with a draw - so the run count
+     * is the optimistic number: it is what a batched path would issue if every draw of the run were
+     * batchable, and it is the number to compare against the calls the frame actually made.
+     */
+    private <T> void countMultiDraw(
+            Collection<RenderPass.Draw<T>> draws,
+            GpuBuffer defaultIndexBuffer,
+            VertexFormat.IndexType defaultIndexType) {
+        int runs = 0;
+        GpuBuffer vertex = null;
+        GpuBuffer index = null;
+        VertexFormat.IndexType type = null;
+
+        for (RenderPass.Draw<T> draw : draws) {
+            GpuBuffer drawIndex = draw.indexBuffer() != null ? draw.indexBuffer() : defaultIndexBuffer;
+            VertexFormat.IndexType drawType =
+                    draw.indexType() != null ? draw.indexType() : defaultIndexType;
+
+            if (vertex != draw.vertexBuffer() || index != drawIndex || type != drawType) {
+                runs++;
+                vertex = draw.vertexBuffer();
+                index = drawIndex;
+                type = drawType;
+            }
+        }
+
+        String pipeline = activePipelineName == null ? "<no pipeline>" : activePipelineName;
+        long[] totals = MULTI_DRAW.computeIfAbsent(pipeline, key -> new long[3]);
+
+        synchronized (totals) {
+            totals[0]++;
+            totals[1] += draws.size();
+            totals[2] += runs;
+        }
+
+        if (multiDrawReportDue()) {
+            reportMultiDraw();
+        }
+    }
+
+    /** One pipeline's `{calls, draws, runs}` since the last report. */
+    private static final Map<String, long[]> MULTI_DRAW = new java.util.concurrent.ConcurrentHashMap<>();
+
+    /** Frames presented when the last report was made, so the numbers can be given per frame. */
+    private static long multiDrawFrames = 0L;
+
+    private static long lastMultiDrawReport = 0L;
+
+    /** Whether a report is due, at most once a second. See [reportCloudDraw] for the same shape. */
+    private static boolean multiDrawReportDue() {
+        long now = System.nanoTime();
+        if (now - lastMultiDrawReport < 1_000_000_000L) {
+            return false;
+        }
+
+        lastMultiDrawReport = now;
+        return true;
+    }
+
+    /** Logs the counts of every pipeline that was drawn through a multi-draw call, then clears them. */
+    private static void reportMultiDraw() {
+        long frames = WgpuDevice.getFramesPresented();
+        long window = frames - multiDrawFrames;
+        multiDrawFrames = frames;
+
+        StringBuilder line = new StringBuilder();
+
+        for (Map.Entry<String, long[]> entry : MULTI_DRAW.entrySet()) {
+            long calls;
+            long draws;
+            long runs;
+
+            synchronized (entry.getValue()) {
+                calls = entry.getValue()[0];
+                draws = entry.getValue()[1];
+                runs = entry.getValue()[2];
+                entry.getValue()[0] = 0L;
+                entry.getValue()[1] = 0L;
+                entry.getValue()[2] = 0L;
+            }
+
+            if (draws == 0L) {
+                continue;
+            }
+
+            if (line.length() > 0) {
+                line.append(", ");
+            }
+
+            line.append(entry.getKey())
+                    .append(": ")
+                    .append(draws)
+                    .append(" draw(s) in ")
+                    .append(calls)
+                    .append(" call(s), ")
+                    .append(runs)
+                    .append(" run(s)");
+        }
+
+        if (line.length() == 0) {
+            return;
+        }
+
+        dev.birb.wgpu.WgpuMcMod.LOGGER.info(
+                "wgpu: multi-draw over {} frame(s): {}", Math.max(window, 1L), line);
     }
 
     @Override

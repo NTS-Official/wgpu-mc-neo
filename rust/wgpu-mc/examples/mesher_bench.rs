@@ -41,7 +41,7 @@ use std::time::Instant;
 
 use glam::{IVec3, ivec3};
 use wgpu_mc::mc::block::{BlockstateKey, ChunkBlockState};
-use wgpu_mc::mc::chunk::{BlockStateProvider, LightLevel, bake_section};
+use wgpu_mc::mc::chunk::{BakePhases, BlockStateProvider, LightLevel, bake_section};
 use wgpu_mc::mc::resource::{ResourcePath, ResourceProvider};
 use wgpu_mc::render::pipeline::BLOCK_ATLAS;
 use wgpu_mc::{Gpu, WmRenderer};
@@ -54,6 +54,12 @@ const BENCH_BLOCKS: &[&str] = &[
     "minecraft:oak_planks",
     "minecraft:oak_leaves",
     "minecraft:glass",
+    // The **translucent** layer, which no other block here reaches: Minecraft sends a sprite to it when
+    // some of its pixels are neither fully opaque nor fully transparent, and glass and leaves are
+    // cutout (alpha is 0 or 255), so both of them bake into `RenderLayer::Cutout`. Ice is a full cube
+    // whose sprite has alpha in between, so it is the one that exercises `sort_translucent_quads` - and
+    // a scenario that cannot reach the sort reports zero quads and says nothing about it.
+    "minecraft:ice",
     "minecraft:oak_slab",
     "minecraft:grass_block",
     "minecraft:poppy",
@@ -106,6 +112,14 @@ enum Scenario {
     /// The case the face baker is supposed to be fastest at - a face that is culled costs a bit flag
     /// test and nothing else - and the one that says how much an interior block costs.
     Solid,
+    /// The checkerboard, but of a block whose sprite puts it in the **translucent** layer - which is
+    /// the only way to reach the quad sort.
+    ///
+    /// The sort is the one part of baking whose cost is not linear in the faces: its comparator decodes
+    /// both quads' centroids on **every comparison**. Nothing else in a bake has that shape, and no
+    /// scenario that draws opaque geometry reaches it - `sort_translucent_quads` returns immediately on
+    /// an empty layer, so every other scenario reports zero quads and says nothing about it.
+    Translucent,
     /// The checkerboard, but the block is a full cube with **no model in the registry**, so every
     /// state resolves to `None` and no face is ever emitted.
     ///
@@ -123,7 +137,7 @@ impl BlockStateProvider for Provider {
     fn get_state(&self, pos: IVec3) -> ChunkBlockState {
         match self.scenario {
             Scenario::Empty | Scenario::Air => ChunkBlockState::Air,
-            Scenario::Checkerboard | Scenario::Unmodelled => {
+            Scenario::Checkerboard | Scenario::Unmodelled | Scenario::Translucent => {
                 let solid = (((pos.x / 2) & 1 == 0) ^ ((pos.z / 2) & 1 == 0) ^ (pos.y & 1 == 0))
                     && (pos.y == 0 || pos.y == 1);
                 if solid || pos.y == 5 {
@@ -184,22 +198,28 @@ fn main() {
         Some("empty") => Scenario::Empty,
         Some("air") => Scenario::Air,
         Some("solid") => Scenario::Solid,
+        Some("translucent") => Scenario::Translucent,
         Some("unmodelled") => Scenario::Unmodelled,
         Some(other) => {
             eprintln!(
                 "unknown scenario `{other}`; the choices are `empty`, `air`, `checkerboard` \
-                 (the default), `solid` and `unmodelled`"
+                 (the default), `solid`, `translucent` and `unmodelled`"
             );
             std::process::exit(5);
         }
     };
-    let assets: PathBuf = arg_str("--assets")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../wgpu-mc-demo/res/assets")
-                .to_path_buf()
-        });
+    // **The phase counters are off unless asked for, and asking costs the number they explain.** See
+    // `BAKE_PHASES`: the two `ns/` rows are a clock read per face, so a run with this on reports a
+    // `ns/section` that is inflated by exactly the thing it is being used to attribute. The two are
+    // meant to be read from two runs.
+    let phases_enabled = flag("--phases");
+    wgpu_mc::mc::chunk::BAKE_PHASES.store(phases_enabled, std::sync::atomic::Ordering::Relaxed);
+
+    let assets: PathBuf = arg_str("--assets").map(PathBuf::from).unwrap_or_else(|| {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../wgpu-mc-demo/res/assets")
+            .to_path_buf()
+    });
 
     if !assets.is_dir() {
         eprintln!(
@@ -265,9 +285,7 @@ fn main() {
         // `bake_blocks` takes the renderer for one thing: the queue it uploads the atlas through.
         wm.mc.bake_blocks(
             &wm,
-            blockstates
-                .iter()
-                .map(|(name, path)| (name.as_str(), path)),
+            blockstates.iter().map(|(name, path)| (name.as_str(), path)),
         );
 
         // **Reported, and never in the section time.** Baking the registry is a one-off that costs
@@ -280,6 +298,35 @@ fn main() {
 
         // Held for the call; the atlas is what the mesher reads afterwards.
         let _ = atlas;
+    }
+
+    // **The face-flag table, which the game fills from the JVM and this has to synthesise.**
+    //
+    // `BlockManager::face_flags` is written by `cacheBlockStates` on the JNI side, from masks the game
+    // computes out of every state's occlusion *shapes* - a question only the game can answer, because it
+    // is `getFaceOcclusionShape(dir) == Shapes.block()` per state and per direction. Without it every
+    // state falls back to "occludes nothing, hides nothing", which means **nothing is ever culled**: a
+    // solid 16x16x16 section comes out with all 24,576 of its faces in the mesh, the cull counters read
+    // zero, and the run looks like a renderer that has lost its culling rather than like a bench that
+    // never had the data. That is exactly how it looked the first time this ran.
+    //
+    // The model's own `cull` bits are the closest honest stand-in: they say which planes the model has a
+    // full-size quad on, which is the *other* half of the same test (`face_is_hidden` requires both). For
+    // a full cube they are `0b11_1111` and the table is right; for a model with a partial face - a slab, a
+    // pane, a plant - they are set on the planes it does cover and the substitution can hide a face the
+    // game would have kept. A scenario that must not be wrong about that should not use this switch.
+    if flag("--no-synthetic-flags") {
+        println!(
+            "face flags: NOT synthesised, so nothing will be culled and the cull counters will read \
+             zero. Only useful to see the no-culling case.\n"
+        );
+    } else {
+        let filled = synthesise_face_flags(&wm);
+
+        println!(
+            "face flags: synthesised for {filled} state(s) from each model's own cull bits - see the \
+             note in this file for what that does and does not stand in for\n"
+        );
     }
 
     // Which block the checkerboard is, resolved once. The mesher only carries the index, so this is
@@ -347,6 +394,12 @@ fn main() {
         drain(&wm);
     }
 
+    // **Drained after the warmup, before the header.** The counters are process-wide, so the warmup's
+    // sections would otherwise be counted into the first repeat's window - and the warmup is on by
+    // default, which would make every published figure a little too low per section and impossible to
+    // reconcile with the section count on the line.
+    let _ = BakePhases::take();
+
     println!(
         "{:>10} {:>14} {:>14} {:>16}",
         "repeat", "ns/section", "ms total", "bytes/section"
@@ -365,6 +418,11 @@ fn main() {
 
         let elapsed = start.elapsed();
         let drained = drain(&wm);
+
+        // **The phases, drained after the clock is read.** They are collected by the mesher itself and
+        // each one is a `fetch_add`, so they are the *last* thing read and they never land inside a
+        // measurement - see `BAKE_PHASES` for what turning them on costs the number above.
+        let phases = BakePhases::take();
 
         if drained != positions.len() as u64 {
             eprintln!(
@@ -395,15 +453,153 @@ fn main() {
                 None => "n/a".to_string(),
             }
         );
+
+        report_phases(&phases, positions.len() as u64);
     }
 
     println!("\nbest: {best:.1} ns/section");
+    if phases_enabled {
+        println!(
+            "note: `--phases` was on, so the two `ns/` rows below are measured with a clock read per \
+             face and the `ns/section` above is inflated by it. Run without it for a number to compare \
+             against."
+        );
+    }
     if !allocation_supported {
         println!(
             "note: this platform does not report a thread's allocated bytes, so the allocation \
              column is `n/a`. It is `getThreadAllocatedBytes` on Linux and Windows only."
         );
     }
+}
+
+/// One window's worth of phase counters, in the two shapes they are read in.
+///
+/// **Two shapes because there are two questions and one divisor cannot answer both.** "How many flag
+/// lookups does a section do" divides the window by the sections in it; "how long does one of those
+/// take" divides by the number of lookups. The first version used the per-section count for both, which
+/// divides the per-face rows by the section count *twice* - and the numbers that come out are small,
+/// plausible-looking and wrong by a factor of the section count.
+///
+/// The `ns/` rows are the ones this exists for: the per-section figure says a solid section takes
+/// 9.8 ms, and these say nearly all of it is the cull - a claim about *where* to look.
+fn report_phases(phases: &BakePhases, sections: u64) {
+    let per_section = |total: u64| total as f64 / sections.max(1) as f64;
+    let per_call = |total: u64, calls: u64| total as f64 / calls.max(1) as f64;
+
+    println!(
+        "            phases/section: {:.0} block(s), {:.0} with a model, {:.0} with a cull bit; \
+         {:.0} cull call(s), {:.0} no cullface, {:.0} hidden, {:.0} emitted, {:.0} fluid",
+        per_section(phases.phase_block_loop),
+        per_section(phases.phase_blocks_with_a_model),
+        per_section(phases.phase_model_cull_bit),
+        per_section(phases.phase_cull_calls),
+        per_section(phases.phase_face_no_cullface),
+        per_section(phases.phase_face_hidden),
+        per_section(phases.phase_face_emitted),
+        per_section(phases.phase_fluid_face),
+    );
+
+    println!(
+        "            phases/section: {:.0} neighbour read(s), {:.0} face-flag lookup(s), \
+         {:.0} of those found a row, {:.0} vertex/vertices written",
+        per_section(phases.phase_neighbour_state),
+        per_section(phases.phase_face_flags),
+        per_section(phases.phase_flags_hit),
+        per_section(phases.phase_vertices_written),
+    );
+
+    println!(
+        "            phases/section: {:.0} quad(s) sorted, {:.0} of them actually moved",
+        per_section(phases.phase_quad_sort),
+        per_section(phases.phase_quads_moved),
+    );
+
+    println!(
+        "            per call:      {:.1} ns in the cull, {:.1} ns in the emitter, \
+         {:.1} neighbour read(s), {:.1} flag lookup(s)",
+        per_call(phases.phase_nanos_in_cull, phases.phase_cull_calls),
+        per_call(phases.phase_nanos_in_emit, phases.phase_face_emitted),
+        per_call(phases.phase_neighbour_state, phases.phase_cull_calls),
+        per_call(phases.phase_face_flags, phases.phase_cull_calls),
+    );
+
+    println!(
+        "            per emitted:   {:.1} ns emitter, {:.1} neighbour read(s), \
+         {:.1} flag lookup(s) - the ambient-occlusion corner is 4 reads and 4 lookups per vertex",
+        per_call(phases.phase_nanos_in_emit, phases.phase_face_emitted),
+        per_call(phases.phase_neighbour_state, phases.phase_face_emitted),
+        per_call(phases.phase_face_flags, phases.phase_face_emitted),
+    );
+}
+
+/// Fills `block_manager.face_flags` from each block's own model, which is the stand-in described where
+/// this is called.
+///
+/// **Every variant of every block gets a row**, because `face_flags` is keyed by the packed
+/// [`BlockstateKey`] - block index and augment - and the mesher asks it about the state a section
+/// carries rather than about the block. A table keyed only by block index would answer `None` for
+/// every state whose augment is not zero, which is most of them.
+///
+/// Returns how many rows it wrote, for the line that says whether this happened at all.
+fn synthesise_face_flags(wm: &WmRenderer) -> usize {
+    use wgpu_mc::mc::block::FaceFlags;
+
+    let mut manager = wm.mc.block_manager.write();
+    let mut rows = 0;
+
+    // Collected first because the borrow of `manager.blocks` has to end before `face_flags` is written.
+    let mut entries: Vec<(u32, FaceFlags)> = Vec::new();
+
+    for (index, (_, block)) in manager.blocks.iter().enumerate() {
+        // The variant count differs by block kind, and asking for one that is not there is answered with
+        // the first entry - so a fixed handful of augments covers the whole registry without needing to
+        // know how each kind stores its list.
+        for augment in 0..8u16 {
+            let Some(mesh) = block.get_model(augment, 0) else {
+                if augment == 0 {
+                    // No model at all: the game's table would have no row either, and the fallback is the
+                    // same one.
+                    break;
+                }
+
+                continue;
+            };
+
+            let key = ((index as u32) << 16) | augment as u32;
+
+            entries.push((
+                key,
+                FaceFlags {
+                    // The model's cull bits are a mask over this crate's `Direction` order and the field
+                    // is in Java's; see `FaceFlags::occludes`. `cull` is built by the model baker in this
+                    // crate's order and `java_mask_has` reads it in Java's, so the two are the same
+                    // convention only because `BlockManager::face_flags` is *also* filled with Java's
+                    // ordinals on the JNI side. Setting it straight from `cull` here is therefore the
+                    // substitution this whole function is a caveat about.
+                    occlusion: mesh.cull & 0b0011_1111,
+                    self_hide: 0,
+                    shades: true,
+                    blocks_motion: true,
+                    offset_max_y: 0.0,
+                    offset_xz: false,
+                    leaves: false,
+                },
+            ));
+
+            rows += 1;
+
+            if augment == 0 {
+                break;
+            }
+        }
+    }
+
+    for (key, flags) in entries {
+        manager.face_flags.insert(key, flags);
+    }
+
+    rows
 }
 
 /// A device with no window and no surface, which is all the atlas needs to exist.
@@ -509,6 +705,18 @@ fn arg<T: std::str::FromStr>(name: &str) -> Option<T> {
     arg_str(name).and_then(|value| value.parse().ok())
 }
 
+/// Whether `--name` is present at all, **without consuming the argument after it**.
+///
+/// This is not the same question as `arg_str(name).is_some()`, and the difference cost a run: a flag
+/// and an option are both written `--name` on the command line, so asking for a flag by searching for
+/// its name and taking the next argument reads `--phases --scenario solid` as "the phases flag is
+/// `--scenario`", skips the scenario, and reports every counter as zero with nothing to say why. A flag
+/// has to be *found* rather than followed.
+fn flag(name: &str) -> bool {
+    std::env::args().skip(1).any(|arg| arg == name)
+}
+
+/// The value after `--name`, and nothing if `--name` is not there.
 fn arg_str(name: &str) -> Option<String> {
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -518,6 +726,3 @@ fn arg_str(name: &str) -> Option<String> {
     }
     None
 }
-
-
-

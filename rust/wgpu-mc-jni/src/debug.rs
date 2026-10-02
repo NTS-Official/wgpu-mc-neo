@@ -325,6 +325,12 @@ pub fn apply(settings: &Settings) {
         terrain_occlusion,
         adv_culling,
         terrain_indirect,
+        // Neither of these is applied here: both are read on the JVM side, which is where the switch
+        // they belong to is - `section_indirect` in `WgpuRenderPass.batching`, `pin_camera` in
+        // `DebugCamera`. They are named rather than left to `..` so that the next setting added cannot
+        // be forgotten in this list.
+        section_indirect: _,
+        pin_camera: _,
         atlas_base_mip_only,
         atlas_lod_bias,
         game_atlas_blend_mips,

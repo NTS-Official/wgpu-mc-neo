@@ -14,6 +14,96 @@ This module is the NeoForge port of the Fabric Electrum mod.
   towards, it is measured rather than guessed, and it is not yet the same picture as the game's own
   meshes - see [The experimental terrain pipeline](#the-experimental-terrain-pipeline) for the list
   with the numbers. Turning the switch on is how you look at it; leaving it alone is how you play.
+- **Minecraft's own section draws are batched**: a whole layer goes out as one
+  `multi_draw_indexed_indirect` per frame rather than one call per section - see
+  [Batching Minecraft's own draws](#batching-minecrafts-own-draws).
+
+## Batching Minecraft's own draws
+
+**This is not the experimental terrain pipeline.** It batches the draws of the pipeline Minecraft
+already has - its own meshes, in its own arena, gathered by its own `LevelRenderer` - and it is on for
+every frame. The section below is about *replacing* that pipeline; this one is about *drawing* it.
+
+Minecraft hands the whole of one layer to a single call: `ChunkSectionsToRender.renderGroup` calls
+`RenderPass.drawMultipleIndexed` once per layer per frame with one `Draw` per section, and this backend
+used to replay that list one `draw_call` per section. It is now one `multi_draw_indexed_indirect` per
+run of draws that share an arena, an index buffer and a binding set.
+
+Measured on one machine and world (render distance 12, Vulkan with `multiDrawIndirect`, 120 fps), per
+second:
+
+| | before | after |
+|---|---|---|
+| `draw_call` downcalls, per frame | 3,467 (one per section per layer) | **3** (one per layer) |
+| draws carried by a batch | 0 | **416,040** of 419,252 |
+| batches refused | - | 0 |
+
+Per layer, over 255 frames: cutout 340,935 draws in 255 calls (one run each), solid 378,930 in 255,
+translucent 164,220 in 255 - so each layer is one run, and each run is one call.
+
+### What makes it possible, and what it costs
+
+**An indirect record has exactly one per-draw channel.** It carries the indices, the vertex offset and
+`first_instance`, and nothing else - so everything else a draw would set has to be equal for the whole
+run, and per-draw data has to travel as that number. For a terrain draw that data is the section's own
+block, `DynamicUniforms.ChunkSectionInfo` (position, fade, atlas size), which the game writes into a
+uniform ring - one block per section - and binds per draw with a dynamic offset. A batched call cannot
+vary a binding offset per record, so:
+
+- the block is declared a **read-only storage buffer** in the pipeline layout (`perDrawStorageNames` in
+  `WgpuCompiledRenderPipeline.kt`, the one place the rule lives) and bound **whole**, at offset zero,
+  so one bind group serves the whole run;
+- the slice Minecraft named for a draw becomes that draw's **`first_instance`** - `offset / length`,
+  which is the record it is, because the ring advances by one whole block per record;
+- the shader reads `wmPerDraw[gl_InstanceIndex]`, which `preprocessing.rs` produces by rewriting
+  `chunksection.glsl` when the layout declares the block that way. The declaration gains a stride
+  padding (`WM_CHUNK_PAD`, computed on the JVM from `DynamicUniforms.CHUNK_SECTION_UBO_SIZE` and the
+  device's uniform offset alignment), so record `i` is read from `i * stride` and not from
+  `i * sizeof(struct)`.
+- the **fragment** stage has no instance index at all, so the two members it reads (the fade and the
+  atlas size) travel as varyings the vertex stage writes.
+
+**Every way out is automatic, and none of them is a mode.** A device whose multi-draw is emulated, a
+submission that runs out of record space, and any draw that uploads a per-draw uniform that is *not* the
+storage block all fall back to the per-draw path for the run in question - the same picture, drawn one
+`draw_call` at a time. **DirectX 12 is excluded, and the reason is not the draw call but the per-draw
+channel**: see [DirectX 12](#directx-12-multi-draw-yes-the-per-draw-channel-no) at the end of this file.
+
+### The frame comparison, and what it cost to make one
+
+Batching is a *how*, not a *what*, so the check is that the picture does not move. Three **settings** make
+that a measurement, because the thing that made every earlier attempt useless was comparing two runs'
+camera positions rather than two pictures:
+
+- **`pin_camera`** (Debug) freezes the player where the world put them, every tick, with the motion
+  zeroed, so the position is a constant instead of a starting point (`DebugCamera`);
+- **`dump_frames`** (Debug) writes out the next N frames the renderer presents - the one-frame-per-ask
+  `wgpu-dump-now` file is gone, and with the camera pinned a frame number means the same view;
+- **`section_indirect`** (Debug, on by default) is the switch this whole section is about: off, every
+  section is drawn one `draw_call` at a time.
+
+They are settings rather than marker files because that is what a switch is here: in the schema, on the
+options screen under Debug, persisted in `config/wgpu-mc-renderer.json`. A marker file is a filesystem
+call, and reading one per draw took a frame from 120 fps to **6.5** on a machine whose antivirus filters
+every open (measured: `Files.exists` on an absent marker, **32.6 µs**; seven thousand of them a frame is
+228 ms). Two runs with `pin_camera` on and `section_indirect` set either way give the A/B.
+
+Four dumps, 2560x1334, two seconds apart each (`frame-2299/2312` batched, `frame-2339/2397` per-draw):
+
+| pair | paths | mean channel difference | pixels over 20 |
+|---|---|---|---|
+| 2299 vs 2312 | batched vs batched | 0.87 | 1.24% |
+| 2339 vs 2397 | per-draw vs per-draw | 0.49 | 0.45% |
+| **2312 vs 2339** | **batched vs per-draw** | **0.78** | **1.12%** |
+| 2299 vs 2339 | batched vs per-draw | 0.94 | 1.17% |
+| 2312 vs 2397 | batched vs per-draw | 0.80 | 1.30% |
+
+**The difference between the two paths is no larger than the difference between two frames of the same
+path**, which is the animated water and leaves moving between them. That is the whole claim: the batched
+path draws the same picture, and what is left over is the animation the two sides cannot share.
+
+The same three markers are what any future A/B should use - in particular the one the terrain pipeline
+still owes, which now has a recipe rather than a paragraph about why it cannot be done.
 
 ## The experimental terrain pipeline
 
@@ -84,12 +174,15 @@ grass tufts darker) while the solid terrain and the fluid differ far less.
 2. **The lily pad's ~0.3×**, which is the extreme end of the same darkening. With the vertex chain,
    both tint tables and the mip level cleared, what is left is the **sampled texel** (the sprite rect
    and the UVs the face is baked with, against the game's own `TextureAtlasSprite`) and the alpha path.
-3. **A frame comparison needs the camera pinned.** The quickplay script places the player, but between
-   two runs the view still differs - the slower path lets the player fall or slide somewhere else
-   before the dumped frame number arrives. Two attempts made while adding the layers above produced
-   45-50% "differences" that were exactly that, and one pair turned out to be the *same file* copied
-   twice. Check each dump's mtime and hash, or pin the camera (spectator, a fixed position from the
-   init script), before reading anything off a frame number from a changed build.
+3. **A frame comparison needs the camera pinned - and it now can be.** The quickplay script places the
+   player, but between two runs the view still differs - the slower path lets the player fall or slide
+   somewhere else before the dumped frame number arrives. Two attempts made while adding the layers above
+   produced 45-50% "differences" that were exactly that, and one pair turned out to be the *same file*
+   copied twice. That is fixed: `DebugCamera` + the `wgpu-pin-camera` marker hold the player still (see
+   [The frame comparison](#the-frame-comparison-and-what-it-cost-to-make-one)), `wgpu-dump-now` asks for a
+   frame from outside the game, and a one-run A/B - both sides from the same camera, seconds apart - is
+   what the batched section draws were measured with. A comparison against the *game's* meshes should now
+   be done the same way rather than by trusting a frame number from a changed build.
 4. **The diagnostic switches change the picture, so a picture judged under them is not the shipped
    one.** `atlas_lod_bias` was left at `-4.0` by an earlier session and is now `0.0`; `LOD_FLOOR` is
    back to `false`; `diagnostics` and `logging` are off. All four are in
@@ -6594,20 +6687,41 @@ The third is the surprising one. `wgpu-hal`'s Vulkan backend expands `draw_count
 wgpu gates behind `MULTI_DRAW_INDIRECT_COUNT` - a "batch" that is really a loop of indirect draws, which is
 slower than the loop it replaces because each of them still reads its record.
 
-**DirectX 12 is excluded outright, and it is the one exclusion here that is a defect rather than a missing
-capability: `multi_draw_indexed_indirect` is broken in wgpu's DX12 backend.** The bug is in wgpu's
-implementation of that call on that backend - not in D3D12, which offers a perfectly good
-`ExecuteIndirect`, and not in the driver. That is the awkward case for a feature test, because the adapter
-there reports *all three* bits - `dx12/adapter.rs` enables `MULTI_DRAW_INDIRECT_COUNT` unconditionally -
-and the call underneath really is one `ExecuteIndirect` with `MaxCommandCount`. Every question this file
-can ask says yes and the answer is still no, so the test is on the backend and not on the features, and
-**the comment in `try_create_renderer` says not to delete it on the strength of those bits.** It is also
-the worst shape for a renderer to ship - the failure is a picture, not an error, so nothing in a log would
-have said it happened. The way back is a wgpu release that fixes the call on that backend, and that line is
-what to revisit when one lands.
+## DirectX 12: multi-draw yes, the per-draw channel no
 
-Nothing is lost but the batching: DX12 draws the same records, in the same order, through the same shader,
-one `draw_indexed` per section.
+**Two rounds of this file said "`multi_draw_indexed_indirect` is broken in wgpu's DX12 backend". That
+was wrong, and the correction comes from wgpu 30.0.1's own source, one run on this machine, and one
+picture.**
+
+MDI works on DX12. `wgpu-hal`'s DX12 backend has no multi-draw emulation at all: `unsafe fn
+draw_indexed_indirect` hands `draw_count` straight to `ExecuteIndirect` as `MaxCommandCount` with a null
+count buffer (`dx12/command.rs`), over a command signature built with
+`ByteStride: size_of::<wgt::DrawIndexedIndirectArgs>()` (`dx12/device.rs`) - twenty bytes, field for
+field what `indirect.rs` writes. The "one `vkCmdDrawIndexedIndirect` per record" emulation the old
+comment described belongs to the **Vulkan** backend, when the adapter has no `multiDrawIndirect`. A run
+with the exclusion removed confirmed it:
+
+| DirectX 12, render distance 16 | |
+|---|---|
+| draws carried by a batch | 257,880 of 262,863 per second, 0 refused |
+| validation errors, panics | none |
+
+**What DX12 cannot do is carry the per-draw data the way this design does.** A batched run has exactly
+one channel for anything per draw - a record's `first_instance` - and the terrain shader reads the
+section's own block at `instance_index`. On Vulkan that builtin is `InstanceIndex`, which is
+`firstInstance + instance`; **naga's HLSL backend emits `SV_InstanceID` for it**
+(`naga-30.0.1/src/back/hlsl/conv.rs`), and D3D12's `SV_InstanceID` does not include
+`StartInstanceLocation`. Every record draws one instance, so every section read record 0's
+`ChunkPosition`: **the whole world's geometry, drawn at one section's position** - one screen of blocks
+piled into a single block. That is the picture a DX12 run showed, and it is why DX12 is excluded again.
+
+The exclusion is therefore right and its reason is not: it is the per-draw channel, not the draw call. A
+DX12 batching path needs a channel D3D12 honours - `first_instance` *does* offset **instance-step vertex
+buffer reads** there, so an instance-step attribute carrying the record number is the shape that would
+work - and that is a change to the vertex layout and the shader rather than a switch.
+
+Nothing is lost but the batching: DX12 draws the same records, in the same order, through the same
+shader, with the uniform block bound per draw as it always was.
 
 The capability line names which of the reasons applied, one per branch, because the first version of it
 said "the switch is off, or it is DX12" and that ambiguity is what hid the wiring bug below for a run.

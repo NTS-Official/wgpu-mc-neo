@@ -120,6 +120,32 @@ pub struct Settings {
     /// answered. See `device::try_create_renderer` and `wgpu_mc::render::graph::terrain_batches_draws`.
     #[serde(default = "no_terrain_indirect")]
     pub terrain_indirect: BoolSetting,
+
+    /// Whether **Minecraft's own** section layers are drawn with `multi_draw_indexed_indirect` rather
+    /// than one call per section. See [`Settings::section_indirect`].
+    ///
+    /// **On by default, unlike [`Settings::terrain_indirect`]** - this is the game's own terrain
+    /// pipeline (its meshes, its arena, its draw list), so the batching changes only how those same
+    /// draws are issued, and it was measured against the per-draw path frame by frame: see the README's
+    /// frame comparison. It is forced off where it cannot be carried, with the reason in the log -
+    /// **DirectX 12**, where a batch has no channel for the per-draw block, because naga's HLSL backend
+    /// emits `SV_InstanceID` for `instance_index` and D3D12 does not put `StartInstanceLocation` in it.
+    /// See `device::try_create_renderer` and `wgpu_mc::render::graph::terrain_batching_possible`.
+    #[serde(default)]
+    pub section_indirect: BoolSetting,
+    /// Whether the player is held still, so that two runs (or two paths) can be compared frame by
+    /// frame. See [`Settings::pin_camera`].
+    ///
+    /// **The reason a frame comparison needs it** is that two runs of the same world do not stand in
+    /// the same place: the player is still falling, still sliding, and a frame number does not mean the
+    /// same view if the view drifted. Every A/B this project attempted before this switch produced
+    /// differences that were nothing but two camera positions, and one pair turned out to be the same
+    /// file copied twice.
+    ///
+    /// It freezes the player where the world put them and zeroes the motion every tick, which is what
+    /// makes the position a constant instead of a starting point. It is not a mode to play in.
+    #[serde(default = "off")]
+    pub pin_camera: BoolSetting,
     /// Everything below is a debug switch, offered under the options screen's `Debug` heading.
     /// They are the marker files this renderer grew while it was being written, with a place in
     /// the UI: the marker still works (see [`crate::debug`]), and the setting is what a player can
@@ -358,6 +384,8 @@ pub struct SettingsInfo {
     bind_group_cache: SettingInfo,
     dynamic_offsets: SettingInfo,
     terrain_indirect: SettingInfo,
+    section_indirect: SettingInfo,
+    pin_camera: SettingInfo,
     host_validation: SettingInfo,
     gpu_based_validation: SettingInfo,
     shader_debug_info: SettingInfo,
@@ -523,8 +551,34 @@ lazy_static! {
             meant to draw the same picture**, so this switch answers \"did the batching break \
             something\".\n\n\
             It is forced off where it cannot be worth anything, with the reason in the log. \
-            **DirectX 12 never gets it: the call is broken in wgpu's DX12 backend** - wgpu's \
-            implementation, not D3D12 and not the driver, which is why no feature test can find it.",
+            **DirectX 12 never gets it, and not because multi-draw is missing there** - the call is fine, \
+            but a batch has no channel for the per-draw block: naga's HLSL backend turns `instance_index` \
+            into `SV_InstanceID`, and D3D12 does not put `StartInstanceLocation` in it, so every section \
+            would be drawn at one section's position.",
+            false,
+        ),
+        section_indirect: SettingInfo::optimization(
+            "Draw **Minecraft's own** section layers with `multi_draw_indexed_indirect` - one call per \
+            run of sections that share an arena, index buffer and bindings - instead of one draw call per \
+            section. The terrain pipeline itself is untouched: the same meshes, the same arena, the same \
+            draw list.\n\n\
+            On by default. **Both paths are meant to draw the same picture**, and the README records the \
+            frame comparison that says they do; turning this off is how that comparison is made.\n\n\
+            Forced off where it cannot be carried, with the reason in the log. **DirectX 12 never gets \
+            it**, and not because multi-draw is missing there: a batch has no channel for the per-draw \
+            block, since naga's HLSL backend turns `instance_index` into `SV_InstanceID` and D3D12 does \
+            not put `StartInstanceLocation` in it - every section would be drawn at one section's \
+            position.",
+            false,
+        ),
+        pin_camera: SettingInfo::debug(
+            "Hold the player still, with their motion zeroed every tick, so that two runs or two paths \
+            can be compared from the same place.\n\n\
+            **A frame comparison needs this**: two runs of the same world do not stand in the same spot, \
+            because the player is still falling or sliding, and a frame number from a changed build then \
+            shows a different view rather than a different renderer. With it on, the same frame number is \
+            the same picture.\n\n\
+            It is a diagnostic, not a mode: the camera does not move at all while it is on.",
             false,
         ),
         trace_dynamic_offsets: SettingInfo::debug(
@@ -852,6 +906,8 @@ impl Default for Settings {
             // path with nobody watching it is a place for a difference to hide. Asking for it is one
             // setting away, and the picture is meant to be identical when it is on.
             terrain_indirect: no_terrain_indirect(),
+            section_indirect: BoolSetting::default(),
+            pin_camera: BoolSetting::of(false),
             // Off, and by the same reasoning the switch above it is on: the walk is a stricter cull than
             // the list this renderer has always obeyed, so a config written before it existed is asking
             // for what the renderer did before it. See [`Settings::adv_culling`].
@@ -927,6 +983,10 @@ pub struct DebugSettings {
     /// `wgpu_mc::render::graph::set_terrain_indirect`, and what the device and the backend allow is
     /// recorded separately, in `device::try_create_renderer`.
     pub terrain_indirect: bool,
+    /// Whether Minecraft's own section layers are batched. See [`Settings::section_indirect`].
+    pub section_indirect: bool,
+    /// Whether the player is held still for a frame comparison. See [`Settings::pin_camera`].
+    pub pin_camera: bool,
     /// Whether the game's block atlas is sampled from its base mip level only. See
     /// [`Settings::atlas_base_mip_only`].
     pub atlas_base_mip_only: bool,
@@ -967,6 +1027,8 @@ impl Settings {
             terrain_occlusion: self.terrain_occlusion.value,
             adv_culling: self.adv_culling.value.clamp(0, 16) as u8,
             terrain_indirect: self.terrain_indirect.value,
+            section_indirect: self.section_indirect.value,
+            pin_camera: self.pin_camera.value,
             atlas_base_mip_only: self.atlas_base_mip_only.value,
             atlas_lod_bias: self.atlas_lod_bias.value as f32,
             game_atlas_blend_mips: self.game_atlas_blend_mips.value,
@@ -1562,7 +1624,7 @@ mod tests {
 
     /// Every setting's name, which is the same in both documents. Kept as a list because the two
     /// documents' own key order is not readable through `serde_json::Value` - see the test above.
-    const NAME_LIST: [&str; 32] = [
+    const NAME_LIST: [&str; 34] = [
         "backend",
         "vsync",
         "fullscreen_mode",
@@ -1572,6 +1634,8 @@ mod tests {
         "bind_group_cache",
         "dynamic_offsets",
         "terrain_indirect",
+        "section_indirect",
+        "pin_camera",
         "adv_culling",
         "host_validation",
         "gpu_based_validation",

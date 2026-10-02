@@ -173,6 +173,21 @@ object WmNative {
     /** `struct DrawVertexBuffer { const uint8_t *buffer; uint64_t offset; uint64_t size; }` */
     @JvmField val DRAW_VERTEX_BUFFER: MemoryLayout = MemoryLayout.structLayout(PTR, LONG, LONG)
 
+    /**
+     * `struct BatchRecord { uint32_t first; uint32_t count; int32_t base_vertex; uint32_t instance; }`
+     *
+     * One draw of a batch: what varies between the draws of one `drawCallBatch`, which is all the
+     * native side needs to write that draw's indirect record. See `BatchRecord` in `indirect.rs`,
+     * whose own test asserts this layout.
+     */
+    @JvmField val BATCH_RECORD: MemoryLayout = MemoryLayout.structLayout(INT, INT, INT, INT)
+
+    /** Offsets inside [BATCH_RECORD]. */
+    const val BATCH_RECORD_FIRST = 0L
+    const val BATCH_RECORD_COUNT = 4L
+    const val BATCH_RECORD_BASE_VERTEX = 8L
+    const val BATCH_RECORD_INSTANCE = 12L
+
     /** `struct DrawCall`, in declaration order. */
     @JvmField val DRAW_CALL: MemoryLayout = MemoryLayout.structLayout(
         PTR,  // pipeline
@@ -189,6 +204,7 @@ object WmNative {
         MemoryLayout.sequenceLayout(MAX_DRAW_BINDINGS.toLong(), DRAW_BINDING),
         INT,  // combo
         INT,  // bindings_present
+        INT,  // first_instance
     )
 
     /** Offsets inside [DRAW_CALL]. */
@@ -219,6 +235,16 @@ object WmNative {
      */
     const val DRAW_CALL_COMBO = 1264L
     const val DRAW_CALL_BINDINGS_PRESENT = 1268L
+
+    /**
+     * The first instance this draw covers, which is the per-draw number its vertex stage reads.
+     *
+     * The last field of `DrawCall`, and appended rather than placed beside `DRAW_CALL_INSTANCE_COUNT`
+     * so that every offset above it stays where it was. Blaze3D's `drawIndexed` has no such parameter,
+     * so the pass sets it for the duration of one draw; the batched path writes the same number into
+     * an indirect record's `first_instance`. See `DrawCall::first_instance` in `blaze.rs`.
+     */
+    const val DRAW_CALL_FIRST_INSTANCE = 1272L
 
     /** Offsets inside [PLAN_BINDING] and [DRAW_BINDING]. */
     const val PLAN_BINDING_NAME = 0L
@@ -374,6 +400,16 @@ object WmNative {
     const val ENTRY_UNIFORM_BUFFER = 1L
     const val ENTRY_SAMPLER = 2L
 
+    /**
+     * A read-only storage buffer: the block a draw reads per-draw data out of.
+     *
+     * The same resource as [ENTRY_TEXEL_BUFFER] on the native side, and a different statement about
+     * what the shader does with it - see `UniformType::StorageBuffer` in `blaze.rs`. The JVM declares
+     * the terrain pipelines' `ChunkSection` this way, because a batched run has no other channel for
+     * per-draw data than the record number its shader reads.
+     */
+    const val ENTRY_STORAGE_BUFFER = 3L
+
     const val TOPOLOGY_LINES = 1L
     const val TOPOLOGY_DEBUG_LINE_STRIP = 2L
     const val TOPOLOGY_POINTS = 3L
@@ -411,6 +447,32 @@ object WmNative {
      */
     @JvmField val drawCall: MethodHandle =
         handle("draw_call", FunctionDescriptor.of(ValueLayout.JAVA_BOOLEAN, PTR, PTR, PTR))
+
+    /**
+     * Records a run of draws that differ only in their parameters as one
+     * `multi_draw_indexed_indirect`.
+     *
+     * The third argument is one [DRAW_CALL] for the whole run - the pipeline, the vertex and index
+     * buffers and every binding, which every draw of the run has to agree about - and the fourth is a
+     * [RAW_ARRAY] of [BATCH_RECORD], one per draw.
+     *
+     * The answer is how many draws were recorded, and **zero means "not as a batch"**: the run has to
+     * be drawn one draw at a time, which is what this side does when the path is switched off, on a
+     * device whose multi-draw is emulated, or when the records did not fit the buffer they are written
+     * into. See `draw_call_batch` in `blaze.rs`.
+     */
+    @JvmField val drawCallBatch: MethodHandle =
+        handle("draw_call_batch", FunctionDescriptor.of(INT, PTR, PTR, PTR, PTR))
+
+    /**
+     * Whether this device and this backend can run batched draws at all.
+     *
+     * Asked once, before pipelines are compiled, because it decides **how the terrain's per-draw block
+     * is declared**: a storage buffer where batching works, and the uniform block it always was where it
+     * does not. See `batching_possible` in `device.rs`.
+     */
+    @JvmField val batchingPossible: MethodHandle =
+        handle("batching_possible", FunctionDescriptor.of(ValueLayout.JAVA_BOOLEAN))
 
     @JvmField val createCommandEncoder: MethodHandle =
         handle("create_command_encoder", FunctionDescriptor.of(PTR, PTR))

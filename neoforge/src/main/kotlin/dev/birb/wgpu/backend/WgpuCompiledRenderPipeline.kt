@@ -12,8 +12,10 @@ import com.mojang.blaze3d.shaders.UniformType
 import com.mojang.blaze3d.vertex.VertexFormat
 import dev.birb.wgpu.rust.NativeNames
 import dev.birb.wgpu.rust.WmNative
+import net.minecraft.client.renderer.DynamicUniforms
 import net.minecraft.client.renderer.ShaderDefines
 import net.minecraft.resources.Identifier
+import net.minecraft.util.Mth
 import java.lang.foreign.Arena
 import java.lang.foreign.MemorySegment
 import java.util.concurrent.ConcurrentHashMap
@@ -145,6 +147,7 @@ class WgpuCompiledRenderPipeline private constructor(
         readPlanBindings(
             variants.withDepth ?: variants.withoutDepth ?: MemorySegment.NULL,
             pipeline.location.toString(),
+            perDrawStorageNames(pipeline),
         )
     }
 
@@ -295,7 +298,7 @@ class WgpuCompiledRenderPipeline private constructor(
             descriptor.set(
                 WmNative.ADDRESS,
                 WmNative.PIPELINE_DIRECTIVES,
-                arena.allocateFrom(pipeline.shaderDefines.asSourceDirectives()),
+                arena.allocateFrom(pipeline.shaderDefines.asSourceDirectives() + perDrawPad(device)),
             )
             descriptor.set(WmNative.ADDRESS, WmNative.PIPELINE_FRAG_STATE, MemorySegment.NULL)
             descriptor.set(
@@ -486,6 +489,29 @@ class WgpuCompiledRenderPipeline private constructor(
          * entry array per bind group with uniforms first, which is the order the shader binding
          * indices assume.
          */
+        /**
+         * The `WM_CHUNK_PAD` directive: how many `vec4`s of padding a per-draw section block needs.
+         *
+         * The game writes one `DynamicUniforms.ChunkSectionInfo` per section into a uniform ring whose
+         * stride is `Mth.roundToward(CHUNK_SECTION_UBO_SIZE, device.getUniformOffsetAlignment())` - the
+         * same arithmetic `DynamicUniformStorage` does, and the same ring the slices Minecraft binds per
+         * draw come out of. A shader that reads its own record out of that ring at the number the draw
+         * carries has to declare a struct whose *array stride* is that stride, or record `i` would be
+         * read from `i * sizeof(struct)`; this is the difference, in `vec4`s.
+         *
+         * **It is computed here rather than in Rust because both numbers are on this side**: the block's
+         * size is Minecraft's own constant and the alignment belongs to the device the pipeline is being
+         * compiled for. It travels as a directive, and directives are part of the shader cache key - so
+         * a cached translation can never come back carrying another device's stride.
+         */
+        private fun perDrawPad(device: WgpuDevice): String {
+            val alignment = device.getUniformOffsetAlignment()
+            val block = Mth.roundToward(DynamicUniforms.CHUNK_SECTION_UBO_SIZE, alignment)
+            val pad = (block - DynamicUniforms.CHUNK_SECTION_UBO_SIZE) / 16
+
+            return "\n#define WM_CHUNK_PAD $pad\n"
+        }
+
         private fun bindGroupLayouts(arena: Arena, pipeline: RenderPipeline): MemorySegment {
             val uniforms = pipeline.uniforms
             val samplers = pipeline.samplers
@@ -502,8 +528,11 @@ class WgpuCompiledRenderPipeline private constructor(
             for ((index, uniform) in uniforms.withIndex()) {
                 writeEntry(
                     index,
-                    if (uniform.type() == UniformType.TEXEL_BUFFER) WmNative.ENTRY_TEXEL_BUFFER
-                    else WmNative.ENTRY_UNIFORM_BUFFER,
+                    when {
+                        uniform.type() == UniformType.TEXEL_BUFFER -> WmNative.ENTRY_TEXEL_BUFFER
+                        uniform.name() in perDrawStorageNames(pipeline) -> WmNative.ENTRY_STORAGE_BUFFER
+                        else -> WmNative.ENTRY_UNIFORM_BUFFER
+                    },
                     uniform.name(),
                     uniform.textureFormat()?.let { WgpuFormat.nativeId(it) } ?: WmNative.NONE,
                 )
@@ -648,6 +677,16 @@ class PlanBindings internal constructor(
      * every one of them in a bind group of its own.
      */
     @JvmField val dynamicSlots: BooleanArray,
+    /**
+     * Slot `i`: whether the binding there is per-draw data the shader reads out of a storage buffer.
+     *
+     * Such a slot is bound **whole** rather than by slice - a slice would give every draw of a batched
+     * run the same block - and the draw's `first_instance` is the index it reads. That number is what
+     * the pass works out from the slice Minecraft binds for the draw: the slice's offset over its
+     * length is the record it is, because the ring those blocks live in advances by one whole block per
+     * record. See `perDrawStorageNames` for which bindings these are.
+     */
+    @JvmField val storageSlots: BooleanArray,
 ) {
     private val slots = HashMap<String, IntArray>()
 
@@ -878,6 +917,52 @@ class PlanBindings internal constructor(
  */
 private val NEXT_COMBINATION = java.util.concurrent.atomic.AtomicInteger(1)
 
+/** The block the terrain shaders declare once per section. See [perDrawStorageNames]. */
+internal const val CHUNK_SECTION = "ChunkSection"
+
+/**
+ * Whether the terrain's per-draw block is read out of a storage buffer, asked once.
+ *
+ * **The declaration and the draw path have to agree about this, and it is not a rendering decision: it
+ * is a decision about whether the batching this exists for can happen at all.** A backend whose
+ * multi-draw is off - DirectX 12, where wgpu's `multi_draw_indexed_indirect` is broken - gets nothing
+ * from a per-draw channel in a storage buffer, and pays for it: every draw binds the whole ring instead
+ * of a slice, and the shader indexes it. So the answer comes from the same place the draw path's own
+ * gate does (`batching_possible` in `device.rs`), and on such a backend the terrain keeps the uniform
+ * block and the dynamic offset it always had - the path that was measured before any of this existed.
+ */
+private val TERRAIN_SECTION_STORAGE: Boolean by lazy {
+	WmNative.batchingPossible.invokeExact() as Boolean
+}
+
+/**
+ * The bindings a pipeline reads per draw out of a **storage buffer** rather than a uniform block.
+ *
+ * **One rule, in one place, because three things have to agree about it and nothing checks that they
+ * do:** the pipeline layout (this binding is a read-only storage buffer, not a uniform), the shader
+ * (the same block, read at the record number the draw's first instance carries - `preprocessing.rs`
+ * finds it by the layout kind this function produces), and the draw path (which binds the buffer
+ * whole and passes the record number instead of a per-draw offset).
+ *
+ * Today the answer is the terrain pipelines' `ChunkSection`, and it is recognised by its *shaders*:
+ * `core/terrain.vsh` and `core/terrain.fsh` are the only two in the game that import
+ * `chunksection.glsl`, which is what declares the block - so a pipeline that draws with them is
+ * exactly a pipeline whose sections carry one. Recognising it by the shader rather than by the
+ * pipeline's name is what makes a mod's pipeline with the same arrangement work, and what keeps the
+ * `wireframe` variant (a terrain snippet with different pipeline state) on the same path.
+ *
+ * It is empty where batching cannot happen. See [TERRAIN_SECTION_STORAGE].
+ */
+internal fun perDrawStorageNames(pipeline: RenderPipeline): Set<String> =
+    if (TERRAIN_SECTION_STORAGE && pipeline.vertexShader.path == TERRAIN_VERTEX_SHADER) {
+        setOf(CHUNK_SECTION)
+    } else {
+        emptySet()
+    }
+
+/** The terrain vertex shader's path, which is what [perDrawStorageNames] recognises a section by. */
+private const val TERRAIN_VERTEX_SHADER = "core/terrain"
+
 /**
  * Reads the plan's binding table out of the native pipeline.
  *
@@ -889,7 +974,11 @@ private val NEXT_COMBINATION = java.util.concurrent.atomic.AtomicInteger(1)
  * has to name the pipeline it is about: "a binding is not in the plan" is not actionable without
  * knowing whose plan.
  */
-internal fun readPlanBindings(pipeline: MemorySegment, label: String): PlanBindings? =
+internal fun readPlanBindings(
+    pipeline: MemorySegment,
+    label: String,
+    storageNames: Set<String>,
+): PlanBindings? =
     Arena.ofConfined().use { arena ->
         val entries = arena.allocate(WmNative.PLAN_BINDING, WmNative.MAX_DRAW_BINDINGS.toLong())
         val array = arena.allocate(WmNative.RAW_ARRAY)
@@ -906,7 +995,8 @@ internal fun readPlanBindings(pipeline: MemorySegment, label: String): PlanBindi
 
         val kinds = IntArray(count)
         val dynamicSlots = BooleanArray(count)
-        val table = PlanBindings(label, kinds, dynamicSlots)
+        val storageSlots = BooleanArray(count)
+        val table = PlanBindings(label, kinds, dynamicSlots, storageSlots)
         val textures = HashMap<String, Int>()
         val samplers = HashMap<String, Int>()
 
@@ -919,6 +1009,7 @@ internal fun readPlanBindings(pipeline: MemorySegment, label: String): PlanBindi
 
             kinds[slot] = kind
             dynamicSlots[slot] = dynamic != 0
+            storageSlots[slot] = declared in storageNames
 
             when (kind) {
                 WmNative.DRAW_BINDING_TEXTURE -> textures[declared] = slot

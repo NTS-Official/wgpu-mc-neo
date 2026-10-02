@@ -7,11 +7,11 @@ use glsl::syntax::{
     Statement, StorageQualifier, TranslationUnit, TypeName, TypeQualifier, TypeQualifierSpec,
     TypeSpecifier, TypeSpecifierNonArray,
 };
-use glsl::transpiler::glsl::{show_expr, show_translation_unit};
+use glsl::transpiler::glsl::{show_expr, show_struct_field, show_translation_unit};
 use glsl::visitor::{Host, HostMut, Visit, Visitor, VisitorMut};
 use log::{debug, error, warn};
 use once_cell::sync::Lazy;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 static OPENGL_TO_WGPU_MATRIX_AST: Lazy<Statement> = Lazy::new(|| {
     Statement::Simple(Box::new(SimpleStatement::Expression(Some(
@@ -1108,6 +1108,279 @@ pub fn apply_layouts(
     });
 }
 
+// ---------------------------------------------------------------------------------------------
+// The per-draw block
+// ---------------------------------------------------------------------------------------------
+
+/// The instance name a rewritten per-draw block is bound under.
+const PER_DRAW_ARRAY: &str = "wmPerDraw";
+
+/// The per-draw members the fragment stage is handed as varyings, as `(member, varying type)`.
+///
+/// **This is the one part of the arrangement that is not read out of the shader**, and it cannot be: a
+/// fragment stage has no instance index, so a member it reads has to arrive as a varying - and a
+/// varying needs a type written down somewhere. Terrain reads the block's fade and its atlas size, so
+/// those two are what this hands over. A member outside this list stays undeclared in the fragment
+/// stage, which naga reports by name instead of quietly reading zero.
+const PER_DRAW_VARYINGS: [(&str, &str); 2] =
+    [("ChunkVisibility", "float"), ("TextureSize", "vec2")];
+
+/// Which stage a per-draw block is being rewritten for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PerDrawStage {
+    /// The stage that has an instance index - which *is* the record number a batched draw carries in
+    /// its indirect record. It reads the block, and publishes what the other stage needs.
+    Vertex,
+    /// The stage that has none, so it reads the varyings the vertex stage wrote.
+    Fragment,
+}
+
+/// The members one per-draw block declares, in declaration order.
+///
+/// The order is not cosmetic: the block is a std140 layout the game writes itself (`Std140Builder`
+/// over `DynamicUniforms.ChunkSectionInfo`), and the storage declaration this side produces has to put
+/// the same members at the same offsets - so the rewrite copies the fields it finds rather than naming
+/// them from a table of its own.
+fn per_draw_members(block: &Block) -> Vec<String> {
+    let mut members = Vec::new();
+
+    for field in block.fields.iter() {
+        for identifier in field.identifiers.0.iter() {
+            members.push(identifier.ident.0.clone());
+        }
+    }
+
+    members
+}
+
+/// The storage declaration a per-draw uniform block becomes.
+///
+/// `pad` is what makes the array's stride the stride of the ring the records live in: the game writes
+/// one block per section into a uniform ring whose stride is the device's uniform offset alignment, so
+/// one `vec4` of padding per sixteen bytes of the difference is what puts record `i` at `i * stride`.
+/// The number arrives as the `WM_CHUNK_PAD` directive, from the side that can see both the block's own
+/// size and the device - and a directive is part of the shader cache key, so a cached translation can
+/// never hold another device's stride.
+fn per_draw_declaration(
+    block: &Block,
+    locations: &HashMap<String, (u32, u32)>,
+    pad: usize,
+) -> Option<String> {
+    let (set, binding) = locations.get(&block.name.0).copied()?;
+    let name = block.name.0.clone();
+
+    let mut fields = String::new();
+
+    for field in block.fields.iter() {
+        show_struct_field(&mut fields, field);
+    }
+
+    Some(format!(
+        "layout(std430, set = {set}, binding = {binding}) readonly buffer {name}Block {{\n\
+         {fields}vec4 _wm_pad[{pad}];\n}} {PER_DRAW_ARRAY}[];"
+    ))
+}
+
+/// The padding directive's value, out of the directives the JVM sent. See [`per_draw_declaration`].
+///
+/// Nothing means the pipeline declares no per-draw block, which is the case for all but the terrain
+/// pipelines - so a missing directive is not an error, it is the ordinary answer.
+pub fn per_draw_pad(directives: &str) -> Option<usize> {
+    directives.lines().find_map(|line| {
+        let value = line.trim().strip_prefix("#define WM_CHUNK_PAD ")?;
+
+        value.trim().parse().ok()
+    })
+}
+
+/// Renames the bare members of a per-draw block to the expression each becomes.
+///
+/// The members are declared with **bare names** (`ChunkPosition`, not `block.member`), so a use of one
+/// is an `Expr::Variable` - and a *field* of some other expression is a `Dot`, which this cannot reach
+/// by accident. What it must also not see is a replacement of its own, and it does not: the varyings
+/// are written after this has run.
+struct PerDrawMembers<'a> {
+    replacements: &'a HashMap<String, String>,
+}
+
+impl VisitorMut for PerDrawMembers<'_> {
+    fn visit_expr(&mut self, expression: &mut Expr) -> Visit {
+        if let Expr::Variable(identifier) = expression
+            && let Some(replacement) = self.replacements.get(&identifier.0)
+        {
+            *expression = Expr::parse(replacement.clone()).unwrap();
+        }
+
+        Visit::Children
+    }
+}
+
+/// Publishes the per-draw varyings the fragment stage reads, at the top of the vertex `main`.
+struct PerDrawVaryingWriter {
+    assignments: Vec<String>,
+}
+
+impl VisitorMut for PerDrawVaryingWriter {
+    fn visit_function_definition(&mut self, definition: &mut FunctionDefinition) -> Visit {
+        if definition.prototype.name.0 == "main" {
+            for (index, assignment) in self.assignments.iter().enumerate() {
+                definition.statement.statement_list.insert(
+                    index,
+                    Statement::parse(assignment.clone()).expect("a varying assignment"),
+                );
+            }
+        }
+
+        Visit::Children
+    }
+}
+
+/// Rewrites the blocks a pipeline reads per draw into the storage array its shaders index them at.
+///
+/// `blocks` is the plan's own answer ([`crate::blaze::BindGroupPlan::per_draw_storage`]) and `pad` is
+/// [`per_draw_pad`]. A block that is not in `blocks` is left alone entirely: it is a uniform this side
+/// still binds per draw, and declaring it as storage would declare a binding the pipeline's layout does
+/// not have - which is a validation error, and on this path that ends the process.
+///
+/// **The two stages are not symmetrical, and that is the whole of the work.** The vertex stage has
+/// `gl_InstanceIndex` - the record number a batched draw carries - so it reads the array directly. The
+/// fragment stage has no instance index at all, so the members it needs travel as varyings the vertex
+/// stage writes; see [`PER_DRAW_VARYINGS`].
+///
+/// It runs **before** the layout annotations, so the varyings it adds are numbered by the same two
+/// annotators that number every other one - the vertex stage's outputs in declaration order, and the
+/// fragment stage's inputs by name out of that same map - which is what keeps the two stages' `in` and
+/// `out` in step without a second mechanism.
+pub fn rewrite_per_draw_blocks(
+    vert_stage: &mut ShaderStage,
+    frag_stage: &mut ShaderStage,
+    blocks: &HashSet<String>,
+    locations: &HashMap<String, (u32, u32)>,
+    pad: usize,
+) {
+    rewrite_per_draw_stage(vert_stage, blocks, locations, pad, PerDrawStage::Vertex);
+    rewrite_per_draw_stage(frag_stage, blocks, locations, pad, PerDrawStage::Fragment);
+}
+
+fn rewrite_per_draw_stage(
+    stage: &mut ShaderStage,
+    blocks: &HashSet<String>,
+    locations: &HashMap<String, (u32, u32)>,
+    pad: usize,
+    which: PerDrawStage,
+) {
+    // Which per-draw blocks this stage declares, and what they declare - read before anything is
+    // replaced, because the replacement is what takes the bare member names out of scope.
+    let mut found: Vec<(String, Vec<String>)> = Vec::new();
+
+    for declaration in stage.0.0.iter() {
+        if let ExternalDeclaration::Declaration(Declaration::Block(block)) = declaration
+            && blocks.contains(&block.name.0)
+        {
+            found.push((block.name.0.clone(), per_draw_members(block)));
+        }
+    }
+
+    if found.is_empty() {
+        return;
+    }
+
+    let mut replacements = HashMap::new();
+
+    for (name, members) in found.iter() {
+        for member in members {
+            let replacement = match which {
+                PerDrawStage::Vertex => format!("{PER_DRAW_ARRAY}[gl_InstanceIndex].{member}"),
+                PerDrawStage::Fragment => match PER_DRAW_VARYINGS
+                    .iter()
+                    .find(|(varying, _)| varying == member)
+                {
+                    Some((varying, _)) => format!("wm{varying}"),
+                    // A member the fragment stage has no way to read: left alone, so naga reports an
+                    // undeclared identifier by name rather than this picking up whatever was in scope.
+                    None => continue,
+                },
+            };
+
+            replacements.insert(member.clone(), replacement);
+        }
+
+        debug!("wgpu-mc: {name} is a per-draw block; {which:?} reads it as storage");
+    }
+
+    let mut keep = Vec::with_capacity(stage.0.0.len() + PER_DRAW_VARYINGS.len());
+
+    for declaration in stage.0.0.drain(..) {
+        let block = match &declaration {
+            ExternalDeclaration::Declaration(Declaration::Block(block))
+                if blocks.contains(&block.name.0) =>
+            {
+                block.clone()
+            }
+            _ => {
+                keep.push(declaration);
+                continue;
+            }
+        };
+
+        // The vertex stage reads the block. The fragment stage reads the varyings instead, so its copy
+        // of the declaration goes away: the *binding* belongs to the pipeline and is declared for both
+        // stages at once, so nothing is lost by a stage that does not mention it.
+        if which == PerDrawStage::Vertex
+            && let Some(text) = per_draw_declaration(&block, locations, pad)
+        {
+            keep.push(ExternalDeclaration::Declaration(
+                Declaration::parse(text).expect("a per-draw storage declaration"),
+            ));
+        }
+    }
+
+    stage.0.0 = keep;
+
+    stage.visit_mut(&mut PerDrawMembers {
+        replacements: &replacements,
+    });
+
+    // **At the front, not the end.** A varying is used inside `main`, and GLSL wants a declaration
+    // before the use that reads it - appending these put them after the function, and naga said so:
+    // `UnknownVariable("wmChunkVisibility")`. The `#version` line is inserted at the very front later
+    // on, which pushes them down one and leaves the order valid.
+    for (offset, (member, ty)) in PER_DRAW_VARYINGS.iter().enumerate() {
+        stage.0.0.insert(
+            offset,
+            ExternalDeclaration::Declaration(
+                Declaration::parse(format!("{} {ty} wm{member};", which.varying_qualifier()))
+                    .expect("a per-draw varying"),
+            ),
+        );
+    }
+
+    if which == PerDrawStage::Fragment {
+        return;
+    }
+
+    // The vertex stage's side of it: one cast per varying, so a member declared as an integer vector
+    // arrives as the float pair the fragment stage declared.
+    let assignments = PER_DRAW_VARYINGS
+        .iter()
+        .map(|(member, ty)| {
+            format!("wm{member} = {ty}({PER_DRAW_ARRAY}[gl_InstanceIndex].{member});")
+        })
+        .collect();
+
+    stage.visit_mut(&mut PerDrawVaryingWriter { assignments });
+}
+
+impl PerDrawStage {
+    /// The storage qualifier the varyings are declared with in this stage.
+    fn varying_qualifier(self) -> &'static str {
+        match self {
+            PerDrawStage::Vertex => "out",
+            PerDrawStage::Fragment => "in",
+        }
+    }
+}
+
 pub struct ProcessedShaderResult {
     pub frag: String,
     pub vert: String,
@@ -1191,6 +1464,7 @@ pub fn process_shaders(
     directives: &str,
     uniform_locations: &HashMap<String, (u32, u32)>,
     vertex_stage_input_layout: HashMap<String, u32>,
+    per_draw_storage: &HashSet<String>,
 ) -> ProcessedShaderResult {
     let vert_source = format!("{directives}{vert_source}");
     let frag_source = format!("{directives}{frag_source}");
@@ -1215,6 +1489,28 @@ pub fn process_shaders(
     let mut uniform_locations = uniform_locations.clone();
     let implicit_uniforms =
         add_implicit_uniforms(&vert_stage_ast, &frag_stage_ast, &mut uniform_locations);
+
+    // **The per-draw blocks, before the layouts are annotated.** A block the plan declares as storage
+    // becomes the array its stage indexes by record number, and the varyings that carry the members the
+    // fragment stage reads are declared here rather than later, so that the annotators below number
+    // them with everything else - which is what keeps a vertex `out` and its fragment `in` in step.
+    // See `rewrite_per_draw_blocks`.
+    if !per_draw_storage.is_empty() {
+        match per_draw_pad(directives) {
+            Some(pad) => rewrite_per_draw_blocks(
+                &mut vert_stage_ast,
+                &mut frag_stage_ast,
+                per_draw_storage,
+                &uniform_locations,
+                pad,
+            ),
+            None => error!(
+                "wgpu-mc: a pipeline declares the per-draw block(s) {per_draw_storage:?} but its \
+                 directives carry no WM_CHUNK_PAD, so the block stays a uniform block and the storage \
+                 binding the layout declares will not match it"
+            ),
+        }
+    }
 
     //Apply the set and binding layouts to the uniforms
     apply_layouts(
@@ -1519,8 +1815,6 @@ mod texel_buffer_tests {
     /// this side - a panic, and the process ends. That is what a `.length()` bounds check in the
     /// texel fetch did the first time it was tried, and nothing but running the game said so.
     fn naga_error(source: &str, stage: naga::ShaderStage) -> Option<String> {
-        use wgpu_mc::wgpu::naga;
-
         let mut frontend = naga::front::glsl::Frontend::default();
         let options = naga::front::glsl::Options {
             stage,
@@ -1629,6 +1923,189 @@ mod roundtrip_tests {
             printed.contains("*="),
             "multiplication was rewritten after preprocessing: {printed}"
         );
+    }
+}
+
+#[cfg(test)]
+mod per_draw_block_tests {
+    use super::*;
+    use wgpu_mc::wgpu::naga;
+
+    /// The two stages the game ships for terrain, cut down to the parts the rewrite touches: the block
+    /// itself (declared with bare member names, as `assets/minecraft/shaders/include/chunksection.glsl`
+    /// declares it), one uniform the pipeline declares as an ordinary block, and a `main` that uses a
+    /// member in each of the two ways the two stages do.
+    const VERTEX: &str = r#"#version 330
+layout(std140) uniform ChunkSection {
+    mat4 ModelViewMat;
+    float ChunkVisibility;
+    ivec2 TextureSize;
+    ivec3 ChunkPosition;
+};
+layout(std140) uniform Projection {
+    mat4 ProjMat;
+};
+in vec3 Position;
+void main() {
+    vec3 pos = Position + vec3(ChunkPosition);
+    gl_Position = ProjMat * ModelViewMat * vec4(pos, 1.0);
+}"#;
+
+    const FRAGMENT: &str = r#"#version 330
+layout(std140) uniform ChunkSection {
+    mat4 ModelViewMat;
+    float ChunkVisibility;
+    ivec2 TextureSize;
+    ivec3 ChunkPosition;
+};
+out vec4 fragColor;
+void main() {
+    fragColor = vec4(1.0 / vec2(TextureSize), ChunkVisibility, 1.0);
+}"#;
+
+    /// Both stages through the whole preprocessor with `ChunkSection` declared as a per-draw block.
+    fn rewritten() -> (String, String) {
+        let locations: HashMap<String, (u32, u32)> = [
+            ("ChunkSection".to_string(), (0u32, 1u32)),
+            ("Projection".to_string(), (0u32, 0u32)),
+        ]
+        .into_iter()
+        .collect();
+
+        let per_draw: HashSet<String> = ["ChunkSection".to_string()].into_iter().collect();
+
+        let result = process_shaders(
+            VERTEX,
+            FRAGMENT,
+            "#define WM_CHUNK_PAD 10\n",
+            &locations,
+            [("Position".to_string(), 0u32)].into_iter().collect(),
+            &per_draw,
+        );
+
+        (result.vert, result.frag)
+    }
+
+    /// The vertex stage has the one thing a batched draw can carry per record, so it reads the block.
+    #[test]
+    fn the_vertex_stage_reads_the_block_at_its_instance() {
+        let (vert, _) = rewritten();
+
+        assert!(vert.contains("readonly buffer ChunkSectionBlock"), "{vert}");
+        assert!(vert.contains("vec4 _wm_pad[10];"), "{vert}");
+        assert!(vert.contains("wmPerDraw[]"), "{vert}");
+        assert!(
+            vert.contains("wmPerDraw[gl_InstanceIndex].ChunkPosition"),
+            "{vert}"
+        );
+        assert!(
+            vert.contains("wmPerDraw[gl_InstanceIndex].ModelViewMat"),
+            "{vert}"
+        );
+        assert!(!vert.contains("uniform ChunkSection"), "{vert}");
+        assert!(vert.contains("out float wmChunkVisibility;"), "{vert}");
+        assert!(vert.contains("out vec2 wmTextureSize;"), "{vert}");
+        assert!(
+            vert.contains(
+                "wmChunkVisibility = float(wmPerDraw[gl_InstanceIndex].ChunkVisibility);"
+            ),
+            "{vert}"
+        );
+        assert!(
+            vert.contains("wmTextureSize = vec2(wmPerDraw[gl_InstanceIndex].TextureSize);"),
+            "{vert}"
+        );
+    }
+
+    /// **The fragment stage has no instance index**, so it reads what the vertex stage published - and
+    /// it must not be left declaring the block, or naga would want an index it cannot write.
+    #[test]
+    fn the_fragment_stage_reads_the_varyings() {
+        let (_, frag) = rewritten();
+
+        assert!(frag.contains("in float wmChunkVisibility;"), "{frag}");
+        assert!(frag.contains("in vec2 wmTextureSize;"), "{frag}");
+        assert!(!frag.contains("uniform ChunkSection"), "{frag}");
+        assert!(
+            !frag.contains("readonly buffer"),
+            "the fragment stage declared the storage binding: {frag}"
+        );
+        // The bare member is gone - and `wmChunkVisibility` does not count as it, which is why the
+        // needle has the separator the varying does not.
+        assert!(!frag.contains(" ChunkVisibility"), "{frag}");
+        assert!(!frag.contains("TextureSize,"), "{frag}");
+    }
+
+    /// A pipeline that declares the block as an ordinary uniform keeps it as one, untouched.
+    #[test]
+    fn a_pipeline_with_no_per_draw_block_is_not_rewritten() {
+        let locations: HashMap<String, (u32, u32)> = [("ChunkSection".to_string(), (0u32, 0u32))]
+            .into_iter()
+            .collect();
+
+        let result = process_shaders(
+            VERTEX,
+            FRAGMENT,
+            "// no WM_CHUNK_PAD\n",
+            &locations,
+            [("Position".to_string(), 0u32)].into_iter().collect(),
+            &HashSet::new(),
+        );
+
+        assert!(
+            result.vert.contains("uniform ChunkSection"),
+            "{}",
+            result.vert
+        );
+        assert!(
+            result.vert.contains("layout (set = 0, binding = 0)"),
+            "{}",
+            result.vert
+        );
+        assert!(!result.vert.contains("readonly buffer"), "{}", result.vert);
+    }
+
+    /// What naga makes of a rewritten stage, which is what decides whether the game runs at all.
+    fn naga_error(source: &str, stage: naga::ShaderStage) -> Option<String> {
+        let mut frontend = naga::front::glsl::Frontend::default();
+        let options = naga::front::glsl::Options {
+            stage,
+            defines: Default::default(),
+        };
+
+        let module = match frontend.parse(&options, source) {
+            Ok(module) => module,
+            Err(errors) => return Some(format!("{errors:?}")),
+        };
+
+        let mut validator = naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        );
+
+        match validator.validate(&module) {
+            Ok(_) => None,
+            Err(error) => Some(format!("{error:?}")),
+        }
+    }
+
+    /// **The rewritten shaders have to be ones naga will compile**, because a shader module that fails
+    /// validation is a wgpu error on this path - a panic, and the process ends. The interesting parts
+    /// are the ones this side invented: a runtime array of a block whose last member is a fixed-size
+    /// array (the stride padding), and `gl_InstanceIndex` as its index.
+    #[test]
+    fn both_stages_survive_naga() {
+        use wgpu_mc::wgpu::naga;
+
+        let (vert, frag) = rewritten();
+
+        if let Some(error) = naga_error(&vert, naga::ShaderStage::Vertex) {
+            panic!("naga rejects the rewritten terrain vertex shader: {error}\n{vert}");
+        }
+
+        if let Some(error) = naga_error(&frag, naga::ShaderStage::Fragment) {
+            panic!("naga rejects the rewritten terrain fragment shader: {error}\n{frag}");
+        }
     }
 }
 

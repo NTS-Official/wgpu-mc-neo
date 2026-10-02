@@ -269,7 +269,10 @@ class WgpuDevice(
 
     override fun setVsync(enabled: Boolean) = WgpuSurface.setVsync(enabled)
 
-    override fun presentFrame() = surface.present()
+    override fun presentFrame() {
+        framesPresented++
+        surface.present()
+    }
 
     /** wgpu follows the D3D/Metal convention where depth maps to [0, 1]. */
     override fun isZZeroToOne(): Boolean = true
@@ -282,6 +285,16 @@ class WgpuDevice(
         const val UNNAMED_TEXTURE = "<wgpu-mc/unnamed texture>"
         const val UNNAMED_BUFFER = "<wgpu-mc/unnamed buffer>"
         const val IMPLEMENTATION = "wgpu 29"
+
+        /**
+         * Frames presented since startup.
+         *
+         * Read by the diagnostics that report a number "per second": dividing by the frames in the
+         * same window gives the per-frame number without assuming a framerate.
+         */
+        @JvmStatic
+        var framesPresented: Long = 0L
+            private set
 
         /** `GpuTexture.USAGE_RENDER_ATTACHMENT` and `USAGE_TEXTURE_BINDING`, for the placeholders. */
         private const val USAGE_RENDER_ATTACHMENT = 8

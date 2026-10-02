@@ -1,13 +1,14 @@
 use crate::device::{
     BlazePipeline, LIVE_BIND_GROUP_COUNT, count_bind_groups, count_cache_hit, count_cache_miss,
-    count_draw, count_numbered, count_pipeline_bind, count_tableless, count_vertices, fan_indices,
-    log_pipeline_once, quad_indices, trace_draw, trace_pipeline,
+    count_draw, count_draws, count_numbered, count_pipeline_bind, count_tableless, count_vertices,
+    fan_indices, log_pipeline_once, quad_indices, trace_draw, trace_pipeline,
 };
+use crate::indirect::BatchRecord;
 use glsl::syntax::TypeSpecifierNonArray;
 use log::info;
 use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString, c_char};
 use std::fmt::{Debug, Display, Formatter};
 use std::ops::{Deref, Index, Range};
@@ -232,6 +233,21 @@ pub struct DrawCall {
     /// refused (`draw_call` returns false) rather than bound from a table that describes whatever the
     /// JVM drew last; the JVM then sends the bindings with it and draws again.
     pub bindings_present: u32,
+    /// The first instance this draw covers, which is the per-draw number its vertex stage reads.
+    ///
+    /// **Appended after the fields above rather than next to `instance_count`, deliberately**: every
+    /// offset the JVM writes by (`DRAW_CALL_BINDINGS`, `DRAW_CALL_VERTEX_BUFFERS`, the two numbers
+    /// above) stays where it was, so a draw call written by an older JVM is still read correctly and
+    /// the only thing that moved is the struct's size. See `DRAW_CALL_FIRST_INSTANCE` in `WmNative.kt`
+    /// and the offset test in `abi_tests.rs`.
+    ///
+    /// It exists because of the batched path: `multi_draw_indexed_indirect` gives each record its own
+    /// `first_instance`, and that field is the only per-draw channel such a call has - so a pipeline
+    /// whose draws read per-draw data (the terrain pass' `ChunkSection`) reads it at this index. The
+    /// per-draw path has to carry the same number to draw the same picture, and Blaze3D's own
+    /// `drawIndexed` has no such parameter: this is where the JVM puts it, and it is zero for every
+    /// draw that reads no per-draw data.
+    pub first_instance: u32,
 }
 
 impl Default for DrawCall {
@@ -261,6 +277,7 @@ impl Default for DrawCall {
             }; MAX_DRAW_BINDINGS],
             combo: 0,
             bindings_present: 0,
+            first_instance: 0,
         }
     }
 }
@@ -295,7 +312,9 @@ pub struct PlanBinding {
 impl PlanBinding {
     pub fn kind_of(resource: &PlannedResource) -> u32 {
         match resource {
-            PlannedResource::Uniform { .. } | PlannedResource::Storage => DRAW_BINDING_BUFFER,
+            PlannedResource::Uniform { .. }
+            | PlannedResource::Storage
+            | PlannedResource::PerDrawStorage => DRAW_BINDING_BUFFER,
             PlannedResource::Texture { .. } => DRAW_BINDING_TEXTURE,
             PlannedResource::Sampler => DRAW_BINDING_SAMPLER,
         }
@@ -550,6 +569,15 @@ pub enum PlannedResource {
     Uniform { min_size: Option<u64> },
     /// A texel buffer, which wgpu sees as a read-only storage buffer with a runtime-sized array.
     Storage,
+    /// A block a draw reads per-draw data out of: **the same binding as [`Self::Storage`] and a
+    /// different statement about the shader that reads it.**
+    ///
+    /// A texel buffer is fetched by index out of its own bytes; this is read at the record number the
+    /// draw's `first_instance` carries, which is the whole reason it exists - see
+    /// [`UniformType::StorageBuffer`]. The only reader of the difference is the shader preprocessing,
+    /// which finds a block the layout declares this way and rewrites it from a uniform block into the
+    /// storage array its stage can index (`per_draw_storage` below is what it is told).
+    PerDrawStorage,
     /// The texture half of a shimmed combined sampler.
     Texture { cube: bool },
     /// The sampler half of a shimmed combined sampler.
@@ -637,6 +665,15 @@ impl BindGroupPlan {
                         },
                         1,
                     ),
+                    UniformType::StorageBuffer => (
+                        PlannedBinding {
+                            name: name.clone(),
+                            declared_name: name,
+                            resource: PlannedResource::PerDrawStorage,
+                            binding: next,
+                        },
+                        1,
+                    ),
                     UniformType::Sampler => {
                         // A combined sampler is two bindings and two names, because WGSL has no
                         // combined sampler; the shader declares both after the shim.
@@ -697,13 +734,36 @@ impl BindGroupPlan {
                 locations.insert(binding.name.clone(), (set as u32, binding.binding));
 
                 // A texture buffer is declared by its own name in the shader, not by a shim name.
-                if binding.resource == PlannedResource::Storage {
+                if matches!(
+                    binding.resource,
+                    PlannedResource::Storage | PlannedResource::PerDrawStorage
+                ) {
                     locations.insert(binding.declared_name.clone(), (set as u32, binding.binding));
                 }
             }
         }
 
         locations
+    }
+
+    /// The blocks this pipeline reads per draw out of a storage buffer, by declared name.
+    ///
+    /// Read by the shader preprocessing, which has to rewrite exactly those blocks - and only those -
+    /// from uniform blocks into the storage array a stage can index by record number: a block that is
+    /// left as a uniform is one this side still binds per draw, and rewriting it would declare a
+    /// binding the pipeline's layout does not have. See [`PlannedResource::PerDrawStorage`].
+    pub fn per_draw_storage(&self) -> HashSet<String> {
+        let mut names = HashSet::new();
+
+        for bindings in self.sets.iter() {
+            for binding in bindings {
+                if binding.resource == PlannedResource::PerDrawStorage {
+                    names.insert(binding.declared_name.clone());
+                }
+            }
+        }
+
+        names
     }
 
     /// Adds the uniform blocks the shaders declared that the pipeline never listed.
@@ -782,12 +842,18 @@ impl BindGroupPlan {
                                 has_dynamic_offset: true,
                                 min_binding_size: min_size.and_then(BufferSize::new),
                             },
-                            PlannedResource::Storage => wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Storage { read_only: true },
-                                // DX12 has no offset for a storage descriptor, so these are static.
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
+                            PlannedResource::Storage | PlannedResource::PerDrawStorage => {
+                                wgpu::BindingType::Buffer {
+                                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                                    // DX12 has no offset for a storage descriptor, so these are static.
+                                    // That is also what makes a per-draw block bindable **whole**: the
+                                    // binding is the ring the records live in, at offset zero, and the
+                                    // record each draw reads is its `first_instance` - not an offset on
+                                    // the descriptor, which a multi-draw could not vary per record.
+                                    has_dynamic_offset: false,
+                                    min_binding_size: None,
+                                }
+                            }
                             PlannedResource::Texture { cube } => wgpu::BindingType::Texture {
                                 sample_type: Default::default(),
                                 view_dimension: if *cube {
@@ -1221,7 +1287,7 @@ fn bind_groups_for_call(
 
                     count += 1;
                 }
-                PlannedResource::Storage => {
+                PlannedResource::Storage | PlannedResource::PerDrawStorage => {
                     if numbering {
                         continue;
                     }
@@ -1343,7 +1409,7 @@ fn bind_groups_for_call(
                                 }),
                             }
                         }
-                        PlannedResource::Storage => {
+                        PlannedResource::Storage | PlannedResource::PerDrawStorage => {
                             let (buffer, address) = call_buffer(&plan.name, binding, &entry);
                             let range = entry.offset..entry.offset + entry.length;
 
@@ -1413,7 +1479,45 @@ fn bind_groups_for_call(
 ///
 /// This is the whole per-draw ABI: it used to be a pipeline bind, one bind per uniform, one per
 /// sampler, one per buffer and then the draw, each with its own name lookup on the native side.
+///
+/// It is [`bind_for_call`] plus the draw, because the batched path wants that same setup once for a
+/// whole run of draws - see [`draw_call_batch`], which is the other caller.
 pub fn draw_call(wm: &WmRenderer, pass: &mut BlazeRenderPass, call: &DrawCall) -> bool {
+    if !bind_for_call(wm, pass, call) {
+        return false;
+    }
+
+    // **Counted here rather than on the way in**, because a refused draw is not one: the JVM sends the
+    // bindings and calls again, and counting both would report twice the draws the frame made.
+    count_draw();
+    trace_draw();
+    count_vertices((call.count as u64) * (call.instance_count as u64));
+
+    // Safety: the pipeline pointer comes from `compile_render_pipeline` and the JVM keeps the compiled
+    // pipeline alive for as long as any pass can draw with it. `bind_for_call` has checked it is not
+    // null, which is the one thing about it this borrow needs.
+    let pipeline = unsafe { &*call.pipeline };
+    // The instance range starts where the draw says, because that number is what a shader with
+    // per-draw data reads its record at - the batched path writes the same number into an indirect
+    // record's `first_instance`. See `DrawCall::first_instance`.
+    let instances = call.first_instance..call.first_instance + call.instance_count.max(1);
+
+    draw_geometry(wm, &mut pass.pass, pipeline, call, instances);
+
+    true
+}
+
+/// Sets up everything one draw of a call needs except the draw itself, and answers whether the pass is
+/// ready to record it.
+///
+/// Split out for [`draw_call_batch`], which does this once for a whole run of draws: that is sound only
+/// because the JVM batches draws that agree about every one of these - the pipeline, the vertex
+/// buffers, the index buffer and the bindings - and checks so before it asks.
+///
+/// **`false` is the refusal [`draw_call`] documents**: a combination no bind group has been built for,
+/// on a draw that did not carry the bindings to build one from. The pipeline and the vertex buffers
+/// have been set either way, and both are idempotent, so the JVM's second attempt changes nothing.
+fn bind_for_call(wm: &WmRenderer, pass: &mut BlazeRenderPass, call: &DrawCall) -> bool {
     if call.pipeline.is_null() {
         panic!("wgpu-mc: a draw arrived with no pipeline bound");
     }
@@ -1514,11 +1618,6 @@ pub fn draw_call(wm: &WmRenderer, pass: &mut BlazeRenderPass, call: &DrawCall) -
         return false;
     }
 
-    // Counted here rather than on the way in, because a refused draw is not one: the JVM sends the
-    // bindings and calls again, and counting both would report twice the draws the frame made.
-    count_draw();
-    trace_draw();
-
     if let Some(built) = outcome.groups {
         *groups = Some(built);
         *key = outcome.key;
@@ -1546,13 +1645,81 @@ pub fn draw_call(wm: &WmRenderer, pass: &mut BlazeRenderPass, call: &DrawCall) -
         );
     }
 
-    count_vertices((call.count as u64) * (call.instance_count as u64));
-
-    let instances = 0..call.instance_count.max(1);
-
-    draw_geometry(wm, raw_pass, pipeline, call, instances);
-
     true
+}
+
+/// Records a run of draws that differ only in their parameters as one `multi_draw_indexed_indirect`.
+///
+/// `template` is one draw of the run, and it is the whole of what the run shares: the pipeline, the
+/// vertex and index buffers, every binding, and the combination those bindings make up. `records` is
+/// what each draw of the run has of its own - the indices it reads, the vertex offset they are read
+/// from, and the number of the pass' per-draw record it reads if its pipeline reads one.
+///
+/// **What a multi-draw cannot express, and what this therefore refuses:**
+///
+/// - A non-indexed draw. The call is `multi_draw_indexed_indirect`, and an indirect record has no room
+///   for which index buffer it reads - so every draw of a run reads the one bound here.
+/// - More than one instance per draw. Each record is written with one instance, which is how the
+///   per-draw number reaches the shader as `gl_InstanceIndex`.
+/// - A device whose multi-draw is not one call. wgpu emulates `multi_draw_*` as a loop of single
+///   indirect draws without the count feature, and the DX12 backend's implementation of it is broken -
+///   the same two answers the terrain pass' own batching reads, from the one place that resolved them.
+///   See `can_batch_terrain_draws`.
+/// - No room left in the submission's record buffer, which is where [`crate::indirect`] keeps them.
+///
+/// The answer is how many draws were recorded, and **zero means the caller draws the run one draw at a
+/// time** - which is what it does anyway when this path is switched off, so a refusal costs the
+/// batching and never the picture.
+pub fn draw_call_batch(
+    wm: &WmRenderer,
+    pass: &mut BlazeRenderPass,
+    template: &DrawCall,
+    records: &RawArray<BatchRecord>,
+) -> u32 {
+    let count = records.len();
+
+    if count == 0
+        || template.indexed == 0
+        || template.index_buffer.is_null()
+        || template.instance_count > 1
+        || count > u32::MAX as usize
+    {
+        crate::indirect::note_declined();
+        return 0;
+    }
+
+    if !wgpu_mc::render::graph::terrain_batching_possible() {
+        crate::indirect::note_declined();
+        return 0;
+    }
+
+    // The run's setup, once. A refusal here is answered rather than retried: the caller has the
+    // bindings, and its fallback - one draw at a time - is the retry.
+    if !bind_for_call(wm, pass, template) {
+        crate::indirect::note_declined();
+        return 0;
+    }
+
+    let commands: Vec<crate::indirect::IndirectCommand> =
+        records.iter().map(|record| record.command()).collect();
+    let vertices: u64 = commands
+        .iter()
+        .map(|command| command.index_count as u64)
+        .sum();
+
+    let Some((buffer, offset)) = crate::indirect::write(&wm.gpu.device, &wm.gpu.queue, &commands)
+    else {
+        // Counted where the room ran out, which says both things: a declined batch *and* why.
+        return 0;
+    };
+
+    pass.pass
+        .multi_draw_indexed_indirect(&buffer, offset, commands.len() as u32);
+
+    count_draws(commands.len() as u64);
+    count_vertices(vertices);
+
+    commands.len() as u32
 }
 
 /// Draws the geometry of a call, generating an index buffer for the topologies wgpu has no
@@ -1666,7 +1833,7 @@ fn trace_call(plan: &BindGroupPlan, call: &DrawCall, alignment: u64, key: u64) {
                         if dynamic { "DYNAMIC" } else { "baked" }
                     )
                 }
-                PlannedResource::Storage => {
+                PlannedResource::Storage | PlannedResource::PerDrawStorage => {
                     let (_, address) = call_buffer(&plan.name, binding, &entry);
                     format!(
                         "s{set}/b{} {} storage id={address:#x} start={}",
@@ -1767,6 +1934,15 @@ pub enum UniformType {
     TexelBuffer = 0,
     UBO = 1,
     Sampler = 2,
+    /// A block a draw reads out of a storage buffer rather than a uniform.
+    ///
+    /// It is the same resource as [`Self::TexelBuffer`] on this side - a read-only storage binding -
+    /// and the difference is entirely in the shader: a texel buffer is fetched by index, and this is
+    /// read at the record number the draw's `first_instance` carries, which is how a batched run gives
+    /// each of its draws its own block. The JVM declares it (see `perDrawStorageNames` in
+    /// `WgpuCompiledRenderPipeline.kt`, which is the one place the rule lives), and the shader
+    /// preprocessing finds the declaration again by this kind - see `preprocessing.rs`.
+    StorageBuffer = 3,
 }
 
 #[repr(C)]
