@@ -21,6 +21,9 @@
 作者最初的想法，是在这样一个实验性项目中引入光追/路径追踪，以及 DirectX 下的 DLSS、DLSSD、DLSSR 等现代图形技术。但受 WebGPU 这一 crate 的能力所限，目前只能通过 hook C++ 库之类相当“脏”的手段来实现。因此，本项目不再考虑加入这些技术，转而专注于提升这个跨 API 图形项目的实用性与稳定性。
 
 ## Neolectrum —— 面向 Minecraft 的 Rust 渲染引擎模组
+> [!NOTE]
+> **模组现在是一个独立仓库：[NTS-Official/Neolectrum](https://github.com/NTS-Official/Neolectrum)。** 构建与发布都在那边进行；它从旁边的引擎检出目录取原生库——默认是 `../wgpu-mc-neo/rust`，也可以用 `wgpu_mc_rust_dir` 指向别处。
+
 > [!CAUTION]
 > Neolectrum 目前仍是**alpha**状态。[欢迎贡献](https://github.com/NTS-Official/wgpu-mc-neo/labels/neolectrum)。
 

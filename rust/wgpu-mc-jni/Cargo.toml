@@ -44,6 +44,11 @@ glsl = { git = "https://github.com/wgpu-mc/glsl.git" }
 # `cargo update` belongs in the tree, not in a pinned revision.
 cyntax = { path = "../cyntax" }
 
+[dev-dependencies]
+# The tests read the mod's Kotlin, its language files and its metadata out of the Neolectrum
+# checkout; this is the crate that finds it, and it says what it does when it is not there.
+wgpu-mc-modtree = { path = "../modtree" }
+
 [build-dependencies]
 cbindgen = "0.29"
 

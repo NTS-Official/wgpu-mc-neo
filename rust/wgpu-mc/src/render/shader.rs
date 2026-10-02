@@ -156,16 +156,7 @@ impl WmShader for GlslShader {
 #[cfg(test)]
 mod unguarded_index_tests {
     use crate::wgpu::naga;
-
-    /// The two terrain shaders, which is where the indexing this module promises about lives.
-    const TERRAIN: &str = include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../neoforge/src/main/resources/assets/wgpu_mc/shaders/terrain.wgsl"
-    ));
-    const TERRAIN_SOLID: &str = include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../neoforge/src/main/resources/assets/wgpu_mc/shaders/terrain_solid.wgsl"
-    ));
+    use wgpu_mc_modtree as modtree;
 
     /// How many expressions index a **storage buffer** in `source`, by the global they start from.
     ///
@@ -248,15 +239,20 @@ mod unguarded_index_tests {
     /// counts out loud, so a change that adds one has to come here and say why it is safe.
     ///
     /// A file that is not in this table must have none, which is the half that catches a *new* shader.
+    ///
+    /// The files are read out of the Neolectrum checkout, so a clone of this repository that has never
+    /// seen the mod skips the check rather than failing it; see `wgpu_mc_modtree`.
     const UNGUARDED_STORAGE_READS: &[(&str, usize)] =
         &[("entity", 1), ("terrain", 9), ("terrain_solid", 9)];
 
     #[test]
     fn the_shaders_this_crate_builds_index_a_storage_buffer_only_where_it_is_listed() {
-        // The same directory `graph.yaml`'s pipelines name their shaders in; two levels up from
-        // `rust/wgpu-mc` is the repository root.
-        let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../neoforge/src/main/resources/assets/wgpu_mc/shaders");
+        // The same directory `graph.yaml`'s pipelines name their shaders in, read out of the
+        // Neolectrum checkout; a checkout that is not there skips this rather than failing it.
+        let Some(directory) = modtree::shader_dir() else {
+            modtree::skip("the storage-read table");
+            return;
+        };
 
         let mut seen = Vec::new();
 
@@ -324,7 +320,20 @@ mod unguarded_index_tests {
     /// that made nine worth removing.
     #[test]
     fn the_terrain_vertex_stage_is_where_the_nine_reads_are() {
-        for (name, source) in [("terrain", TERRAIN), ("terrain_solid", TERRAIN_SOLID)] {
+        let Some(terrain) = modtree::shader("terrain") else {
+            modtree::skip("the unguarded-index checks");
+            return;
+        };
+
+        let Some(terrain_solid) = modtree::shader("terrain_solid") else {
+            modtree::skip("the unguarded-index checks");
+            return;
+        };
+
+        for (name, source) in [
+            ("terrain", terrain.as_str()),
+            ("terrain_solid", terrain_solid.as_str()),
+        ] {
             let reads = storage_reads(source);
 
             assert!(

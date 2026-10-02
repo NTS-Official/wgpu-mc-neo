@@ -49,6 +49,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # The tests that check this side of the bridge against the mod's own source - its Kotlin, its
+      # language files, the shaders it ships, `updates.json` - read them out of the Neolectrum checkout,
+      # and skip when it is not there. Without it this job would run green having checked only the half
+      # of the bridge that is in this repository, so the checkout is part of the job: `WGPU_MC_MOD_DIR`
+      # names it, and names it as an error if the clone did not happen.
+      - name: checkout the mod
+        uses: actions/checkout@v4
+        with:
+          repository: NTS-Official/Neolectrum
+          path: neolectrum
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly-2026-09-26
@@ -62,6 +72,8 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
       - run: cargo test --manifest-path rust/Cargo.toml
+        env:
+          WGPU_MC_MOD_DIR: neolectrum
 
   fmt:
     name: Rustfmt

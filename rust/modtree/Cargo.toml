@@ -1,0 +1,6 @@
+[package]
+name = "wgpu-mc-modtree"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Finds the Neolectrum checkout that this repository's tests read the mod's own files from (dev-dependency only)."

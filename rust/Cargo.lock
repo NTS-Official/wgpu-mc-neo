@@ -5121,6 +5121,7 @@ dependencies = [
  "treeculler",
  "web-sys",
  "wgpu",
+ "wgpu-mc-modtree",
  "winit",
 ]
 
@@ -5189,8 +5190,13 @@ dependencies = [
  "strum 0.26.3",
  "strum_macros 0.26.4",
  "wgpu-mc",
+ "wgpu-mc-modtree",
  "winapi",
 ]
+
+[[package]]
+name = "wgpu-mc-modtree"
+version = "0.1.0"
 
 [[package]]
 name = "wgpu-naga-bridge"

@@ -11,7 +11,11 @@ members = [
     # face is drawn at its direction's brightness or at `up`. Upstream has no such field, and the crate is
     # 136 KB of serde types, so a copy that can be edited is cheaper than a fork that has to be published
     # before this renderer can use it.
-    "minecraft-assets"
+    "minecraft-assets",
+    # The tests of the two crates above read the mod's own files - its Kotlin, its language files, its
+    # shader sources - out of the Neolectrum checkout, and this is the crate that finds it. It is a
+    # dev-dependency and builds nothing into either library.
+    "modtree"
 ]
 
 # The vendored GLSL preprocessor is a workspace of its own with its own lock file, reached only

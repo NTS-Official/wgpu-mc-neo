@@ -3661,6 +3661,7 @@ fn with_gl_depth_range(mvp: [[f32; 4]; 4]) -> [[f32; 4]; 4] {
 #[cfg(test)]
 mod terrain_layer_tests {
     use super::*;
+    use wgpu_mc_modtree as modtree;
 
     /// The split, and the three cutoffs that go with it.
     ///
@@ -3733,16 +3734,21 @@ mod terrain_layer_tests {
     /// see this: `discard` is not a pipeline state, it is an instruction inside the fragment stage, and
     /// its effect on early-Z is a property of the compiled program. A pipeline that draws the solid
     /// layer and has one is the bug this pair of files exists to fix.
+    ///
+    /// The sources come out of the Neolectrum checkout, so a clone without the mod skips the check
+    /// rather than failing it; see `wgpu_mc_modtree`.
     #[test]
     fn only_the_cut_out_terrain_shaders_discard() {
-        let source = |name: &str| {
-            let path = format!(
-                "{}/../../neoforge/src/main/resources/assets/wgpu_mc/shaders/{name}.wgsl",
-                env!("CARGO_MANIFEST_DIR")
-            );
+        // Whether there is a checkout to read from at all: `source` below reads whichever file it is
+        // asked for, so the answer here is only about the Neolectrum checkout being there.
+        if modtree::shader_dir().is_none() {
+            modtree::skip("the discard check");
+            return;
+        }
 
-            std::fs::read_to_string(&path)
-                .unwrap_or_else(|err| panic!("{path} is unreadable: {err}"))
+        let source = |name: &str| {
+            modtree::shader(name)
+                .unwrap_or_else(|| panic!("the Neolectrum checkout has no {name}.wgsl to read"))
         };
 
         // The two that are allowed one: the cutout layer's, and the translucent layer's.
@@ -3924,6 +3930,7 @@ mod terrain_layer_tests {
 #[cfg(test)]
 mod texture_sample_uniformity_tests {
     use crate::wgpu::naga;
+    use wgpu_mc_modtree as modtree;
 
     /// How many auto-level image fetches the module holds, at any depth. The sanity check beside the
     /// assertion: "found no sample in a branch" is also true of a shader with no samples at all.
@@ -4080,13 +4087,10 @@ mod texture_sample_uniformity_tests {
     #[test]
     fn the_terrain_shaders_never_sample_a_texture_under_a_branch() {
         for name in ["terrain", "terrain_solid"] {
-            let path = format!(
-                "{}/../../neoforge/src/main/resources/assets/wgpu_mc/shaders/{name}.wgsl",
-                env!("CARGO_MANIFEST_DIR")
-            );
-
-            let source = std::fs::read_to_string(&path)
-                .unwrap_or_else(|err| panic!("{path} is unreadable: {err}"));
+            let Some(source) = modtree::shader(name) else {
+                modtree::skip("the branch-walk check");
+                return;
+            };
 
             // The sanity check first, so a shader that lost its samples says *that* rather than passing
             // the assertion below by finding nothing.
@@ -4140,8 +4144,10 @@ mod texture_sample_uniformity_tests {
     /// the terrain pair is where the explicit level was the point. This is only about where a sample sits.
     #[test]
     fn no_shader_this_crate_builds_samples_a_texture_under_a_branch() {
-        let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../neoforge/src/main/resources/assets/wgpu_mc/shaders");
+        let Some(directory) = modtree::shader_dir() else {
+            modtree::skip("the branch-walk check");
+            return;
+        };
 
         let mut checked = 0;
 
@@ -4190,27 +4196,7 @@ mod binding_visibility_tests {
     use super::*;
     use crate::wgpu::naga;
     use naga::valid::{Capabilities, ValidationFlags, Validator};
-
-    /// The shipped terrain shader, which is the one that samples a texture in its **vertex** stage.
-    ///
-    /// The same file the mod ships and `graph.yaml` names, read from this crate's own source tree: two
-    /// levels up from `rust/wgpu-mc` is the repository root. A path that moves has to move this with it,
-    /// which is what a compile error here means.
-    const TERRAIN: &str = include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../neoforge/src/main/resources/assets/wgpu_mc/shaders/terrain.wgsl"
-    ));
-
-    /// The solid layer's terrain shader: the same program with the cutout test taken out.
-    ///
-    /// Kept next to [`TERRAIN`] so a change to one that has to be made to the other is a change two
-    /// lines apart, and validated by the same test - because the one thing that must not happen is that
-    /// the solid shader stops parsing. It is skipped in silence when it does (`create_pipelines`), and a
-    /// skipped pipeline here is the solid layer of the world not drawn at all.
-    const TERRAIN_SOLID: &str = include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../neoforge/src/main/resources/assets/wgpu_mc/shaders/terrain_solid.wgsl"
-    ));
+    use wgpu_mc_modtree as modtree;
 
     /// Every global a function reaches, following the calls it makes.
     fn globals_used(
@@ -4292,8 +4278,13 @@ mod binding_visibility_tests {
     /// worth a test that fails here rather than a log line that is easy to miss.
     #[test]
     fn the_solid_terrain_shader_parses_and_validates() {
+        let Some(terrain_solid) = modtree::shader("terrain_solid") else {
+            modtree::skip("the solid-shader check");
+            return;
+        };
+
         let module =
-            naga::front::wgsl::parse_str(TERRAIN_SOLID).expect("the solid terrain shader parses");
+            naga::front::wgsl::parse_str(&terrain_solid).expect("the solid terrain shader parses");
 
         Validator::new(ValidationFlags::all(), Capabilities::all())
             .validate(&module)
@@ -4318,11 +4309,25 @@ mod binding_visibility_tests {
     /// failure mode of a layout change here is not a wrong colour, it is a process that stops. `naga` gives
     /// the same number the device would, which is what makes this a test.
     ///
-    /// Both terrain shaders, because a layout that agreed with one of them and not the other would abort on
-    /// whichever layer drew first.
+    /// Both terrain shaders, because a layout that agreed with one of them and not the other would abort
+    /// on whichever layer drew first. They are read out of the Neolectrum checkout, so a clone without the
+    /// mod skips this rather than failing it; see `wgpu_mc_modtree`.
     #[test]
     fn the_shaders_section_position_is_the_size_the_immediate_declares() {
-        for (name, source) in [("terrain", TERRAIN), ("terrain_solid", TERRAIN_SOLID)] {
+        let Some(terrain) = modtree::shader("terrain") else {
+            modtree::skip("the immediate-layout checks");
+            return;
+        };
+
+        let Some(terrain_solid) = modtree::shader("terrain_solid") else {
+            modtree::skip("the immediate-layout checks");
+            return;
+        };
+
+        for (name, source) in [
+            ("terrain", terrain.as_str()),
+            ("terrain_solid", terrain_solid.as_str()),
+        ] {
             let module = naga::front::wgsl::parse_str(source).expect("the terrain shader parses");
 
             let structure = module
@@ -4359,10 +4364,24 @@ mod binding_visibility_tests {
     /// this test, and none of them is anything else.
     ///
     /// `terrain_solid.wgsl` too, because the two share one immediate and a mismatch there aborts the
-    /// layer that draws first.
+    /// layer that draws first. Both files come out of the Neolectrum checkout, so a clone without the
+    /// mod skips the check rather than failing it.
     #[test]
     fn the_immediates_members_line_up_by_name_and_offset() {
-        for (name, source) in [("terrain", TERRAIN), ("terrain_solid", TERRAIN_SOLID)] {
+        let Some(terrain) = modtree::shader("terrain") else {
+            modtree::skip("the immediate-layout checks");
+            return;
+        };
+
+        let Some(terrain_solid) = modtree::shader("terrain_solid") else {
+            modtree::skip("the immediate-layout checks");
+            return;
+        };
+
+        for (name, source) in [
+            ("terrain", terrain.as_str()),
+            ("terrain_solid", terrain_solid.as_str()),
+        ] {
             let module = naga::front::wgsl::parse_str(source).expect("the terrain shader parses");
 
             let members = module
@@ -4460,9 +4479,25 @@ mod binding_visibility_tests {
     ///
     /// Every member of both is a four-byte scalar, so the struct's size is its stride; the assertion is
     /// written against the size because that is the number naga will give.
+    ///
+    /// The two shaders are read out of the Neolectrum checkout; without a checkout the check is skipped
+    /// rather than failed.
     #[test]
     fn a_draw_record_is_the_size_the_shader_strides_over() {
-        for (name, source) in [("terrain", TERRAIN), ("terrain_solid", TERRAIN_SOLID)] {
+        let Some(terrain) = modtree::shader("terrain") else {
+            modtree::skip("the draw-record checks");
+            return;
+        };
+
+        let Some(terrain_solid) = modtree::shader("terrain_solid") else {
+            modtree::skip("the draw-record checks");
+            return;
+        };
+
+        for (name, source) in [
+            ("terrain", terrain.as_str()),
+            ("terrain_solid", terrain_solid.as_str()),
+        ] {
             let module = naga::front::wgsl::parse_str(source).expect("the terrain shader parses");
 
             let structure = module
@@ -4498,10 +4533,24 @@ mod binding_visibility_tests {
     ///
     /// and that refusal arrives as a panic inside a `#[jni_fn]` frame, which ends the game rather than
     /// the draw. Both terrain shaders, because one is a copy of the other and a change made to one of
-    /// them is exactly the shape this is here to catch.
+    /// them is exactly the shape this is here to catch. They are read out of the Neolectrum checkout, so
+    /// a clone of this repository without the mod skips the check rather than failing it.
     #[test]
     fn the_draw_records_are_read_by_the_vertex_stage_alone() {
-        for (name, source) in [("terrain", TERRAIN), ("terrain_solid", TERRAIN_SOLID)] {
+        let Some(terrain) = modtree::shader("terrain") else {
+            modtree::skip("the draw-record visibility checks");
+            return;
+        };
+
+        let Some(terrain_solid) = modtree::shader("terrain_solid") else {
+            modtree::skip("the draw-record visibility checks");
+            return;
+        };
+
+        for (name, source) in [
+            ("terrain", terrain.as_str()),
+            ("terrain_solid", terrain_solid.as_str()),
+        ] {
             let used = sampled(source);
 
             assert!(
@@ -4596,9 +4645,17 @@ mod binding_visibility_tests {
     /// and because the device reports that by panicking inside a `#[jni_fn]` frame - which cannot
     /// unwind - the game ended while entering a world. The terrain was never drawn at all, so the
     /// picture was not "wrong", it was absent.
+    ///
+    /// The shader is read out of the Neolectrum checkout, so a clone of this repository that has never
+    /// seen the mod skips the check rather than failing it; see `wgpu_mc_modtree`.
     #[test]
     fn a_binding_is_visible_to_the_stage_that_samples_it() {
-        let used = sampled(TERRAIN);
+        let Some(terrain) = modtree::shader("terrain") else {
+            modtree::skip("the binding-visibility check");
+            return;
+        };
+
+        let used = sampled(&terrain);
 
         assert!(
             used.iter().any(|(stage, kind, group, binding)| {
@@ -4951,6 +5008,7 @@ fn frag(in: V) -> @location(0) vec4<f32> {
 #[cfg(test)]
 mod shader_interface_tests {
     use crate::wgpu::naga;
+    use wgpu_mc_modtree as modtree;
 
     /// Whether the source says, next to this member's declaration, that it is not read.
     ///
@@ -5164,16 +5222,17 @@ mod shader_interface_tests {
             .unwrap_or_default()
     }
 
+    /// The two terrain shaders carry no varying their fragment stage never reads without saying so.
+    ///
+    /// They are read out of the Neolectrum checkout, so a clone of this repository that has never seen
+    /// the mod skips the check rather than failing it; see `wgpu_mc_modtree`.
     #[test]
     fn the_terrain_shaders_do_not_carry_a_silently_dead_varying() {
         for name in ["terrain", "terrain_solid"] {
-            let path = format!(
-                "{}/../../neoforge/src/main/resources/assets/wgpu_mc/shaders/{name}.wgsl",
-                env!("CARGO_MANIFEST_DIR")
-            );
-
-            let source = std::fs::read_to_string(&path)
-                .unwrap_or_else(|err| panic!("{path} is unreadable: {err}"));
+            let Some(source) = modtree::shader(name) else {
+                modtree::skip("the dead-varying check");
+                return;
+            };
 
             let unexplained: Vec<String> = unread_varyings(&source)
                 .into_iter()
@@ -5421,17 +5480,7 @@ mod atlas_entry_point_tests {
     use super::shader_interface_tests::for_each_call;
     use crate::wgpu::naga;
     use std::collections::{BTreeSet, HashSet};
-
-    /// The shader files, read from the resource directory the mod ships - the same files and the same
-    /// directory the other shader tests read, so a shader that moves breaks all of them at once.
-    const TERRAIN: &str = include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../neoforge/src/main/resources/assets/wgpu_mc/shaders/terrain.wgsl"
-    ));
-    const TERRAIN_SOLID: &str = include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../neoforge/src/main/resources/assets/wgpu_mc/shaders/terrain_solid.wgsl"
-    ));
+    use wgpu_mc_modtree as modtree;
 
     /// Every module-scope variable one entry point can reach, following the calls out of it.
     ///
@@ -5498,6 +5547,10 @@ mod atlas_entry_point_tests {
     ///
     /// What it does **not** assert is anything about the machine code the driver produces, and it cannot:
     /// the point of removing the branch from the source is precisely that nothing downstream has to.
+    ///
+    /// The shader files come out of the Neolectrum checkout - the same files and the same directory the
+    /// other shader tests read, so a shader that moves is missing from all of them at once - and a
+    /// checkout that is not there skips the check rather than failing it; see `wgpu_mc_modtree`.
     #[test]
     fn the_single_atlas_entry_point_samples_one_atlas() {
         const THE_GAMES: [&str; 4] = [
@@ -5513,7 +5566,20 @@ mod atlas_entry_point_tests {
             "t_sampler_animated",
         ];
 
-        for (name, source) in [("terrain", TERRAIN), ("terrain_solid", TERRAIN_SOLID)] {
+        let Some(terrain) = modtree::shader("terrain") else {
+            modtree::skip("the single-atlas entry-point check");
+            return;
+        };
+
+        let Some(terrain_solid) = modtree::shader("terrain_solid") else {
+            modtree::skip("the single-atlas entry-point check");
+            return;
+        };
+
+        for (name, source) in [
+            ("terrain", terrain.as_str()),
+            ("terrain_solid", terrain_solid.as_str()),
+        ] {
             let single = globals_reached(source, "frag_game_atlas");
 
             for variable in THE_GAMES {

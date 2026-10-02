@@ -23,8 +23,8 @@ run/
 # Project references, including VulkanMod, Radiance(and its MCVR), C2ME and Bye-Pregen
 references/
 
-# NeoGradle writes per-run directories for the generated run configs
-neoforge/runs/
+# The demo's generated assets and the header cbindgen used to write into the Fabric tree, which this
+# repository no longer has a copy of.
 rust/wgpu-mc-demo/tmp
 rust/wgpu-mc-demo/res/assets
 fabric/src/main/wgpu-mc.h
@@ -51,8 +51,5 @@ result
 # DeepSeek Harness
 /.dsh-tmp/
 
-# throwaway 26.1 bytecode-inspection helpers
-neoforge/.analysis/
-neoforge/tools/
 /.kotlin
 /logs

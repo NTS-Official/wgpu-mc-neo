@@ -21,6 +21,9 @@
 The author's original intention was to introduce ray tracing/path tracing and modern graphics technologies like DLSS, DLSSD, and DLSSR under DirectX in such an experimental project. However, due to the limitations of the crate WebGPU, currently they can only be implemented through pretty dirty methods like hooking in C++ libraries. So, this project will no longer consider adding those technologies and will instead focus on improving the practicality and stability of this cross-API graphics project.
 
 ## Neolectrum — Rust-based Rendering Engine Mod for Minecraft
+> [!NOTE]
+> **The mod is a repository of its own now: [NTS-Official/Neolectrum](https://github.com/NTS-Official/Neolectrum).** It is built and released there, and it takes this engine's native library out of a checkout beside it - `../wgpu-mc-neo/rust` by default, or wherever its `wgpu_mc_rust_dir` points.
+
 > [!CAUTION]
 > Neolectrum is currently in **alpha**. [Feel free to contribute!](https://github.com/NTS-Official/wgpu-mc-neo/labels/neolectrum).
 

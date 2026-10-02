@@ -1,6 +1,9 @@
 //! The mod's own metadata: the version numbers NeoForge is told, in the two files that carry them.
 //!
-//! `neoforge/updates.json` is what NeoForge's update checker fetches (the `updateJSONURL` in
+//! Both files live in **the mod's repository** (Neolectrum), not in this one: this test reads them out
+//! of the checkout `wgpu_mc_modtree` finds, and skips when there is none.
+//!
+//! The mod's `updates.json` is what NeoForge's update checker fetches (the `updateJSONURL` in its
 //! `neoforge.mods.toml`) so that the mod list can show a newer build. **Nothing in this tree reads it**: a
 //! version bump that forgets it leaves a file that still parses, and whose `promos` answer "you are up to
 //! date" to every older build - which looks exactly like a project that has no updates at all.
@@ -25,33 +28,27 @@
 mod tests {
     use serde_json::Value;
 
-    /// The file that owns the numbers, and the files that consume them.
-    const GRADLE: &str = include_str!("../../../gradle.properties");
-    const UPDATES: &str = include_str!("../../../neoforge/updates.json");
-    const MODS_TOML: &str =
-        include_str!("../../../neoforge/src/main/resources/META-INF/neoforge.mods.toml");
-
-    fn property(name: &str) -> String {
+    fn property(gradle: &str, name: &str) -> String {
         let prefix = format!("{name}=");
 
-        GRADLE
+        gradle
             .lines()
             .find_map(|line| line.strip_prefix(&prefix))
-            .unwrap_or_else(|| panic!("`{name}` is not in gradle.properties"))
+            .unwrap_or_else(|| panic!("`{name}` is not in the mod's gradle.properties"))
             .trim()
             .to_string()
     }
 
-    fn updates() -> Value {
-        serde_json::from_str(UPDATES)
+    fn parse_updates(updates: &str) -> Value {
+        serde_json::from_str(updates)
             .expect("updates.json is valid JSON - NeoForge will not read it if it is not")
     }
 
     /// The version the mod file is stamped with - the `version` of the `minecraft` mod file, which is what
     /// the checker keys `promos` on. NeoForge 26.1 versions are `<minecraft>-<hotfix>.<release>` (see the
     /// note in `gradle.properties`), so the Minecraft version is that string without its last part.
-    fn minecraft_version() -> String {
-        let neo = property("neoforge_neo_version");
+    fn minecraft_version(gradle: &str) -> String {
+        let neo = property(gradle, "neoforge_neo_version");
 
         let mut parts = neo.split('.').collect::<Vec<_>>();
 
@@ -69,9 +66,18 @@ mod tests {
     /// will ask about.
     #[test]
     fn the_update_file_offers_the_version_this_tree_builds() {
-        let updates = updates();
-        let version = property("neoforge_mod_version");
-        let minecraft = minecraft_version();
+        let Some(gradle) = wgpu_mc_modtree::gradle_properties() else {
+            wgpu_mc_modtree::skip("the update-file check");
+            return;
+        };
+        let Some(json) = wgpu_mc_modtree::updates_json() else {
+            wgpu_mc_modtree::skip("the update-file check");
+            return;
+        };
+
+        let updates = parse_updates(&json);
+        let version = property(&gradle, "neoforge_mod_version");
+        let minecraft = minecraft_version(&gradle);
 
         assert!(
             updates["homepage"]
@@ -106,7 +112,12 @@ mod tests {
     /// a version and no changelog for it.
     #[test]
     fn every_promo_names_a_listed_minecraft_version() {
-        let updates = updates();
+        let Some(json) = wgpu_mc_modtree::updates_json() else {
+            wgpu_mc_modtree::skip("the promo check");
+            return;
+        };
+
+        let updates = parse_updates(&json);
         let promos = updates["promos"]
             .as_object()
             .expect("`promos` is an object");
@@ -127,18 +138,24 @@ mod tests {
         }
     }
 
-    /// The URL the mod file points the checker at is this file, on the branch the project develops on.
+    /// The URL the mod file points the checker at is this file, in the repository the mod develops in.
     #[test]
     fn the_mod_file_points_at_this_file() {
-        let url = MODS_TOML
+        let Some(mods_toml) = wgpu_mc_modtree::mods_toml() else {
+            wgpu_mc_modtree::skip("the update-URL check");
+            return;
+        };
+
+        let url = mods_toml
             .lines()
             .find_map(|line| line.strip_prefix("updateJSONURL="))
             .expect("`updateJSONURL` is what makes NeoForge check at all");
 
         assert!(
-            url.contains("/master/neoforge/updates.json"),
-            "the update URL has to name this file on the development branch, or the checker reads \
-             something else: {url}"
+            url.contains("/NTS-Official/Neolectrum/main/updates.json"),
+            "the update URL has to name `updates.json` on the development branch of the repository \
+             the mod lives in - the file is not in the engine's repository any more, and a URL that \
+             outlived the move answers the checker with a 404: {url}"
         );
     }
 }

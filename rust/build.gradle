@@ -16,21 +16,20 @@
 //}
 //
 //
-tasks.register('copyToResources', Copy) {
-    dependsOn 'copyBindings'
-
-    from ('target/release/' + System.mapLibraryName("wgpu_mc_jni"))
-    into '../fabric/build/resources/main/assets/wgpu_mc/natives/'
-    duplicatesStrategy = DuplicatesStrategy.INCLUDE
-}
-
-tasks.register('copyBindings', Copy) {
-    dependsOn 'build'
-
-    from 'wgpu-mc-jni/bindings.h' into '../fabric/src/main/'
-    rename 'bindings.h', 'wgpu-mc.h'
-    duplicatesStrategy = DuplicatesStrategy.INCLUDE
-}
+// ---------------------------------------------------------------------------
+// The two copies that used to live here are gone, together with the `fabric/` tree they wrote into.
+//
+// The native library reaches the mod by being *pulled*, not pushed: the Neolectrum build's
+// `copyNatives` task reads `target/release/wgpu_mc_jni.<ext>` - and the `.pdb` beside it - out of
+// this checkout and into the mod's resources, and `-Pwgpu_mc_rust_dir=<this directory>` is how it is
+// told where that checkout is when it is not the sibling `../wgpu-mc-neo/rust`. A second copy on
+// this side would be a second thing to keep in step with that one, and it wrote into a build
+// directory the mod's own build overwrites anyway.
+//
+// `bindings.h` is cbindgen's dump of the C ABI, written into `wgpu-mc-jni/` by that crate's build
+// script on every build. It belongs to the crate that owns the ABI, and nothing in the mod tree
+// reads it.
+// ---------------------------------------------------------------------------
 
 tasks.register("build", Exec) {
     commandLine "cargo", "build", "--release"

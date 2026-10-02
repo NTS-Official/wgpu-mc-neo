@@ -1676,14 +1676,16 @@ mod tests {
     /// the renderer or written to the config - a restart then put every one of them back. A page is
     /// found by what its rows hold now, and the checks below are the text of that: this is a review
     /// that cannot be forgotten rather than a test of behaviour.
-    const OPTION_PAGES: &str =
-        include_str!("../../../neoforge/src/main/kotlin/dev/birb/wgpu/gui/OptionPages.kt");
-
     #[test]
     fn the_renderer_settings_page_is_not_found_by_its_label() {
+        let Some(page) = wgpu_mc_modtree::option_pages_kt() else {
+            wgpu_mc_modtree::skip("the options-page check");
+            return;
+        };
+
         // Comments are dropped, because both this file and `OptionPages.kt` quote the mistake on
         // purpose - the quote is what says what not to do again.
-        let source = code_of(OPTION_PAGES);
+        let source = code_of(&page);
 
         // The mistake was a *comparison*: `name.string == "Electrum"` decided which page owned the
         // renderer's settings. Reading a label to print it is fine - the apply log names the rows it
@@ -1717,15 +1719,8 @@ mod tests {
             .join("\n")
     }
 
-    /// The section feed, pulled in for the one invariant in it that is a hole in the world when broken.
-    const RUST_CHUNK_BAKE: &str =
-        include_str!("../../../neoforge/src/main/kotlin/dev/birb/wgpu/chunk/RustChunkBake.kt");
-
-    /// The hook that starts a bake, pulled in because *what it records* is the same invariant from the
-    /// other side: it must not write the answer a second time. See the assertions that use it.
-    const RUST_CHUNK_BAKE_MIXIN: &str = include_str!(
-        "../../../neoforge/src/main/java/dev/birb/wgpu/mixin/chunk/RustChunkBakeMixin.java"
-    );
+    // The section feed and the hook that starts a bake are both mod sources now, read out of the
+    // Neolectrum checkout by `wgpu_mc_modtree`; the checks that need them skip when it is not there.
 
     /// The native side of the "is this side keeping up" question, pulled in for what it keys on.
     const TERRAIN_ARENA_CAPACITY: &str = include_str!("device.rs");
@@ -1745,7 +1740,12 @@ mod tests {
     /// `sent.clear()` that nobody thought about fails here rather than in a world.
     #[test]
     fn forgetting_what_rust_was_told_forgets_that_rust_is_drawing_it() {
-        let source = code_of(RUST_CHUNK_BAKE);
+        let Some(feed) = wgpu_mc_modtree::rust_chunk_bake_kt() else {
+            wgpu_mc_modtree::skip("the sent/rustHas check");
+            return;
+        };
+
+        let source = code_of(&feed);
 
         let clears = |name: &str| source.matches(&format!("{name}.clear()")).count();
 
@@ -1797,7 +1797,18 @@ mod tests {
     /// line, and a missing line is what a test can see.
     #[test]
     fn a_refused_section_is_queued_for_a_rebuild_and_not_dropped() {
-        let source = code_of(RUST_CHUNK_BAKE);
+        let Some(feed) = wgpu_mc_modtree::rust_chunk_bake_kt() else {
+            wgpu_mc_modtree::skip("the refusal-queue check");
+            return;
+        };
+        // The hook that starts a bake, which is *what it records* of the same invariant from the other
+        // side: it must not write the answer a second time either.
+        let Some(hook) = wgpu_mc_modtree::rust_chunk_bake_mixin_java() else {
+            wgpu_mc_modtree::skip("the refusal-queue check");
+            return;
+        };
+
+        let source = code_of(&feed);
 
         // A queue, and the drain adds to it rather than acting on the batch directly.
         assert!(
@@ -1991,7 +2002,7 @@ mod tests {
         );
 
         // The mixin must not write the answer a second time - a coarser one would overwrite it.
-        let mixin = code_of(RUST_CHUNK_BAKE_MIXIN);
+        let mixin = code_of(&hook);
         assert!(
             !mixin.contains("noteTookSection"),
             "the mixin writes `tookThisSection` as well, which overwrites the capacity check with \
@@ -1999,16 +2010,24 @@ mod tests {
         );
     }
 
-    /// The language files, pulled in so that editing one of them re-runs these tests.
+    /// The two language files this mod ships, read out of the Neolectrum checkout.
     ///
     /// The options screen builds every key it asks for out of a setting's name - `wgpu_mc.option.`
     /// and, for the description, `.tooltip` - so a setting the language files have never heard of
     /// is not an error anywhere: it is a row with a name made out of the config key. That is worth
     /// a test rather than a review, because adding a setting is exactly when it happens.
-    const EN_US: &str =
-        include_str!("../../../neoforge/src/main/resources/assets/wgpu_mc/lang/en_us.json");
-    const ZH_CN: &str =
-        include_str!("../../../neoforge/src/main/resources/assets/wgpu_mc/lang/zh_cn.json");
+    ///
+    /// `None` when the mod is not checked out beside the engine, which is what the checks that use
+    /// it skip on.
+    fn languages() -> Option<[(&'static str, serde_json::Value); 2]> {
+        let english = wgpu_mc_modtree::language("en_us")?;
+        let chinese = wgpu_mc_modtree::language("zh_cn")?;
+
+        Some([
+            ("en_us", translations(&english)),
+            ("zh_cn", translations(&chinese)),
+        ])
+    }
 
     fn translations(json: &str) -> serde_json::Value {
         serde_json::from_str(json).expect("a language file")
@@ -2025,11 +2044,12 @@ mod tests {
 
     #[test]
     fn every_setting_has_a_name_in_every_language() {
+        let Some(languages) = languages() else {
+            wgpu_mc_modtree::skip("the language checks");
+            return;
+        };
+
         let info: serde_json::Value = serde_json::from_str(&SETTINGS_INFO_JSON).expect("schema");
-        let languages = [
-            ("en_us", translations(EN_US)),
-            ("zh_cn", translations(ZH_CN)),
-        ];
 
         for (language, translations) in &languages {
             for setting in setting_names(&info) {
@@ -2045,11 +2065,12 @@ mod tests {
 
     #[test]
     fn every_value_of_an_enum_setting_has_a_name_in_every_language() {
+        let Some(languages) = languages() else {
+            wgpu_mc_modtree::skip("the language checks");
+            return;
+        };
+
         let info: serde_json::Value = serde_json::from_str(&SETTINGS_INFO_JSON).expect("schema");
-        let languages = [
-            ("en_us", translations(EN_US)),
-            ("zh_cn", translations(ZH_CN)),
-        ];
 
         for (language, translations) in &languages {
             for setting in setting_names(&info) {
@@ -2087,8 +2108,10 @@ mod tests {
     /// mod ships and the tests already treat as a pair.
     #[test]
     fn every_language_has_the_keys_the_others_have() {
-        let english = translations(EN_US);
-        let chinese = translations(ZH_CN);
+        let Some([(_, english), (_, chinese)]) = languages() else {
+            wgpu_mc_modtree::skip("the language-key check");
+            return;
+        };
 
         let keys = |value: &serde_json::Value| {
             let mut keys = value
@@ -2135,10 +2158,12 @@ mod tests {
         // A key that names nothing is a typo that would show up as a missing translation somewhere
         // else - usually a whole section of the screen left in English - so the namespace is
         // checked from this side, where the settings are.
-        for (language, translations) in [
-            ("en_us", translations(EN_US)),
-            ("zh_cn", translations(ZH_CN)),
-        ] {
+        let Some(languages) = languages() else {
+            wgpu_mc_modtree::skip("the translation-namespace check");
+            return;
+        };
+
+        for (language, translations) in languages {
             for key in translations.as_object().expect("an object").keys() {
                 assert!(
                     key.starts_with("wgpu_mc."),

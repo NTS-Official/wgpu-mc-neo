@@ -1,30 +1,13 @@
-pluginManagement {
-    repositories {
-        maven {
-            name = 'NeoForged'
-            url = 'https://maven.neoforged.net/releases'
-        }
-        maven {
-            name = 'Kotlin for Forge'
-            url = 'https://thedarkcolour.github.io/KotlinForForge/'
-        }
-        mavenCentral()
-        gradlePluginPortal()
-    }
-}
-
+// This repository is the Rust engine, and the NeoForge mod that loads it is no longer a subproject
+// here: **Neolectrum** is a repository of its own, checked out beside this one, and it carries its
+// own settings script with the plugin repositories it needs - NeoGradle and Kotlin for Forge are not
+// on the Gradle Plugin Portal, and the mod is the only thing in either repository that applies a
+// plugin. Nothing in this build resolves one, so the pluginManagement block that used to be here
+// went with the mod.
 rootProject.name = "wgpu-mc"
 
-def subProject(String name) {
-    setupSubproject("wgpu-mc-$name") {
-        projectDir = file(name)
-    }
-}
-
-def setupSubproject(String name, Closure block) {
-    include(name)
-    project(":$name").with(block)
-}
-
-subProject("rust")
-subProject("neoforge")
+// The Rust workspace is the whole of this build. Its project path stays `:wgpu-mc-rust` so that the
+// commands the mod's documentation gives for building the engine - `./gradlew :wgpu-mc-rust:build` -
+// keep meaning what they meant when the two were one build.
+include("wgpu-mc-rust")
+project(":wgpu-mc-rust").projectDir = file("rust")

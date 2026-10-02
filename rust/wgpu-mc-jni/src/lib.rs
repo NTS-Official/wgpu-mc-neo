@@ -70,7 +70,7 @@ mod timing;
 #[cfg(test)]
 mod abi_tests;
 
-/// Checks the mod's own metadata: the version NeoForge is told in `neoforge/updates.json` against
+/// Checks the mod's own metadata: the version NeoForge is told in its `updates.json` against
 /// the version this tree builds. See the module for why nothing else can notice that they disagree.
 #[cfg(test)]
 mod packaging;

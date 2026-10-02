@@ -2,7 +2,7 @@
 //!
 //! There are two ways across, and neither is checked by either compiler:
 //!
-//!  * **JNI** - `neoforge/src/main/kotlin/dev/birb/wgpu/rust/WgpuNative.kt` declares `external fun`s
+//!  * **JNI** - `WgpuNative.kt` declares `external fun`s
 //!    that are resolved by name against the `#[jni_fn]` implementations here. A declaration with no
 //!    implementation is not a compile error anywhere: it throws `UnsatisfiedLinkError` - an `Error`,
 //!    so `catch (e: Exception)` does not see it - the first time that code path runs.
@@ -10,10 +10,13 @@
 //!    reads the structs `bindings.h` declares by *byte offset*. A wrong offset is not a compile
 //!    error either; it reads whatever field happens to live there.
 //!
-//! The Kotlin files are pulled in with `include_str!`, so editing one of them re-runs these tests.
+//! Both files belong to **the mod's repository** (Neolectrum) and are read out of that checkout at run
+//! time by `wgpu_mc_modtree`, so editing one of them re-runs these tests on the next `cargo test`. A
+//! machine that has the engine and not the mod skips them, rather than failing to compile them.
 
 use std::collections::HashMap;
 use std::mem::{offset_of, size_of};
+use std::sync::OnceLock;
 
 use crate::blaze::{
     BindGroupEntryDescriptor, BlazeAttachmentDescriptor, BlazeBindGroupLayout, BlazeBlendState,
@@ -21,10 +24,39 @@ use crate::blaze::{
     DrawCall, PlanBinding, RawArray, RenderPipeline, VertexFormat, VertexFormatElement,
 };
 
-const WM_NATIVE_KT: &str =
-    include_str!("../../../neoforge/src/main/kotlin/dev/birb/wgpu/rust/WmNative.kt");
-const WGPU_NATIVE_KT: &str =
-    include_str!("../../../neoforge/src/main/kotlin/dev/birb/wgpu/rust/WgpuNative.kt");
+/// The two Kotlin files, read out of the Neolectrum checkout once and kept.
+///
+/// `None` when the mod is not checked out beside the engine: the checks that need them skip, and the
+/// parsing helpers below are only ever reached from a check that has already asked.
+fn sources() -> Option<(&'static str, &'static str)> {
+    static SOURCES: OnceLock<Option<(String, String)>> = OnceLock::new();
+
+    let (wm, wgpu) = SOURCES
+        .get_or_init(|| {
+            Some((
+                wgpu_mc_modtree::wm_native_kt()?,
+                wgpu_mc_modtree::wgpu_native_kt()?,
+            ))
+        })
+        .as_ref()?;
+
+    Some((wm, wgpu))
+}
+
+/// `WmNative.kt`, for the parsing helpers - a helper reached without its check having called
+/// [`sources`] first is a bug in that check, not a missing checkout.
+fn wm_native_kt() -> &'static str {
+    sources()
+        .expect("a check that skipped when the Neolectrum checkout is missing")
+        .0
+}
+
+/// `WgpuNative.kt`, by the same rules as [`wm_native_kt`].
+fn wgpu_native_kt() -> &'static str {
+    sources()
+        .expect("a check that skipped when the Neolectrum checkout is missing")
+        .1
+}
 
 /// Every file that exports something across one of the two bridges.
 const BRIDGE_SOURCES: &[&str] = &[
@@ -443,7 +475,12 @@ fn rust_c_abi_exports(sources: &[&str]) -> Vec<(String, usize)> {
 
 #[test]
 fn every_struct_the_jvm_reads_by_offset_still_has_that_layout() {
-    let constants = kotlin_constants(WM_NATIVE_KT);
+    if sources().is_none() {
+        wgpu_mc_modtree::skip("the JVM-struct-layout check");
+        return;
+    }
+
+    let constants = kotlin_constants(wm_native_kt());
 
     check_layout(
         "ATTACHMENT_F32X4",
@@ -595,13 +632,13 @@ fn every_struct_the_jvm_reads_by_offset_still_has_that_layout() {
     // `RawArray`'s fields are private, so only its size is readable from here. The JVM writes
     // `{ contents, size }` through `writeRawArray`, which is why the size has to be 16.
     assert_eq!(
-        kotlin_layout(WM_NATIVE_KT, "RAW_ARRAY").len(),
+        kotlin_layout(wm_native_kt(), "RAW_ARRAY").len(),
         2,
         "RawArray is a two-field struct"
     );
     assert_eq!(
         size_of::<RawArray<u8>>(),
-        layout_offsets(&kotlin_layout(WM_NATIVE_KT, "RAW_ARRAY")).1 as usize,
+        layout_offsets(&kotlin_layout(wm_native_kt(), "RAW_ARRAY")).1 as usize,
         "RawArray<u8>"
     );
 
@@ -841,7 +878,7 @@ fn every_struct_the_jvm_reads_by_offset_still_has_that_layout() {
     fn check_layout(layout: &str, rust_size: usize, fields: &[(&str, usize)]) {
         // Trailing padding is a layout entry without a field behind it, which is how the 24-byte
         // `BlazeColorTargetState` is spelled out.
-        let entries: Vec<(String, u64)> = kotlin_layout(WM_NATIVE_KT, layout)
+        let entries: Vec<(String, u64)> = kotlin_layout(wm_native_kt(), layout)
             .into_iter()
             .scan(0u64, |offset, entry| {
                 let (size, alignment) = layout_field(&entry);
@@ -862,7 +899,7 @@ fn every_struct_the_jvm_reads_by_offset_still_has_that_layout() {
             );
         }
 
-        let size = layout_offsets(&kotlin_layout(WM_NATIVE_KT, layout)).1;
+        let size = layout_offsets(&kotlin_layout(wm_native_kt(), layout)).1;
         assert_eq!(
             size as usize, rust_size,
             "{layout}: WmNative.kt says {size} bytes, Rust says {rust_size}"
@@ -883,7 +920,12 @@ fn every_struct_the_jvm_reads_by_offset_still_has_that_layout() {
 
 #[test]
 fn the_enum_numbers_the_jvm_passes_are_the_ones_this_crate_matches_on() {
-    let constants = kotlin_constants(WM_NATIVE_KT);
+    if sources().is_none() {
+        wgpu_mc_modtree::skip("the enum-number check");
+        return;
+    }
+
+    let constants = kotlin_constants(wm_native_kt());
 
     check_enum(&constants, "GpuFormat", "");
     check_enum(&constants, "UniformType", "ENTRY_");
@@ -917,7 +959,12 @@ fn the_enum_numbers_the_jvm_passes_are_the_ones_this_crate_matches_on() {
 
 #[test]
 fn every_jni_declaration_has_an_implementation() {
-    let declarations = kotlin_jni_declarations(WGPU_NATIVE_KT);
+    if sources().is_none() {
+        wgpu_mc_modtree::skip("the JNI-declaration check");
+        return;
+    }
+
+    let declarations = kotlin_jni_declarations(wgpu_native_kt());
     let implementations: HashMap<String, usize> = rust_jni_implementations(BRIDGE_SOURCES)
         .into_iter()
         .collect();
@@ -961,7 +1008,12 @@ fn every_jni_declaration_has_an_implementation() {
 
 #[test]
 fn every_c_abi_binding_has_an_export() {
-    let bindings = kotlin_c_abi_bindings(WM_NATIVE_KT);
+    if sources().is_none() {
+        wgpu_mc_modtree::skip("the C-ABI-binding check");
+        return;
+    }
+
+    let bindings = kotlin_c_abi_bindings(wm_native_kt());
     let exports: HashMap<String, usize> = rust_c_abi_exports(BRIDGE_SOURCES).into_iter().collect();
 
     assert!(

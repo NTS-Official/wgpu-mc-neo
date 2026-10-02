@@ -405,7 +405,7 @@ mod tests {
 
         /// Every shader the mod ships, by the name a pipeline would resolve.
         ///
-        /// Transcribed from `neoforge/src/main/resources/assets/wgpu_mc/shaders/` rather than globbed:
+        /// Transcribed from the mod's `src/main/resources/assets/wgpu_mc/shaders/` rather than globbed:
         /// a build script that read that directory would be the only way to glob it, and this list is
         /// the thing that has to be *kept* in step with it - a shader added there without being added
         /// here fails this test, which is the right direction for the warning to point.
@@ -448,19 +448,23 @@ mod tests {
     /// Validation is naga's, which is the same front end wgpu compiles WGSL with, so what passes here
     /// is what the pipeline creation will accept. `IMMEDIATES` is part of `Capabilities::all()`, which
     /// is what the pass needs for its `var<immediate>` section position.
+    ///
+    /// The file is read out of the Neolectrum checkout, so this skips on a machine that has the engine
+    /// without the mod; see `wgpu_mc_modtree`.
     #[test]
     fn the_shipped_terrain_shader_compiles() {
         use wgpu_mc::wgpu::naga;
 
-        let source = include_str!(
-            "../../../neoforge/src/main/resources/assets/wgpu_mc/shaders/terrain.wgsl"
-        );
+        let Some(source) = wgpu_mc_modtree::shader("terrain") else {
+            wgpu_mc_modtree::skip("the terrain shader check");
+            return;
+        };
 
-        let module = match naga::front::wgsl::parse_str(source) {
+        let module = match naga::front::wgsl::parse_str(&source) {
             Ok(module) => module,
             Err(error) => panic!(
                 "naga will not parse the terrain shader: {}",
-                error.emit_to_string(source)
+                error.emit_to_string(&source)
             ),
         };
 

@@ -1448,11 +1448,13 @@ mod tests {
     /// asserts is that both halves are named.
     #[test]
     fn the_writer_knows_both_halves_of_every_fluid() {
-        const WRITER: &str =
-            include_str!("../../../neoforge/src/main/kotlin/dev/birb/wgpu/chunk/RustChunkBake.kt");
+        let Some(writer) = wgpu_mc_modtree::rust_chunk_bake_kt() else {
+            wgpu_mc_modtree::skip("the fluid-halves check");
+            return;
+        };
 
         // Comments dropped, because the file and this test both quote the mistake.
-        let code = WRITER
+        let code = writer
             .lines()
             .map(str::trim_start)
             .filter(|line| {
