@@ -1,3 +1,4 @@
+use glam::IVec3;
 use linked_hash_map::LinkedHashMap;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -13,11 +14,16 @@ use wgpu::{
 
 use crate::WmRenderer;
 use crate::mc::Scene;
+use crate::mc::SectionDraw;
 use crate::mc::chunk::RenderLayer;
+use crate::mc::chunk::SectionStorage;
 use crate::mc::entity::InstanceVertex;
 use crate::mc::resource::ResourcePath;
 use crate::render::entity::EntityVertex;
 use crate::render::pipeline::{BLOCK_ATLAS, QuadVertex};
+use crate::render::section_graph;
+use crate::render::section_graph::SectionSource;
+use crate::render::section_graph::Visibility;
 use crate::render::shader::WgslShader;
 use crate::render::shaderpack::{
     BindGroupDef, LonghandResourceConfig, PipelineConfig, ShaderPackConfig,
@@ -39,9 +45,20 @@ enum SectionVisibility {
     Draw,
     /// The game looked and did not name this one: do not.
     OutOfSight,
-    /// Nothing has been sent, so the frustum is the best answer there is.
+    /// Nothing has been sent, or the list was sent before this section was here, so the frustum is the
+    /// best answer there is.
     AskTheFrustum,
 }
+
+/// How many sections asked the frustum because the game's occlusion list was too old to have judged
+/// them. See [`RenderGraph::section_visibility`] and `Scene::sections_since_the_list`.
+///
+/// **This is the number that says the snapshot fix is doing something.** It is not a fault count and
+/// not a "these were drawn" count - a section that answers `AskTheFrustum` this way still has to survive
+/// the frustum test - it is "the list had no answer for this one, so the frustum was asked instead". A
+/// run that streams terrain in shows it moving; a settled world shows zero, because nothing is being
+/// taken over and the list has judged everything the arena holds.
+static SECTIONS_TOO_NEW: AtomicU64 = AtomicU64::new(0);
 
 /// One section that survived the gather: where it is, what the arena holds for each layer, and how far
 /// away it is.
@@ -65,15 +82,436 @@ struct VisibleSection {
     distance_squared: f32,
 }
 
-/// The gather's list of drawable sections, kept between passes so its capacity is not re-earned sixty
-/// times a second.
+/// One draw a terrain pass is about to make: the arena it reads, the indices to draw, and which
+/// [`SectionDraw`] describes it.
 ///
-/// A field on the graph and a `RefCell` rather than a local `Vec`, because the point is that the
-/// allocation happens once: a local would be one allocation per pass, and the gather is on the path that
-/// this exists to make cheaper. The graph is shared but only the render thread draws, and a `RefCell`
-/// borrow that overlapped would panic rather than corrupt - which is the right failure for scratch.
+/// The gather produces *sections* and a draw needs *draws* - a section with two layers is two of them,
+/// and the record a draw reads is per draw rather than per section - so the pass builds this list once
+/// and both draw paths below walk it. `instance` is the index of the matching record, which is what the
+/// vertex stage receives as `instance_index`: through `first_instance` of an indirect record on the
+/// batched path, and through the instance range of a plain `draw_indexed` on the other.
+///
+/// Which layer a draw belongs to is not here: the list is built layer by layer and the pass keeps the
+/// span of each layer's run instead, so a layer's draws are a contiguous slice and the layer is already
+/// known where they are walked. See `PassDraws::spans`.
+#[derive(Debug)]
+struct DrawCall {
+    /// Which arena buffer the section lives in. A batched call may only span one arena, because the
+    /// index buffer and the bind group are per arena and a `multi_draw` has one of each.
+    arena: u32,
+    index_range: std::ops::Range<u32>,
+    instance: u32,
+}
+
+/// `DrawIndexedIndirectArgs` in bytes: what an indirect draw's offset into its buffer is measured in.
+const INDIRECT_RECORD_SIZE: u64 = std::mem::size_of::<wgpu::util::DrawIndexedIndirectArgs>() as u64;
+
+/// The terrain pass' immediate, **as a struct rather than as a run of byte offsets**.
+///
+/// The same members in the same order as the shader's `SectionPosition`, which is the whole of the
+/// contract: this side has to write exactly the bytes that struct declares, at the offsets it declares
+/// them at. It was a `[u8; 28]` with a `constants[..4]`, `constants[4..8]`, ... table, and this is what
+/// that cost - **the level-of-detail bias was dropped from it during the change that removed the
+/// section's position from the immediate**, and nothing said so: every member is four bytes and most
+/// of them are `f32`, so a field that is never written is a zero and a field written one slot early is
+/// another field's value. Both draw a picture. `#[repr(C)]` and `bytemuck` make the offsets
+/// `size_of`'s and `align_of`'s business, and the test beside this one pins every member by name
+/// against the offsets naga reads out of the shipped shaders.
+///
+/// See the shader's `SectionPosition` for what each one means and `SectionDraw` for the three that are
+/// *not* here - the section's position, which a `multi_draw` cannot be told per draw and which travels
+/// in the storage buffer instead.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+struct SectionPositionImmediate {
+    /// `0.5` for the cutout layer, `0.01` for the translucent one, and nothing at all for the solid
+    /// one's shader, which has no test to make. Set per layer rather than per pass.
+    alpha_cutout: f32,
+    /// The atlas level-of-detail bias. Read from the setting at the top of every pass, so it is as
+    /// current as the frame it is drawn in - see `atlas_lod_bias`.
+    lod_bias: f32,
+    /// Half a texel of each atlas. **Zero**, and the experiment that made it worth a field is over: a
+    /// half-texel shift is a picture shifted by half a texel, which is what a player reported. The two
+    /// fields stay because the shader reads them and a constant of zero is the honest way to say so.
+    half_texel_ours: f32,
+    half_texel_game: f32,
+    /// One texel of each atlas, as a fraction of it, which is what the magnification test compares the
+    /// coordinates' screen-space derivative against.
+    texel_ours: f32,
+    texel_game: f32,
+    /// Whether the game's `textureFiltering` option is RGSS. A `u32` rather than a `bool`, because the
+    /// shader declares a `u32` and Rust's `bool` is one byte where WGSL's is four.
+    use_rgss: u32,
+}
+
+/// **One frame's terrain work, so the frame's three passes gather, build and upload once between them.**
+///
+/// The frame is three terrain passes - `terrain_solid`, `terrain` and `translucent_terrain` - and each of
+/// them used to walk the whole arena, cull it against the frustum, build its own records and upload them.
+/// **The walk and the cull do not depend on which layer is being drawn**, so the three passes produced the
+/// same list three times; the first pass of a frame now does it for every terrain pipeline the graph
+/// holds, and the other two draw from what it left.
+///
+/// A field on the graph and a `RefCell` rather than a local, for the reason the list it replaced gave: the
+/// vectors keep their capacity between frames, so a few hundred sections a frame is not a few hundred
+/// allocations. The graph is shared but only the render thread draws, and a `RefCell` borrow that
+/// overlapped would panic rather than corrupt - which is the right failure for scratch.
 #[derive(Debug, Default)]
-pub struct TerrainScratch(std::cell::RefCell<Vec<VisibleSection>>);
+struct TerrainFrame {
+    /// What the cached work was built from, or `None` before anything has been built. See
+    /// [`TerrainFrameKey`].
+    key: Option<TerrainFrameKey>,
+    /// The gather's list, in the order the passes that write depth draw it in.
+    ///
+    /// **Storage order, which is not an order at all - and that is the point.** It is what the batched
+    /// path needs: `multi_draw_indexed_indirect` reads one index buffer and one arena bind group per
+    /// call, so a call may only span draws of one arena, and the runs are as long as the list keeps
+    /// sections of one arena together. Sorting this list would interleave arenas by distance and turn a
+    /// handful of calls into one per section or worse. See [`TerrainFrame::sorted`].
+    visible: Vec<VisibleSection>,
+    /// The same sections **far to near**, for the pass that blends.
+    ///
+    /// Two lists and not one because the two orders are for two different things and only one of them is
+    /// free: a blending layer mixes with what is already in the target, so its order *is* the picture,
+    /// while the opaque layers write depth and are ordered by the depth test - but they are 90% of the
+    /// draws and their order decides how many batched calls there are. One list would have to pick, and
+    /// either choice is a real loss. Built once a frame, which is what the per-pass sort used to be.
+    sorted: Vec<VisibleSection>,
+    /// One entry per **pass slot**, parallel to `Scene::section_draws` and `Scene::indirect_buffers`.
+    ///
+    /// Per pass and not per layer because a pass is what owns a buffer and an indirect argument array:
+    /// the records a pass draws have to be in the buffer that pass binds, and two passes drawing the same
+    /// layer would otherwise write over each other.
+    passes: Vec<PassDraws>,
+    /// **The gather-level counts, which belong to the frame rather than to a pass.** How many sections
+    /// the game's list did not name, how many the frustum rejected, and how many had no layer at all.
+    /// They were per pass, which is three walks deep and therefore three times the same number; see
+    /// `report_terrain_pass` for what the line says now.
+    culled: u64,
+    out_of_sight: u64,
+}
+
+impl TerrainFrame {
+    /// Whether the work about to be built belongs to a **new frame** rather than to a second view inside
+    /// the frame already built.
+    ///
+    /// The distinction decides whether every pass is rebuilt or only the ones that have not drawn yet, so
+    /// getting it wrong is not a slow frame: read as "new" when it is not, a pass that has already
+    /// recorded its draws has the buffer under it rewritten; read as "not new" when it is, the frame
+    /// counter would never clear [`PassDraws::drawn`] and every frame after the first would draw the
+    /// first frame's list - one frame's world, frozen, which is what the first version of this did.
+    fn starts_a_new_frame(&self, incoming: &TerrainFrameKey) -> bool {
+        self.key.map(|built| built.frame) != Some(incoming.frame)
+    }
+}
+
+/// One terrain pass's share of a frame: the records it uploads and the draws that read them.
+#[derive(Debug, Default)]
+struct PassDraws {
+    records: Vec<SectionDraw>,
+    calls: Vec<DrawCall>,
+    /// Per layer this pass draws: `(layer, first call, one past the last call)`. The calls of one layer
+    /// are a contiguous run of `calls`, which is what lets a layer be handed to `multi_draw` in segments.
+    spans: Vec<(usize, usize, usize)>,
+    /// Sections the arena held nothing in for each layer, this frame.
+    empty: [u64; 3],
+    /// **Whether this pass draws in batches**, decided when the records were built rather than when they
+    /// are drawn. The switch behind it is a setting, and a setting that moved between the build and the
+    /// draw would pick a different loop from the one the indirect arguments were written for.
+    batched: bool,
+    /// **Whether this pass has already drawn from these records.** It is what makes a rebuild in the
+    /// middle of a frame safe rather than corrupting: a pass whose draws are recorded reads its records
+    /// out of the buffer at submission time, so rewriting that buffer after the fact would leave the
+    /// recorded draw counts and offsets describing a list that is no longer there. A rebuild therefore
+    /// leaves a drawn pass alone - its records are still in the arena's own terms, because a section's
+    /// ranges are not reused inside the frame they were recorded in (`SectionStorage` defers a freed
+    /// range for as many frames as are in flight).
+    drawn: bool,
+}
+
+/// What [`TerrainFrame`] was built from: **everything the gather reads, and nothing else.**
+///
+/// Exact rather than a frame number, so a cache hit is a list a fresh gather would have produced
+/// character for character - and so that a frame in which the camera has not moved, the world has not
+/// been re-meshed and the game's occlusion list has not changed reuses the list instead of rebuilding the
+/// same one. The frame counter is the part that cannot be inferred from the world: a section's *ranges*
+/// stop being valid after the frames that may still draw them, so a list may not outlive its frame even
+/// when everything above it is unchanged.
+///
+/// Two `f32`s that are equal are equal bit for bit here, and a NaN anywhere fails the comparison and
+/// rebuilds - which is the safe direction.
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct TerrainFrameKey {
+    /// The frame the work belongs to. See [`begin_frame`].
+    frame: u64,
+    /// The frustum's six planes, which is the camera's projection and rotation: a camera that moved or
+    /// turned has a different one, so the cull is redone. The matrix itself is not kept because this is
+    /// all the culler reads of it.
+    frustum: [[f32; 4]; 6],
+    /// **The camera's section, and it is not in the frustum.** The view matrix carries the camera's
+    /// offset *within* its own section, so two sections with the same offset produce the same matrix and
+    /// the same planes - while the boxes being culled are relative to that section and move with it.
+    camera_section: glam::IVec3,
+    /// Which revision of the game's occlusion list the gather honoured. See
+    /// [`Scene::visible_sections_revision`].
+    visible: u64,
+    /// The model matrix's translation, which the culler is handed and warns about. In the key because it
+    /// is an argument of the thing being cached.
+    model_translation: [f32; 3],
+}
+
+/// How many frames the renderer has begun. See [`begin_frame`].
+///
+/// A static rather than a field, because "which frame is this" is a fact about the renderer and not about
+/// a graph: the frame boundary is a submission, which the command encoder knows about and the graph does
+/// not. One process, one renderer, one counter - and the demo that drives a graph by hand leaves it at
+/// zero, which simply means its cache lives until something else in the key moves.
+static FRAME: AtomicU64 = AtomicU64::new(0);
+
+/// The budgets the flood is cross-checked at **while the setting is off**.
+///
+/// With `adv_culling` at zero the walk decides nothing, so the cross-check probes these and reports each
+/// of them; with it on, the budget it is deciding with is the one reported instead. These four agreeing
+/// with each other is how the saturation below them was found.
+///
+/// A list rather than one value because the question the cross-check answers is *which* budget reproduces
+/// the game's own list: what the walk reaches and what it costs both move with this number, and nothing
+/// but a measurement says where the two meet. The original's `maxDirectionsChanges` is `advCulling - 1`.
+const FLOOD_BUDGETS: [u8; 4] = [4, 8, 16, 127];
+
+/// The second the cross-check last reported in, so that it runs once a second rather than once a frame.
+static FLOOD_REPORTED: AtomicU64 = AtomicU64::new(0);
+
+/// The world as the flood sees it: the game's answers, what the arena holds, and the frame's frustum.
+///
+/// The three are what [`SectionSource`] asks for, and they are gathered here rather than read inside the
+/// walk because two of them are behind locks: the walk polls thousands of positions, and a lock per poll
+/// would be a lock per section in the world.
+struct FloodWorld<'a> {
+    /// The game's occlusion answers, by section. Absent means "nobody has said", which stops the walk.
+    answers: &'a HashMap<IVec3, u64>,
+    /// The arena, for "is there anything to draw here" - read through the guard the caller already holds.
+    sections: &'a SectionStorage,
+    /// The frame's frustum, which is measured from the camera's own section. See [`Self::in_frustum`].
+    frustum: &'a Frustum<f32>,
+    /// The section the camera is in, which is the origin every box in the frustum test is measured from.
+    camera_section: IVec3,
+}
+
+impl SectionSource for FloodWorld<'_> {
+    /// The game's answer where there is one, and **open air where there is not**.
+    ///
+    /// The second half is not a fallback, it is the rule that makes the walk work at all: Minecraft
+    /// never compiles a section that is all air, so no payload ever carries an answer for one, and a walk
+    /// that stopped at those sections would propagate through rock and be stopped by sky. The original
+    /// does not have the problem because it walks its own grid, where every loaded chunk is present and an
+    /// air section is present-and-empty; here the only thing that says "this section is air" is that
+    /// nobody has ever described it.
+    ///
+    /// What bounds the walk instead is the world itself: an unanswered section is open only where the
+    /// game has a world - [`Self::in_world`], the game's own `ViewArea`, pushed once a frame - and inside
+    /// that, the frustum. The order is the box first because it is the cheaper test, and because a
+    /// position outside the world is not a cull but the end of the world.
+    fn visibility(&self, pos: IVec3) -> Option<Visibility> {
+        Some(
+            self.answers
+                .get(&pos)
+                .map_or(Visibility::EVERY_PAIR, |bits| Visibility::from_bits(*bits)),
+        )
+    }
+
+    /// "Nothing to draw here" is the arena's own answer, and asking it is what keeps the walk's idea of a
+    /// section the same as the draw loop's: a section with no layer is one no draw would name.
+    fn is_empty(&self, pos: IVec3) -> bool {
+        !self.sections.holds(pos)
+    }
+
+    /// The world's own edge: the game's `ViewArea`, which is what says whether a position is a section of
+    /// this level at all.
+    ///
+    /// Asked before the frustum, and the reason the walk no longer fills the sky. "Nobody has described
+    /// this section" means air *inside* the world and nothing at all outside it, so a walk with only the
+    /// frustum for a boundary walks the whole cone - above the build limit, below the level, and out to
+    /// the far plane - and pays a poll for every one of those positions. See
+    /// `crate::mc::world_extent` for where the box comes from and how it was measured.
+    ///
+    /// Until the JVM has said anything the box is absent and every position is in the world, which is the
+    /// behaviour this walk had before the box existed: a test, or a demo driving a graph by hand, must not
+    /// have its walk silently emptied.
+    fn in_world(&self, pos: IVec3) -> bool {
+        crate::mc::world_extent::get().is_none_or(|extent| extent.holds(pos, self.camera_section))
+    }
+
+    /// The same test the gather's own cull uses, in the same space.
+    ///
+    /// The frustum comes from a view matrix that carries the camera's offset *within its section* and
+    /// nothing else, so a box built from the absolute section position would stand thousands of blocks
+    /// away from the geometry it describes. Sixteen blocks wide, relative to the camera's section, is
+    /// where the shader draws it and therefore where the frustum can judge it.
+    fn in_frustum(&self, pos: IVec3) -> bool {
+        let rel = pos - self.camera_section;
+
+        let a: Vec3<f32> = [
+            rel.x as f32 * 16.0,
+            rel.y as f32 * 16.0,
+            rel.z as f32 * 16.0,
+        ]
+        .into();
+        let b: Vec3<f32> = a + Vec3::new(16.0, 16.0, 16.0);
+
+        // The plane hint is 0: this walk goes face to face rather than in the arena's iteration order, so
+        // there is no "the plane that culled the last one" to hand back.
+        AABB::new(a.into_array(), b.into_array())
+            .coherent_test_against_frustum(self.frustum, 0)
+            .0
+    }
+}
+
+/// Runs the flood beside the game's own answer, once a second, and reports both.
+///
+/// **This decides nothing.** The list it compares against is the one this renderer already obeys, and
+/// running the two side by side on the same world is the only way to know whether the flood is right
+/// before it is allowed to decide anything. What the line says, in order: how many sections the game
+/// named, how many of those the arena can actually draw, how many sections the arena holds in all, how
+/// many of those have an answer at all - and then, per budget, what the walk reached and how much of it
+/// the game agreed with.
+fn cross_check_the_flood(scene: &Scene, frustum: &Frustum<f32>, camera_section: IVec3) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_secs())
+        .unwrap_or(0);
+
+    if FLOOD_REPORTED.swap(now, Ordering::Relaxed) == now {
+        return;
+    }
+
+    let culling = ADV_CULLING.load(Ordering::Relaxed).min(16) as u8;
+
+    // The same locks the gather takes, in the same order - the visible list, then the arena - and the
+    // answers' own lock after both. Nothing here may take them in another order, or the drain's publish
+    // (arena, then the too-new set) and this would be a cycle.
+    let visible = scene.visible_sections.read();
+    let sections = scene.section_storage.read();
+
+    let Some(list) = visible.as_ref() else {
+        log::info!(
+            "wgpu-mc: the flood has nothing to compare against yet: the game has sent no visible list"
+        );
+        return;
+    };
+
+    let answers = crate::mc::visibility::snapshot();
+
+    // What the game named *and* the arena can draw: what a flood that was perfect would have to reach. A
+    // section the list names that the arena holds nothing for is not a miss - nothing draws it either way.
+    let named: std::collections::HashSet<IVec3> = list
+        .iter()
+        .copied()
+        .filter(|pos| sections.holds(*pos))
+        .collect();
+    let answered = sections
+        .iter()
+        .filter(|(pos, _)| answers.contains_key(pos))
+        .count();
+
+    let mut budgets = String::new();
+
+    // With the walk deciding, the number that matters is the one it is deciding with; while it is off,
+    // what is worth reporting is the probe. Either way the line names a budget that something used.
+    let to_report: Vec<u8> = match culling {
+        0 => FLOOD_BUDGETS.to_vec(),
+        culling => vec![culling - 1],
+    };
+
+    for budget in to_report {
+        // **A world per budget, and its own clock.** The source counts what the world's own box refused,
+        // so it cannot be shared between budgets; and with the setting on, the budget reported here is
+        // the one the frame decides with - which makes this the cost of the walk the renderer is running,
+        // measured, rather than an estimate of it.
+        let world = FloodWorld {
+            answers: &answers,
+            sections: &sections,
+            frustum,
+            camera_section,
+        };
+
+        let started = std::time::Instant::now();
+        let flood = section_graph::flood(&world, camera_section, budget);
+        let took = started.elapsed();
+
+        let agreed = flood
+            .visible
+            .iter()
+            .filter(|pos| named.contains(*pos))
+            .count();
+
+        // **Where the misses are, and why - split in two, because the two need different work.** A section
+        // the game named, the arena holds and the walk did not reach is either one this side's own
+        // *per-section* frustum test refuses - which is a tighter bound than the game's own octree visit,
+        // and one that can be widened - or one no route inside the frustum reaches at all. One number
+        // cannot tell those apart, and the answer decides whether the missing reach is a bound or a rule.
+        let drawn: std::collections::HashSet<IVec3> = flood.visible.iter().copied().collect();
+        let missed_behind_the_frustum = named
+            .iter()
+            .filter(|pos| !drawn.contains(*pos) && !world.in_frustum(**pos))
+            .count();
+        let missed_unreachable = named
+            .iter()
+            .filter(|pos| !drawn.contains(*pos) && world.in_frustum(**pos))
+            .count();
+
+        budgets.push_str(&format!(
+            " [budget {budget}: {} drawn ({agreed} named, {} not), {} missed ({missed_behind_the_frustum} \
+             behind this side's frustum, {missed_unreachable} unreachable), {} polled, {} over budget, {} \
+             behind the camera, {} outside the world, {:.2} ms]",
+            flood.visible.len(),
+            flood.visible.len() - agreed,
+            named.len().saturating_sub(agreed),
+            flood.polled,
+            flood.over_budget,
+            flood.out_of_frustum,
+            flood.outside_the_world,
+            took.as_secs_f64() * 1000.0,
+        ));
+    }
+
+    // **The box the walk is bounded by, named in the line.** A run whose walk costs something other than
+    // the last run's is either a different world or no world at all, and the two are told apart here
+    // rather than guessed at: "has not arrived" means this side is walking on the frustum alone.
+    let box_line = match crate::mc::world_extent::get() {
+        None => {
+            "the world's own box has not arrived, so every position in the frustum is walkable air"
+                .to_string()
+        }
+        Some(extent) if !extent.holds_the_layer(camera_section.y) => format!(
+            "the camera's own layer {} is outside the level's {}..={}, so the walk is not used this \
+             frame",
+            camera_section.y, extent.min_section_y, extent.max_section_y
+        ),
+        Some(extent) => format!(
+            "the world's own box is +/-{} chunk(s) around the camera and layers {}..={}",
+            extent.horizon, extent.min_section_y, extent.max_section_y
+        ),
+    };
+
+    log::info!(
+        "wgpu-mc: the flood against the game's list: the game named {} section(s), {} of them held by the \
+         arena, {} held in all and {answered} of those with an answer; {box_line};{budgets}",
+        list.len(),
+        named.len(),
+        sections.len(),
+    );
+}
+
+/// Says that a new frame has begun, which is what expires the terrain pass' frame scratch.
+///
+/// **Called from the one submission point**, `device::flush_shared_encoder`, so a frame is what the
+/// encoder says it is. `TerrainFrameKey` also carries everything the gather reads, so a caller that never
+/// calls this still cannot draw a stale *list* - only one whose sections' arena ranges may have been
+/// handed back, which is why this exists at all.
+pub fn begin_frame() {
+    FRAME.fetch_add(1, Ordering::Relaxed);
+}
 
 static TERRAIN_DRAWN: AtomicU64 = AtomicU64::new(0);
 static TERRAIN_CULLED: AtomicU64 = AtomicU64::new(0);
@@ -85,6 +523,64 @@ static TERRAIN_EMPTY: AtomicU64 = AtomicU64::new(0);
 /// list never got there. See [`report_terrain_pass`].
 static TERRAIN_OUT_OF_SIGHT: AtomicU64 = AtomicU64::new(0);
 static TERRAIN_REPORTED: AtomicU64 = AtomicU64::new(0);
+
+/// How many times the frame's gather ran, how many arena sections it walked, and how many it kept.
+///
+/// **The three numbers that say whether the frame's work is per frame or per pass.** The gather is one walk
+/// of the arena a frame (`rebuild_terrain_frame`), and the sections it keeps are then walked once by each
+/// terrain pass that builds records - three in a frame with water in view. `walked` against `visible` is
+/// what the gather costs, and `visible` against the gathers is what the per-pass loops cost. See the
+/// terrain build line in [`report_terrain_pass`].
+static TERRAIN_GATHERS: AtomicU64 = AtomicU64::new(0);
+static TERRAIN_WALKED: AtomicU64 = AtomicU64::new(0);
+static TERRAIN_VISIBLE: AtomicU64 = AtomicU64::new(0);
+
+/// The most draw calls any one pass has been left with, **for the whole session**.
+///
+/// Against [`crate::mc::INDIRECT_DRAW_CAPACITY`], this is how close the frame has ever come to the cliff
+/// where `PassDraws::batched` goes false and the pass falls back to one draw per section. It is a session
+/// maximum rather than a per-second one because the question it answers - "should the capacity be raised" -
+/// is about the worst case a run can produce, and because a per-second maximum would be reset by the report
+/// that the number is read in.
+static TERRAIN_CALLS_PEAK: AtomicU64 = AtomicU64::new(0);
+
+/// Passes that went over [`crate::mc::INDIRECT_DRAW_CAPACITY`] and lost the batched path, and when the last
+/// one was reported. See [`report_the_indirect_cap`].
+static TERRAIN_OVER_CAPACITY: AtomicU64 = AtomicU64::new(0);
+static TERRAIN_OVER_CAPACITY_REPORTED: AtomicU64 = AtomicU64::new(0);
+
+/// The terrain frame's uploads: one per pass with records, one more per batched pass with arguments.
+///
+/// `Queue::write_buffer` allocates staging memory per call, so this is a count of the allocations a frame
+/// makes on the render thread - six of them for a frame that draws all three passes batched. Counted here
+/// rather than in `device.rs` because it is the terrain path's own shape that decides the number.
+static TERRAIN_UPLOADS: AtomicU64 = AtomicU64::new(0);
+static TERRAIN_UPLOAD_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// How long [`RenderGraph::rebuild_terrain_frame`] takes, and how much of that is the gather.
+///
+/// **The number that decides whether any of the above is worth changing.** The counters beside these say
+/// what the work is proportional to - sections walked, sections kept, uploads made - and none of them says
+/// whether the whole thing is 20 µs a frame or 2 ms. Two clock reads a frame, only while the frame is
+/// actually rebuilt: a frame the key says is unchanged does not come here at all.
+static TERRAIN_BUILD_NANOS: AtomicU64 = AtomicU64::new(0);
+static TERRAIN_GATHER_NANOS: AtomicU64 = AtomicU64::new(0);
+
+/// And how much of the build is the per-pass half: the records and their uploads.
+///
+/// The two halves are the two things that scale with how much of the world is in view, and they are what
+/// decides where a change would pay: the gather is one walk of the arena a frame, and the record sets are one
+/// walk of the *kept* sections per pass - three of them in a frame with water in view - plus an upload each.
+static TERRAIN_RECORDS_NANOS: AtomicU64 = AtomicU64::new(0);
+
+/// Terrain frame rebuilds, and how many of them the submission counter alone forced.
+///
+/// [`TerrainFrameKey::frame`] advances at every *submission* ([`begin_frame`]), and a presented frame makes
+/// more than one of those. Everything else in the key is the camera, the frustum and the occlusion list - so
+/// a rebuild whose "same except the frame" twin matches is a rebuild that re-walked the whole arena to
+/// produce a list identical to the one it replaced. See the report line in [`report_terrain_pass`].
+static TERRAIN_REBUILDS: AtomicU64 = AtomicU64::new(0);
+static TERRAIN_REBUILDS_FRAME_ONLY: AtomicU64 = AtomicU64::new(0);
 
 /// The same three counts, per layer.
 ///
@@ -175,6 +671,72 @@ pub fn set_terrain_occlusion(honour: bool) {
     TERRAIN_OCCLUSION.store(honour, Ordering::Relaxed);
 }
 
+/// How many direction changes this renderer's own occlusion walk may take, or zero to draw from the game's
+/// own list. See `Settings::adv_culling`.
+///
+/// Read per gather, like [`TERRAIN_OCCLUSION`] and for the same reason: it decides which list an `if`
+/// tests against, so it takes effect on the next frame with nothing rebuilt. Zero is the default and means
+/// the game decides - the walk is measured beside that list (see [`cross_check_the_flood`]) rather than
+/// trusted in its place.
+static ADV_CULLING: AtomicU64 = AtomicU64::new(0);
+
+/// Sets how many direction changes the occlusion walk may take. See [`ADV_CULLING`].
+pub fn set_adv_culling(culling: u8) {
+    ADV_CULLING.store(culling as u64, Ordering::Relaxed);
+}
+
+/// Whether the terrain pass batches its draws, **as the setting asks**. See [`terrain_batches_draws`],
+/// which is the answer the draw path uses: this one is only half of it.
+static TERRAIN_INDIRECT: AtomicBool = AtomicBool::new(false);
+
+/// Whether this device may batch the terrain pass' draws at all: `device::can_batch_terrain_draws`,
+/// minus the backends that may not be asked, resolved where the device is created. See
+/// [`terrain_batches_draws`].
+///
+/// The other half, and it is a separate flag because the two are decided in different places and at
+/// different times: the setting is read from the config when the run directory is sent - **which is
+/// from the mod constructor, before there is a device** - and this is what the device turned out to be
+/// able to do, recorded where the device was created. Resolving the pair where the setting is read is
+/// what went wrong the first time this was written: `debug::apply` asked the adapter a question no
+/// adapter had answered yet, got "no" every launch, and printed
+///
+/// ```text
+/// indirect draws: execution yes, real batched multi-draw yes, non-zero first instance yes
+/// the terrain pass is drawing one section at a time, and this device could batch
+/// ```
+///
+/// - which is the pair of lines that found it.
+static TERRAIN_BATCHING_POSSIBLE: AtomicBool = AtomicBool::new(false);
+
+/// Sets whether the terrain pass batches its draws, as the setting asks. See [`terrain_indirect`].
+pub fn set_terrain_indirect(batched: bool) {
+    TERRAIN_INDIRECT.store(batched, Ordering::Relaxed);
+}
+
+/// Records whether this device may batch the terrain pass' draws at all. See
+/// [`TERRAIN_BATCHING_POSSIBLE`], which is where the feature bits and the backend are resolved.
+pub fn set_terrain_batching_possible(possible: bool) {
+    TERRAIN_BATCHING_POSSIBLE.store(possible, Ordering::Relaxed);
+}
+
+/// Whether the `terrain_indirect` setting asks for batching: **the setting alone**, without the device.
+///
+/// One caller, and it is a diagnostic: `device::report_device_capabilities` prints which of the reasons
+/// the terrain pass is drawing one section at a time, and "the switch is off" and "the device was not
+/// allowed to" are different answers that the combined flag cannot tell apart. See [`terrain_indirect`]
+/// for what the draw path reads.
+pub fn terrain_indirect_requested() -> bool {
+    TERRAIN_INDIRECT.load(Ordering::Relaxed)
+}
+
+/// Whether the terrain pass batches its draws: **the setting and the device, in one answer**.
+///
+/// Read per pass by the draw path, and written once per world by the capability report - so what a run
+/// prints about the batching is what the batching did.
+pub fn terrain_batches_draws() -> bool {
+    terrain_indirect_requested() && TERRAIN_BATCHING_POSSIBLE.load(Ordering::Relaxed)
+}
+
 /// Whether the game's block atlas is sampled from its base mip level only.
 ///
 /// **Off, and the argument for leaving it off is in the sampler's own comment** - the game animates
@@ -212,6 +774,86 @@ pub fn set_pipeline_diagnostics(no_cull: bool, greater_depth: bool) -> bool {
         TERRAIN_GREATER_DEPTH.swap(greater_depth, Ordering::Relaxed) != greater_depth;
 
     no_cull_changed || depth_changed
+}
+
+/// Draws a terrain pass had to leave out because its buffers had no room for a record of them,
+/// cumulatively, and the last second one was reported in.
+///
+/// See [`report_truncated_draws`] for why the line is not behind the diagnostics switch.
+static TERRAIN_TRUNCATED: AtomicU64 = AtomicU64::new(0);
+static TERRAIN_TRUNCATED_REPORTED: AtomicU64 = AtomicU64::new(0);
+
+/// Says so, once a second, when a pass had more draws than it has room to describe.
+///
+/// **Not gated on the diagnostics switch**, unlike every other line the terrain pass writes. The ones
+/// that are gated are counters - how much was drawn, how much was culled - and this is geometry that
+/// was *not* drawn. It cannot happen at the sizes here, and if it ever does the picture is missing
+/// sections with nothing else anywhere to say why, which is the one failure this renderer keeps
+/// choosing to make loud.
+fn report_truncated_draws(truncated: u64) {
+    if truncated == 0 {
+        return;
+    }
+
+    let total = TERRAIN_TRUNCATED.fetch_add(truncated, Ordering::Relaxed) + truncated;
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_secs())
+        .unwrap_or(0);
+
+    if TERRAIN_TRUNCATED_REPORTED.swap(now, Ordering::Relaxed) == now {
+        return;
+    }
+
+    log::error!(
+        "wgpu-mc: a terrain pass had more draws than the {} its buffers hold and left the rest out; \
+         {total} draw(s) dropped so far this session. Raise `SECTION_DRAW_CAPACITY`",
+        crate::mc::SECTION_DRAW_CAPACITY
+    );
+}
+
+/// Whether a pass with this many draw calls can still be recorded as one `multi_draw` argument list.
+///
+/// **The one place `PassDraws::batched`'s capacity is decided**, so the decision and the warning that reports
+/// it cannot come apart: the pass takes the batched path while this is true, and
+/// [`report_the_indirect_cap`] is what says so when it is false. The bound is inclusive - a pass with
+/// exactly [`crate::mc::INDIRECT_DRAW_CAPACITY`] calls has a slot for every one of them, because the buffers
+/// are allocated at that size.
+fn the_indirect_path_holds(calls: usize) -> bool {
+    calls <= crate::mc::INDIRECT_DRAW_CAPACITY
+}
+
+/// Says so, once a second, when a terrain pass had more draws than the indirect path can batch.
+///
+/// **Not gated on the diagnostics switch**, for the reason [`report_truncated_draws`] is not: this is a step
+/// change in what the frame costs - the pass stops writing one argument list and starts submitting one draw
+/// per section, on the render thread, for the rest of the frame - and it arrives with no other symptom. A run
+/// that hits it looks like "the frame time jumped when I turned toward the open" and nothing else, which is
+/// exactly the kind of thing that is worth a line in the log of a run nobody is profiling. The counters on
+/// the gated terrain build line say how close the session has come; this says when it arrived.
+///
+/// It is not an error and the picture is unchanged: the fallback is what this renderer did before the
+/// indirect path existed, and the capacity is what bounds the argument buffers. See
+/// [`crate::mc::INDIRECT_DRAW_CAPACITY`] and `PassDraws::batched`.
+fn report_the_indirect_cap(calls: u64) {
+    let total = TERRAIN_OVER_CAPACITY.fetch_add(1, Ordering::Relaxed) + 1;
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_secs())
+        .unwrap_or(0);
+
+    if TERRAIN_OVER_CAPACITY_REPORTED.swap(now, Ordering::Relaxed) == now {
+        return;
+    }
+
+    log::warn!(
+        "wgpu-mc: a terrain pass has {calls} draw calls, over the {} the indirect path batches, so this \
+         frame draws it one draw per section instead; {total} pass(es) over it so far this session. Raise \
+         `INDIRECT_DRAW_CAPACITY`, or split the pass into several multi-draws",
+        crate::mc::INDIRECT_DRAW_CAPACITY
+    );
 }
 
 /// Reports what the terrain pass drew, once a second and only while the section diagnostics are on.
@@ -252,6 +894,11 @@ fn report_terrain_pass() {
     // hard is the graph's list not arriving at all. Those two count sections; the per-layer ones count
     // draws.
     //
+    // **`culled`, `out of sight` and `empty` are counted once per frame now, not once per pass.** They
+    // are properties of the gather, and there is one gather a frame rather than three - so they are about
+    // a third of what they used to be, and their *ratio*, which is what they are read for, is unchanged.
+    // `drawn` is still per pass, because a pass is what draws. See `TerrainFrame`.
+    //
     // The per-layer figures are the **totals**, not the drained ones: this report runs at a pipeline
     // boundary and the opaque group is two pipelines, so the drained per-layer count would be whichever
     // of the two the graph reached last - a solid layer reported as zero while it drew, which is exactly
@@ -275,9 +922,64 @@ fn report_terrain_pass() {
 
     log::info!(
         "wgpu-mc: terrain pass: {drawn} section draw(s) - solid and cutout of one pass, transparent of \
-         the other -, {out_of_sight} not named by the game's occlusion graph, {culled} culled by the \
-         frustum, {empty} with no layer at all; per layer: {}",
+         the other -, {out_of_sight} not named by the game's occlusion graph and old enough to believe, \
+         {} too new for it to have judged (the list had not been refilled since they were taken over, so \
+         the frustum decided them instead), {culled} culled by the frustum, {empty} with no layer at \
+         all; per layer: {}",
+        SECTIONS_TOO_NEW.load(Ordering::Relaxed),
         per_layer.join(", ")
+    );
+
+    // **Faces by atlas, cumulative, so two of these lines are a rate.** The question this answers is
+    // whether the two-atlas branch in the terrain shaders is live: `decide_game_atlas` sends every face to
+    // the game's atlas once it is bound, so faces still arriving on this side's own after the handover are
+    // the fallback, and a session where the second number stops moving is one whose shader could carry a
+    // single atlas. See `set_game_block_atlas`, which says the same pair at the handover.
+    let (game, ours) = crate::mc::block::atlas_face_counts();
+
+    log::info!(
+        "wgpu-mc: faces by atlas, cumulative: {game} from the game's, {ours} from this side's"
+    );
+
+    // **What building the frame's draws costs, per second.** The three numbers on the left are the shape of
+    // the work: one gather a frame, that many arena sections walked, and that many sections kept - and the
+    // kept ones are walked once more by each terrain pass that builds records, which is three of them in a
+    // frame with water in view. The two on the right are what that work hands to the GPU: an upload per pass
+    // with records and one more per batched pass, each of which is a `Queue::write_buffer` and therefore an
+    // allocation of staging memory.
+    //
+    // `peak` is the session's maximum and never drained, because the question it is read for - how close a
+    // run has come to `INDIRECT_DRAW_CAPACITY` - is about the worst frame a run has produced. The rest are
+    // per report, which is what makes them a rate.
+    let gathers = TERRAIN_GATHERS.swap(0, Ordering::Relaxed);
+    let walked = TERRAIN_WALKED.swap(0, Ordering::Relaxed);
+    let visible = TERRAIN_VISIBLE.swap(0, Ordering::Relaxed);
+    let uploads = TERRAIN_UPLOADS.swap(0, Ordering::Relaxed);
+    let uploaded = TERRAIN_UPLOAD_BYTES.swap(0, Ordering::Relaxed) / 1024;
+    let peak = TERRAIN_CALLS_PEAK.load(Ordering::Relaxed);
+    let over = TERRAIN_OVER_CAPACITY.load(Ordering::Relaxed);
+    let build_nanos = TERRAIN_BUILD_NANOS.swap(0, Ordering::Relaxed);
+    let gather_nanos = TERRAIN_GATHER_NANOS.swap(0, Ordering::Relaxed);
+    let records_nanos = TERRAIN_RECORDS_NANOS.swap(0, Ordering::Relaxed);
+    let rebuilds = TERRAIN_REBUILDS.swap(0, Ordering::Relaxed);
+    let frame_only = TERRAIN_REBUILDS_FRAME_ONLY.swap(0, Ordering::Relaxed);
+
+    // A second with no gather in it is a second with no world drawn, and the arithmetic would be a panic
+    // rather than a zero - which is the shape of a report taken while the world is being entered.
+    let per_gather = walked.checked_div(gathers).unwrap_or(0);
+    let build_us = build_nanos / 1000;
+    let build_per_frame = build_nanos.checked_div(gathers).unwrap_or(0) / 1000;
+    let gather_us = gather_nanos / 1000;
+    let records_us = records_nanos / 1000;
+
+    log::info!(
+        "wgpu-mc: terrain build: {gathers} gather(s) ({per_gather} section(s) walked each, {visible} kept \
+         in all - a pass builds records from the kept ones, three of them a frame), {uploads} upload(s) in \
+         {uploaded} KB; {build_us} us building it, {build_per_frame} us a gather, {gather_us} us of it the \
+         gather and {records_us} us the records and uploads; {rebuilds} rebuild(s), {frame_only} of them \
+         because the submission counter moved and nothing else did; the most calls any pass has had is \
+         {peak} of the {} the indirect path batches, {over} pass(es) over it so far",
+        crate::mc::INDIRECT_DRAW_CAPACITY
     );
 }
 
@@ -334,6 +1036,24 @@ pub fn set_game_block_atlas(view: wgpu::TextureView, size: (u32, u32)) {
     *GAME_BLOCK_ATLAS.write() = Some(Arc::new(view));
     *GAME_ATLAS_SIZE.write() = Some(size);
     GAME_ATLAS_BOUND.store(true, Ordering::Relaxed);
+
+    // **The number the terrain shader's "which atlas" branch turns on, said at the one moment it is a
+    // decision.** `decide_game_atlas` sends *every* face here when this is bound and the JVM registered a
+    // rectangle for its sprite - the two-atlas branch in `terrain.wgsl` exists for the faces that did not
+    // get one, and the only such faces left in a normal session are the ones baked before this call.
+    //
+    // Both counts are cumulative and never reset, so this line plus the per-second one in
+    // `report_terrain_pass` is a *rate*: faces still going to this side's atlas after the handover are
+    // the fallback being live, and zero is the axis being removable.
+    let (game, ours) = crate::mc::block::atlas_face_counts();
+
+    log::info!(
+        "wgpu-mc: the game's block atlas is bound, {}x{}: {game} face(s) are baked for it so far and \
+         {ours} for this side's own atlas - the ones that fell back, because the game has no rectangle \
+         for their sprite, because the animation is off, or because they were baked before this call",
+        size.0,
+        size.1,
+    );
 }
 
 /// The game's block atlas, if the JVM has handed one over.
@@ -580,6 +1300,14 @@ pub struct BoundPipeline {
     /// What is left for a draw is the data, handed over as a slice parallel to this one - see
     /// [`set_immediates`]. Two `Vec`s of two `u32`s, one per pipeline, once.
     pub immediates: Vec<(u32, u32)>,
+    /// Which of the scene's draw-buffer slots this pass writes its records and indirect arguments
+    /// into, or `None` when it is not a terrain pass.
+    ///
+    /// **A slot and not the buffers themselves**, because the buffers belong to the scene - they are
+    /// replaced when the scene is - while the slot is a fact about the graph's own pipeline list.
+    /// Assigned in [`RenderGraph::create_pipelines`] in the order the config lists terrain pipelines;
+    /// see [`crate::mc::SECTION_DRAW_SLOTS`] for why each pass needs one of its own.
+    pub draw_slot: Option<usize>,
 }
 
 impl BoundPipeline {
@@ -602,8 +1330,8 @@ pub struct RenderGraph {
     pub config: ShaderPackConfig,
     pub pipelines: LinkedHashMap<String, BoundPipeline>,
     pub resources: HashMap<String, ResourceBacking>,
-    /// The terrain gather's list. See [`TerrainScratch`].
-    terrain_visible: TerrainScratch,
+    /// The frame's terrain: the gather and the draws each pass will issue. See [`TerrainFrame`].
+    terrain_frame: std::cell::RefCell<TerrainFrame>,
 }
 
 /// What a caught panic said, as one line.
@@ -652,6 +1380,9 @@ fn device_call<T>(what: &str, build: impl FnOnce() -> T) -> Option<T> {
     }
 }
 
+/// The last second the plane hint reported itself, so a per-frame count is a per-second line.
+static PLANE_HINT_REPORTED: AtomicU64 = AtomicU64::new(0);
+
 impl RenderGraph {
     fn create_pipelines(
         &mut self,
@@ -662,6 +1393,12 @@ impl RenderGraph {
         self.pipelines.clear();
 
         let arena = WmArena::new(1024);
+
+        // Which of the frame's draw-buffer slots a terrain pass has claimed, in the order this config
+        // lists its pipelines. See `SECTION_DRAW_SLOTS`: a pass needs a pair of buffers of its own,
+        // because every `write_buffer` a frame makes is applied at the head of that frame's submission
+        // and two passes sharing one buffer would both draw the second pass's records.
+        let mut next_draw_slot = 0usize;
 
         for (pipeline_name, pipeline_config) in &self.config.pipelines.pipelines {
             // A pipeline whose resources are not all registered is skipped rather than unwrapped: this
@@ -712,6 +1449,12 @@ impl RenderGraph {
                     BindGroupDef::Resource(resource) => {
                         match (&resource[..], &custom_bind_groups) {
                             ("@bg_ssbo_chunks", _) => wm.bind_group_layouts.get("ssbo").unwrap(),
+                            // The draw arguments a terrain pass writes and reads back. A layout of its
+                            // own rather than `ssbo`, because it is visible to the vertex stage alone -
+                            // see the entry in `create_bind_group_layouts`.
+                            ("@bg_section_draws", _) => {
+                                wm.bind_group_layouts.get("section_draws").unwrap()
+                            }
                             ("@bg_entity", _) => wm.bind_group_layouts.get("entity").unwrap(),
                             (_, Some(custom)) => {
                                 if let Some(entry) = custom.get(resource) {
@@ -817,11 +1560,57 @@ impl RenderGraph {
             // that was left to look for a shader named after itself was skipped in silence.
             let shader_name = pipeline_config.shader.as_deref().unwrap_or(pipeline_name);
             let shader_resource = ResourcePath(format!("wgpu_mc:shaders/{shader_name}.wgsl"));
+
+            // **Which fragment entry point, and the one pipeline state that is really a shader choice.**
+            //
+            // `terrain.wgsl` has two: `frag`, which picks between the game's atlas and this side's copy
+            // with a per-vertex flag, and `frag_game_atlas`, which samples the game's atlas and nothing
+            // else. The second is smaller by three `sample_at_level` call sites, one texture and three
+            // samplers, and it is the *source* that is smaller - not a branch naga or a driver has to fold
+            // away - which is the whole reason it is a second entry point rather than a pipeline constant.
+            //
+            // It is chosen only when it is certainly right: the game's atlas is bound, and no face in the
+            // arena fell back to this side's copy. See `block::faces_are_all_the_games`, which is the bake
+            // answering for what it actually did rather than a guess from the settings.
+            //
+            // The vertex stage stays one entry point: the flag it writes is a varying `frag_game_atlas`
+            // does not read, and naga drops the interface a stage does not use. Splitting the vertex stage
+            // too would only save two selects per vertex, against a second copy of the hottest code in
+            // the renderer.
+            let terrain = matches!(
+                &pipeline_config.geometry[..],
+                "@geo_terrain" | "@geo_terrain_translucent"
+            );
+
+            let frag_entry =
+                if terrain && game_atlas_bound() && crate::mc::block::faces_are_all_the_games() {
+                    "frag_game_atlas"
+                } else {
+                    "frag"
+                };
+
+            // **Said out loud, because it is not visible in a picture.** Which of the two fragment entry
+            // points a terrain pass ended up with is a difference in the shader and not in what it draws -
+            // both sample the same texture when every face is the game's - so a log line is the only place
+            // a run can be read for it. Once per terrain pipeline per graph build, and a graph is built a
+            // handful of times a session.
+            if terrain {
+                log::info!(
+                    "wgpu-mc: the '{pipeline_name}' terrain pass samples {} (shader entry point \
+                     `{frag_entry}`)",
+                    if frag_entry == "frag_game_atlas" {
+                        "the game's block atlas and nothing else"
+                    } else {
+                        "whichever atlas each face was baked for"
+                    }
+                );
+            }
+
             let Some(shader) = WgslShader::init(
                 &shader_resource,
                 &*wm.mc.resource_provider,
                 &wm.gpu.device,
-                "frag".into(),
+                frag_entry.into(),
                 "vert".into(),
             ) else {
                 log::error!(
@@ -967,6 +1756,37 @@ impl RenderGraph {
                 continue;
             };
 
+            // A terrain pass claims a draw-buffer slot of its own, and claimed here rather than at the
+            // top of the loop because every `continue` above is a pipeline that will not draw: a
+            // skipped pass that had already taken a slot would leave the pass after it without one.
+            //
+            // Running out is not a picture that is wrong, it is a pass that draws nothing - so it is
+            // said out loud. `SECTION_DRAW_SLOTS` is three and the shipped graph has three terrain
+            // pipelines; a test in `wgpu-mc-jni` counts them in `graph.yaml` so that a fourth is a
+            // failing test rather than an invisible layer.
+            let draw_slot = if matches!(
+                &pipeline_config.geometry[..],
+                "@geo_terrain" | "@geo_terrain_translucent"
+            ) {
+                let slot = next_draw_slot;
+                next_draw_slot += 1;
+
+                if slot >= crate::mc::SECTION_DRAW_SLOTS {
+                    log::error!(
+                        "wgpu-mc: the render graph's '{pipeline_name}' is terrain pipeline {} and this \
+                         build has {} draw-buffer slot(s) for them; skipping it, because sharing a slot \
+                         with a pass recorded in the same submission draws that pass's sections",
+                        slot + 1,
+                        crate::mc::SECTION_DRAW_SLOTS
+                    );
+                    continue;
+                }
+
+                Some(slot)
+            } else {
+                None
+            };
+
             self.pipelines.insert(
                 pipeline_name.clone(),
                 BoundPipeline {
@@ -981,6 +1801,7 @@ impl RenderGraph {
                         .map(|(index, name)| (*index as u32, immediate_size_of(name)))
                         .collect(),
                     config: pipeline_config.clone(),
+                    draw_slot,
                 },
             );
         }
@@ -1057,7 +1878,13 @@ impl RenderGraph {
             config,
             pipelines: LinkedHashMap::new(),
             resources,
-            terrain_visible: TerrainScratch::default(),
+            terrain_frame: std::cell::RefCell::new(TerrainFrame {
+                // One entry per pass slot, so a pass can index its own draws by the slot it claimed.
+                passes: (0..crate::mc::SECTION_DRAW_SLOTS)
+                    .map(|_| PassDraws::default())
+                    .collect(),
+                ..TerrainFrame::default()
+            }),
         };
 
         // The sampler is always available; the atlas only once a resource reload has baked one. The
@@ -1349,13 +2176,29 @@ impl RenderGraph {
     /// as it stands **including when it is empty**. An empty set meaning "not told" is the bug this
     /// variant exists to make impossible - it draws the whole arena for a frame in which the game
     /// deliberately culled everything, and it reads as "occlusion culling does nothing".
+    ///
+    /// **And a third answer, for a section the list has not had the chance to judge.** The list is a
+    /// snapshot between refills - `LevelRenderer#applyFrustum` runs only when the camera has turned by
+    /// more than two degrees or the occlusion graph reports a change - so an unnamed section that entered
+    /// the arena *after* the last refill is unnamed because the answer is old, not because the game
+    /// looked and said no. Asking the frustum about it is the difference between drawing it and leaving a
+    /// 16x16x16 hole in a frame that neither renderer draws it in. Every other unnamed section is still
+    /// `OutOfSight`, so the culling itself is untouched. See `Scene::sections_since_the_list`.
     fn section_visibility(
         visible: Option<&std::collections::HashSet<glam::IVec3>>,
+        sections_since_the_list: &std::collections::HashSet<glam::IVec3>,
         pos: &glam::IVec3,
     ) -> SectionVisibility {
         match visible {
             None => SectionVisibility::AskTheFrustum,
             Some(visible) if visible.contains(pos) => SectionVisibility::Draw,
+            Some(_) if sections_since_the_list.contains(pos) => {
+                // Counted here rather than at the call site, because this is the only place the reason
+                // for the answer is known. See [`SECTIONS_TOO_NEW`].
+                SECTIONS_TOO_NEW.fetch_add(1, Ordering::Relaxed);
+
+                SectionVisibility::AskTheFrustum
+            }
             Some(_) => SectionVisibility::OutOfSight,
         }
     }
@@ -1425,10 +2268,499 @@ impl RenderGraph {
         );
     }
 
+    /// How many direction changes this frame's walk may take, or `None` to draw from the game's list.
+    ///
+    /// `None` is the default - `adv_culling` at zero - and it is also the answer for a camera this side
+    /// cannot seed a walk from. The walk starts in the camera's own section and is bounded by the world's
+    /// own box, so a camera above the build limit or below the level has a box that refuses its own seed.
+    /// Minecraft's own graph handles the same case by seeding a whole plane of sections at the level's
+    /// edge; this walk has one seed, so the honest thing is to draw from the game's list this frame -
+    /// which is what the frame does with the setting off - rather than to draw nothing at all. The
+    /// cross-check says when that is happening, once a second.
+    fn terrain_walk_budget(camera_section: IVec3) -> Option<u8> {
+        let culling = ADV_CULLING.load(Ordering::Relaxed).min(16) as u8;
+
+        if culling == 0 {
+            return None;
+        }
+
+        // No box yet - the first frame of a run, or a caller that never pushes one - is not a reason to
+        // refuse: the walk is then bounded by the frustum alone, as it was before the box existed.
+        match crate::mc::world_extent::get() {
+            None => Some(culling - 1),
+            Some(extent) if !extent.holds_the_layer(camera_section.y) => None,
+            Some(_) => Some(culling - 1),
+        }
+    }
+
+    /// **The frame's one pass over the world**: the gather, every terrain pass's records, and the
+    /// uploads, all built together so the frame's three passes do not each do it.
+    ///
+    /// Called from a terrain pass when the frame's key does not match: once a frame in practice, since
+    /// [`begin_frame`] is what advances the key's frame, and once more if a *second* view is drawn
+    /// inside one frame. That second case is why a pass that has already drawn keeps the records it has,
+    /// which [`PassDraws::drawn`] is about.
+    ///
+    /// The gather is the reason this exists. It walks the arena's `HashMap` and tests every section
+    /// against the frustum and against the game's occlusion list, and **none of that depends on which
+    /// layer is being drawn** - so three passes over one frame produced the same list three times. The
+    /// records do depend on the layer, which is why they are built per pass from the one list.
+    fn rebuild_terrain_frame(
+        &self,
+        frame: &mut TerrainFrame,
+        wm: &WmRenderer,
+        scene: &Scene,
+        frustum: &Frustum<f32>,
+        key: TerrainFrameKey,
+        honour_occlusion: bool,
+    ) {
+        let camera_section = key.camera_section;
+
+        // How many direction changes this renderer's own walk may take, or `None` to draw from the game's
+        // list. Read once a frame: it decides the walk below and nothing about a pipeline.
+        let budget = Self::terrain_walk_budget(camera_section);
+
+        // **The flood is run beside the game's answer once a second, and it decides nothing.** This is
+        // the one place the frame's frustum, the camera's section and the arena are all in hand. See
+        // `cross_check_the_flood`.
+        //
+        // **Gated on the diagnostic-log switch, because it is not free either.** The cross-check walks up
+        // to four budgets a second, which measured 8 ms of frame thread a second at render distance 16 and
+        // 33 ms at 32 - a hitch, once a second, in a feature that is off by default. The line it writes is
+        // a diagnostic of the walk, so the switch that turns diagnostics on is where it belongs, and with
+        // that switch off this costs nothing at all.
+        //
+        // **And it is outside the timing below**, which is the one thing about it worth saying here: it runs
+        // inside this function, once a second, and it costs tens of milliseconds when it does - so a build
+        // time that included it would be a measurement of the diagnostic in the second it fired rather than
+        // of the frame. The numbers this function reports are the ones a session without the switch pays.
+        if crate::mc::chunk::DIAGNOSTIC_LOGGING.load(Ordering::Relaxed) {
+            cross_check_the_flood(scene, frustum, camera_section);
+        }
+
+        // The whole call from here is timed, and the gather and the record loop inside it are timed
+        // separately: the first number is what a rebuilt frame costs on the render thread, and the other two
+        // are the halves of it - the walk of the arena, and building and uploading one set of records per
+        // pass. There is no early return in this function to miss, which is why one pair of reads is enough.
+        // See [`TERRAIN_BUILD_NANOS`].
+        let build_started = std::time::Instant::now();
+
+        // The areas this frame's sections fall in, and their frustum tables: one entry per 128-block
+        // region, which is a handful against the thousands of sections inside them.
+        // ---- the gather, once ----
+
+        let mut culled = 0u64;
+        let mut out_of_sight = 0u64;
+
+        // **Which plane culled the last section**, handed back to the frustum test as its cache index.
+        // The crate returns the plane that answered "outside" (`coherent_test_against_frustum`'s second
+        // value) and takes it back as a hint, so it is tried first: a run of sections on one side of the
+        // view - which is what a frustum's edge is, section after section in one plane - is then culled by
+        // one plane test instead of six. It is a hint and not a filter: every plane is still tested before
+        // anything is culled, which is what makes this an ordering rather than a second cull.
+        let mut culled_by: u8 = 0;
+        let mut hint_hits = 0u64;
+        let mut hint_misses = 0u64;
+        frame.visible.clear();
+
+        let gather_started = std::time::Instant::now();
+
+        {
+            // **Read locks, and they are held for the walk only.** The arena's is a read lock because
+            // nothing under it writes - it was `write()`, which took the exclusive lock for the whole of
+            // the gather once a frame while every bake thread's `allocate` needs that same lock.
+            let sections = scene.section_storage.read();
+            let visible = scene.visible_sections.read();
+
+            // **And which sections are too new for the list to have judged.** Taken in the same order the
+            // drain takes them in (the arena first), so the two can never deadlock: the drain inserts into
+            // this set at the publish, under the arena's write lock. See `section_visibility`.
+            let sections_since_the_list = scene.sections_since_the_list.read();
+
+            // **The walk's own answer, when the setting asks for it.** One flood per frame, into a set
+            // the loop below tests by position: the walk is a map of a few thousand sections while the
+            // loop visits every section the arena holds, so building the set is the cheap side of that.
+            //
+            // The answers are snapshotted rather than read through the lock per poll - a walk polls
+            // thousands of positions and the arena's guard is already held here.
+            let flooded: Option<std::collections::HashSet<IVec3>> = budget.map(|budget| {
+                let answers = crate::mc::visibility::snapshot();
+                let world = FloodWorld {
+                    answers: &answers,
+                    sections: &sections,
+                    frustum,
+                    camera_section,
+                };
+
+                section_graph::flood(&world, camera_section, budget)
+                    .visible
+                    .into_iter()
+                    .collect()
+            });
+
+            for (pos, section) in sections.iter() {
+                if honour_occlusion {
+                    // **Which list this frame obeys.** The walk's answer when the setting asks for one -
+                    // and it is a *subset* of the game's, so what it drops is the whole of what the
+                    // setting does - and the game's own list otherwise, which is the default.
+                    //
+                    // The walk's path does not go through `section_visibility`, so the stale-snapshot
+                    // answer that function gives is not asked for here: the walk starts from the camera's
+                    // own section every frame and never reads a list that can be a frame old.
+                    let drawn = match flooded.as_ref() {
+                        Some(drawn) => drawn.contains(pos),
+                        None => {
+                            Self::section_visibility(
+                                visible.as_ref(),
+                                &sections_since_the_list,
+                                pos,
+                            ) != SectionVisibility::OutOfSight
+                        }
+                    };
+
+                    if !drawn {
+                        out_of_sight += 1;
+                        continue;
+                    }
+                }
+                // The section's position *relative to the camera's section*: the view matrix carries the
+                // camera's offset within its own section and nothing else, so a draw is placed by naming
+                // where it is with the big part taken out of it. See [`TerrainFrameKey::camera_section`].
+                let rel_pos = *pos - camera_section;
+
+                // The box the section occupies *where the shader draws it*: the same
+                // camera-section-relative position the immediate carries, times sixteen to the block
+                // units the frustum is measured in. A box built from the absolute name instead would be
+                // thousands of blocks from the geometry it stands for, and the sections around the camera
+                // would be culled out of their own frame.
+                let a: Vec3<f32> = [
+                    rel_pos.x as f32 * 16.0,
+                    rel_pos.y as f32 * 16.0,
+                    rel_pos.z as f32 * 16.0,
+                ]
+                .into();
+                let b: Vec3<f32> = a + Vec3::new(16.0, 16.0, 16.0);
+
+                let bounds: AABB<f32> = AABB::new(a.into_array(), b.into_array());
+
+                // Still tested, because it is nearly free and the two disagree in both directions: the
+                // game's graph is a frame old and conservative about what a neighbour hides, and a
+                // section it left out may be one the camera has since turned toward.
+                // The second value is the plane that culled it - or the hint back, for one that was not
+                // culled - and it is carried into the next section's test. See `culled_by`.
+                let (in_the_frustum, plane) =
+                    bounds.coherent_test_against_frustum(frustum, culled_by);
+
+                if plane == culled_by {
+                    hint_hits += 1;
+                } else {
+                    hint_misses += 1;
+                }
+
+                culled_by = plane;
+
+                if !in_the_frustum {
+                    culled += 1;
+                    continue;
+                }
+                // Which layers the arena actually holds for this section. Both ranges travel, because a
+                // draw needs both: the index range to draw and the vertex range to draw it *from*. A
+                // section the arena has nothing in for a layer is counted where that layer's records are
+                // built, because "the arena has no cutout here" is a fact about the layer.
+                let mut ranges: [Option<crate::mc::chunk::DrawnLayer>; 3] = [None, None, None];
+                let mut any = false;
+
+                for (layer_index, layer) in section.layers.iter().enumerate() {
+                    if let Some(layer) = layer {
+                        // The arena the layer lives in travels with its ranges: the draw loop rebinds
+                        // when it changes, and drawing a section against another arena is a section of
+                        // somebody else's geometry.
+                        ranges[layer_index] = Some((
+                            layer.buffer,
+                            layer.index_range.clone(),
+                            layer.vertex_range.start..layer.vertex_range.start + 1,
+                        ));
+                        any = true;
+                    }
+                }
+
+                if !any {
+                    continue;
+                }
+
+                // The distance the translucent layer is sorted by, measured between section centres the
+                // way the game measures it - in sections, and squared, because a square root would be
+                // thrown away by the comparison it feeds.
+                let dx = rel_pos.x as f32;
+                let dy = rel_pos.y as f32;
+                let dz = rel_pos.z as f32;
+
+                frame.visible.push(VisibleSection {
+                    relative_position: rel_pos,
+                    ranges,
+                    distance_squared: dx * dx + dy * dy + dz * dz,
+                });
+            }
+
+            // The walk's own two sizes: what it visited and what it kept. Counted here rather than after the
+            // block because the arena guard is what knows the first, and this is the one place a frame walks
+            // it. See [`TERRAIN_GATHERS`].
+            TERRAIN_GATHERS.fetch_add(1, Ordering::Relaxed);
+            TERRAIN_WALKED.fetch_add(sections.len() as u64, Ordering::Relaxed);
+            TERRAIN_VISIBLE.fetch_add(frame.visible.len() as u64, Ordering::Relaxed);
+        }
+
+        TERRAIN_GATHER_NANOS.fetch_add(
+            gather_started.elapsed().as_nanos() as u64,
+            Ordering::Relaxed,
+        );
+
+        frame.culled = culled;
+        frame.out_of_sight = out_of_sight;
+
+        // **Far to near, once, for the pass that blends** - and the storage order is left alone for the
+        // passes that do not. See [`TerrainFrame::sorted`] for why there are two lists and not one.
+        //
+        // Always built rather than only when some pass blends: the copy is a few hundred entries and the
+        // sort is one a frame, against two arena walks removed, and building it conditionally would make
+        // a pass's correctness depend on a predicate in this function agreeing with the one in
+        // `terrain_layers`.
+        frame.sorted.clear();
+        frame.sorted.extend_from_slice(&frame.visible);
+        Self::sort_for_drawing(&mut frame.sorted, &[(RenderLayer::Transparent, 0.01)]);
+
+        // The gather-level counts belong to the frame, so they are added here, once. See
+        // [`TerrainFrame`].
+        TERRAIN_CULLED.fetch_add(culled, Ordering::Relaxed);
+        TERRAIN_OUT_OF_SIGHT.fetch_add(out_of_sight, Ordering::Relaxed);
+
+        // **What the plane hint bought**, once a second: a section whose culling plane was the one the
+        // section before it was culled by costs one plane test instead of six. See `culled_by`.
+        {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|since| since.as_secs())
+                .unwrap_or(0);
+
+            if PLANE_HINT_REPORTED.swap(now, Ordering::Relaxed) != now {
+                let total = hint_hits + hint_misses;
+
+                log::info!(
+                    "wgpu-mc: the frustum cull, last frame: {} section(s) tested, {} of them answered by the \
+                     plane the section before was culled by ({:.1}% - one plane test rather than up to six)",
+                    total,
+                    hint_hits,
+                    if total == 0 {
+                        0.0
+                    } else {
+                        100.0 * hint_hits as f64 / total as f64
+                    }
+                );
+            }
+        }
+
+        // ---- the records, one set per pass ----
+
+        let chunk_buffers = scene.chunk_buffers.load_full();
+
+        // **A new frame starts with nothing drawn from it**, which is what lets every pass below be
+        // rebuilt. The flag means "this pass has already drawn from *this frame's* records" - so it has
+        // to be cleared when the records are about to be replaced wholesale, and it has to *not* be
+        // cleared when this is a second view inside the same frame, because that is the case it exists
+        // for. Without this the flags would stand forever after the first frame and every later frame
+        // would draw the first frame's list, one frame's world frozen in place.
+        if frame.starts_a_new_frame(&key) {
+            for draws in &mut frame.passes {
+                draws.drawn = false;
+            }
+        }
+
+        // Asked once for the frame rather than per pass, and kept on each set of draws: the draw loop has
+        // to run the loop the arguments were written for, and this is a setting. See
+        // [`PassDraws::batched`].
+        let batchable = terrain_batches_draws();
+
+        let mut empty = 0u64;
+        let mut layer_empty = [0u64; 3];
+
+        // The other half of the frame's build cost, timed from here to the end of the loop below: the record
+        // sets (one per pass, each a walk of the sections the gather kept) and their uploads. See
+        // [`TERRAIN_RECORDS_NANOS`].
+        let records_started = std::time::Instant::now();
+
+        for (name, pipeline) in self.pipelines.iter() {
+            let Some(slot) = pipeline.draw_slot else {
+                continue;
+            };
+
+            let draws = &mut frame.passes[slot];
+
+            // A pass that has already drawn this frame keeps what it has. See [`PassDraws::drawn`].
+            if draws.drawn {
+                continue;
+            }
+
+            draws.records.clear();
+            draws.calls.clear();
+            draws.spans.clear();
+            draws.empty = [0u64; 3];
+
+            let mut truncated = 0u64;
+
+            // **Which order this pass draws in**, which is the one thing about the lists that is per pass:
+            // a pass that draws a blending layer needs far to near, and a pass that does not needs the
+            // storage order that keeps its batched calls long. See [`TerrainFrame::sorted`].
+            let layers = Self::terrain_layers(name);
+            let blending = layers
+                .iter()
+                .any(|(layer, _)| *layer == RenderLayer::Transparent);
+            let sections: &[VisibleSection] = if blending {
+                &frame.sorted
+            } else {
+                &frame.visible
+            };
+
+            for (layer_index, _) in layers {
+                let layer_index = *layer_index as usize;
+                let start = draws.calls.len();
+
+                for section in sections {
+                    let Some((arena, index_range, vertex_range)) =
+                        section.ranges[layer_index].clone()
+                    else {
+                        draws.empty[layer_index] += 1;
+                        empty += 1;
+                        layer_empty[layer_index] += 1;
+                        continue;
+                    };
+
+                    // An arena the storage knows about and the renderer does not: the two lists are kept
+                    // in step, so this is a bug rather than a state - but leaving one section out is
+                    // better than panicking mid-pass, which ends the process.
+                    if chunk_buffers.get(arena as usize).is_none() {
+                        log::warn!(
+                            "wgpu-mc: a section names arena {arena}, which the renderer has no buffer \
+                             for; skipping it"
+                        );
+                        continue;
+                    }
+
+                    // A draw past the end of the record buffer is a draw with nowhere to describe
+                    // itself, so it is left out and counted rather than wrapped or dropped in silence.
+                    // See `SECTION_DRAW_CAPACITY` and `report_truncated_draws`.
+                    if draws.records.len() >= crate::mc::SECTION_DRAW_CAPACITY {
+                        truncated += 1;
+                        continue;
+                    }
+
+                    let instance = draws.records.len() as u32;
+
+                    draws.records.push(SectionDraw {
+                        x: section.relative_position.x,
+                        y: section.relative_position.y,
+                        z: section.relative_position.z,
+                        word_base: vertex_range.start,
+                    });
+
+                    draws.calls.push(DrawCall {
+                        arena,
+                        index_range,
+                        instance,
+                    });
+                }
+
+                draws.spans.push((layer_index, start, draws.calls.len()));
+            }
+
+            draws.batched = batchable && the_indirect_path_holds(draws.calls.len());
+
+            // **How close the frame is to the cliff**, and whether it went over it. Only counted while the
+            // indirect path is on at all: with `terrain_indirect` off there is no cap to be near, and a
+            // peak recorded from a run that never batches would answer a question nobody asked.
+            if batchable {
+                let calls = draws.calls.len() as u64;
+                TERRAIN_CALLS_PEAK.fetch_max(calls, Ordering::Relaxed);
+
+                if !the_indirect_path_holds(draws.calls.len()) {
+                    report_the_indirect_cap(calls);
+                }
+            }
+
+            // ---- the upload, once per pass and before its first draw ----
+            //
+            // `Queue::write_buffer` is applied at the next `submit`, ahead of everything recorded in that
+            // submission - so every write a frame makes lands before every draw in it, which is why each
+            // pass has a slot of its own. See `SECTION_DRAW_SLOTS`.
+            if !draws.records.is_empty() {
+                wm.gpu.queue.write_buffer(
+                    &scene.section_draws[slot].buffer,
+                    0,
+                    bytemuck::cast_slice(&draws.records),
+                );
+
+                TERRAIN_UPLOADS.fetch_add(1, Ordering::Relaxed);
+                TERRAIN_UPLOAD_BYTES.fetch_add(
+                    (draws.records.len() * std::mem::size_of::<SectionDraw>()) as u64,
+                    Ordering::Relaxed,
+                );
+            }
+
+            if draws.batched && !draws.calls.is_empty() {
+                let args = draws
+                    .calls
+                    .iter()
+                    .map(|call| wgpu::util::DrawIndexedIndirectArgs {
+                        index_count: call.index_range.len() as u32,
+                        instance_count: 1,
+                        first_index: call.index_range.start,
+                        // **Zero on both paths.** `base_vertex` is added to the *vertex* index, and the
+                        // index buffer holds the section's own indices - so the arena slot is in the
+                        // record instead. See `SectionDraw`.
+                        base_vertex: 0,
+                        // **Which record this draw is.** The vertex stage reads
+                        // `section_draws[instance_index]`, and for an indirect draw this is the only
+                        // channel there is for anything per draw.
+                        first_instance: call.instance,
+                    })
+                    .collect::<Vec<_>>();
+
+                wm.gpu.queue.write_buffer(
+                    &scene.indirect_buffers[slot],
+                    0,
+                    bytemuck::cast_slice(&args),
+                );
+
+                TERRAIN_UPLOADS.fetch_add(1, Ordering::Relaxed);
+                TERRAIN_UPLOAD_BYTES.fetch_add(
+                    (args.len() * std::mem::size_of::<wgpu::util::DrawIndexedIndirectArgs>())
+                        as u64,
+                    Ordering::Relaxed,
+                );
+            }
+
+            report_truncated_draws(truncated);
+        }
+
+        TERRAIN_RECORDS_NANOS.fetch_add(
+            records_started.elapsed().as_nanos() as u64,
+            Ordering::Relaxed,
+        );
+
+        TERRAIN_EMPTY.fetch_add(empty, Ordering::Relaxed);
+
+        for layer in 0..3 {
+            LAYER_EMPTY[layer].fetch_add(layer_empty[layer], Ordering::Relaxed);
+            LAYER_EMPTY_TOTAL[layer].fetch_add(layer_empty[layer], Ordering::Relaxed);
+        }
+
+        TERRAIN_BUILD_NANOS.fetch_add(build_started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+
+        frame.key = Some(key);
+    }
+
     /// The same, recording **the named pipelines and nothing else**.
     ///
-    /// The two terrain groups are one graph but two moments in a frame, and the moment is not cosmetic.
-    /// Minecraft draws its opaque terrain, then its entities and features, then its translucent terrain
+    /// The two terrain groups are one graph but two moments in a frame, and the moment is not cosmetic.    /// Minecraft draws its opaque terrain, then its entities and features, then its translucent terrain
     /// (`LevelRenderer#addMainPass`: `renderGroup(OPAQUE)`, `submitEntities`,
     /// `renderTranslucentFeatures`, `renderGroup(TRANSLUCENT)`), and water that is blended into the
     /// frame **before** the entities is water the entities are then drawn on top of - which is exactly
@@ -1604,13 +2936,17 @@ impl RenderGraph {
                 "@geo_terrain" | "@geo_terrain_translucent" => {
                     render_pass.set_pipeline(&bound_pipeline.pipeline);
 
-                    // **The arenas, loaded once for this pass and held for all of it.** There is one
-                    // buffer per arena now, and a section names which one it lives in, so the draw loop
-                    // rebinds when that changes - see `SectionRanges::buffer`. The list is loaded once
-                    // rather than per section for the reason the single buffer used to be: it is replaced
-                    // when an arena is added, and a pass that read the list at two different moments
-                    // could bind one buffer and index another.
-                    let chunk_buffers = scene.chunk_buffers.load_full();
+                    // The pair of draw buffers this pass owns. `None` cannot happen - a terrain pipeline
+                    // that could not claim a slot is not in the graph, see `create_pipelines` - and a
+                    // pass that drew nothing is a better answer to it than an index panic inside a
+                    // `#[jni_fn]` frame, which ends the process.
+                    let Some(draw_slot) = bound_pipeline.draw_slot else {
+                        log::error!(
+                            "wgpu-mc: the '{pipeline_name}' pipeline draws terrain and holds no \
+                             draw-buffer slot; drawing nothing for it this frame"
+                        );
+                        continue;
+                    };
 
                     // Everything the pipeline binds that is *not* the arena: the matrices, the two
                     // atlases and their samplers, the lightmap, the fog block. The arena's own group is
@@ -1621,6 +2957,24 @@ impl RenderGraph {
                             WmBindGroup::Resource(name) => match &name[..] {
                                 // Bound per draw - see `bound_arena`.
                                 "@bg_ssbo_chunks" => {}
+                                // Bound once for the whole pass, which is the point of the buffer: a
+                                // `multi_draw` cannot be told anything per draw, so the section's
+                                // position and its arena slot travel in this buffer and the vertex
+                                // stage reads them by `instance_index`. Written below, before the first
+                                // draw of this pass and after the gather that decides what goes in it.
+                                "@bg_section_draws" => {
+                                    let Some(slot) = bound_pipeline.draw_slot else {
+                                        // Unreachable: a pipeline draws terrain only if it claimed a
+                                        // slot, and one that could not is not in the graph at all.
+                                        continue;
+                                    };
+
+                                    render_pass.set_bind_group(
+                                        *index,
+                                        &scene.section_draws[slot].bind_group,
+                                        &[],
+                                    );
+                                }
                                 _ => unimplemented!(),
                             },
                             WmBindGroup::Custom(bind_group) => {
@@ -1636,31 +2990,13 @@ impl RenderGraph {
                     // arena 1.
                     let mut bound_arena: Option<u32> = None;
 
-                    // **A read lock, because nothing under it writes.** This was `write()`, and it is
-                    // only ever iterated (`sections_source.iter()` below) - so the render thread was
-                    // taking the arena's exclusive lock for the whole of the gather, once a frame, and
-                    // every bake thread's `allocate` needs that same lock. A read lock is also what makes
-                    // the two sides' access patterns compatible rather than merely brief.
-                    let sections_source = scene.section_storage.read();
-
-                    // **The counters are local `u64`s and they are added once, at the end.**
-                    //
-                    // They were a relaxed `fetch_add` per section per layer, which is a lock-prefixed
-                    // read-modify-write on a cache line every other core on the machine wants: a few
-                    // hundred sections over two layers, every frame, for numbers that are only read once
-                    // a second by a log line. Two of them are not even reported - `drawn_total` and the
-                    // two `*_total` arrays exist only for the log line - so those were atomics with no
-                    // reader at all. A `u64` on this stack and one `fetch_add` each is the same number
-                    // and no contention. See `report_terrain_pass`, which takes them.
+                    // The draw-time counters only, and they are added once, at the end. The gather's own
+                    // counts - what the frustum rejected and what the game's list did not name - belong to
+                    // the frame and are added where the gather is. See `TerrainFrame`.
                     let mut drawn = 0u64;
                     let mut drawn_total = 0u64;
-                    let mut culled = 0u64;
-                    let mut empty = 0u64;
-                    let mut out_of_sight = 0u64;
                     let mut layer_drawn = [0u64; 3];
-                    let mut layer_empty = [0u64; 3];
                     let mut layer_drawn_total = [0u64; 3];
-                    let mut layer_empty_total = [0u64; 3];
 
                     // The section the camera is in, which is the origin every draw is placed *relative
                     // to*. The alternative - the section's own absolute position - is a number of up to
@@ -1681,13 +3017,6 @@ impl RenderGraph {
                     // for the same reason.
                     let camera_section = *scene.camera_section_pos.read();
 
-                    // The game's own answer to "what can be seen", held for the whole pass rather than
-                    // read per section: it is one lock for a few hundred lookups either way, and the
-                    // guard cannot be held across a `continue` in a way that matters here. `None` is
-                    // "nothing has been sent", which is not the same as an empty list. See
-                    // `Scene::visible_sections` and the test below.
-                    let visible = scene.visible_sections.read();
-
                     // The frustum the culler below is handed is built from this same view-projection
                     // matrix, so the boxes have to be in the space that matrix reads - which is
                     // camera-section-relative blocks, and that is what the model matrix being the
@@ -1705,127 +3034,76 @@ impl RenderGraph {
                         );
                     }
 
-                    // **One pass over the sections, then one pass over what survived.**
+                    // **The frame's one pass over the world, and this pass is three passes deep.**
                     //
                     // Everything that decides whether a section is drawn at all - is it named by the
-                    // game's occlusion graph, is it inside the frustum, does the arena hold the layer -
-                    // is asked once, here, and what comes out is a list of `(position, ranges, distance)`.
-                    // The draw loops below then walk that list and nothing else: they do not touch the
+                    // game's occlusion graph, is it inside the frustum, does the arena hold the layer - is
+                    // asked once per *frame* now, and what comes out is a list of
+                    // `(position, ranges, distance)` plus, per pass, the records and draws built from it.
+                    // The frame's three terrain passes walk that and nothing else: they do not touch the
                     // arena's `HashMap`, they do not rebuild a box, and they do not re-run the frustum
-                    // test per layer. The box and the two visibility answers do not depend on which layer
-                    // is being drawn, so asking them twice was asking them once too often.
-                    //
-                    // The list is a field on the graph rather than a local so that its capacity survives
-                    // the pass: a few hundred entries, cleared and refilled sixty times a second, is a
-                    // thousand allocations a second otherwise. See [`TerrainScratch`].
-                    let mut scratch = self.terrain_visible.0.borrow_mut();
-                    let out = &mut *scratch;
+                    // test. None of that depends on which layer is being drawn, so the three passes used
+                    // to produce the same list three times and now produce it once. See
+                    // [`TerrainFrame`], which is where it is kept, and [`TerrainFrameKey`], which is what
+                    // decides whether it has to be produced again.
+                    let key = TerrainFrameKey {
+                        frame: FRAME.load(Ordering::Relaxed),
+                        // The culler's own planes, which is all it reads of the matrix.
+                        frustum: frustum.planes.map(|plane| plane.into_array()),
+                        camera_section,
+                        visible: scene.visible_sections_revision(),
+                        model_translation,
+                    };
 
-                    out.clear();
-                    let honour_occlusion = TERRAIN_OCCLUSION.load(Ordering::Relaxed);
+                    let mut frame = self.terrain_frame.borrow_mut();
 
-                    for (pos, section) in sections_source.iter() {
-                        if honour_occlusion
-                            && Self::section_visibility(visible.as_ref(), pos)
-                                == SectionVisibility::OutOfSight
-                        {
-                            out_of_sight += 1;
-                            continue;
-                        }
+                    if frame.key != Some(key) {
+                        // **How much of this is the submission counter alone.** `frame` advances at every
+                        // submission (`begin_frame`), and what the records must not outlive is the *arena's
+                        // deferred free*, which happens once per presented frame in the drain. So a
+                        // submission that is not a present - a second flush inside one frame, which
+                        // `render stats` reports as more submissions than presented frames - changes
+                        // nothing the gather reads, and this counts the rebuilds that were thrown away for
+                        // it. Everything else about the key is compared with the frame number pinned.
+                        TERRAIN_REBUILDS.fetch_add(1, Ordering::Relaxed);
 
-                        // The section's position *relative to the camera's section*: the view matrix
-                        // carries the camera's offset within its own section and nothing else, so a draw
-                        // is placed by naming where it is with the big part taken out of it. See
-                        // `camera_section` above for the whole of it.
-                        let rel_pos = *pos - camera_section;
-
-                        // The box the section occupies *where the shader draws it*: the same
-                        // camera-section-relative position the immediate carries, times sixteen to the
-                        // block units the frustum is measured in. A box built from the absolute name
-                        // instead would be thousands of blocks from the geometry it stands for, and the
-                        // sections around the camera would be culled out of their own frame.
-                        let a: Vec3<f32> = [
-                            rel_pos.x as f32 * 16.0,
-                            rel_pos.y as f32 * 16.0,
-                            rel_pos.z as f32 * 16.0,
-                        ]
-                        .into();
-                        let b: Vec3<f32> = a + Vec3::new(16.0, 16.0, 16.0);
-
-                        let bounds: AABB<f32> = AABB::new(a.into_array(), b.into_array());
-
-                        // Still tested, because it is nearly free and the two disagree in both
-                        // directions: the game's graph is a frame old and conservative about what a
-                        // neighbour hides, and a section it left out may be one the camera has since
-                        // turned toward.
-                        if !bounds.coherent_test_against_frustum(frustum, 0).0 {
-                            culled += 1;
-                            continue;
-                        }
-
-                        // Which layers the arena actually holds for this section, gathered once. Both
-                        // ranges travel, because a draw needs both: the index range to draw and the
-                        // vertex range to draw it *from* (`draw_indexed`'s instance range is the
-                        // section's slot in the arena). A section the arena has nothing in for the layer
-                        // being drawn is counted where the layer is drawn, because "the arena has no
-                        // cutout here" is a fact about the layer and not about the section.
-                        let mut ranges: [Option<crate::mc::chunk::DrawnLayer>; 3] =
-                            [None, None, None];
-                        let mut any = false;
-
-                        for (layer_index, layer) in section.layers.iter().enumerate() {
-                            if let Some(layer) = layer {
-                                // The arena the layer lives in travels with its ranges: the draw loop
-                                // rebinds when it changes, and drawing a section against another arena
-                                // is a section of somebody else's geometry.
-                                ranges[layer_index] = Some((
-                                    layer.buffer,
-                                    layer.index_range.clone(),
-                                    layer.vertex_range.start..layer.vertex_range.start + 1,
-                                ));
-                                any = true;
-                            }
-                        }
-
-                        if !any {
-                            continue;
-                        }
-
-                        // The distance the translucent layer is sorted by, measured between section
-                        // centres the way the game measures it - in sections, and squared, because a
-                        // square root would be thrown away by the comparison it feeds.
-                        let dx = rel_pos.x as f32;
-                        let dy = rel_pos.y as f32;
-                        let dz = rel_pos.z as f32;
-
-                        out.push(VisibleSection {
-                            relative_position: rel_pos,
-                            ranges,
-                            distance_squared: dx * dx + dy * dy + dz * dz,
+                        let same_except_the_frame = frame.key.is_some_and(|previous| {
+                            TerrainFrameKey {
+                                frame: previous.frame,
+                                ..key
+                            } == previous
                         });
+
+                        if same_except_the_frame {
+                            TERRAIN_REBUILDS_FRAME_ONLY.fetch_add(1, Ordering::Relaxed);
+                        }
+
+                        self.rebuild_terrain_frame(
+                            &mut frame,
+                            wm,
+                            scene,
+                            frustum,
+                            key,
+                            TERRAIN_OCCLUSION.load(Ordering::Relaxed),
+                        );
                     }
 
-                    // **Far to near, which is what a blending layer needs and what it did not have.**
-                    //
-                    // The translucent layer blends with what is already in the target, so the order it
-                    // is drawn in is the picture: every face has to be drawn before the face behind it.
-                    // This pass walked the arena's `HashMap` in *hash order*, which is not any order at
-                    // all - so two panes of glass, or a lake and the water behind it, blended in
-                    // whatever sequence the hasher happened to produce, and it produced a different one
-                    // as the map grew. Sorting once, here, is the whole fix: the draw loops below walk
-                    // this list in order.
-                    //
-                    // Keyed on the section and not on the face. Sorting faces is what the game does for
-                    // *its* translucent mesh, which is built per section and re-sorted when the camera
-                    // moves a block; a section is the granularity this side has, and it is the granularity
-                    // the game's own `ChunkSectionLayer.TRANSLUCENT` is ordered at too.
-                    Self::sort_for_drawing(out, Self::terrain_layers(pipeline_name));
+                    // **Marked before the draws, not after.** The draws read the record buffer at
+                    // submission time rather than here, so a rebuild that happened between this pass's
+                    // draws and the next pass's would leave the counts and offsets already recorded
+                    // describing a list that is no longer in the buffer. A pass that is about to draw is
+                    // therefore a pass a later rebuild leaves alone. See [`PassDraws::drawn`].
+                    frame.passes[draw_slot].drawn = true;
 
-                    // The section position, written into a fixed-size array on this stack once per
-                    // draw: twenty-eight bytes in the layout the shader's `SectionPosition` spells out -
-                    // the three integers, the layer's alpha cutoff, the atlas level-of-detail bias, and
-                    // the half-texel shift for the atlas being sampled. See `set_immediates`.
-                    let mut constants = [0u8; 40];
+                    let draws = &frame.passes[draw_slot];
+
+                    // The arenas, loaded once for the draws and held for all of them: a pass that read
+                    // the list at two different moments could bind one buffer and index another. Loaded
+                    // *after* the frame's records were built, which is the order that fails safely - an
+                    // arena added in between is one the build did not know about, so a section naming it
+                    // was left out of the records; the other order is a section left in and indexed into a
+                    // list with no such entry, which is a panic inside a `#[jni_fn]` frame.
+                    let chunk_buffers = scene.chunk_buffers.load_full();
 
                     // Half a texel for this side's own atlas, which is a fixed size, and for the game's,
                     // which is not - see the write below for why the two cannot share a number.
@@ -1880,126 +3158,168 @@ impl RenderGraph {
                     let game_texel =
                         game_atlas_size().map_or(our_texel, |(width, _)| 1.0 / width as f32);
 
-                    for (layer_index, alpha_cutout) in Self::terrain_layers(pipeline_name) {
-                        let layer_index = *layer_index as usize;
-                        let alpha_cutout = *alpha_cutout;
+                    // **One record per draw, built with the frame rather than here.**
+                    //
+                    // `draws.records[i]` is what the vertex stage reads for draw `i` - the section's
+                    // position and its arena slot - and `draws.calls[i]` is what the draw itself needs.
+                    // Both paths read the record out of the buffer, because the section's position is not
+                    // in the immediate: a `multi_draw` is one call, so an immediate can only hold what
+                    // every draw in it shares. See [`RenderGraph::rebuild_terrain_frame`], which is where
+                    // they are built and uploaded - once for the frame, not once per pass.
+                    // The half-texel shifts, in the order the shader's `SectionPosition` declares them,
+                    // and the shader picks the one belonging to the atlas the face samples. Not
+                    // conditional here: the flag that says which atlas a face uses is per vertex, and a
+                    // layer can hold faces of both kinds, so there is no answer at this level to write.
+                    // The pass' immediate: the five numbers about the two atlases that every draw of a
+                    // layer shares, and the layer's own alpha cutoff, which is filled in per layer below.
+                    // See [`SectionPositionImmediate`] for the layout and for why the section's own
+                    // position is not one of these.
+                    //
+                    // **The bias is read here, once per pass, rather than per draw.** It is a setting,
+                    // so a value cached across frames would follow the options screen late - and a value
+                    // read at the top of the pass is as current as the frame it is drawn in. That is the
+                    // granularity the batching forced: a `multi_draw` cannot be handed an immediate per
+                    // draw, so everything in here has to be true for all of them.
+                    let mut immediate = SectionPositionImmediate {
+                        alpha_cutout: 0.0,
+                        lod_bias: crate::render::atlas::atlas_lod_bias(),
+                        half_texel_ours: our_half_texel,
+                        half_texel_game: game_half_texel,
+                        texel_ours: our_texel,
+                        texel_game: game_texel,
+                        // **The two numbers the game's own terrain shader is handed for its sampling**:
+                        // whether the `textureFiltering` option has RGSS on, and one texel of the atlas
+                        // it reads. See the shader's `use_rgss` and `sampleRGSS`, which is a port of the
+                        // game's and cannot be expressed with a sampler. `GameRenderer` writes exactly
+                        // this comparison into its own `GlobalSettingsUniform`.
+                        use_rgss: u32::from(
+                            crate::render::atlas::texture_filtering()
+                                == crate::render::atlas::TEXTURE_FILTERING_RGSS,
+                        ),
+                    };
 
-                        for visible in out.iter() {
-                            let Some((arena, index_range, vertex_range)) =
-                                visible.ranges[layer_index].clone()
-                            else {
-                                empty += 1;
-                                layer_empty[layer_index] += 1;
-                                layer_empty_total[layer_index] += 1;
-                                continue;
-                            };
+                    // **Whether this pass batches its draws, and the uploads, are with the build.** Both
+                    // are decisions about the records rather than about the draws - the batching is what
+                    // the indirect arguments were written for, and the upload has to happen before the
+                    // frame's first draw of that buffer - so they live in
+                    // [`RenderGraph::rebuild_terrain_frame`] and this pass only obeys. See
+                    // [`PassDraws::batched`].
 
-                            // **Rebind when the section lives in a different arena.** The bind group is
-                            // the storage buffer the vertex stage reads `chunk_data` out of and the index
-                            // buffer is where `draw_indexed` reads the indices, so both are per arena and
-                            // both have to move together - binding one and not the other draws a section
-                            // out of somebody else's geometry. Sections are gathered in storage order and
-                            // the allocator hands out of one arena until it is full, so this is a handful
-                            // of rebinds per frame rather than one per section.
-                            if bound_arena != Some(arena) {
-                                let Some(buffer) = chunk_buffers.get(arena as usize) else {
-                                    // An arena the storage knows about and the renderer does not: the two
-                                    // lists are kept in step, so this is a bug rather than a state - but
-                                    // skipping one section is better than panicking mid-pass, which ends
-                                    // the process.
-                                    log::warn!(
-                                        "wgpu-mc: a section names arena {arena}, which the renderer has \
-                                         no buffer for; skipping it"
-                                    );
-                                    continue;
-                                };
+                    for ((layer_index, start, end), (_, alpha_cutout)) in
+                        draws.spans.iter().zip(Self::terrain_layers(pipeline_name))
+                    {
+                        // The immediate, **once for the layer**: the alpha cutoff is the one field of it
+                        // a layer changes, and the rest is what every draw of the pass shares. Set
+                        // before the layer's first draw and not per draw, because the batched path
+                        // cannot set anything per draw at all.
+                        immediate.alpha_cutout = *alpha_cutout;
+                        set_immediates(
+                            &bound_pipeline.immediates,
+                            &mut render_pass,
+                            &[bytemuck::bytes_of(&immediate)],
+                        );
+
+                        if draws.batched {
+                            // **The longest runs of consecutive draws that share an arena.**
+                            //
+                            // `multi_draw_indexed_indirect` reads one index buffer and one arena bind
+                            // group for every record in the call, so a call may only span draws of one
+                            // arena. The runs are contiguous slices of the list and are issued in order,
+                            // so the transparent layer's far-to-near order comes out exactly as it went
+                            // in: a run boundary splits a call, it does not reorder anything.
+                            //
+                            // Sections are gathered in storage order and the allocator hands out of one
+                            // arena until it is full, so this is a handful of calls per frame rather
+                            // than one per section.
+                            let mut index = *start;
+
+                            while index < *end {
+                                let arena = draws.calls[index].arena;
+                                let mut stop = index + 1;
+
+                                while stop < *end && draws.calls[stop].arena == arena {
+                                    stop += 1;
+                                }
+
+                                let buffer = &chunk_buffers[arena as usize];
 
                                 render_pass.set_bind_group(1, &buffer.bind_group, &[]);
                                 render_pass.set_index_buffer(
                                     buffer.buffer.slice(..),
                                     wgpu::IndexFormat::Uint32,
                                 );
-                                bound_arena = Some(arena);
+
+                                render_pass.multi_draw_indexed_indirect(
+                                    &scene.indirect_buffers[draw_slot],
+                                    // In bytes, and every record is the same size - so the offset of
+                                    // record `i` is `i` records in. The records were written in this
+                                    // same order, which is what makes the two agree.
+                                    index as u64 * INDIRECT_RECORD_SIZE,
+                                    (stop - index) as u32,
+                                );
+
+                                let count = (stop - index) as u64;
+                                drawn += count;
+                                drawn_total += count;
+                                layer_drawn[*layer_index] += count;
+                                layer_drawn_total[*layer_index] += count;
+
+                                index = stop;
                             }
-
-                            constants[..12].copy_from_slice(bytemuck::cast_slice(
-                                &visible.relative_position.to_array(),
-                            ));
-                            constants[12..16].copy_from_slice(&alpha_cutout.to_ne_bytes());
-                            // Read per draw rather than hoisted out of the loop, because it is a
-                            // setting: a value cached for the pass would be a frame behind the options
-                            // screen, and the whole point of moving this out of the shader was that
-                            // moving it takes effect.
-                            constants[16..20].copy_from_slice(
-                                &crate::render::atlas::atlas_lod_bias().to_ne_bytes(),
-                            );
-                            // **Half a texel of the atlas these faces are drawn from**, which is a
-                            // different number for each of the two and is the whole reason it is sent
-                            // rather than written into the shader as a constant.
+                        } else {
+                            // **One call per draw**, which is the path this renderer has always had -
+                            // and now the fallback: for a device without
+                            // `Features::INDIRECT_FIRST_INSTANCE` (a record's `first_instance` may not
+                            // be non-zero there), for a pass with more draws than the indirect buffer
+                            // holds, and for a run with the switch off.
                             //
-                            // The game's stitcher packs `blocks.png` at whatever size the sprites need
-                            // and that changes between runs - 2048x2048 one launch, 1024x1024 the next -
-                            // so `0.5 / 2048` in a shader is half a texel on one launch and a quarter of
-                            // one on the other. The size is asked for here, once per frame, from the
-                            // handover that knows it.
-                            //
-                            // The two half-texel shifts, in the order the shader's `SectionPosition`
-                            // declares them, and the shader picks the one belonging to the atlas the face
-                            // samples. Not conditional here: the flag that says which atlas a face uses
-                            // is per vertex, and a layer can hold faces of both kinds, so there is no
-                            // answer at this level to write.
-                            constants[20..24].copy_from_slice(&our_half_texel.to_ne_bytes());
-                            constants[24..28].copy_from_slice(&game_half_texel.to_ne_bytes());
-                            // One texel of each atlas: the magnification test compares the
-                            // coordinates' derivative against this, so it has to be the size of
-                            // the atlas the sample actually comes from.
-                            constants[28..32].copy_from_slice(&our_texel.to_ne_bytes());
-                            constants[32..36].copy_from_slice(&game_texel.to_ne_bytes());
-                            // **The two numbers the game's own terrain shader is handed**: the size of the
-                            // atlas it samples, and whether the `textureFiltering` option has RGSS on. See
-                            // the shader's `TexelSize` and `use_rgss` for what they do - `sampleNearest` and
-                            // `sampleRGSS` are ports of the game's, and neither can be expressed with a
-                            // sampler.
-                            //
-                            // Read per draw for the same reason the bias above is: it is the game's
-                            // option, and a value cached for the pass would follow the options screen by a
-                            // frame. `GameRenderer` writes exactly this comparison into its own
-                            // `GlobalSettingsUniform`.
-                            let use_rgss = u32::from(
-                                crate::render::atlas::texture_filtering()
-                                    == crate::render::atlas::TEXTURE_FILTERING_RGSS,
-                            );
-                            constants[36..40].copy_from_slice(&use_rgss.to_ne_bytes());
+                            // The picture is the same either way, and by construction rather than by
+                            // care: the same records in the same order, the same shader, and the same
+                            // `instance_index` - a record's own number - reaching it.
+                            for call in &draws.calls[*start..*end] {
+                                // **Rebind when the section lives in a different arena.** The bind group
+                                // is the storage buffer the vertex stage reads `chunk_data` out of and
+                                // the index buffer is where `draw_indexed` reads the indices, so both
+                                // are per arena and both have to move together - binding one and not the
+                                // other draws a section out of somebody else's geometry.
+                                if bound_arena != Some(call.arena) {
+                                    let buffer = &chunk_buffers[call.arena as usize];
 
-                            set_immediates(
-                                &bound_pipeline.immediates,
-                                &mut render_pass,
-                                &[&constants],
-                            );
-                            render_pass.draw_indexed(index_range, 0, vertex_range);
+                                    render_pass.set_bind_group(1, &buffer.bind_group, &[]);
+                                    render_pass.set_index_buffer(
+                                        buffer.buffer.slice(..),
+                                        wgpu::IndexFormat::Uint32,
+                                    );
+                                    bound_arena = Some(call.arena);
+                                }
 
-                            drawn += 1;
-                            drawn_total += 1;
-                            layer_drawn[layer_index] += 1;
-                            layer_drawn_total[layer_index] += 1;
+                                // One instance, and its number is which record the vertex stage is to
+                                // read - the number the batched path writes into `first_instance`.
+                                render_pass.draw_indexed(
+                                    call.index_range.clone(),
+                                    0,
+                                    call.instance..call.instance + 1,
+                                );
+
+                                drawn += 1;
+                                drawn_total += 1;
+                                layer_drawn[*layer_index] += 1;
+                                layer_drawn_total[*layer_index] += 1;
+                            }
                         }
                     }
 
                     // One `fetch_add` each, for the whole pass: the atomics are drained by a log line
-                    // once a second and nothing on the draw path reads them.
+                    // once a second and nothing on the draw path reads them. The gather's own counts and
+                    // the per-layer "the arena has nothing here" counts are added where the frame is
+                    // built, so what is left here is what this pass drew.
                     TERRAIN_DRAWN.fetch_add(drawn, Ordering::Relaxed);
                     TERRAIN_DRAWN_TOTAL.fetch_add(drawn_total, Ordering::Relaxed);
-                    TERRAIN_CULLED.fetch_add(culled, Ordering::Relaxed);
-                    TERRAIN_EMPTY.fetch_add(empty, Ordering::Relaxed);
-                    TERRAIN_OUT_OF_SIGHT.fetch_add(out_of_sight, Ordering::Relaxed);
 
                     for layer in 0..3 {
                         LAYER_DRAWN[layer].fetch_add(layer_drawn[layer], Ordering::Relaxed);
-                        LAYER_EMPTY[layer].fetch_add(layer_empty[layer], Ordering::Relaxed);
                         LAYER_DRAWN_TOTAL[layer]
                             .fetch_add(layer_drawn_total[layer], Ordering::Relaxed);
-                        LAYER_EMPTY_TOTAL[layer]
-                            .fetch_add(layer_empty_total[layer], Ordering::Relaxed);
                     }
 
                     report_terrain_pass();
@@ -2256,10 +3576,12 @@ pub fn set_push_constants(
 fn immediate_size_of(name: &str) -> u32 {
     match name {
         "@pc_mat4_model" => 64,
-        // **Five four-byte members, and the fifth is why this is not sixteen.** `SectionPosition` is
-        // three integers, the layer's alpha cutoff and the atlas level-of-detail bias; see the struct in
-        // `terrain.wgsl` for what the bias is for and why it had to stop being a `const`.
-        "@pc_section_position" => 40,
+        // **Seven four-byte members, and the three that are missing are the point.** `SectionPosition`
+        // is the layer's alpha cutoff, the atlas level-of-detail bias, the two half-texel shifts, one
+        // texel of each atlas, and whether the game's RGSS filtering is on. The section's x, y and z
+        // were the first three members and are in `SectionDraw` now, because a `multi_draw` is one call
+        // and an immediate holds what the whole of it shares. See the struct in `terrain.wgsl`.
+        "@pc_section_position" => 28,
         "@pc_total_sections" => 4,
         "@pc_parts_per_entity" => 4,
         "@pc_electrum_color" => 16,
@@ -2445,32 +3767,67 @@ mod terrain_layer_tests {
         let mut told = std::collections::HashSet::new();
         told.insert(here);
 
+        // What the gather passes when no section has been taken over since the list arrived, which is
+        // the state every assertion about culling below is made in.
+        let nothing_taken = std::collections::HashSet::new();
+
         // Nothing has been sent: the frustum decides, so anything might still be drawn.
         assert_eq!(
-            RenderGraph::section_visibility(None, &here),
+            RenderGraph::section_visibility(None, &nothing_taken, &here),
             SectionVisibility::AskTheFrustum
         );
         assert_eq!(
-            RenderGraph::section_visibility(None, &elsewhere),
+            RenderGraph::section_visibility(None, &nothing_taken, &elsewhere),
             SectionVisibility::AskTheFrustum
         );
 
         // A set that names this section draws it and one that does not, does not.
         assert_eq!(
-            RenderGraph::section_visibility(Some(&told), &here),
+            RenderGraph::section_visibility(Some(&told), &nothing_taken, &here),
             SectionVisibility::Draw
         );
         assert_eq!(
-            RenderGraph::section_visibility(Some(&told), &elsewhere),
-            SectionVisibility::OutOfSight
+            RenderGraph::section_visibility(Some(&told), &nothing_taken, &elsewhere),
+            SectionVisibility::OutOfSight,
+            "the steady state is what the culling is for: a section the list has had every chance to \
+             name, and did not"
         );
 
         // And the empty set: the game looked and saw nothing.
         let empty = std::collections::HashSet::new();
         assert_eq!(
-            RenderGraph::section_visibility(Some(&empty), &here),
+            RenderGraph::section_visibility(Some(&empty), &nothing_taken, &here),
             SectionVisibility::OutOfSight,
             "an empty list is the game saying it saw nothing, not the JVM saying nothing"
+        );
+
+        // **And the section the list was never given the chance to judge**, which is the hole this
+        // third answer exists to close: it entered the arena after the list was last refilled, so "not
+        // named" is a stale answer rather than the game saying no. The frustum decides instead.
+        let mut since = std::collections::HashSet::new();
+        since.insert(elsewhere);
+
+        assert_eq!(
+            RenderGraph::section_visibility(Some(&told), &since, &elsewhere),
+            SectionVisibility::AskTheFrustum,
+            "a section taken over since the list was sent is not culled by it"
+        );
+        assert_eq!(
+            RenderGraph::section_visibility(Some(&empty), &since, &elsewhere),
+            SectionVisibility::AskTheFrustum,
+            "not even by an empty list: the game looked before this section was here"
+        );
+
+        // A named section is still drawn whatever the set says, and the set does not reach a section
+        // the list *has* judged - both of which are the culling surviving the fix.
+        assert_eq!(
+            RenderGraph::section_visibility(Some(&told), &since, &here),
+            SectionVisibility::Draw
+        );
+        assert_eq!(
+            RenderGraph::section_visibility(Some(&empty), &since, &here),
+            SectionVisibility::OutOfSight,
+            "a section the list named is not, and this one it did not name and has judged"
         );
     }
 
@@ -2733,14 +4090,17 @@ mod texture_sample_uniformity_tests {
             //
             // The invariant below is what actually matters and it is now stronger than it was: a
             // `textureSampleGrad` still computes its level from derivatives, and the derivatives of a
-            // `sample_nearest` are of the *unshifted* coordinates, so the same rule applies - every fetch
-            // happens in uniform control flow and the choice is a `select`. See the sampling note in
+            // `sample_nearest` are of the *unshifted* coordinates, so the same rule applies. What the
+            // shaders do now is **hoist every derivative, and every level, into one `sample_geometry`
+            // called at the top level**, and branch over fetches that name their level outright - which
+            // is why the shape below is allowed to be real `if`s again. See the sampling note in
             // `terrain.wgsl`.
             assert_eq!(
                 auto, 0,
                 "{name}.wgsl has {auto} auto-level texture fetch(es); the game's own sampling functions take \
-                 the level explicitly, so every fetch here should be a `textureSampleGrad` or a \
-                 `textureSampleLevel` - an `Auto` or `Bias` sample means one was written the old way"
+                 the level explicitly, so every fetch here should be a `textureSampleLevel` - an `Auto` or \
+                 `Bias` sample means one was written the old way, and one inside a branch is the undefined \
+                 behaviour this test exists for"
             );
 
             let found = samples_inside_branches(&source);
@@ -2749,10 +4109,66 @@ mod texture_sample_uniformity_tests {
                 found.is_empty(),
                 "{name}.wgsl samples a texture inside a branch at {found:?}; the level of detail comes \
                  from derivatives, which WGSL only defines in uniform control flow, so this is undefined \
-                 behaviour however uniform the condition looks. Sample both textures unconditionally and \
-                 `select` between the results."
+                 behaviour however uniform the condition looks. Take the level explicitly - \
+                 `textureSampleLevel` carries no uniformity requirement - or sample both and `select` \
+                 between the results."
             );
         }
+    }
+
+    /// **The same invariant, on every shader in the directory rather than on the two terrain ones.**
+    ///
+    /// The test above names `terrain` and `terrain_solid`, and that scope is exactly why a real one
+    /// survived: `sun_moon_cycle.wgsl` sampled its sun or its moon from inside an `if` on an interpolated
+    /// varying - the same undefined behaviour, in a shader nothing was looking at. A file is covered the
+    /// moment it is in the directory now, which is the only version of this that cannot be outgrown.
+    ///
+    /// What is *not* asserted here is a count of auto-level fetches: those are fine at the top level, and
+    /// the terrain pair is where the explicit level was the point. This is only about where a sample sits.
+    #[test]
+    fn no_shader_this_crate_builds_samples_a_texture_under_a_branch() {
+        let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../neoforge/src/main/resources/assets/wgpu_mc/shaders");
+
+        let mut checked = 0;
+
+        for entry in std::fs::read_dir(&directory)
+            .unwrap_or_else(|err| panic!("{} is unreadable: {err}", directory.display()))
+            .map(|entry| entry.expect("a readable directory entry"))
+        {
+            let path = entry.path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("wgsl") {
+                continue;
+            }
+
+            let name = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .expect("a UTF-8 file name")
+                .to_string();
+
+            let source = std::fs::read_to_string(&path)
+                .unwrap_or_else(|err| panic!("{} is unreadable: {err}", path.display()));
+
+            let found = samples_inside_branches(&source);
+
+            assert!(
+                found.is_empty(),
+                "{name}.wgsl samples a texture inside a branch at {found:?}; the level of detail comes \
+                 from derivatives, which WGSL only defines in uniform control flow, so this is undefined \
+                 behaviour however uniform the condition looks. Sample both and `select` between the \
+                 results, or take the level explicitly with `textureSampleLevel`."
+            );
+
+            checked += 1;
+        }
+
+        // A walk that found nothing would satisfy the assertion above.
+        assert!(
+            checked > 8,
+            "only {checked} shader(s) were found in {}",
+            directory.display()
+        );
     }
 }
 
@@ -2911,6 +4327,189 @@ mod binding_visibility_tests {
                 "{name}.wgsl's `SectionPosition` is {size} bytes and the immediate is declared {} - wgpu \
                  aborts the process when the shader asks for more than was set",
                 immediate_size_of("@pc_section_position")
+            );
+        }
+    }
+
+    /// **Every member of the immediate, by name and by offset, on both sides of it.**
+    ///
+    /// The size test above is not enough on its own, and this is the bug that says so. The immediate was
+    /// a `[u8; 28]` with a hand-written offset table, and the change that took the section's position
+    /// out of it left `constants[4..8]` - the atlas level-of-detail bias - with nothing writing it. Every
+    /// member is four bytes, so the struct stayed twenty-eight and the test above stayed green; the
+    /// picture was a `lod_bias` of zero, which is to say a player's `-4` silently stopped applying, and
+    /// the field next to it was one slot from having the bias written into it instead.
+    ///
+    /// So the check is per member: naga is asked for the shipped struct's member list, and every name,
+    /// offset and size is compared against the Rust struct the pass writes. A renamed member, a
+    /// reordered pair of same-sized fields, a field added to one side and not the other - all three are
+    /// this test, and none of them is anything else.
+    ///
+    /// `terrain_solid.wgsl` too, because the two share one immediate and a mismatch there aborts the
+    /// layer that draws first.
+    #[test]
+    fn the_immediates_members_line_up_by_name_and_offset() {
+        for (name, source) in [("terrain", TERRAIN), ("terrain_solid", TERRAIN_SOLID)] {
+            let module = naga::front::wgsl::parse_str(source).expect("the terrain shader parses");
+
+            let members = module
+                .types
+                .iter()
+                .find(|(_, ty)| ty.name.as_deref() == Some("SectionPosition"))
+                .and_then(|(_, ty)| match &ty.inner {
+                    naga::TypeInner::Struct { members, .. } => Some(members.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("{name}.wgsl declares no `SectionPosition` struct"));
+
+            // The same seven names in the same order, taken from the other side. `offset_of!` rather
+            // than a written-down number: a literal here would be a second hand-written table, which is
+            // the thing this replaced.
+            let written = [
+                (
+                    "alpha_cutout",
+                    std::mem::offset_of!(SectionPositionImmediate, alpha_cutout),
+                ),
+                (
+                    "lod_bias",
+                    std::mem::offset_of!(SectionPositionImmediate, lod_bias),
+                ),
+                (
+                    "half_texel_ours",
+                    std::mem::offset_of!(SectionPositionImmediate, half_texel_ours),
+                ),
+                (
+                    "half_texel_game",
+                    std::mem::offset_of!(SectionPositionImmediate, half_texel_game),
+                ),
+                (
+                    "texel_ours",
+                    std::mem::offset_of!(SectionPositionImmediate, texel_ours),
+                ),
+                (
+                    "texel_game",
+                    std::mem::offset_of!(SectionPositionImmediate, texel_game),
+                ),
+                (
+                    "use_rgss",
+                    std::mem::offset_of!(SectionPositionImmediate, use_rgss),
+                ),
+            ];
+
+            assert_eq!(
+                members.len(),
+                written.len(),
+                "{name}.wgsl's `SectionPosition` has {} member(s) and the immediate this side writes \
+                 has {} - a member on one side only is a field the shader reads at another's offset",
+                members.len(),
+                written.len()
+            );
+
+            for (member, (field, offset)) in members.iter().zip(written) {
+                assert_eq!(
+                    member.name.as_deref(),
+                    Some(field),
+                    "{name}.wgsl's `SectionPosition` declares `{:?}` where this side writes `{field}`, \
+                     and the pass fills its fields by name",
+                    member.name
+                );
+                assert_eq!(
+                    member.offset as usize, offset,
+                    "{name}.wgsl puts `{field}` at byte {} and this side writes it at byte {offset}",
+                    member.offset
+                );
+                assert_eq!(
+                    module.types[member.ty].inner.size(module.to_ctx()),
+                    4,
+                    "{name}.wgsl's `{field}` is not four bytes, so the Rust struct's stride and this \
+                     one's have parted"
+                );
+            }
+
+            assert_eq!(
+                std::mem::size_of::<SectionPositionImmediate>(),
+                immediate_size_of("@pc_section_position") as usize,
+                "the immediate this side writes is {} bytes and the layout declares {}",
+                std::mem::size_of::<SectionPositionImmediate>(),
+                immediate_size_of("@pc_section_position")
+            );
+        }
+    }
+
+    /// **The size of one draw's record, on both sides of it.**
+    ///
+    /// The pass writes `SectionDraw` as a flat array of `#[repr(C)]` structs and the vertex stage reads
+    /// `section_draws[instance_index]` out of the same bytes, so the two have to agree on the stride.
+    /// wgpu would not refuse a disagreement: the buffer is bound as an untyped run of bytes and only the
+    /// shader knows where a record starts, so a shader that read 32 bytes per record would take the
+    /// next draw's `x` as this one's `word_base` - and what that looks like is sections drawn at other
+    /// sections' positions and vertices read from other sections' slots, not an error anywhere.
+    ///
+    /// Every member of both is a four-byte scalar, so the struct's size is its stride; the assertion is
+    /// written against the size because that is the number naga will give.
+    #[test]
+    fn a_draw_record_is_the_size_the_shader_strides_over() {
+        for (name, source) in [("terrain", TERRAIN), ("terrain_solid", TERRAIN_SOLID)] {
+            let module = naga::front::wgsl::parse_str(source).expect("the terrain shader parses");
+
+            let structure = module
+                .types
+                .iter()
+                .find(|(_, ty)| ty.name.as_deref() == Some("SectionDraw"))
+                .map(|(handle, _)| handle)
+                .unwrap_or_else(|| panic!("{name}.wgsl declares no `SectionDraw`"));
+
+            let size = module.types[structure].inner.size(module.to_ctx());
+
+            assert_eq!(
+                size as usize,
+                std::mem::size_of::<SectionDraw>(),
+                "{name}.wgsl's `SectionDraw` is {size} bytes and the one the pass writes is {} - the \
+                 records are a flat array, so a different stride is every draw reading its neighbour's \
+                 fields",
+                std::mem::size_of::<SectionDraw>()
+            );
+        }
+    }
+
+    /// **`section_draws` is visible to the vertex stage alone, and this is the half of that a layout
+    /// cannot check for itself.**
+    ///
+    /// The layout in `create_bind_group_layouts` declares `ShaderStages::VERTEX` for this one binding -
+    /// the only binding in this renderer narrower than both stages - and that is legal exactly as long
+    /// as no other stage names it. If one ever does, wgpu refuses to build the pipeline:
+    ///
+    /// ```text
+    /// Shader global ResourceBinding { group: 2, binding: 0 } is not available in the pipeline layout
+    /// ```
+    ///
+    /// and that refusal arrives as a panic inside a `#[jni_fn]` frame, which ends the game rather than
+    /// the draw. Both terrain shaders, because one is a copy of the other and a change made to one of
+    /// them is exactly the shape this is here to catch.
+    #[test]
+    fn the_draw_records_are_read_by_the_vertex_stage_alone() {
+        for (name, source) in [("terrain", TERRAIN), ("terrain_solid", TERRAIN_SOLID)] {
+            let used = sampled(source);
+
+            assert!(
+                used.iter().any(|(stage, kind, group, binding)| {
+                    *stage == naga::ShaderStage::Vertex
+                        && *group == 2
+                        && *binding == 0
+                        && *kind == ResourceKind::Storage
+                }),
+                "{name}.wgsl's vertex stage has to read group 2 binding 0 - the record with the \
+                 section's position and its arena slot in it - so if it no longer does, this test is \
+                 about nothing and the layout can be narrowed or the batching removed: {used:?}"
+            );
+
+            assert!(
+                !used.iter().any(|(stage, _, group, binding)| {
+                    *stage == naga::ShaderStage::Fragment && *group == 2 && *binding == 0
+                }),
+                "{name}.wgsl's fragment stage names group 2 binding 0, and the layout declares that \
+                 binding visible to the vertex stage only - which is a pipeline wgpu refuses to build, \
+                 and a refusal on this path ends the process"
             );
         }
     }
@@ -3337,7 +4936,7 @@ fn frag(in: V) -> @location(0) vec4<f32> {
 /// name next to the word, in the text above the struct - so satisfying it means a person wrote down why,
 /// which is the whole point.
 #[cfg(test)]
-mod dead_varying_tests {
+mod shader_interface_tests {
     use crate::wgpu::naga;
 
     /// Whether the source says, next to this member's declaration, that it is not read.
@@ -3390,16 +4989,82 @@ mod dead_varying_tests {
         .any(|phrase| above.contains(phrase))
     }
 
-    /// The location-bearing struct members the fragment entry point never reads.
-    fn unread_varyings(source: &str) -> Vec<String> {
-        let module = naga::front::wgsl::parse_str(source).expect("the terrain shader parses");
+    /// Every call a function makes, at any depth of its own control flow.
+    ///
+    /// **A call is a `Statement` in naga, not an expression** - the expression arena holds only the
+    /// `CallResult` - so following calls out of an entry point means walking the body, and the body is a
+    /// tree: a call inside an `if`, a loop or a `switch` is a call. The shader this is written for calls
+    /// `shade` and `fragment_geometry` at the top level of each entry point, so a shallow walk would work
+    /// today and stop working the first time one of them moves into a branch.
+    pub(super) fn for_each_call(
+        statements: &[naga::Statement],
+        visit: &mut impl FnMut(naga::Handle<naga::Function>, &[naga::Handle<naga::Expression>]),
+    ) {
+        for statement in statements {
+            match statement {
+                naga::Statement::Call {
+                    function,
+                    arguments,
+                    ..
+                } => visit(*function, arguments),
+                naga::Statement::Block(block) => for_each_call(block, visit),
+                naga::Statement::If { accept, reject, .. } => {
+                    for_each_call(accept, visit);
+                    for_each_call(reject, visit);
+                }
+                naga::Statement::Loop {
+                    body, continuing, ..
+                } => {
+                    for_each_call(body, visit);
+                    for_each_call(continuing, visit);
+                }
+                naga::Statement::Switch { cases, .. } => {
+                    for case in cases {
+                        for_each_call(&case.body, visit);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
 
-        let mut unread = Vec::new();
+    /// The location-bearing struct members **no fragment entry point reads**.
+    ///
+    /// Per entry point, and then across them: a varying that one variant reads is not dead. The vertex
+    /// stage is shared between `frag` and `frag_game_atlas`, so the single-atlas variant pays the write of
+    /// `game_atlas` and never looks at it - deliberately, because a vertex entry point of its own would be
+    /// a second copy of the hottest code in the renderer to save two selects per vertex. See
+    /// `the_single_atlas_entry_point_samples_one_atlas` for what *is* asserted about that variant.
+    ///
+    /// **The reads are followed through calls**, and that is not a detail: the body that reads the
+    /// varyings is `shade` and `fragment_geometry`, which both entry points call. The first version of this
+    /// looked only at the entry point's own expression arena, which was right while the fragment stage was
+    /// one function and sees a fragment stage that reads nothing at all now.
+    ///
+    /// A called function's argument is mapped back to the entry point's own: `shade(in, texel)` passes the
+    /// entry point's `in` as `shade`'s first argument, so an `AccessIndex` off that handle is a read of the
+    /// same varying. A worklist of `(function, argument)` pairs, starting from the entry point's `in`, is
+    /// the whole of it. `None` is the entry point's own function, which is not in `module.functions`.
+    fn unread_varyings(source: &str) -> Vec<String> {
+        use std::collections::HashSet;
+
+        let module = naga::front::wgsl::parse_str(source).expect("the shader parses");
+
+        let named: Vec<(usize, &naga::Function)> = module
+            .functions
+            .iter()
+            .map(|(handle, function)| (handle.index(), function))
+            .collect();
+
+        // Per entry point, the members it does not read; the answer is their intersection.
+        let mut unread_by_entry: Vec<Vec<String>> = Vec::new();
 
         for entry in &module.entry_points {
             if entry.stage != naga::ShaderStage::Fragment {
                 continue;
             }
+
+            let mut unread: Vec<String> = Vec::new();
 
             for (which_arg, argument) in entry.function.arguments.iter().enumerate() {
                 let naga::TypeInner::Struct { members, .. } = &module.types[argument.ty].inner
@@ -3407,20 +5072,50 @@ mod dead_varying_tests {
                     continue;
                 };
 
-                // Every field of this argument the function touches. A read of `in.ao3` is an
-                // `AccessIndex` off *this* argument handle - the probe this was written from shows
-                // `AccessIndex(base=FunctionArgument(0), idx=field)` for each one - so the set of
-                // indices reached that way is the set of fields that mean something.
                 let mut touched: Vec<usize> = Vec::new();
+                let mut seen: HashSet<(Option<usize>, u32)> = HashSet::new();
+                let mut queue: Vec<(Option<usize>, u32)> = vec![(None, which_arg as u32)];
 
-                for (_, expression) in entry.function.expressions.iter() {
-                    if let naga::Expression::AccessIndex { base, index } = expression
-                        && let Ok(naga::Expression::FunctionArgument(the_arg)) =
-                            entry.function.expressions.try_get(*base)
-                        && *the_arg as usize == which_arg
-                    {
-                        touched.push(*index as usize);
+                while let Some((caller, arg)) = queue.pop() {
+                    if !seen.insert((caller, arg)) {
+                        continue;
                     }
+
+                    let function = match caller {
+                        None => &entry.function,
+                        Some(index) => named
+                            .iter()
+                            .find(|(handle, _)| *handle == index)
+                            .map(|(_, function)| *function)
+                            .expect("a callee of a function in this module"),
+                    };
+
+                    for (_, expression) in function.expressions.iter() {
+                        // Every field of this argument the function touches. A read of `in.ao3` is an
+                        // `AccessIndex` off *this* argument handle - the probe this was written from
+                        // shows `AccessIndex(base=FunctionArgument(0), idx=field)` for each one - so the
+                        // set of indices reached that way is the set of fields that mean something.
+                        if let naga::Expression::AccessIndex { base, index } = expression
+                            && let Ok(naga::Expression::FunctionArgument(the_arg)) =
+                                function.expressions.try_get(*base)
+                            && *the_arg == arg
+                        {
+                            touched.push(*index as usize);
+                        }
+                    }
+
+                    // And what it hands to whatever it calls, which is how a read inside `shade` is
+                    // attributed to the entry point that called it.
+                    for_each_call(&function.body, &mut |callee, arguments| {
+                        for (position, passed) in arguments.iter().enumerate() {
+                            if let Ok(naga::Expression::FunctionArgument(from)) =
+                                function.expressions.try_get(*passed)
+                                && *from == arg
+                            {
+                                queue.push((Some(callee.index()), position as u32));
+                            }
+                        }
+                    });
                 }
 
                 for (field, member) in members.iter().enumerate() {
@@ -3429,21 +5124,31 @@ mod dead_varying_tests {
                         continue;
                     }
 
-                    if touched.contains(&field) {
-                        continue;
+                    if !touched.contains(&field) {
+                        unread.push(
+                            member
+                                .name
+                                .clone()
+                                .unwrap_or_else(|| format!("field {field}")),
+                        );
                     }
-
-                    unread.push(
-                        member
-                            .name
-                            .clone()
-                            .unwrap_or_else(|| format!("field {field}")),
-                    );
                 }
             }
+
+            unread_by_entry.push(unread);
         }
 
-        unread
+        // A member is dead only when **every** variant ignores it.
+        unread_by_entry
+            .first()
+            .map(|first| {
+                first
+                    .iter()
+                    .filter(|member| unread_by_entry.iter().all(|entry| entry.contains(member)))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     #[test]
@@ -3538,5 +5243,312 @@ fn frag(in: VertexResult) -> @location(0) vec4<f32> {
             ["blend"],
             "`tex_coords2` now says it is unused and `blend` still does not, so exactly one is left"
         );
+    }
+}
+
+#[cfg(test)]
+mod terrain_frame_tests {
+    use super::*;
+
+    /// A key that matches nothing on its own, so each field can be changed one at a time.
+    fn base_key() -> TerrainFrameKey {
+        TerrainFrameKey {
+            frame: 7,
+            frustum: [[1.0, 2.0, 3.0, 4.0]; 6],
+            camera_section: glam::IVec3::new(3, 4, 5),
+            visible: 11,
+            model_translation: [0.0, 0.0, 0.0],
+        }
+    }
+
+    /// **Every field of the frame key is load-bearing**, and this is what says so one at a time.
+    ///
+    /// A field that does not break the match is a field that does not invalidate the cache, and the
+    /// failure that makes is not a slow frame: a list that is reused when it should not be is a frame
+    /// drawn from sections that are no longer there, or from arena ranges that have been handed back.
+    /// The two that are easiest to leave out are the ones that look like they are already in the frustum:
+    /// the camera's *section* (the view matrix carries only the offset within it), and the frame (a
+    /// camera that has not moved produces the same frustum every frame while a section's ranges stop
+    /// being valid after the frames that may still draw them).
+    #[test]
+    fn every_part_of_the_frame_key_breaks_the_match_on_its_own() {
+        let base = base_key();
+
+        let moved = |key: TerrainFrameKey| {
+            assert_ne!(
+                key, base,
+                "this field does not take part in the comparison, so changing it alone would serve the \
+                 cached list"
+            );
+        };
+
+        moved(TerrainFrameKey {
+            frame: base.frame + 1,
+            ..base
+        });
+        moved(TerrainFrameKey {
+            frustum: [[9.0, 2.0, 3.0, 4.0]; 6],
+            ..base
+        });
+        moved(TerrainFrameKey {
+            camera_section: base.camera_section + glam::IVec3::X,
+            ..base
+        });
+        moved(TerrainFrameKey {
+            visible: base.visible + 1,
+            ..base
+        });
+        moved(TerrainFrameKey {
+            model_translation: [1.0, 0.0, 0.0],
+            ..base
+        });
+
+        assert_eq!(base, base_key(), "the key is not comparable with itself");
+    }
+
+    /// **A new frame expires the scratch**, which is what [`begin_frame`] is for.
+    ///
+    /// The counter is read when the key is built, so a frame that is announced makes the next key differ
+    /// from the last one whatever else has or has not changed - and that is the whole mechanism: a camera
+    /// standing still produces the same frustum, the same camera section and (with the game's list
+    /// unchanged) the same revision, but it may not produce the same *frame*.
+    #[test]
+    fn begin_frame_expires_the_scratch() {
+        let before = FRAME.load(Ordering::Relaxed);
+
+        begin_frame();
+
+        assert_eq!(
+            FRAME.load(Ordering::Relaxed),
+            before + 1,
+            "the frame counter did not move, so a scratch built before this call would still match"
+        );
+    }
+
+    /// The scratch starts empty and with one draw set per pass slot, so a pass can index its own.
+    #[test]
+    fn the_scratch_has_one_draw_set_per_pass_slot() {
+        // Built the way `RenderGraph::new` builds it, which is what the pass relies on: `passes[slot]`
+        // is a lookup that must not be out of bounds for any slot a pipeline could claim.
+        let passes: Vec<PassDraws> = (0..crate::mc::SECTION_DRAW_SLOTS)
+            .map(|_| PassDraws::default())
+            .collect();
+
+        assert_eq!(passes.len(), crate::mc::SECTION_DRAW_SLOTS);
+        assert_eq!(
+            passes.len(),
+            // The layers, in the order `RenderLayer` declares them. Written out rather than counted,
+            // because nothing on `RenderLayer` iterates - a fourth variant has to be added here too,
+            // which is the point: `SECTION_DRAW_SLOTS` and the `[_; 3]` arrays beside it are written as
+            // three, and a new layer would need all of them.
+            [
+                RenderLayer::Solid,
+                RenderLayer::Cutout,
+                RenderLayer::Transparent
+            ]
+            .len(),
+            "there is one section-draw buffer per pass slot and `SECTION_DRAW_SLOTS` is written as the \
+             number of layers - if a layer were added, every slot index past the new one would be wrong"
+        );
+    }
+
+    /// **The two answers `starts_a_new_frame` has to give**, and why both matter.
+    ///
+    /// Read as "new" when it is not, a pass that has already recorded its draws has the record buffer
+    /// rewritten under it: the recorded counts and offsets then describe a list that is no longer there.
+    /// Read as "not new" when it is, the drawn flags are never cleared and every frame after the first
+    /// rebuilds nothing - the arena is walked once, for the whole session, and the world stops following
+    /// the camera. The first version of this had the second bug, which is why the flags and the frame
+    /// counter are one test rather than two lines in the middle of a two-hundred-line function.
+    #[test]
+    fn a_frame_is_new_only_when_its_number_is() {
+        let mut frame = TerrainFrame::default();
+
+        let first = base_key();
+        assert!(
+            frame.starts_a_new_frame(&first),
+            "a scratch that has never been built must be built, or the first frame draws nothing"
+        );
+
+        // What the rebuild does at the end, which is what the next call is compared against.
+        frame.key = Some(first);
+
+        assert!(
+            !frame.starts_a_new_frame(&first),
+            "the same frame asked twice is a second view inside it, not a new frame"
+        );
+
+        // The same frame number with *everything else* different is still the same frame: a second view
+        // in one frame is what the drawn flags exist for, and it must not clear them.
+        let mut second_view = first;
+        second_view.frustum = [[9.0, 2.0, 3.0, 4.0]; 6];
+        second_view.camera_section = glam::IVec3::new(-1, -2, -3);
+        second_view.visible = first.visible + 1;
+
+        assert!(
+            !frame.starts_a_new_frame(&second_view),
+            "a different view inside the same frame cleared the drawn flags, so a pass that has already \
+             drawn would have its records rewritten under it"
+        );
+
+        let next = TerrainFrameKey {
+            frame: first.frame + 1,
+            ..second_view
+        };
+
+        assert!(
+            frame.starts_a_new_frame(&next),
+            "a new frame did not clear the drawn flags, so nothing would ever be rebuilt again"
+        );
+    }
+}
+
+#[cfg(test)]
+mod atlas_entry_point_tests {
+    use super::shader_interface_tests::for_each_call;
+    use crate::wgpu::naga;
+    use std::collections::{BTreeSet, HashSet};
+
+    /// The shader files, read from the resource directory the mod ships - the same files and the same
+    /// directory the other shader tests read, so a shader that moves breaks all of them at once.
+    const TERRAIN: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../neoforge/src/main/resources/assets/wgpu_mc/shaders/terrain.wgsl"
+    ));
+    const TERRAIN_SOLID: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../neoforge/src/main/resources/assets/wgpu_mc/shaders/terrain_solid.wgsl"
+    ));
+
+    /// Every module-scope variable one entry point can reach, following the calls out of it.
+    ///
+    /// "Reachable" and not "mentioned in the entry point's own body": the fragment stage's sampling is
+    /// three functions deep (`frag` calls `sample_at_level`, which names the texture and the sampler), so
+    /// a walk that stopped at the entry point would find no textures at all and this test would pass on a
+    /// shader that samples everything.
+    fn globals_reached(source: &str, entry: &str) -> BTreeSet<String> {
+        let module = naga::front::wgsl::parse_str(source).expect("the shader parses");
+
+        let entry_point = module
+            .entry_points
+            .iter()
+            .find(|candidate| candidate.name == entry)
+            .unwrap_or_else(|| panic!("{entry} is not an entry point of this shader"));
+
+        let named: Vec<(usize, &naga::Function)> = module
+            .functions
+            .iter()
+            .map(|(handle, function)| (handle.index(), function))
+            .collect();
+
+        let mut seen: HashSet<Option<usize>> = HashSet::new();
+        let mut queue: Vec<Option<usize>> = vec![None];
+        let mut reached = BTreeSet::new();
+
+        while let Some(index) = queue.pop() {
+            if !seen.insert(index) {
+                continue;
+            }
+
+            let function = match index {
+                None => &entry_point.function,
+                Some(handle) => named
+                    .iter()
+                    .find(|(candidate, _)| *candidate == handle)
+                    .map(|(_, function)| *function)
+                    .expect("a callee of a function in this module"),
+            };
+
+            for (_, expression) in function.expressions.iter() {
+                if let naga::Expression::GlobalVariable(variable) = expression
+                    && let Some(name) = &module.global_variables[*variable].name
+                {
+                    reached.insert(name.clone());
+                }
+            }
+
+            for_each_call(&function.body, &mut |callee, _| {
+                queue.push(Some(callee.index()));
+            });
+        }
+
+        reached
+    }
+
+    /// **The single-atlas entry point reaches one atlas, and the two-atlas one reaches both.**
+    ///
+    /// This is the claim that justifies having a second entry point at all, and it is checkable in the
+    /// only place that matters - the source the pipeline is built from. `frag_game_atlas` does not mention
+    /// this side's texture or any of its three samplers *anywhere in its call graph*, so there is no
+    /// branch for naga to keep and no folding for a driver to do; `frag` mentions both atlases, so the
+    /// choice between the two entry points is a real choice and the fallback still exists.
+    ///
+    /// What it does **not** assert is anything about the machine code the driver produces, and it cannot:
+    /// the point of removing the branch from the source is precisely that nothing downstream has to.
+    #[test]
+    fn the_single_atlas_entry_point_samples_one_atlas() {
+        const THE_GAMES: [&str; 4] = [
+            "t_game_atlas",
+            "t_game_sampler",
+            "t_game_sampler_magnify",
+            "t_game_sampler_animated",
+        ];
+        const OURS: [&str; 4] = [
+            "t_texture",
+            "t_sampler",
+            "t_sampler_magnify",
+            "t_sampler_animated",
+        ];
+
+        for (name, source) in [("terrain", TERRAIN), ("terrain_solid", TERRAIN_SOLID)] {
+            let single = globals_reached(source, "frag_game_atlas");
+
+            for variable in THE_GAMES {
+                assert!(
+                    single.contains(variable),
+                    "{name}.wgsl's `frag_game_atlas` does not reach {variable}, so it is not the \
+                     game's atlas it samples: {single:?}"
+                );
+            }
+
+            for variable in OURS {
+                assert!(
+                    !single.contains(variable),
+                    "{name}.wgsl's `frag_game_atlas` reaches {variable}, so the second atlas is still in \
+                     the shader a terrain pipeline is built from - which is the whole thing the entry \
+                     point exists to remove: {single:?}"
+                );
+            }
+
+            // And the other one still has both, or the choice between them would be no choice at all.
+            let both = globals_reached(source, "frag");
+
+            for variable in THE_GAMES.into_iter().chain(OURS) {
+                assert!(
+                    both.contains(variable),
+                    "{name}.wgsl's `frag` does not reach {variable}, so it is not the two-atlas variant \
+                     any more and the fallback has nowhere to go: {both:?}"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod indirect_capacity_tests {
+    use super::*;
+
+    /// **The boundary, written down.** A pass with exactly `INDIRECT_DRAW_CAPACITY` calls is batched - the
+    /// argument buffer is allocated at that size, so the last slot is a slot - and one call more is the cliff
+    /// the warning line exists for. The decision and the warning share this predicate, which is the point of
+    /// it being a function: a counter that disagreed with the branch it reports would be a number about
+    /// nothing.
+    #[test]
+    fn the_capacity_is_inclusive_and_the_next_call_is_the_cliff() {
+        assert!(the_indirect_path_holds(0));
+        assert!(the_indirect_path_holds(crate::mc::INDIRECT_DRAW_CAPACITY));
+        assert!(!the_indirect_path_holds(
+            crate::mc::INDIRECT_DRAW_CAPACITY + 1
+        ));
     }
 }

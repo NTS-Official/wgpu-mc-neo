@@ -10,17 +10,18 @@ use arc_swap::ArcSwap;
 use core::slice;
 use glam::{IVec3, ivec3};
 use jni::objects::{
-    AutoElements, GlobalRef, JByteArray, JClass, JObject, JString, JValue, JValueOwned,
-    ReleaseMode, WeakRef,
+    AutoElements, GlobalRef, JByteArray, JClass, JLongArray, JObject, JStaticMethodID, JString,
+    JValue, JValueOwned, ReleaseMode, WeakRef,
 };
-use jni::sys::{jboolean, jbyte, jfloat, jint, jlong, jlongArray, jstring};
+use jni::signature::{Primitive, ReturnType};
+use jni::sys::{jboolean, jbyte, jfloat, jint, jlong, jlongArray, jstring, jvalue};
 use jni::{JNIEnv, JavaVM};
 use jni_fn::jni_fn;
 use once_cell::sync::{Lazy, OnceCell};
 use parking_lot::{Mutex, RwLock};
 use rayon::{ThreadPool, ThreadPoolBuilder};
-use std::cell::RefCell;
-use std::collections::HashMap;
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, VecDeque};
 use std::fmt::Debug;
 use std::io::{Write, stdout};
 use std::path::PathBuf;
@@ -256,7 +257,7 @@ pub fn call_static_from_class_loader<'env>(
 /// the game is running, and holding it strongly here would keep it - and every class it loaded -
 /// alive past shutdown.
 #[jni_fn("dev.birb.wgpu.rust.WgpuNative")]
-pub fn setClassLoader(env: JNIEnv, _class: JClass, class_loader: JObject) {
+pub fn setClassLoader(mut env: JNIEnv, _class: JClass, class_loader: JObject) {
     match env.new_weak_ref(class_loader) {
         Ok(Some(weak)) => {
             if CLASSLOADER.set(weak).is_err() {
@@ -266,6 +267,299 @@ pub fn setClassLoader(env: JNIEnv, _class: JClass, class_loader: JObject) {
         Ok(None) => log::error!("wgpu-mc: the game's class loader was null"),
         Err(err) => log::error!("wgpu-mc: could not register the game's class loader: {err}"),
     }
+
+    // **And the tint helpers, resolved here rather than per call.** This is the one place that has both the
+    // loader and a `JNIEnv` *before* a bake can ask for a tint - the library is loaded before any section
+    // is - and `loadClass` does not initialise the class, so resolving it here runs none of the game's own
+    // code. See [`TintHelpers`] for what a per-call lookup of the same two ids cost.
+    //
+    // A failure is not fatal and is retried never: the tint path keeps the slow lookup it had before, which
+    // is also the path that can still say *why* a tint could not be had. What it must not do is leave the
+    // exception pending - `loadClass` throwing is the ordinary way this fails, and a pending exception on
+    // the thread that loads the renderer fails every later JNI call on it.
+    match resolve_tint_helpers(&mut env) {
+        Ok(helpers) => {
+            if TINT_HELPERS.set(helpers).is_err() {
+                log::warn!("wgpu-mc: the class loader was registered more than once");
+            }
+        }
+        Err(err) => {
+            // The reason is kept for the first tint to report - see [`TINT_HELPERS_FAILED`] - and the
+            // exception is cleared here, because `loadClass` throwing is the ordinary way this fails and a
+            // pending exception on the thread that loads the renderer fails every later call on it.
+            describe_and_clear(&mut env, "the tint helpers");
+            let _ = TINT_HELPERS_FAILED.set(err.to_string());
+        }
+    }
+}
+
+/// The class the two tint helpers live on, named once.
+const TINT_HELPER_CLASS: &str = "dev.birb.wgpu.render.Wgpu";
+
+/// `Wgpu`'s two tint helpers, resolved once: the class, and one method id per helper.
+///
+/// **Why they are cached.** Every tinted face - every grass side, every leaf, every water surface - used to
+/// do the whole lookup: `ClassLoader.loadClass` as a *method call* (a `String` allocation, a local
+/// reference, a virtual dispatch into the JVM) and then a `GetStaticMethodID`, which walks the class's
+/// method table with a signature string. A `jmethodID` is valid for as long as the class that declares it
+/// is loaded and is not moved by a class-loader change, and this class is owned by the game's loader for
+/// the life of the process - so all of that was a fixed cost paid per *face* for an answer that cannot
+/// change.
+///
+/// The signature is checked once, here, by `get_static_method_id`: a wrong one is a `MethodNotFound` at
+/// this resolution rather than at a call, which matters because the unchecked call at the other end cannot
+/// report anything about the method it was handed.
+struct TintHelpers {
+    /// Global, because a local reference lives only to the end of the JNI frame that made it - and the
+    /// frame that resolved this is the library load, not the bake that asks for a tint.
+    class: GlobalRef,
+    block_color: JStaticMethodID,
+    fluid_color: JStaticMethodID,
+    /// The bulk call: every colour a whole section needs, in one array. See [`Self::section_tints`].
+    section_tints: JStaticMethodID,
+    /// The same, for the *fluid* colours of a section, which are a different question with a different
+    /// answer (`FluidTintSources.water()` rather than the block's own source). See
+    /// [`Self::section_fluid_tints`].
+    section_fluid_tints: JStaticMethodID,
+}
+
+impl TintHelpers {
+    /// The class as a `JClass`, for the unchecked calls below.
+    ///
+    /// **Safety**: the [`GlobalRef`] this struct holds keeps the class alive for as long as this value does,
+    /// and a `JClass` is a `JObject` that happens to name a class - so naming the global reference's object
+    /// as one is valid for the call it is passed to. Nothing is released by dropping it: a `JClass` built
+    /// here owns no reference of its own, which is why this is a method rather than a field.
+    fn class(&self) -> JClass<'static> {
+        // Safety: see above - the pointer came from the JVM and the global reference is what keeps it
+        // valid for the life of the process.
+        unsafe { JClass::from_raw(self.class.as_obj().as_raw()) }
+    }
+
+    /// `Wgpu.helperGetBlockColor(x, y, z, tintIndex)`, through the cached id.
+    fn block_color(
+        &self,
+        env: &mut JNIEnv,
+        pos: IVec3,
+        tint_index: i32,
+    ) -> jni::errors::Result<i32> {
+        let args = [
+            jvalue { i: pos.x },
+            jvalue { i: pos.y },
+            jvalue { i: pos.z },
+            jvalue { i: tint_index },
+        ];
+
+        self.call_int(env, self.block_color, &args)
+    }
+
+    /// `Wgpu.helperGetFluidColor(x, y, z)`, through the cached id. See [`Self::block_color`].
+    fn fluid_color(&self, env: &mut JNIEnv, pos: IVec3) -> jni::errors::Result<i32> {
+        let args = [
+            jvalue { i: pos.x },
+            jvalue { i: pos.y },
+            jvalue { i: pos.z },
+        ];
+
+        self.call_int(env, self.fluid_color, &args)
+    }
+
+    /// Every colour one section needs, in **one call**, unpacked from the layout `Wgpu`'s
+    /// `helperGetSectionTints` documents and packs:
+    ///
+    /// ```text
+    /// bits 63..36  the position in the section, in Minecraft's own storage order
+    /// bits 35..32  the model's tint index
+    /// bits 31..0   the colour, in the same packing `helperGetBlockColor` returns
+    /// ```
+    ///
+    /// **Why a table rather than a call per face.** The single-call path is one JNI call, one `BlockPos` and
+    /// one biome lookup *per tinted face* - five for a grass block, six for a leaf block - and a bake knows
+    /// every one of them before it draws anything, because it walks the section's blocks in order. This asks
+    /// for all of them at once, which is the difference between a callback per face and a callback per
+    /// section.
+    ///
+    /// A local frame, because this is the only call on this path that returns an **object**: the array is a
+    /// local reference, and a bake thread's references are not popped per call - the thread stays attached for
+    /// the life of the process, so one reference per section would be one reference per section for the whole
+    /// run, until the local reference table overflows. `with_local_frame` pops it either way.
+    fn section_tints(&self, env: &mut JNIEnv, section: IVec3) -> jni::errors::Result<Vec<u64>> {
+        self.fetch_section(env, self.section_tints, section)
+    }
+
+    /// Every fluid colour one section needs, in one call, from the other bulk method.
+    ///
+    /// The same shape as [`Self::section_tints`] with the tint index left out of the packing - a fluid has
+    /// one colour per block rather than one per face - and a second call rather than more entries in the
+    /// first, because the JVM side walks for a different reason: the fluid walk is only ever asked for a
+    /// section the baker already knows holds water. See `Wgpu.helperGetSectionFluidTints`.
+    fn section_fluid_tints(
+        &self,
+        env: &mut JNIEnv,
+        section: IVec3,
+    ) -> jni::errors::Result<Vec<u64>> {
+        self.fetch_section(env, self.section_fluid_tints, section)
+    }
+
+    /// One bulk call, whatever it is: three ints in, a `long[]` out.
+    fn fetch_section(
+        &self,
+        env: &mut JNIEnv,
+        method: JStaticMethodID,
+        section: IVec3,
+    ) -> jni::errors::Result<Vec<u64>> {
+        env.with_local_frame(8, |env| {
+            let args = [
+                jvalue { i: section.x },
+                jvalue { i: section.y },
+                jvalue { i: section.z },
+            ];
+
+            // Safety: the id was resolved from this class with `(III)[J` in `resolve_tint_helpers`, which is
+            // the signature these three arguments are built for.
+            let value = unsafe {
+                env.call_static_method_unchecked(self.class(), method, ReturnType::Object, &args)
+            }?;
+
+            // The unchecked call does not look for a pending exception, and this path can throw where the
+            // primitive ones rarely do - a section that is not there, a level that is not there. See
+            // [`Self::call_int`].
+            if env.exception_check()? {
+                return Err(jni::errors::Error::JavaException);
+            }
+
+            let array = JLongArray::from(value.l()?);
+            let length = env.get_array_length(&array)? as usize;
+            let mut out = vec![0i64; length];
+
+            if length > 0 {
+                env.get_long_array_region(&array, 0, &mut out)?;
+            }
+
+            Ok(out.into_iter().map(|entry| entry as u64).collect())
+        })
+    }
+
+    /// One `int`-returning static call through a cached id.
+    ///
+    /// **The exception is checked here because the unchecked call does not check it.** The checked call
+    /// this replaces reported a Java exception as `Error::JavaException`, and the tint path's failure arm
+    /// describes and clears it - a pending exception left on a bake thread fails every later call on that
+    /// thread. `call_static_method_unchecked` returns the (meaningless) value instead, so the check has to
+    /// be made by hand rather than inherited.
+    fn call_int(
+        &self,
+        env: &mut JNIEnv,
+        method: JStaticMethodID,
+        args: &[jvalue],
+    ) -> jni::errors::Result<i32> {
+        // Safety: `method` was resolved from this class in `resolve_tint_helpers`, with the signature the
+        // matching `args` are built for - `(IIII)I` for the block tint and `(III)I` for the fluid one - and
+        // both are held together in this struct, so the id cannot outlive the class that declares it.
+        let value = unsafe {
+            env.call_static_method_unchecked(
+                self.class(),
+                method,
+                ReturnType::Primitive(Primitive::Int),
+                args,
+            )
+        }?;
+
+        if env.exception_check()? {
+            return Err(jni::errors::Error::JavaException);
+        }
+
+        value.i()
+    }
+}
+
+/// Both helper ids and the class they live on, or unset while they could not be resolved.
+///
+/// A `OnceCell` rather than a lock on the tint path: `get` is one atomic load, and the value never changes,
+/// because there is one game, one class loader and one of each helper. It is filled by [`setClassLoader`],
+/// which runs as the library loads - before any bake - and a run where that resolution failed keeps the
+/// slow path, which is exactly what every tint did before this existed.
+static TINT_HELPERS: OnceCell<TintHelpers> = OnceCell::new();
+
+/// Why [`TINT_HELPERS`] could not be resolved, if they could not be.
+///
+/// Kept rather than only logged, because the resolution happens as the native library loads - which is
+/// *before* the JVM side has a logger for these lines, so a line written there is a line nobody sees. The
+/// first tint is minutes later and certainly after it is, and that is where the reason is said.
+static TINT_HELPERS_FAILED: OnceCell<String> = OnceCell::new();
+
+/// Counts a tint that had to look its helper up, and says why the first one happened.
+///
+/// The counter is the diagnostic that survives a run: [`TINT_HELPERS`] being empty is not visible anywhere
+/// else, and the failure it would be - every tinted face paying for a `loadClass` and a method lookup - is a
+/// cost rather than a wrong answer, so nothing would look broken.
+fn note_the_slow_tint_path() {
+    static REPORTED: AtomicBool = AtomicBool::new(false);
+
+    TINT_SLOW_LOOKUPS.fetch_add(1, Ordering::Relaxed);
+
+    if REPORTED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+
+    let why = match TINT_HELPERS_FAILED.get() {
+        Some(reason) => format!(" ({reason})"),
+        None => String::new(),
+    };
+
+    log::warn!(
+        "wgpu-mc: the game's tint helpers are not cached{why}, so every tinted face looks the class and \
+         its method up again; see `TintHelpers`"
+    );
+}
+
+/// Resolves [`TINT_HELPERS`] through the game's own class loader.
+///
+/// Split out of [`setClassLoader`] so that the two ways it can fail - no loader registered, and the class
+/// not visible through it - are one `Err` in one place rather than a branch inside the loader's own
+/// registration.
+fn resolve_tint_helpers(env: &mut JNIEnv) -> jni::errors::Result<TintHelpers> {
+    let Some(class_loader) = CLASSLOADER.get() else {
+        return Err(jni::errors::Error::NullPtr(
+            "the game's class loader was never registered - see setClassLoader",
+        ));
+    };
+
+    // Only a weak reference is held, so it is legitimate for the JVM to have collected it.
+    let Some(class_loader) = class_loader.upgrade_local(&*env)? else {
+        return Err(jni::errors::Error::NullPtr(
+            "the game's class loader has been garbage collected",
+        ));
+    };
+
+    let arg = env.new_string(TINT_HELPER_CLASS)?;
+    // `loadClass`, for the reason [`call_static_from_class_loader`] spells out: `findClass` is the loader's
+    // *define* hook and ends in "attempted duplicate class definition" for a class that is already loaded.
+    let class: JClass = env
+        .call_method(
+            class_loader,
+            "loadClass",
+            "(Ljava/lang/String;)Ljava/lang/Class;",
+            &[JValue::Object(&arg)],
+        )?
+        .l()?
+        .into();
+
+    let block_color = env.get_static_method_id(&class, "helperGetBlockColor", "(IIII)I")?;
+    let fluid_color = env.get_static_method_id(&class, "helperGetFluidColor", "(III)I")?;
+    // The bulk one. Resolved here with the rest, so that a wrong signature is a `MethodNotFound` at load
+    // rather than a white world: the unchecked call that uses it can report nothing about the method.
+    let section_tints = env.get_static_method_id(&class, "helperGetSectionTints", "(III)[J")?;
+    let section_fluid_tints =
+        env.get_static_method_id(&class, "helperGetSectionFluidTints", "(III)[J")?;
+
+    Ok(TintHelpers {
+        class: env.new_global_ref(&class)?,
+        block_color,
+        fluid_color,
+        section_tints,
+        section_fluid_tints,
+    })
 }
 
 struct MinecraftResourceManagerAdapter {
@@ -355,12 +649,16 @@ impl ResourceProvider for MinecraftResourceManagerAdapter {
 /// turns "this one resource could not be read" into "nothing on this thread can be read". Printing
 /// it first is what keeps the original Java stack in the log, and clearing it is what lets the next
 /// call have a chance.
+///
+/// Two callers, and the sentence is deliberately about neither of them: the resource path, where a
+/// resource could not be read, and the class loader's own resolution of
+/// [`TintHelpers`], where a class could not be loaded.
 fn describe_and_clear(env: &mut JNIEnv, what: &str) {
     if !env.exception_check().unwrap_or(false) {
         return;
     }
 
-    log::error!("wgpu-mc: {what}: the JVM threw while reading this resource");
+    log::error!("wgpu-mc: {what}: the JVM threw");
 
     if let Err(err) = env.exception_describe() {
         log::error!("wgpu-mc: {what}: and the exception could not be described: {err}");
@@ -689,6 +987,40 @@ pub fn registerBlockStateFaceFlags(
 struct MinecraftBlockStateProviderWrapper<'a> {
     internal: CachedBlockstateProvider,
     env: RefCell<JNIEnv<'a>>,
+    /// The section this bake is for, which is what the bulk tint call is asked about.
+    section: IVec3,
+    /// The section's colours: `(position index << 4 | tint index) -> colour`.
+    ///
+    /// Fetched on the first tint the bake asks for and kept for the whole section - which is the point of
+    /// asking in bulk. A fetch that failed is [`SectionTints::Unavailable`] and stays that way, so a failure
+    /// costs one warning rather than a lookup per face.
+    tints: RefCell<SectionTints>,
+    /// The section's **fluid** colours, keyed by position index alone, fetched the same way and only ever
+    /// asked for by a block the baker knows holds water.
+    fluid_tints: RefCell<SectionTints>,
+}
+
+/// What a bake knows about its section's colours. See [`MinecraftBlockStateProviderWrapper::tints`].
+enum SectionTints {
+    /// Nobody has asked yet.
+    Unasked,
+    /// The table, as the bulk call returned it.
+    Ready(HashMap<u32, u32>),
+    /// The bulk call failed, or the helper ids were never resolved: every tint falls back to the
+    /// single-call path, which is what a bake did before the table existed.
+    Unavailable,
+}
+
+/// The key the section's colours are indexed by: the position in the section, then the tint index.
+///
+/// Twelve bits of position and four of tint index, which is the layout `Wgpu.helperGetSectionTints` packs
+/// into the high half of each `long`. The position is Minecraft's own storage order - `x | z << 4 | y << 8` -
+/// which is the order the baker walks blocks in, so a face's position is its own index with the tint along
+/// side it rather than a second lookup.
+fn tint_key(pos: IVec3, tint_index: i32) -> u32 {
+    let index = (pos.x & 15) | ((pos.z & 15) << 4) | ((pos.y & 15) << 8);
+
+    ((index as u32) << 4) | (tint_index as u32 & 15)
 }
 
 impl<'a> BlockStateProvider for MinecraftBlockStateProviderWrapper<'a> {
@@ -710,12 +1042,31 @@ impl<'a> BlockStateProvider for MinecraftBlockStateProviderWrapper<'a> {
         self.internal.get_fluid(pos)
     }
 
+    /// The variant the game picked for a position, forwarded for **exactly** the reason [`Self::get_fluid`]
+    /// is: this wrapper is the provider the bake actually runs with, and the trait's own default answers
+    /// `0` - the first variant - for every block.
+    ///
+    /// Written down because this was got wrong in precisely that way: the blob arrived, parsed, was
+    /// stored on the target section, was read back correctly by the inner provider's own test - and the
+    /// bake never saw it, because the method that was implemented was the one on `CachedBlockstateProvider`
+    /// and the one being *called* was the default here. Every lily pad pointed the same way and no
+    /// counter said anything, which is the same shape as the fluid bug the comment above describes.
+    fn get_model_variant(&self, pos: IVec3) -> u8 {
+        self.internal.get_model_variant(pos)
+    }
+
     fn is_section_empty(&self, rel_pos: IVec3) -> bool {
         self.internal.is_section_empty(rel_pos)
     }
 
     /// The biome tint for one tinted face, asked of the game itself: the tint is a property of the
     /// world at that position, and this side only has the section data.
+    ///
+    /// **Answered from the section's table, which is fetched once.** The bake asks for a colour per tinted
+    /// face - five for a grass block, six for a leaf block - and this side asks Java for all of a section's
+    /// colours in one call the first time one is wanted, then answers from that table. See
+    /// [`TintHelpers::section_tints`] for what that saves and [`SectionTints`] for what happens when it
+    /// cannot be had.
     ///
     /// This runs on a bake thread, which is a plain native thread attached to the JVM, so the class
     /// has to be looked up through the game's own loader - `FindClass` on such a thread resolves
@@ -724,21 +1075,134 @@ impl<'a> BlockStateProvider for MinecraftBlockStateProviderWrapper<'a> {
     /// process) down the moment a tinted face was baked. White is what a face with no tint gets, so
     /// that is the answer when the call cannot be made, once per failure mode with a log line.
     fn get_block_color(&self, pos: IVec3, tint_index: i32) -> u32 {
+        let mut tints = self.tints.borrow_mut();
+
+        if matches!(*tints, SectionTints::Unasked) {
+            let mut env = self.env.borrow_mut();
+
+            // **The switch the bulk table can be taken out with**, for the one comparison no counter can
+            // make: a frame baked with the table against a frame baked without it, both against the same
+            // vanilla frame - see the dump recipe in the README. It has to be a *frame* comparison because
+            // the two paths differ in cost, and a slower bake changes what is loaded by any given frame
+            // number, which is what made the first attempt at it read as a camera difference.
+            const USE_BULK_TINTS: bool = true;
+
+            *tints = match TINT_HELPERS.get().filter(|_| USE_BULK_TINTS) {
+                Some(helpers) => match helpers.section_tints(&mut env, self.section) {
+                    Ok(entries) => {
+                        TINT_TABLE_FETCHES.fetch_add(1, Ordering::Relaxed);
+                        TINT_TABLE_ENTRIES.fetch_add(entries.len() as u64, Ordering::Relaxed);
+
+                        // The entry layout is `Wgpu.helperGetSectionTints`'s: twelve bits of position,
+                        // four of tint index, then the colour.
+                        SectionTints::Ready(
+                            entries
+                                .into_iter()
+                                .map(|entry| {
+                                    let index = ((entry >> 36) & 0xfff) as u32;
+                                    let tint = ((entry >> 32) & 0xf) as u32;
+
+                                    ((index << 4) | tint, entry as u32)
+                                })
+                                .collect(),
+                        )
+                    }
+                    Err(err) => {
+                        describe_and_clear(&mut env, "helperGetSectionTints");
+                        log::warn!(
+                            "wgpu-mc: the biome tints of the section at {} could not be fetched in bulk \
+                             ({err}); each tinted face will ask for its own",
+                            self.section
+                        );
+
+                        SectionTints::Unavailable
+                    }
+                },
+                None => SectionTints::Unavailable,
+            };
+        }
+
+        if let SectionTints::Ready(table) = &*tints {
+            TINT_TABLE_HITS.fetch_add(1, Ordering::Relaxed);
+
+            return match table.get(&tint_key(pos, tint_index)) {
+                Some(color) => {
+                    TINT_TABLE_FOUND.fetch_add(1, Ordering::Relaxed);
+
+                    // **The bulk table against the per-face path, for the *same* position, while the
+                    // diagnostics are on.** They are different code and, if the table's position packing
+                    // were wrong, they would be different colours - which is the one thing neither the key
+                    // counters nor a `TintProfile` row can see, because both of those read the game's own
+                    // functions and not what this side did with the answer. Measured: **zero mismatches in
+                    // 20,000 positions**, which is what closed the last way a *block* tint could have been
+                    // sampled at a mirrored position. The check costs one JNI call per tinted face *only*
+                    // when the diagnostics are on.
+                    if wgpu_mc::mc::chunk::DIAGNOSTIC_LOGGING.load(Ordering::Relaxed) {
+                        use std::sync::atomic::AtomicU64;
+
+                        static CHECKED: AtomicU64 = AtomicU64::new(0);
+                        static MISMATCHES: AtomicU64 = AtomicU64::new(0);
+
+                        if CHECKED.load(Ordering::Relaxed) < 20_000 {
+                            CHECKED.fetch_add(1, Ordering::Relaxed);
+
+                            if let Some(helpers) = TINT_HELPERS.get() {
+                                let mut env = self.env.borrow_mut();
+
+                                if let Ok(single) = helpers.block_color(&mut env, pos, tint_index)
+                                    && single as u32 != *color
+                                {
+                                    let seen = MISMATCHES.fetch_add(1, Ordering::Relaxed);
+
+                                    if seen < 24 {
+                                        log::warn!(
+                                            "wgpu-mc: tint mismatch at {pos} index {tint_index}: bulk \
+                                             {color:#010x}, per-face {single:#010x}"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    *color
+                }
+                // A key the table does not hold: a position the JVM's walk did not report, or - the case
+                // this counter exists for - a packing the two sides disagree about. White is the game's own
+                // answer for "no tint source", so it is the safe answer as well as a silent one.
+                None => 0xffff_ffff,
+            };
+        }
+
+        drop(tints);
+
         let mut env = self.env.borrow_mut();
 
-        let result = call_static_from_class_loader(
-            &mut env,
-            "dev.birb.wgpu.render.Wgpu",
-            "helperGetBlockColor",
-            "(IIII)I",
-            &[
-                JValue::Int(pos.x),
-                JValue::Int(pos.y),
-                JValue::Int(pos.z),
-                JValue::Int(tint_index),
-            ],
-        )
-        .and_then(|value| value.i());
+        let result = match TINT_HELPERS.get() {
+            // **The resolved ids: one `CallStaticIntMethodA` per tinted face and nothing else.** See
+            // [`TintHelpers`] for what the class and method lookup that used to be here cost, per face.
+            Some(helpers) => helpers.block_color(&mut env, pos, tint_index),
+            // Not resolved - the class was not visible through the loader when the library loaded, or the
+            // loader was never registered. This is what every tint did before, and it is the path that can
+            // still report *why* the call could not be made.
+            None => {
+                note_the_slow_tint_path();
+
+                call_static_from_class_loader(
+                    &mut env,
+                    TINT_HELPER_CLASS,
+                    "helperGetBlockColor",
+                    "(IIII)I",
+                    &[
+                        JValue::Int(pos.x),
+                        JValue::Int(pos.y),
+                        JValue::Int(pos.z),
+                        JValue::Int(tint_index),
+                    ],
+                )
+                .and_then(|value| value.i())
+            }
+        };
 
         match result {
             Ok(color) => {
@@ -772,28 +1236,136 @@ impl<'a> BlockStateProvider for MinecraftBlockStateProviderWrapper<'a> {
 
     /// **The colour water is tinted by, asked of the game rather than held as a constant.**
     ///
-    /// The same shape as [`Self::get_block_color`] and for the same reasons - one JNI call per request,
-    /// one warning per failure mode, white when the call cannot be made - with one difference that
-    /// matters: it is a *different* question. A fluid is tinted by its **fluid** model, not its block
-    /// model (`FluidRenderer#tesselate` asks `model.fluidTintSource().colorInWorld(..)`, and the model
-    /// comes from `FluidStateModelSet#get(fluidState)`), so the block tint path cannot answer it even in
-    /// principle - a water block's block model is not what colours water.
+    /// The same shape as [`Self::get_block_color`] and for the same reasons - one warning per failure mode,
+    /// white when the call cannot be made - with two differences that matter. It is a *different* question:
+    /// a fluid is tinted by its **fluid** model, not its block model (`FluidRenderer#tesselate` asks
+    /// `model.fluidTintSource().colorInWorld(..)`, and the model comes from
+    /// `FluidStateModelSet#get(fluidState)`), so the block tint path cannot answer it even in principle - a
+    /// water block's block model is not what colours water. And it is asked **per block rather than per
+    /// face**, because `bake_fluid_faces_with` asks once and gives the colour to every face of that block.
+    ///
+    /// **Answered from the section's fluid table**, fetched in one call the first time a fluid block asks -
+    /// which is the whole of what the fluid path used to spend: one JNI call, one `BlockPos`, one
+    /// `getFluidState` and one biome lookup *per fluid block*, in an ocean. See
+    /// [`TintHelpers::section_fluid_tints`].
     ///
     /// The default is `WATER_TINT` rather than white, through the trait's own default: this is only a
     /// failure path, and the colour the game uses where no biome says otherwise is a better guess than
     /// no tint at all. It is also what every test provider answers, so a test's water looks exactly as
     /// it did before this existed.
     fn get_fluid_color(&self, pos: IVec3) -> u32 {
+        let mut tints = self.fluid_tints.borrow_mut();
+
+        if matches!(*tints, SectionTints::Unasked) {
+            let mut env = self.env.borrow_mut();
+
+            *tints = match TINT_HELPERS.get() {
+                Some(helpers) => match helpers.section_fluid_tints(&mut env, self.section) {
+                    Ok(entries) => {
+                        TINT_TABLE_FETCHES.fetch_add(1, Ordering::Relaxed);
+                        TINT_TABLE_ENTRIES.fetch_add(entries.len() as u64, Ordering::Relaxed);
+
+                        // The entry layout is `Wgpu.helperGetSectionFluidTints`'s: twelve bits of
+                        // position, then the colour - a fluid has no tint index to carry.
+                        SectionTints::Ready(
+                            entries
+                                .into_iter()
+                                .map(|entry| (((entry >> 36) & 0xfff) as u32, entry as u32))
+                                .collect(),
+                        )
+                    }
+                    Err(err) => {
+                        describe_and_clear(&mut env, "helperGetSectionFluidTints");
+                        log::warn!(
+                            "wgpu-mc: the fluid tints of the section at {} could not be fetched in bulk \
+                             ({err}); each fluid block will ask for its own",
+                            self.section
+                        );
+
+                        SectionTints::Unavailable
+                    }
+                },
+                None => SectionTints::Unavailable,
+            };
+        }
+
+        if let SectionTints::Ready(table) = &*tints {
+            let key = ((pos.x & 15) | ((pos.z & 15) << 4) | ((pos.y & 15) << 8)) as u32;
+            TINT_TABLE_FLUID_HITS.fetch_add(1, Ordering::Relaxed);
+
+            if let Some(color) = table.get(&key) {
+                TINT_TABLE_FLUID_FOUND.fetch_add(1, Ordering::Relaxed);
+
+                // **The bulk fluid table against the per-face path, for the same position**, while the
+                // diagnostics are on. The fluid side has no key counters and no `TintProfile` row that
+                // could see a mirrored position packing - a mirrored *fluid* table would show as water
+                // moving the wrong way across a biome boundary and as nothing else at all, which is
+                // exactly what the report describes. A mismatch here is that bug; none is this path
+                // cleared.
+                if wgpu_mc::mc::chunk::DIAGNOSTIC_LOGGING.load(Ordering::Relaxed) {
+                    use std::sync::atomic::AtomicU64;
+
+                    static CHECKED: AtomicU64 = AtomicU64::new(0);
+                    static MISMATCHES: AtomicU64 = AtomicU64::new(0);
+
+                    if CHECKED.load(Ordering::Relaxed) < 20_000 {
+                        let nth = CHECKED.fetch_add(1, Ordering::Relaxed);
+
+                        if let Some(helpers) = TINT_HELPERS.get() {
+                            let mut env = self.env.borrow_mut();
+                            let single = helpers.fluid_color(&mut env, pos).ok();
+
+                            if let Some(single) = single {
+                                if single as u32 != *color {
+                                    let seen = MISMATCHES.fetch_add(1, Ordering::Relaxed);
+
+                                    if seen < 24 {
+                                        log::warn!(
+                                            "wgpu-mc: fluid tint mismatch at {pos}: bulk {color:#010x}, \
+                                             per-face {single:#010x}"
+                                        );
+                                    }
+                                }
+
+                                // Once, so that "no mismatches" cannot be "nothing compared".
+                                if nth == 0 {
+                                    log::info!(
+                                        "wgpu-mc: the fluid tint check is running: bulk {color:#010x}, \
+                                         per-face {single:#010x} at {pos}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+
+                return *color;
+            }
+
+            // A position the JVM's walk did not report, or a packing the two sides disagree about. The
+            // trait's own default is the right answer here rather than white: this is water.
+            return wgpu_mc::mc::chunk::WATER_TINT;
+        }
+
+        drop(tints);
+
         let mut env = self.env.borrow_mut();
 
-        let result = call_static_from_class_loader(
-            &mut env,
-            "dev.birb.wgpu.render.Wgpu",
-            "helperGetFluidColor",
-            "(III)I",
-            &[JValue::Int(pos.x), JValue::Int(pos.y), JValue::Int(pos.z)],
-        )
-        .and_then(|value| value.i());
+        let result = match TINT_HELPERS.get() {
+            Some(helpers) => helpers.fluid_color(&mut env, pos),
+            None => {
+                note_the_slow_tint_path();
+
+                call_static_from_class_loader(
+                    &mut env,
+                    TINT_HELPER_CLASS,
+                    "helperGetFluidColor",
+                    "(III)I",
+                    &[JValue::Int(pos.x), JValue::Int(pos.y), JValue::Int(pos.z)],
+                )
+                .and_then(|value| value.i())
+            }
+        };
 
         match result {
             Ok(color) => {
@@ -937,6 +1509,45 @@ pub fn windowModeReloadResult(_env: JNIEnv, _class: JClass) -> jint {
 /// question is whether a number that *should* be large is zero.
 static FLUID_TINTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// How many tints were answered by looking the class and its method up again instead of using the cache.
+///
+/// **Zero is the whole point of [`TintHelpers`], and this is the number that says it.** It is drained beside
+/// [`FLUID_TINTS`] on the same once-a-second line, so the two are read as a pair: tints large and lookups
+/// zero is the cache doing its job, and lookups climbing is the cache not having resolved - which is a
+/// working tint path and a needless cost, not a failure, so it is counted rather than logged, except for the
+/// first one. See `note_the_slow_tint_path`.
+static TINT_SLOW_LOOKUPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many sections have had their colours fetched in bulk, and how many colours came back.
+///
+/// **The pair that says whether the table is working**: one fetch per section that wanted a colour at all,
+/// and an entry count in the hundreds for a section of grass or leaves. A section with no tinted state is
+/// never asked about, so a run over stone and air has both at zero and is paying nothing.
+static TINT_TABLE_FETCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static TINT_TABLE_ENTRIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many tinted faces were answered from a section's table, which is every one of them while it holds.
+///
+/// The number to read against `FLUID_TINTS`: the calls that are left are the fluids (one per fluid block,
+/// their own path) and whatever fell back to the single-call path.
+static TINT_TABLE_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many of [`TINT_TABLE_HITS`] actually **found** their key in the table.
+///
+/// **The only proof in a run that the two sides agree on the packing.** A position index that means one
+/// thing to `Wgpu.helperGetSectionTints` and another here is a lookup that misses - and a miss is a white
+/// face, which is a valid colour and therefore silent. This number equalling the one above is that
+/// agreement, measured rather than argued.
+static TINT_TABLE_FOUND: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The same two numbers for the **fluid** table, which is a separate call and a separate key space.
+///
+/// Kept apart because the failure they would catch is apart: the fluid entry carries no tint index, so a
+/// packing that agreed for blocks and disagreed for fluids would read as one number below the other here
+/// and nowhere else. See [`TINT_TABLE_FOUND`].
+static TINT_TABLE_FLUID_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static TINT_TABLE_FLUID_FOUND: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// One section rebuild, in one call.
 ///
 /// The payload is written by `RustChunkBake` into a buffer it owns and reuses, and `address`/`length`
@@ -957,7 +1568,7 @@ static FLUID_TINTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 /// bookkeeping and call once more with everything it has.
 #[jni_fn("dev.birb.wgpu.rust.WgpuNative")]
 pub fn bakeSections(
-    _env: JNIEnv,
+    mut env: JNIEnv,
     _class: JClass,
     x: jint,
     y: jint,
@@ -970,7 +1581,11 @@ pub fn bakeSections(
     // there is no way to tell a hole from a block: say so once and let the caller try again later.
     // Nothing was accepted, which is what the answer says - the sections stay unsent on the JVM side
     // and come back with the next rebuild.
-    let Some(air) = *AIR else {
+    //
+    // The check is made here, before the payload is even parsed, and again where the bake is queued
+    // (`queue_bake`, which is where a *retry* meets the same state) - the second one is the one that
+    // decides, and this one exists so that a registry that is not ready costs no work at all.
+    let Some(_air) = *AIR else {
         static WARNED: AtomicBool = AtomicBool::new(false);
         if !WARNED.swap(true, Ordering::Relaxed) {
             log::warn!(
@@ -1001,12 +1616,19 @@ pub fn bakeSections(
 
     let target = ivec3(x, y, z);
 
-    let mut world = WORLD.write();
+    // **The cache's write lock covers the apply, and nothing else.** It used to be held across the
+    // whole call, the 27-neighbour resolve included, which put every chunk-build thread in the game
+    // behind one lock for the length of a section's worth of hash-map lookups - and they all offer
+    // sections at once exactly when the world is loading and there are dozens of them.
+    //
+    // The apply needs it: the payload's records replace what was held for them and the ones it says
+    // to forget are dropped, and a bake queued below must never see a half-applied neighbourhood.
+    // Everything after it only reads.
+    let rejected = {
+        let mut world = WORLD.write();
 
-    // Apply the payload first, so a bake queued below never sees a half-applied neighbourhood: the
-    // sections the caller sent replace what was held for them, and the ones it says to forget are
-    // dropped - those are the sections that became air or were unloaded.
-    let rejected = payload.apply(&mut world, target);
+        payload.apply(&mut world, target)
+    };
 
     // A section the JVM marked as "already yours" but that this side does not have - a cache that was
     // trimmed, a new world, a section that became empty under us - means a bake against holes. The
@@ -1018,82 +1640,66 @@ pub fn bakeSections(
             .iter()
             .fold(0u32, |mask, (index, _)| mask | (1 << index));
 
-    let (missing_blocks, missing_light) = world.missing(target, known_blocks, known_light);
+    {
+        let world = WORLD.read();
 
-    if missing_blocks != 0 || missing_light != 0 {
-        static RESYNCS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let resyncs = RESYNCS.fetch_add(1, Ordering::Relaxed);
-        if resyncs < 8 || resyncs.is_multiple_of(256) {
-            log::info!(
-                "wgpu-mc: around {target:?} the JVM counts {missing_blocks:#b} (blocks) and \
-                 {missing_light:#b} (light) as already sent, and this side does not have them; asking \
-                 for the neighbourhood again ({resyncs} resync(s) so far)"
-            );
+        let (missing_blocks, missing_light) = world.missing(target, known_blocks, known_light);
+
+        if missing_blocks != 0 || missing_light != 0 {
+            static RESYNCS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let resyncs = RESYNCS.fetch_add(1, Ordering::Relaxed);
+            if resyncs < 8 || resyncs.is_multiple_of(256) {
+                log::info!(
+                    "wgpu-mc: around {target:?} the JVM counts {missing_blocks:#b} (blocks) and \
+                     {missing_light:#b} (light) as already sent, and this side does not have them; asking \
+                     for the neighbourhood again ({resyncs} resync(s) so far)"
+                );
+            }
+
+            // What did arrive stays: it is the newest version of those sections either way.
+            return (rejected | RESYNC) as jint;
         }
-
-        // What did arrive stays: it is the newest version of those sections either way.
-        return (rejected | RESYNC) as jint;
     }
 
-    let mut blocks: [Option<Arc<SectionBlocks>>; SECTIONS] = Default::default();
-    let mut light: [Option<Arc<SectionLight>>; SECTIONS] = Default::default();
-
-    // Every slot is resolved from the cache, not just the ones this payload carried: a section the
-    // caller did not send is one it believes is already here, and a slot that is still empty is a
-    // section that is not loaded - which is air, as it is for Minecraft's own mesher.
-    for index in 0..SECTIONS {
-        let pos = target + neighbour_offset(index);
-        blocks[index] = world.blocks(pos);
-        light[index] = world.light(pos);
-    }
-
-    let provider = CachedBlockstateProvider { blocks, light, air };
-
-    world.trim(target);
-    drop(world);
-
-    let jvm = match _env.get_java_vm() {
-        Ok(jvm) => jvm,
-        Err(err) => {
-            log::error!("wgpu-mc: could not get the JVM handle for a bake: {err}");
-
-            // No bake was queued, so the section this call was about is not on its way to the arena -
-            // and the JVM must not be told it was. Nothing of it will be drawn until it is offered
-            // again, and a rebuild only draws what changed: without this bit the section would be
-            // recorded as sent, the next rebuild would find nothing to say, and the hole would be
-            // permanent. The 26 neighbours *were* applied, and they are still the newest version of
-            // those sections, so the refusal is the one slot.
+    // **The trim comes last, and that is what makes the shorter lock safe.** It is the only other
+    // thing in this call that mutates the cache, and by the time it runs the bake owns everything it
+    // needs: `queue_bake` takes its own reference to all 27 slots (`SectionWorld::blocks` is a clone
+    // of an `Arc`), so the cache dropping its reference cannot take a slot away from a bake that is
+    // already on its way.
+    WORLD.write().trim(target);
+    wgpu_mc::mc::visibility::trim(target);
+    match queue_bake(&mut env, target) {
+        // **On its way, or waiting for a slot in a pool that is full.** Neither is an answer the JVM
+        // should hear: it counts this section as this side's until it is told otherwise, and both of
+        // these say the same thing - the blocks and the light of all 27 slots are here, held by
+        // reference count, and in the second case the only thing missing is a place in the queue.
+        //
+        // Waiting is what makes that case free. The old path handed it to the JVM, whose recovery was
+        // to mark the section dirty, have Minecraft schedule a rebuild, have a chunk-build worker
+        // assemble the 27-section payload and compile 4096 block positions again, and apply all of it
+        // back into this cache - all of it to arrive at this queue a second time.
+        Queued::Dispatched | Queued::Waiting => rejected as jint,
+        // **Nowhere to bake it and nowhere to wait for one.** The pool is full and
+        // `MAX_WAITING_BAKES` sections are already waiting, or the cache no longer holds the section
+        // (see `queue_bake`), or the JVM handle could not be had.
+        //
+        // **The bit below is not enough on its own, and this comment used to claim it was.** It said
+        // a dropped offer "is not lost work - it comes back", which is true only if something rebuilds
+        // the section again, and nothing does: a rebuild happens when the game decides a section is
+        // out of date, and the section this call is about was just brought up to date. The bit makes
+        // the JVM forget it was sent, so the *next* rebuild carries its blocks - and the next rebuild
+        // is the thing that does not happen. Meanwhile the mesh for it was dropped when this side was
+        // believed to have it, so it is drawn by neither renderer.
+        //
+        // So it is queued for a rebuild the way a refusal is, which is the only mechanism that
+        // actively asks the game for one. See `SectionStorage::forget_trimmed` and
+        // `RustChunkBake.redirtyDue`.
+        Queued::Refused => {
             forget_one(target);
 
-            return (rejected | (1 << CENTER)) as jint;
-        }
-    };
-
-    // The Java thread is done with this section: everything the bake needs is owned by now, so it
-    // goes to the pool and the caller returns to Minecraft's chunk build. See [BakeTask] for what
-    // crosses the thread boundary and what deliberately does not.
-    match BakeTask::new(target, provider, jvm) {
-        Some(task) => THREAD_POOL.spawn(move || task.run()),
-        // The queue is full, so this bake is dropped on the floor.
-        //
-        // **The bit below is not enough on its own, and this comment used to claim it was.** It said a
-        // dropped offer "is not lost work - it comes back", which is true only if something rebuilds the
-        // section again, and nothing does: a rebuild happens when the game decides a section is out of
-        // date, and the section this call is about was just brought up to date. The bit makes the JVM
-        // forget it was sent, so the *next* rebuild carries its blocks - and the next rebuild is the
-        // thing that does not happen. Meanwhile the mesh for it was dropped when Rust was believed to
-        // have it, so it is drawn by neither renderer.
-        //
-        // So it is queued for a rebuild the way a refusal is, which is the only mechanism that actively
-        // asks the game for one. See `SectionStorage::forget_trimmed` and `RustChunkBake.redirtyDue`.
-        None => {
-            forget_one(target);
-
-            return (rejected | (1 << CENTER)) as jint;
+            (rejected | (1 << CENTER)) as jint
         }
     }
-
-    rejected as jint
 }
 
 /// Records that this side is not going to draw one section, so the game is asked to draw it.
@@ -1172,13 +1778,296 @@ fn release_bake_slot() {
     QUEUED_BAKES.fetch_sub(1, Ordering::Relaxed);
 }
 
+/// How many sections may wait for a slot in the bake pool before an offer is refused outright.
+///
+/// The same order as [`MAX_QUEUED_BAKES`] and for the same reason: a section waiting behind a few
+/// hundred others has been overtaken by the player twice, and the ground it is being baked for is
+/// ground nobody is looking at by the time it lands. Past this an offer is refused the old way - the
+/// JVM is told and Minecraft's own mesh takes the section - which costs a rebuild rather than a hole.
+const MAX_WAITING_BAKES: usize = 256;
+
+/// The sections whose bake was refused for want of a slot in the pool, oldest first.
+///
+/// **This queue is what keeps a refusal from being a round trip.** When the pool is full the payload
+/// has already been applied, so the blocks and the light of all 27 slots are here, held by reference
+/// count, and the only thing missing is somewhere to run. Waiting for it costs the JVM nothing: it is
+/// never told, it never sends the section again, and Minecraft never compiles it again.
+static BAKE_WAITERS: Lazy<Mutex<VecDeque<IVec3>>> = Lazy::new(|| Mutex::new(VecDeque::new()));
+
+/// How many bakes have taken a place in [`BAKE_WAITERS`] over the run.
+static BAKES_WAITED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many of those reached the pool on a retry, which is the number that says the round trip was
+/// avoided rather than merely delayed.
+static BAKES_RETRIED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many waiting sections could not be baked at all and went back to the JVM. See [`queue_bake`].
+static RETRIES_REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// What became of an attempt to get a section's bake onto the pool.
+enum Queued {
+    /// It is on its way to the pool.
+    Dispatched,
+    /// The pool was full, so it is waiting in [`BAKE_WAITERS`] and `retryBakes` will offer it again.
+    Waiting,
+    /// It cannot be baked by this side, so the caller has to treat it as a refusal: the cache no
+    /// longer holds the section, there is nowhere left to wait, or there is no block registry yet.
+    Refused,
+}
+
+/// Resolves a section's 27 neighbours out of the cache and puts the bake on the pool.
+///
+/// One function for both callers because the work is the same - a payload that has just arrived and a
+/// section that has been waiting resolve exactly the same slots - and only the first of them had
+/// anything to apply. That is also why the cache is only *read* here: the write lock belongs to
+/// `apply`, which is the one thing a retry does not have to do again. See `bakeSections`.
+fn queue_bake(env: &mut JNIEnv, target: IVec3) -> Queued {
+    // The registry, for the same reason `bakeSections` checks it: without `AIR` there is no way to
+    // tell a hole from a block. A retry can arrive here and a first offer cannot - the registry can
+    // be replaced while a section waits - so the check is made where the answer is used.
+    let Some(air) = *AIR else {
+        return Queued::Refused;
+    };
+
+    let provider = {
+        let world = WORLD.read();
+
+        // **The section itself, which a payload cannot vouch for.** The JVM counts a section it has
+        // sent as one this side holds, so a section the cache has forgotten - trimmed while the
+        // player walked away, or cleared by a level change - is the one case where the two disagree.
+        // Baking it would bake a hole: every slot resolves to `None`, which is air, and a section of
+        // solid ground would come out as nothing at all. Refusing hands it back to the JVM instead,
+        // which re-sends it along with everything else it has.
+        if world.blocks(target).is_none() {
+            return Queued::Refused;
+        }
+
+        let mut blocks: [Option<Arc<SectionBlocks>>; SECTIONS] = Default::default();
+        let mut light: [Option<Arc<SectionLight>>; SECTIONS] = Default::default();
+
+        // Every slot is resolved from the cache, not just the ones a payload carried: a section the
+        // caller did not send is one it believes is already here, and a slot that is still empty is a
+        // section that is not loaded - which is air, as it is for Minecraft's own mesher.
+        for index in 0..SECTIONS {
+            let pos = target + neighbour_offset(index);
+            blocks[index] = world.blocks(pos);
+            light[index] = world.light(pos);
+        }
+
+        CachedBlockstateProvider {
+            variants: world.variants(target),
+            blocks,
+            light,
+            air,
+        }
+    };
+
+    let jvm = match env.get_java_vm() {
+        Ok(jvm) => jvm,
+        Err(err) => {
+            log::error!("wgpu-mc: could not get the JVM handle for a bake: {err}");
+
+            return Queued::Refused;
+        }
+    };
+
+    // The Java thread is done with this section: everything the bake needs is owned by now, so it goes
+    // to the pool and the caller returns to Minecraft's chunk build. See [BakeTask] for what crosses
+    // the thread boundary and what deliberately does not.
+    match BakeTask::new(target, provider, jvm) {
+        Some(task) => {
+            THREAD_POOL.spawn(move || task.run());
+
+            Queued::Dispatched
+        }
+        // **The pool is full, so this section waits here instead of going back to the JVM.** The
+        // payload has been applied and the 27 slots are resolved; what is missing is a place to run,
+        // and a place will free up as the bakes ahead of it finish. Handing it to the JVM instead
+        // means a rebuild of the section through Minecraft's compiler and a second JNI call, to end
+        // up back here with the same queue in front of it.
+        None => {
+            if wait_for_a_bake_slot(target) {
+                Queued::Waiting
+            } else {
+                Queued::Refused
+            }
+        }
+    }
+}
+
+/// Puts a section in the queue of bakes waiting for a slot, and answers whether there was room.
+///
+/// Answers `false` past [`MAX_WAITING_BAKES`], and that is the whole fallback: the offer is then
+/// refused the old way, so a pool that cannot keep up costs a rebuild rather than a queue that grows
+/// with the world.
+fn wait_for_a_bake_slot(target: IVec3) -> bool {
+    let mut waiting = BAKE_WAITERS.lock();
+
+    // Already waiting, which happens when the game rebuilds a section before the bake it is waiting
+    // for has run: the second offer is the same section and not a second place in the queue.
+    if waiting.contains(&target) {
+        return true;
+    }
+
+    if waiting.len() >= MAX_WAITING_BAKES {
+        static WARNED: AtomicBool = AtomicBool::new(false);
+        if !WARNED.swap(true, Ordering::Relaxed) {
+            log::warn!(
+                "wgpu-mc: {MAX_WAITING_BAKES} section bakes are already waiting for a slot in the \
+                 pool; refusing this one, which Minecraft will offer again"
+            );
+        }
+
+        return false;
+    }
+
+    waiting.push_back(target);
+
+    BAKES_WAITED.fetch_add(1, Ordering::Relaxed);
+
+    true
+}
+
+/// Offers the sections waiting for a slot in the bake pool again, up to `limit` of them.
+///
+/// **This is the JVM's whole part in a refused bake now.** One call a frame, no payload, nothing to
+/// send and nothing to assemble: what it replaced was a chain of four steps that all existed to get
+/// the same section back into this queue - the JVM marking it dirty, Minecraft scheduling a rebuild,
+/// a chunk-build worker assembling the 27-section payload and compiling 4096 block positions, and a
+/// JNI call that took the cache's write lock to apply every one of them again.
+///
+/// The limit is the caller's, because the rate belongs to the frame it is called from, and what comes
+/// back is how many sections this call dealt with. A section the cache has forgotten is handed to the
+/// JVM as a refusal (see [`queue_bake`]), and one that meets a pool which is still full goes back to
+/// the front of the queue and ends the call - a slot that was not free for it is not free for
+/// anything behind it either.
+#[jni_fn("dev.birb.wgpu.rust.WgpuNative")]
+pub fn retryBakes(mut env: JNIEnv, _class: JClass, limit: jint) -> jint {
+    if limit <= 0 {
+        return 0;
+    }
+
+    let mut dealt_with = 0;
+
+    while dealt_with < limit {
+        // One at a time, and the lock is dropped before the bake is prepared: this queue is fed by
+        // Minecraft's own chunk-build threads, and holding it across a 27-slot resolve would stall
+        // them for as long as one takes - the serialisation this whole path exists to remove.
+        let Some(target) = BAKE_WAITERS.lock().pop_front() else {
+            break;
+        };
+
+        match queue_bake(&mut env, target) {
+            Queued::Dispatched => {
+                dealt_with += 1;
+
+                BAKES_RETRIED.fetch_add(1, Ordering::Relaxed);
+            }
+            Queued::Waiting => {
+                // Still no room, so nothing behind it can go either.
+                BAKE_WAITERS.lock().push_front(target);
+
+                break;
+            }
+            Queued::Refused => {
+                // The cache no longer holds it, so it is the JVM's section now - the same refusal a
+                // full pool produces when there is nowhere left to wait.
+                forget_one(target);
+
+                dealt_with += 1;
+
+                RETRIES_REFUSED.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    report_bake_waiters();
+
+    dealt_with as jint
+}
+
+/// Says how many bakes are waiting for a slot: once a second while any are, and once when the last
+/// one goes.
+///
+/// Silence is the common case and it means the pool kept up. A line here means the game is rebuilding
+/// sections faster than the pool bakes them, which is the state [`BAKE_WAITERS`] exists to absorb, and
+/// the three numbers say whether it absorbed it - how many waited, how many reached the pool on a
+/// retry, and how many had to go back to Minecraft after all.
+fn report_bake_waiters() {
+    static REPORTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static WAS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    let waiting = BAKE_WAITERS.lock().len();
+    let was = WAS.swap(waiting, Ordering::Relaxed);
+
+    if waiting == 0 && was == 0 {
+        return;
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_secs())
+        .unwrap_or(0);
+
+    if waiting == 0 || REPORTED.swap(now, Ordering::Relaxed) != now {
+        log::info!(
+            "wgpu-mc: {waiting} section bake(s) are waiting for a slot in the pool; {} have waited \
+             over the run, {} of them reached the pool when it had room, and {} could not be baked \
+             here and went back to Minecraft",
+            BAKES_WAITED.load(Ordering::Relaxed),
+            BAKES_RETRIED.load(Ordering::Relaxed),
+            RETRIES_REFUSED.load(Ordering::Relaxed),
+        );
+    }
+}
+
+/// How many bake threads have attached themselves to the JVM, over the whole run.
+///
+/// **The counter that settles a claim about this path.** A bake thread attaches itself because a bake may
+/// call back into Java for a biome tint, and the question that keeps coming back is whether that is once per
+/// *bake* or once per *thread*. It is once per thread: `jni`'s `attach_current_thread_as_daemon` returns the
+/// environment a thread that is already attached already has (a `GetEnv` and nothing else), and the detach
+/// lives in that thread's own TLS and is dropped when the thread *exits*, not when a returned value drops -
+/// `JNIEnv` in this crate owns nothing at all. So this number should stay at the size of the bake pool (one
+/// thread per core) however many thousands of bakes a run does.
+///
+/// Reported on the atlas line, beside the tint counts, which is where the rest of this path's numbers are.
+static BAKE_THREADS_ATTACHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Attaches this bake thread to the JVM, counting the first time per thread. See [`BAKE_THREADS_ATTACHED`].
+///
+/// **A daemon attachment, which is the right one here and the opposite of the panic hook's.** A bake pool
+/// thread must not hold the JVM open once the game is done; the panic hook attaches permanently because its
+/// whole job is to run *while* the JVM is going down.
+///
+/// The alternative to what this does - keeping the `JNIEnv` in a thread-local so that even the `GetEnv` this
+/// makes is skipped - is written down rather than done: that call is a few tens of nanoseconds against a bake
+/// measured in milliseconds, and a cached environment is one more unsafe pointer to reason about.
+fn attach_bake_thread(jvm: &JavaVM) -> jni::errors::Result<JNIEnv<'_>> {
+    // Set only after a successful attach, so a failed one is retried by the next bake on this thread rather
+    // than counted as an attach that happened.
+    thread_local! {
+        static ATTACHED: Cell<bool> = const { Cell::new(false) };
+    }
+
+    let env = jvm.attach_current_thread_as_daemon()?;
+
+    ATTACHED.with(|attached| {
+        if !attached.replace(true) {
+            BAKE_THREADS_ATTACHED.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+
+    Ok(env)
+}
+
 /// One section bake, on its way to the pool.
 ///
 /// Everything it needs is owned: the JNI arrays it was built from are only valid on the thread that
 /// received them, so the palettes, the storages and the two light layers are moved out before the
-/// task is spawned. The `JNIEnv` is deliberately *not* carried across - a pool thread attaches
-/// itself in [`BakeTask::run`], which is also where the callback into Java for biome tints gets a
-/// usable environment from.
+/// task is spawned. The `JNIEnv` is deliberately *not* carried across - a pool thread attaches itself
+/// **once**, in [`BakeTask::run`], which is also where the callback into Java for biome tints gets a
+/// usable environment from. See [`attach_bake_thread`].
 struct BakeTask {
     pos: IVec3,
     provider: CachedBlockstateProvider,
@@ -1209,10 +2098,9 @@ impl BakeTask {
             return;
         };
 
-        // The bake asks Java for a biome tint per tinted face (`Wgpu.helperGetBlockColor`), so this
-        // thread needs its own attachment to the JVM. A daemon attachment is the right one: it does
-        // not hold the JVM open once the game is done, and it is what a worker pool thread wants.
-        let env = match self.jvm.attach_current_thread_as_daemon() {
+        // The bake asks Java for a biome tint per tinted block (`Wgpu.helperGetBlockColor`), so this thread
+        // needs its own attachment to the JVM - once, not once per bake. See [`attach_bake_thread`].
+        let env = match attach_bake_thread(&self.jvm) {
             Ok(env) => env,
             Err(error) => {
                 log::warn!("wgpu-mc: could not attach a bake thread to the JVM: {error}");
@@ -1223,6 +2111,9 @@ impl BakeTask {
         let wrapper = MinecraftBlockStateProviderWrapper {
             internal: self.provider,
             env: RefCell::new(env),
+            section: self.pos,
+            tints: RefCell::new(SectionTints::Unasked),
+            fluid_tints: RefCell::new(SectionTints::Unasked),
         };
 
         bake_section(self.pos, wm, &wrapper);
@@ -1334,6 +2225,16 @@ pub fn clearSections(_env: JNIEnv, _class: JClass) -> jint {
 
     WORLD.write().clear();
 
+    // The occlusion answers describe the world that was just thrown away, under coordinates the next
+    // one is about to use. See `wgpu_mc::mc::visibility`.
+    wgpu_mc::mc::visibility::clear();
+
+    // And the box the occlusion walk is bounded by, for the same reason: the world the next frame is
+    // about is a different one, and a stale horizon is a walk that draws the wrong sections - or, if the
+    // camera is no longer inside the old level's layers, none at all. The frame's own push puts the new
+    // box back. See `wgpu_mc::mc::world_extent`.
+    wgpu_mc::mc::world_extent::clear();
+
     let mut queued = 0usize;
     let mut freed = 0usize;
 
@@ -1350,6 +2251,13 @@ pub fn clearSections(_env: JNIEnv, _class: JClass) -> jint {
             freed = storage.len();
             storage.forget();
         }
+
+        // **For the atlas routing, and it has to be after the arena is empty.** Which atlas a face was
+        // baked for is a property of the face, and the faces are gone; the next ones are baked under
+        // whatever is bound now. Without this a session that fell back once - one sprite the game's atlas
+        // has no rectangle for - would carry the two-atlas shaders for the rest of its life, because the
+        // question they answer would never be asked again. See `block::forget_atlas_faces`.
+        wgpu_mc::mc::block::forget_atlas_faces();
     }
 
     log::info!(
@@ -1792,6 +2700,33 @@ pub fn atlasFaceCounts(env: JNIEnv, _class: JClass) -> jstring {
     // must not be zero. See `FLUID_TINTS`.
     let tints = FLUID_TINTS.swap(0, Ordering::Relaxed);
 
+    // **And how many of the tints had to look their helper up again**, which is the other half of that
+    // number: a tint is a `CallStaticIntMethodA` and nothing else while [`TintHelpers`] holds, and a
+    // `loadClass` plus a method lookup per face while it does not. Zero is the cache working.
+    let lookups = TINT_SLOW_LOOKUPS.swap(0, Ordering::Relaxed);
+
+    // **And how many tint callbacks the baker did not have to make at all**, split by the two reasons it
+    // did not: the faces of one block sharing a colour, and the faces culled before the colour was asked.
+    // The remainder is the `tints` count above, so the three numbers are the whole story of a per-face
+    // callback: asked, reused, and never reached.
+    let (tints_reused, tinted_faces_culled) = wgpu_mc::mc::chunk::take_tint_face_counts();
+
+    // **And how many bake threads have ever attached**, which is the other half of that path's cost: the
+    // attachment exists because a tint may need the JVM, so a run should say whether it happens once per
+    // bake or once per thread. Cumulative rather than drained, and labelled so. See
+    // [`BAKE_THREADS_ATTACHED`].
+    let bake_threads = BAKE_THREADS_ATTACHED.load(Ordering::Relaxed);
+
+    // **And the bulk tint table**, which is what the callbacks above were replaced with: one fetch per
+    // section that wanted a colour, the colours it returned, and how many faces were answered from it. Read
+    // together with the tint count: `hits` should be most of it and the fetches should be one per section.
+    let table_fetches = TINT_TABLE_FETCHES.swap(0, Ordering::Relaxed);
+    let table_entries = TINT_TABLE_ENTRIES.swap(0, Ordering::Relaxed);
+    let table_hits = TINT_TABLE_HITS.swap(0, Ordering::Relaxed);
+    let table_found = TINT_TABLE_FOUND.swap(0, Ordering::Relaxed);
+    let fluid_table_hits = TINT_TABLE_FLUID_HITS.swap(0, Ordering::Relaxed);
+    let fluid_table_found = TINT_TABLE_FLUID_FOUND.swap(0, Ordering::Relaxed);
+
     // **And the animated faces, which are the ones the level-of-detail offset applies to.** Read beside the
     // game-atlas count because the ratio is the question: that offset is a compensation for a level chosen
     // too coarse, it is only legitimate on a sprite whose coarse levels move, and on anything else it is a
@@ -1826,7 +2761,13 @@ pub fn atlasFaceCounts(env: JNIEnv, _class: JClass) -> jstring {
 
     let text = format!(
         "{game} game-atlas, {own} own-atlas, {animated} of them animated ({floored} floored), {forced} leaf \
-         face(s) forced opaque, {tints} fluid tint(s) read from the game, {moved} fluid face(s) with the \
+         face(s) forced opaque, {tints} fluid tint(s) read from the game ({lookups} tint(s) that looked the \
+         helper up again, and zero there is the cache working; {tints_reused} face(s) reused their block's \
+         colour and {tinted_faces_culled} tinted face(s) were culled before asking; {bake_threads} bake \
+         thread(s) attached in all; {table_hits}+{fluid_table_hits} face(s) answered from a section table \
+         ({table_found}+{fluid_table_found} of them found, and each pair agreeing is a packing agreeing), \
+         from {table_fetches} fetch(es) of {table_entries} colour(s)), {moved} fluid face(s) \
+         with the \
          animated flag ({floored_fluid} of them floored) and {still} without (and {unfloored_fluid} \
          animated with no floor)"
     );
@@ -1875,6 +2816,29 @@ pub fn setTextureFiltering(_env: JNIEnv, _class: JClass, method: jint) {
     wgpu_mc::render::atlas::set_texture_filtering(method.max(0) as u32);
 }
 
+/// **The game's `maxAnisotropyBit` option, which is the exponent in `Options#maxAnisotropyValue`.**
+///
+/// The other half of the terrain sampler's `anisotropy_clamp`, and it travels beside
+/// [`setTextureFiltering`] because the two are one line of `LevelRenderer`:
+///
+/// ```java
+/// int maxAnisotropy = this.optionsRenderState.textureFiltering == TextureFilteringMethod.ANISOTROPIC
+///     ? this.optionsRenderState.maxAnisotropyValue
+///     : 1;
+/// ```
+///
+/// The bit is pushed rather than the value, so the shift happens once on the native side and the number
+/// that crosses is the same number `options.txt` holds - which is what makes a hand-edited file and the
+/// slider mean the same thing. The game's own range is `1..3`, so its answers are 2, 4 and 8; the native
+/// side clamps anything past what `wgpu` accepts rather than shifting off the end of the type.
+///
+/// **The value is not validated here.** A bit the option could not produce is still a number, and the
+/// side that owns the shift is the side that knows what its own ceiling is - see `game_anisotropy`.
+#[jni_fn("dev.birb.wgpu.rust.WgpuNative")]
+pub fn setMaxAnisotropyBit(_env: JNIEnv, _class: JClass, bit: jint) {
+    wgpu_mc::render::atlas::set_max_anisotropy_bit(bit.max(0) as u32);
+}
+
 /// **The dimension's `CardinalLighting`, pushed before a bake because it is written into the geometry.**
 ///
 /// The game keeps two tables and picks between them with `ClientLevel#cardinalLighting`: `DEFAULT`
@@ -1910,9 +2874,25 @@ pub fn setCardinalLighting(
 pub fn blockBakeDiagnostics(env: JNIEnv, _class: JClass) -> jstring {
     let mut report = String::new();
 
+    // **Where every block-model face's atlas went, said in the report the JVM already logs.** The two
+    // counts are written by `face_data` - the one place a face's `UV_GAME_ATLAS` bit is decided - and this
+    // is the moment right after the block models are baked, so the numbers are that bake's answer rather
+    // than a running total read at some other time.
+    //
+    // It is deliberately first: it is the count of *every* face, so it is the denominator the three
+    // diagnostics below are read against. A session where the second number is not near zero is one whose
+    // terrain shaders still need the second atlas.
+    let (game, ours) = wgpu_mc::mc::block::atlas_face_counts();
+
+    report.push_str(&format!(
+        "{game} face(s) are baked against the game's block atlas and {ours} against this side's own"
+    ));
+
     let unreadable = wgpu_mc::mc::block::UNREADABLE_TEXTURES.faces();
 
     if unreadable != 0 {
+        report.push_str("; ");
+
         report.push_str(&format!(
             "{} texture(s) a model names could not be read (so their faces are untextured): {}",
             unreadable,
@@ -2100,5 +3080,60 @@ mod bake_queue_tests {
             release_bake_slot();
         }
         assert_eq!(QUEUED_BAKES.load(Ordering::Relaxed), 0);
+    }
+
+    /// **A section whose bake met a full pool waits here** rather than being handed back to the JVM,
+    /// which is what removes the round trip: the payload has been applied, the 27 slots are resolved,
+    /// and a place in the queue is the only thing missing.
+    ///
+    /// One test for the whole queue because it is global, like the counter above: the two of them are
+    /// the shared state this module owns for the length of a test and nothing else touches.
+    #[test]
+    fn a_section_that_meets_a_full_pool_waits_and_the_queue_is_bounded() {
+        BAKE_WAITERS.lock().clear();
+
+        let waited = BAKES_WAITED.load(Ordering::Relaxed);
+
+        assert!(wait_for_a_bake_slot(ivec3(1, 2, 3)));
+        assert_eq!(BAKE_WAITERS.lock().len(), 1);
+        assert!(
+            BAKES_WAITED.load(Ordering::Relaxed) > waited,
+            "and the run counts it, which is the number that says the round trip was avoided"
+        );
+
+        // The same section offered again is one place in the queue and not two: the game can rebuild
+        // a section before the bake it is already waiting for has run.
+        assert!(wait_for_a_bake_slot(ivec3(1, 2, 3)));
+        assert_eq!(BAKE_WAITERS.lock().len(), 1);
+
+        // Oldest first, so what comes off the front is what has been waiting longest - which is what
+        // `retryBakes` relies on when it puts a section back on the front.
+        assert!(wait_for_a_bake_slot(ivec3(4, 5, 6)));
+        assert_eq!(BAKE_WAITERS.lock().pop_front(), Some(ivec3(1, 2, 3)));
+        assert_eq!(BAKE_WAITERS.lock().pop_front(), Some(ivec3(4, 5, 6)));
+
+        // **Past the cap an offer is refused outright**, and that is the whole fallback: a pool that
+        // cannot keep up costs a rebuild of the section rather than a queue that grows with the world.
+        for index in 0..MAX_WAITING_BAKES {
+            assert!(
+                wait_for_a_bake_slot(ivec3(index as i32, 0, 0)),
+                "place {index} of {MAX_WAITING_BAKES}"
+            );
+        }
+
+        assert_eq!(BAKE_WAITERS.lock().len(), MAX_WAITING_BAKES);
+        assert!(
+            !wait_for_a_bake_slot(ivec3(-1, 0, 0)),
+            "the queue is a bound on how much work may wait, not a hope"
+        );
+        assert_eq!(BAKE_WAITERS.lock().len(), MAX_WAITING_BAKES);
+
+        // A section that is already waiting is still answered with `true` at the cap: it is not asking
+        // for a second place, so refusing it would be refusing one that already has a place.
+        assert!(wait_for_a_bake_slot(ivec3(0, 0, 0)));
+        assert_eq!(BAKE_WAITERS.lock().len(), MAX_WAITING_BAKES);
+
+        BAKE_WAITERS.lock().clear();
+        assert_eq!(BAKE_WAITERS.lock().len(), 0, "and the test leaves it empty");
     }
 }

@@ -450,6 +450,20 @@ object WgpuNative {
 	external fun setTextureFiltering(method: Int)
 
 	/**
+	 * The game's `maxAnisotropyBit` option, which is the **exponent** in `Options#maxAnisotropyValue`.
+	 *
+	 * It is the other half of the terrain sampler's `anisotropy_clamp`: the game builds that sampler as
+	 * `1 << maxAnisotropyBit` under `textureFiltering == ANISOTROPIC` and 1 under the other two answers,
+	 * so the two options have to travel together to reproduce one line of `LevelRenderer`. Its own slider
+	 * is `1..3`, making the answers 2, 4 and 8 - and 4 was what the native side used as a constant before
+	 * this existed, which is the default and not the option.
+	 *
+	 * Pushed every frame beside [setTextureFiltering], for the same reason.
+	 */
+	@JvmStatic
+	external fun setMaxAnisotropyBit(bit: Int)
+
+	/**
 	 * The dimension's `CardinalLighting`: six per-face brightness multipliers, in `Direction`'s own order -
 	 * west, east, down, up, north, south.
 	 *
@@ -537,6 +551,27 @@ object WgpuNative {
 	 */
 	@JvmStatic
 	external fun bakeSections(x: Int, y: Int, z: Int, address: Long, length: Int): Int
+
+	/**
+	 * Offers the sections that are waiting for a slot in the bake pool again, up to `limit` of them.
+	 *
+	 * **This is the whole of this side's part in a refused bake.** The native side is the one that
+	 * knows which sections are waiting and why - a bake queue that was full, or an arena with no room
+	 * for the geometry - and it can retry them against data it already holds: the payload was applied
+	 * when it arrived, so the blocks and the light of all 27 slots are there and a retry needs a place
+	 * to run and nothing else. Called once a frame, with the same budget the rebuild drain below uses.
+	 *
+	 * What comes back is how many sections the call dealt with. A section it could not bake after all
+	 * - the cache no longer holds it, or there was nowhere left to wait - is handed over through
+	 * [refusedSections] instead, where the rebuild path picks it up.
+	 *
+	 * It replaced a chain of four steps that all existed to get one section back into that queue: this
+	 * side marking the section dirty, Minecraft scheduling a rebuild, a chunk-build worker assembling
+	 * the 27-section payload and compiling 4096 block positions, and [bakeSections] applying every one
+	 * of them again. See `RustChunkBake.redirtyDue`.
+	 */
+	@JvmStatic
+	external fun retryBakes(limit: Int): Int
 
 	/**
 	 * Forgets every section of the world the bake was built against, and answers the new generation.

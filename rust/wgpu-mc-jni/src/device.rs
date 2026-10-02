@@ -17,7 +17,7 @@ use parking_lot::Mutex;
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
 use std::borrow::Cow;
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::{CStr, c_char};
 use std::num::NonZero;
 use std::path::PathBuf;
@@ -654,11 +654,31 @@ static VALIDATION_LAYERS: std::sync::atomic::AtomicU8 = std::sync::atomic::Atomi
 static OTHER_INSTANCE_FLAGS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 /// What this adapter can do with indirect draws: bit 0 `INDIRECT_EXECUTION`, bit 1
-/// `MULTI_DRAW_INDIRECT_COUNT`.
+/// `MULTI_DRAW_INDIRECT_COUNT`, bit 2 `ANISOTROPIC_FILTERING`, bit 3 `INDIRECT_FIRST_INSTANCE`.
 ///
 /// Recorded where the device is created and reported later, for the reason [`VALIDATION_LAYERS`] is:
 /// nothing from the adapter onwards reaches the log. See [`report_device_capabilities`].
 static MULTI_DRAW: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Whether this **device** can run the terrain pass' batched draw path: the three bits of [`MULTI_DRAW`],
+/// and nothing else.
+///
+/// `INDIRECT_EXECUTION` is the call itself. `INDIRECT_FIRST_INSTANCE` is the record index a batched call
+/// has to carry - wgpu validates `first_instance` against it and requires zero without it, which would
+/// make every record read record zero. And `MULTI_DRAW_INDIRECT_COUNT` is what decides whether the call
+/// is *one* call: **wgpu-hal's Vulkan backend expands `draw_count > 1` into one `vkCmdDrawIndexedIndirect`
+/// per record unless the Vulkan `multiDrawIndirect` feature is enabled, and that feature is what wgpu
+/// gates behind this bit** (`vulkan/command.rs`). A "batch" that is really a loop of indirect draws is
+/// slower than the loop it would replace, because each of those draws still reads its record out of
+/// `section_draws`.
+///
+/// **The answer is about the device and not about the backend**, which is why the one caller in
+/// `try_create_renderer` combines it with a backend exclusion of its own: DX12 reports all three bits and
+/// its `multi_draw_indexed_indirect` is nonetheless broken. A function named "can" that answered no there
+/// would be lying about what the adapter said.
+pub fn can_batch_terrain_draws() -> bool {
+    MULTI_DRAW.load(std::sync::atomic::Ordering::Relaxed) & (1 | 2 | 8) == (1 | 2 | 8)
+}
 
 /// Writes the lines about what the device can do, from somewhere the log is actually listening.
 ///
@@ -668,10 +688,45 @@ fn report_device_capabilities() {
     let multi_draw = MULTI_DRAW.load(std::sync::atomic::Ordering::Relaxed);
 
     info!(
-        "wgpu-mc: indirect draws: execution {}, real batched multi-draw {}. Without the count feature \
-         wgpu emulates multi_draw_* as one draw per entry, which is a loop by another name.",
+        "wgpu-mc: indirect draws: execution {}, real batched multi-draw {}, non-zero first instance {}. \
+         Without the count feature wgpu emulates multi_draw_* as one draw per entry, which is a loop by \
+         another name; without `first_instance` a batched call cannot say which record a draw is, so the \
+         terrain pass falls back to one draw per section.",
         if multi_draw & 1 != 0 { "yes" } else { "no" },
-        if multi_draw & 2 != 0 { "yes" } else { "no" }
+        if multi_draw & 2 != 0 { "yes" } else { "no" },
+        if multi_draw & 8 != 0 { "yes" } else { "no" }
+    );
+
+    // What the terrain pass does with the answer above, which is the number a run is actually read for:
+    // `terrain_indirect` is a switch, and this is the setting *and* the hardware *and* the backend
+    // resolved into the one flag the draw path reads. See `debug::apply`.
+    //
+    // **The three ways it can be off are named separately**, because they call for different things: a
+    // switch that is off is a setting, a device that cannot is hardware, and DirectX 12 is a defect in
+    // the backend's multi-draw indirect (see `try_create_renderer`). A single "the switch is off, or it
+    // is DX12" was the first version of this line and it is the reason the wiring bug it hid took a run
+    // to find.
+    info!(
+        "wgpu-mc: the terrain pass is drawing {}",
+        if wgpu_mc::render::graph::terrain_batches_draws() {
+            "in batches - one multi_draw_indexed_indirect per run of sections that share an arena"
+        } else if multi_draw & 1 == 0 {
+            "one section at a time, because this device has no indirect execution at all"
+        } else if multi_draw & 8 == 0 {
+            "one section at a time, because this device cannot put a non-zero `first_instance` in an \
+             indirect draw, so a batched call could not say which record each draw is"
+        } else if multi_draw & 2 == 0 {
+            "one section at a time, because this device has no real multi-draw: wgpu-hal expands \
+             multi_draw_* into one indirect draw per record here, which is the fallback loop with a \
+             buffer read per draw on top"
+        } else if !wgpu_mc::render::graph::terrain_indirect_requested() {
+            "one section at a time: the `terrain_indirect` switch is off, and this device could batch"
+        } else {
+            "one section at a time: this is the DirectX 12 backend, where wgpu's implementation of \
+             multi-draw indirect is broken, so the terrain pass is not allowed to use it - every \
+             capability above says yes and this is a defect, not a missing feature. See \
+             `try_create_renderer`"
+        }
     );
 
     info!(
@@ -783,6 +838,23 @@ fn try_create_renderer(
         required_features |= wgpu::Features::IMMEDIATES;
     }
 
+    // **A non-zero `first_instance` in an indirect draw**, which is how a terrain pass tells the vertex
+    // stage *which record* a draw is: without it every record would have to read record zero, and the
+    // batching would draw one section's position for all of them. wgpu validates that field against
+    // this feature - "Has to be 0, unless `Features::INDIRECT_FIRST_INSTANCE` is enabled" - so asking
+    // for it is what makes the batched path available at all.
+    //
+    // Asked for whenever the adapter has it, like the three above: requesting a feature changes nothing
+    // about how anything renders. The switch that decides whether the batched path *is* used is read
+    // per pass, and the fallback needs no feature at all - see `TERRAIN_INDIRECT`.
+    let indirect_first_instance = adapter
+        .features()
+        .contains(wgpu::Features::INDIRECT_FIRST_INSTANCE);
+
+    if indirect_first_instance {
+        required_features |= wgpu::Features::INDIRECT_FIRST_INSTANCE;
+    }
+
     // **Multi-draw indirect, and whether it is real.** There is no `Features::MULTI_DRAW_INDIRECT` in
     // this wgpu - the non-count calls are always available and gated only on
     // `DownlevelFlags::INDIRECT_EXECUTION`, and **wgpu emulates them as a series of single draws**
@@ -815,8 +887,37 @@ fn try_create_renderer(
     // takes `Linear` filters and returns a texture that is blurred at every grazing angle with nothing
     // in any log to say why. That is a plausible reading of "the blocks are blurry up close".
     MULTI_DRAW.store(
-        indirect_execution as u8 | (multi_draw_count as u8) << 1 | (anisotropic as u8) << 2,
+        indirect_execution as u8
+            | (multi_draw_count as u8) << 1
+            | (anisotropic as u8) << 2
+            | (indirect_first_instance as u8) << 3,
         std::sync::atomic::Ordering::Relaxed,
+    );
+
+    // **What the terrain pass may do with all of that**, resolved here because this is where the
+    // device is - and recorded in the renderer's own crate rather than tested where the setting is
+    // read. The setting is read from the mod constructor, which is before any adapter exists, so a test
+    // made there answers "no" on every launch; the first run of the batched path printed all three bits
+    // as `yes` and then drew one section at a time.
+    //
+    // **DirectX 12 gets no batching at all, and it is the one exclusion in this file that is a defect
+    // rather than a missing capability: `multi_draw_indexed_indirect` is broken in wgpu's DX12 backend.**
+    // The bug is in wgpu's implementation of that call on that backend - not in D3D12, which offers a
+    // perfectly good `ExecuteIndirect`, and not in the driver - which is exactly why no feature test can
+    // find it: the adapter on DX12 reports `INDIRECT_EXECUTION`, `INDIRECT_FIRST_INSTANCE` *and*
+    // `MULTI_DRAW_INDIRECT_COUNT` (wgpu enables the last one unconditionally there,
+    // `dx12/adapter.rs`), and the call underneath really is one `ExecuteIndirect` with
+    // `MaxCommandCount`. **Every question this side can ask says yes and the answer is still no, so do
+    // not delete this test on the strength of those bits.**
+    //
+    // The failure is also the worst shape for a renderer to ship: it is a picture, not an error, so
+    // nothing in a log would say it happened. The way back is a wgpu release that fixes the call on that
+    // backend, and this is the line to revisit when one lands.
+    //
+    // The terrain is drawn either way, one `draw_indexed` per section - the same records, the same
+    // order, the same shader. What DX12 loses is the batching, not the terrain.
+    wgpu_mc::render::graph::set_terrain_batching_possible(
+        backend != GraphicsBackend::DirectX12 && can_batch_terrain_draws(),
     );
 
     let (device, queue) = match block_on(adapter.request_device(&wgpu::DeviceDescriptor {
@@ -1054,7 +1155,7 @@ static LAST_SUBMISSION: Mutex<Option<wgpu::SubmissionIndex>> = Mutex::new(None);
 /// The submissions of the frames in flight, oldest first.
 ///
 /// A present pushes the frame it is presenting and waits for whatever is left once
-/// the rames in flight setting of them are outstanding, which is what the wait at the bottom of
+/// the frames in flight setting of them are outstanding, which is what the wait at the bottom of
 /// `present_surface` uses.
 static IN_FLIGHT_SUBMISSIONS: Mutex<std::collections::VecDeque<wgpu::SubmissionIndex>> =
     Mutex::new(std::collections::VecDeque::new());
@@ -1131,6 +1232,13 @@ fn flush_shared_encoder(wm: &WmRenderer) {
 
     // Safety: as above - the render thread is the only one recording, and it is here.
     let finished = unsafe { std::mem::replace(&mut *pointer, new_encoder(wm)) };
+
+    // **A submission is a frame boundary, and the one place the terrain pass is told so.** The graph's
+    // terrain scratch holds the frame's gather and its per-pass draw records; a frame that began without
+    // saying so would be a frame drawn from the previous one's list, and the counter is what stops that.
+    // See `wgpu_mc::render::graph::begin_frame`, which is what this is the only caller of - and note
+    // that this returns early above if a pass is still open, so a frame only starts where one can.
+    wgpu_mc::render::graph::begin_frame();
 
     // The encoder that was just installed is where the next frame starts recording, so if the last
     // frame has already been presented, its start timestamp goes here - see `timing`.
@@ -1674,6 +1782,21 @@ pub extern "C" fn create_buffer(
     let label = unsafe { CStr::from_ptr(label) };
 
     let wgpu_usage_flags = wgpu_buffer_usages(usage);
+
+    // **The pool before the device.** This is the call the buffers that are closed and built again come
+    // through - `MappableRingBuffer`'s three, the uniform rings, the cloud face buffers - and one of those
+    // is a driver allocation of the whole size that a waiting buffer of the same size and flags makes
+    // unnecessary. See `POOLED_BUFFERS` for what a hand-out is and why it is zeroed.
+    if let Some(buffer) = take_from_the_pool(&wm.gpu.queue, size, wgpu_usage_flags, None) {
+        // Live from the JVM's point of view again, and counted as such: `drop_buffer` took it out of the
+        // live numbers when it was closed, and the pool's own size is reported separately.
+        LIVE_BUFFER_COUNT.fetch_add(1, Ordering::Relaxed);
+        LIVE_BUFFER_BYTES.fetch_add(size, Ordering::Relaxed);
+
+        return buffer;
+    }
+
+    BUFFER_CREATES.fetch_add(1, Ordering::Relaxed);
 
     let buffer = wm.gpu.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some(label.to_str().unwrap()),
@@ -3286,7 +3409,8 @@ pub extern "C" fn log_render_stats() {
 
     // Read in one lock rather than two: a guard taken inside the `info!` argument list lives until
     // the end of the statement, so a second lock of the same mutex inside it deadlocks the render
-    // thread - which is exactly what it did.
+    // thread - which is exactly what it did. The pool is the same shape of read, and the same lock is not
+    // taken twice because they are different mutexes.
     let (quarantined_count, quarantined_bytes) = {
         let quarantined = QUARANTINED_BUFFERS.lock();
         (
@@ -3298,10 +3422,13 @@ pub extern "C" fn log_render_stats() {
         )
     };
 
+    let (pooled_count, pooled_bytes) = pooled_size();
+
     info!(
         "wgpu-mc: live resources: {} textures ({} MB), {} views ({} with a label), {} buffers ({} \
-         MB, {} quarantined in {} MB), {} encoders, {} passes, {} bind groups, {} pipelines, {} \
-         tombstones, {} fan + {} quad index buffers",
+         MB, {} quarantined in {} MB, {} released in {} MB, {} frame(s) over the allowance, peak \
+         {} KB/frame, {} pooled in {} MB, {} reused of {} created, {} refused a place), {} encoders, \
+         {} passes, {} bind groups, {} pipelines, {} tombstones, {} fan + {} quad index buffers",
         LIVE_TEXTURE_COUNT.load(Ordering::Relaxed),
         LIVE_TEXTURE_BYTES.load(Ordering::Relaxed) / (1024 * 1024),
         LIVE_VIEW_COUNT.load(Ordering::Relaxed),
@@ -3310,6 +3437,17 @@ pub extern "C" fn log_render_stats() {
         LIVE_BUFFER_BYTES.load(Ordering::Relaxed) / (1024 * 1024),
         quarantined_count,
         quarantined_bytes / (1024 * 1024),
+        // Drained rather than read: they are per-report numbers, and the peak is the one that says what a
+        // single frame was asked to do rather than what a second was.
+        QUARANTINE_RELEASED.swap(0, Ordering::Relaxed),
+        QUARANTINE_RELEASE_BYTES.swap(0, Ordering::Relaxed) / (1024 * 1024),
+        QUARANTINE_THROTTLED_FRAMES.swap(0, Ordering::Relaxed),
+        QUARANTINE_PEAK_FRAME_BYTES.swap(0, Ordering::Relaxed) / 1024,
+        pooled_count,
+        pooled_bytes / (1024 * 1024),
+        POOL_REUSES.swap(0, Ordering::Relaxed),
+        BUFFER_CREATES.swap(0, Ordering::Relaxed),
+        POOL_REFUSED.swap(0, Ordering::Relaxed),
         LIVE_ENCODER_COUNT.load(Ordering::Relaxed),
         LIVE_PASS_COUNT.load(Ordering::Relaxed),
         LIVE_BIND_GROUP_COUNT.load(Ordering::Relaxed),
@@ -4340,6 +4478,15 @@ pub extern "C" fn write_buffer_with(
 /// which is a bind group validation error - and a validation error ends the process on this side.
 /// `mapped_at_creation` requires `MAP_WRITE`, so that one is always set; `MAP_READ` is dropped when
 /// the mask asks for `COPY_SRC`, because wgpu rejects that pair outright.
+///
+/// **The mapping is released before the buffer leaves this side, and that is the pool's precondition.**
+/// There is no entry point that hands a mapped range to the JVM - every write goes through the staging path
+/// (`WgpuCommandEncoder#mapBuffer` → `write_to_buffer`), which is why nothing calls this with
+/// `mapped = true` today - so the mapping would be one this side can neither use nor release, and a buffer
+/// with one outstanding cannot be written by `Queue::write_buffer` at all: wgpu answers that with a
+/// validation error, which ends the process. `offer_to_the_pool` takes any buffer it can write into, so a
+/// buffer left mapped would eventually be handed out and written into. Unmapping keeps the door open for a
+/// future `map_async` and closes the one way this side can be killed by a change of plans.
 #[unsafe(no_mangle)]
 pub extern "C" fn allocate_gpu_buffer_mapped(
     wm: &WmRenderer,
@@ -4348,18 +4495,23 @@ pub extern "C" fn allocate_gpu_buffer_mapped(
 ) -> Box<wgpu::Buffer> {
     LIVE_BUFFER_COUNT.fetch_add(1, Ordering::Relaxed);
     LIVE_BUFFER_BYTES.fetch_add(size, Ordering::Relaxed);
+    BUFFER_CREATES.fetch_add(1, Ordering::Relaxed);
 
     let mut usage = wgpu_buffer_usages(usages as u32) | wgpu::BufferUsages::MAP_WRITE;
     if !usage.contains(wgpu::BufferUsages::COPY_SRC) {
         usage.insert(wgpu::BufferUsages::MAP_READ);
     }
 
-    Box::new(wm.gpu.device.create_buffer(&wgpu::BufferDescriptor {
+    let buffer = wm.gpu.device.create_buffer(&wgpu::BufferDescriptor {
         label: None,
         size,
         usage,
         mapped_at_creation: true,
-    }))
+    });
+
+    buffer.unmap();
+
+    Box::new(buffer)
 }
 
 #[unsafe(no_mangle)]
@@ -4436,7 +4588,7 @@ pub extern "C" fn acquire_next_texture(wm: &WmRenderer) -> *mut SurfaceTexture {
     }
 }
 
-/// Presents the frame, waits until only the rames in flight setting's worth of frames are outstanding, and lets wgpu
+/// Presents the frame, waits until only the frames in flight setting's worth of frames are outstanding, and lets wgpu
 /// reclaim what the submissions behind them were holding.
 ///
 /// The poll is not optional. wgpu frees a submission's command buffers, staging memory and
@@ -4451,6 +4603,15 @@ pub extern "C" fn acquire_next_texture(wm: &WmRenderer) -> *mut SurfaceTexture {
 /// whenever the driver decides. Waiting for a *named* submission instead is the same poll with a
 /// bound on it: the frame that leaves that many behind has to be finished before the CPU
 /// records the next one.
+///
+/// **And it is where the buffer quarantine is aged.** A closed buffer is kept alive for half a second
+/// so that the write Minecraft makes to it in the same frame lands in a buffer that still exists, and
+/// *when* it is finally let go of is a question about frames: this is the one point in a frame that
+/// happens exactly once, it is the moment the frame being finished with has just been presented, and a
+/// bounded amount of work per frame is the only shape of "released" that a frame time can absorb. Aging
+/// where a buffer is *admitted* instead - which is where it used to be, because that was the only code
+/// that looked at the queue - released everything that had expired since the last drop in one frame. See
+/// [`age_the_quarantine`].
 #[unsafe(no_mangle)]
 pub extern "C" fn present_surface(wm: &WmRenderer, surface_texture: Box<SurfaceTexture>) {
     // wgpu 30 moved this from the surface texture to the queue: presenting is a submission now, which
@@ -4519,6 +4680,12 @@ pub extern "C" fn present_surface(wm: &WmRenderer, surface_texture: Box<SurfaceT
     // capture` switch is followed here - a capture starts and ends at a frame boundary.
     crate::timing::frame_presented(wm);
     crate::pix::tick();
+
+    // And the same boundary is where a closed buffer is let go of: once a frame rather than once per
+    // closed buffer, so that what is due leaves when it is due instead of when the next drop happens to
+    // arrive, and so that it leaves under a per-frame allowance instead of all at once. See
+    // `age_the_quarantine`, and `present_surface`'s own doc for why the frame boundary is the right place.
+    age_the_quarantine();
 }
 
 #[unsafe(no_mangle)]
@@ -4941,6 +5108,25 @@ pub extern "C" fn terrain_layer_counts(which: i32) -> i64 {
     packed as i64
 }
 
+/// Hands this crate the box the game's own view covers: its render distance in chunks, and the level's
+/// lowest and highest section layers.
+///
+/// This is the boundary of the occlusion walk (`wgpu_mc::render::section_graph`); see
+/// `wgpu_mc::mc::world_extent` for why a walk with only a frustum for a bound cannot work on this side.
+/// It is pushed from the JVM's own numbers - `ViewArea`'s view distance, which is the option the level
+/// renderer builds its section grid with, and the level's own `getMinSectionY`/`getMaxSectionY` - and
+/// once per frame at most, since the JVM sends it only when one of the three changes.
+///
+/// **Three `i32`s rather than a slice of section keys.** The box *is* three numbers: the game's view is a
+/// square around the camera over the whole column, so what is missing here is the square's size and the
+/// column's ends. A list of sections would be a second copy of the per-section data
+/// `wgpu_mc::mc::visibility` already holds, and it would be missing exactly the sections this exists for:
+/// the ones Minecraft never compiled, which are the air.
+#[unsafe(no_mangle)]
+pub extern "C" fn terrain_world_bounds(horizon: i32, min_section_y: i32, max_section_y: i32) {
+    wgpu_mc::mc::world_extent::set(horizon, min_section_y, max_section_y);
+}
+
 /// How many sections the arena has refused to hold, over the whole run. See [terrain_fluid_blocks].
 #[unsafe(no_mangle)]
 pub extern "C" fn terrain_sections_refused() -> u32 {
@@ -5212,6 +5398,22 @@ pub fn setRenderDistance(_env: JNIEnv, _class: JClass, chunks: jint) {
         );
 
         report_device_capabilities();
+
+        // **The arena's plan, at the same known-visible moment.** Both numbers are read off the device and
+        // neither is a constant, so this line is what says whether a run's arena was sized by the device
+        // or by the policy - the difference between "this machine will not make a bigger buffer" and
+        // "this renderer decided not to ask for one". See `ARENA_MEMORY_BUDGET`: a budget of 5 GB on a
+        // device whose `max_buffer_size` is 0.31 GB is a budget fifteen arenas away, and the run that
+        // found that out died in `create_buffer`.
+        info!(
+            "wgpu-mc: the section arena: up to {} buffer(s) of {} slot(s) ({} MB each, the device's own \
+             `max_buffer_size`), a budget of {} MB, of which the device's limits allow {} MB",
+            wgpu_mc::mc::ARENA_BUFFERS,
+            scene.arena_cap_slots,
+            scene.arena_cap_slots as u64 * 4 / (1024 * 1024),
+            scene.arena_memory_budget / (1024 * 1024),
+            scene.arena_cap_slots as u64 * 4 * wgpu_mc::mc::ARENA_BUFFERS as u64 / (1024 * 1024),
+        );
     } else {
         // The report lost the race with the first bake, so the arena cannot be re-created under the
         // sections it is holding. It can still be *grown*, which is the same change made without moving
@@ -5277,7 +5479,7 @@ pub fn setCameraSection(_env: JNIEnv, _class: JClass, x: jint, y: jint, z: jint)
     *scene.camera_section_pos.write() = glam::ivec3(x, y, z);
 }
 
-/// Hands over the sections Minecraft's own occlusion culling says are visible this frame.
+/// Hands over the sections Minecraft's own occlusion culling says are visible.
 ///
 /// **A frustum is not occlusion culling.** This renderer culled its sections against the camera's
 /// frustum, which is what the game does *first* and what its `SectionOcclusionGraph` then throws most of
@@ -5292,9 +5494,12 @@ pub fn setCameraSection(_env: JNIEnv, _class: JClass, x: jint, y: jint, z: jint)
 /// nothing is unpacked and repacked on the way. See `Scene::visible_sections` for what the other side
 /// does with the set, and for why an empty array is not the same as never having sent one.
 ///
-/// Called once per frame from the render thread, before the terrain pass. A frame whose call is missed
-/// leaves the previous list in place, which is a frame of the graph's answer being one frame old - and
-/// that is what the game's own renderer does with it too.
+/// **Called when the game rebuilds its list, not once per frame**: the list is filled by
+/// `LevelRenderer#applyFrustum`, which runs on a two-degree turn of the camera or when the occlusion
+/// graph reports that its answer moved, and the JVM counts those rebuilds and sends on a new one
+/// (`VisibleSectionsRevision`, `TerrainPass.sendVisibleSections`). A list that arrives here is therefore
+/// a *change* of the game's answer - and the frames between two of them keep the last one, which is what
+/// the game's own renderer does with it too.
 #[jni_fn("dev.birb.wgpu.rust.WgpuNative")]
 pub fn setVisibleSections(mut env: JNIEnv, _class: JClass, keys: jni::objects::JLongArray) {
     let Some(wm) = RENDERER.get() else {
@@ -5316,16 +5521,15 @@ pub fn setVisibleSections(mut env: JNIEnv, _class: JClass, keys: jni::objects::J
     let packed =
         unsafe { std::slice::from_raw_parts(elements.as_ptr() as *const i64, elements.len()) };
 
-    let mut visible = std::collections::HashSet::with_capacity(packed.len());
-
-    for key in packed {
+    // Handed over as an iterator rather than as a set this function builds: the native side keeps its own
+    // set and refills it, so nothing is allocated here and a key is hashed once. See
+    // `Scene::set_visible_sections`.
+    scene.set_visible_sections(packed.iter().map(|key| {
         // The layout lives in one place: `section::section_key` writes it - the JVM keys its own records
         // by the same packing - and `section::section_pos` reads it back. Hand-writing the shifts here
         // is how `y` came to be twenty-one bits wide for one revision of this function.
-        visible.insert(crate::section::section_pos(*key));
-    }
-
-    *scene.visible_sections.write() = Some(visible);
+        crate::section::section_pos(*key)
+    }));
 }
 
 /// Blits the frame into the swapchain image, and submits it.
@@ -5418,6 +5622,25 @@ pub extern "C" fn create_buffer_init(
         .collect();
 
     let wgpu_usage_flags = wgpu_buffer_usages(usage);
+
+    // The pool again, with the caller's data as what the buffer is filled with. A hit means the buffer is
+    // the size this data pads the buffer to, which is the same size `create_buffer_init` would allocate -
+    // and the byte count that comes back with it is the one the driver was not asked for.
+    let allocated = padded_data.len() as u64;
+
+    if let Some(buffer) = take_from_the_pool(
+        &wm.gpu.queue,
+        allocated,
+        wgpu_usage_flags,
+        Some(&padded_data),
+    ) {
+        LIVE_BUFFER_COUNT.fetch_add(1, Ordering::Relaxed);
+        LIVE_BUFFER_BYTES.fetch_add(size, Ordering::Relaxed);
+
+        return buffer;
+    }
+
+    BUFFER_CREATES.fetch_add(1, Ordering::Relaxed);
 
     let buffer = wm.gpu.device.create_buffer_init(&BufferInitDescriptor {
         label: Some(label.to_str().unwrap()),
@@ -5514,10 +5737,15 @@ pub extern "C" fn drop_texture_view(view: Box<wgpu::TextureView>) {
 /// 'Cloud UTB #1' label is invalid", and a validation error ends the process. Minecraft closes a
 /// buffer and then writes to it in the same frame - it does that every time the cloud uniform
 /// texel buffer is rebuilt - so a short quarantine makes the write land in a buffer that still
-/// exists. Nothing reads it afterwards, and the entry is dropped once it is old enough or once the
-/// quarantine is over budget, which is what keeps this from being a leak.
-static QUARANTINED_BUFFERS: Mutex<Vec<(Box<wgpu::Buffer>, std::time::Instant)>> =
-    Mutex::new(Vec::new());
+/// exists. Nothing reads it afterwards, and the entry is dropped once it is old enough, which is
+/// what keeps this from being a leak.
+///
+/// **Oldest at the front, and every entry stamped when it is admitted**, which is what makes the age
+/// rule a prefix: they all age by the same duration, so the first entry that is still inside its
+/// quarantine means every entry behind it is too. That is why nothing here has to be scanned to find
+/// what is due - see [`age_the_quarantine`], the only thing that lets go of an entry.
+static QUARANTINED_BUFFERS: Mutex<VecDeque<(Box<wgpu::Buffer>, std::time::Instant)>> =
+    Mutex::new(VecDeque::new());
 
 /// How long a closed buffer is kept alive, and how much of them.
 ///
@@ -5535,12 +5763,326 @@ const BUFFER_QUARANTINE: std::time::Duration = std::time::Duration::from_millis(
 /// worth evicting early.
 const BUFFER_QUARANTINE_BYTES: u64 = 32 * 1024 * 1024;
 
-fn quarantine_buffer(buffer: Box<wgpu::Buffer>) {
+/// How much of the quarantine one frame is allowed to let go of, in entries and in bytes.
+///
+/// **Both, because they bound two different costs.** The count bounds the per-frame work: a `Box::drop`
+/// of a wgpu buffer is a free, a bookkeeping update and - once the GPU is done with it - a deallocation,
+/// and a hundred of those in one frame is a spike that a trickle of the same total is not. The size bounds
+/// the memory: the entries are not a fixed size, so the count alone would let the megabytes that were
+/// worth evicting early (see [`BUFFER_QUARANTINE_BYTES`]) all go in one frame.
+///
+/// The numbers come from what this queue actually holds. A settled 32-chunk world sits at **6-12 entries
+/// under a megabyte** - the cloud uniform texel buffer and the small upload rings - so nothing here binds
+/// there. The runs where the cloud ring was rebuilt every frame reached **207 entries and 31 MB held**,
+/// which is [`BUFFER_QUARANTINE_BYTES`] saturated, and held is the word: the line samples the queue once a
+/// second, so what it says is how much was *waiting*. What the old age rule did with a queue like that is
+/// what this bounds - whatever had expired left together on the next close, and a frame that followed a
+/// burst was that burst's worth of frees. 207 spread over 13 frames is a bounded amount of work every frame
+/// instead, and 31 MB of memory goes back over 8.
+///
+/// Neither limit is a time: a frame that is over its allowance leaves the rest for the next frame, and what
+/// that costs is entries that stay quarantined past their 500 ms - which is safe, because the use this
+/// protects against is *within* a frame, and is bounded, because `quarantine_buffer` still refuses to hold
+/// more than the budget however long the drain takes.
+const QUARANTINE_RELEASE_PER_FRAME: usize = 16;
+const QUARANTINE_RELEASE_BYTES_PER_FRAME: u64 = 4 * 1024 * 1024;
+
+/// Entries let go of since the last report, and the frames where the allowance stopped the drain.
+///
+/// Counted rather than assumed: a cap that never binds is a cap that is not doing anything, and the only
+/// way to know which of the two this is on a real workload is for the line to say it. See
+/// `report_device_resources`.
+static QUARANTINE_RELEASED: AtomicU64 = AtomicU64::new(0);
+static QUARANTINE_RELEASE_BYTES: AtomicU64 = AtomicU64::new(0);
+static QUARANTINE_THROTTLED_FRAMES: AtomicU64 = AtomicU64::new(0);
+
+/// The most any one frame let go of, in bytes, since the last report.
+///
+/// **The number the cap is for.** A count of releases says how much work was done over a second and says
+/// nothing about how it was distributed; this is the largest single frame's share, so a run can be read as
+/// "the queue reached 31 MB and no frame ever released more than X".
+static QUARANTINE_PEAK_FRAME_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Buffers that have been closed and are kept for reuse, keyed by what a descriptor is made of.
+///
+/// **Size and usage flags are the whole of a buffer's descriptor apart from its label**, so a free buffer
+/// of exactly this size with exactly these flags is a buffer any caller asking for that pair can have:
+/// nothing else about it is observable. `mapped_at_creation` is deliberately not in the key and does not
+/// have to be - the one path that creates a buffer mapped unmaps it before it is ever handed out (see
+/// [`allocate_gpu_buffer_mapped`]), so nothing in here is a buffer with a mapping outstanding.
+///
+/// **Fed by the quarantine rather than by [`drop_buffer`], and that ordering is the point.** What
+/// [`QUARANTINED_BUFFERS`] buys is the half second in which the address a closed buffer was named by is
+/// still a live one, because Minecraft writes to a buffer in the same frame it closes it. A buffer handed
+/// from the close straight back out would be handed to a new owner *inside* that window, with the stale
+/// write landing in the new owner's data - which is worse than the destruction the quarantine prevents.
+///
+/// **Only buffers this side can write into are pooled** ([`poolable`]), because one taken from here is
+/// zeroed before it is handed out: a fresh wgpu buffer is zeroed, and a reused one would otherwise hold the
+/// last owner's bytes. That is also the honest answer to the one thing reuse changes - a buffer's *label* is
+/// still the one it was created with, and wgpu 30 has no way to replace it - which costs nothing in the case
+/// this exists for, where the same label is created again and again.
+static POOLED_BUFFERS: Mutex<Option<BufferPool>> = Mutex::new(None);
+
+/// The pool's own shape: what a buffer is looked up by - its size and its usage flags - and the buffers
+/// waiting under it.
+///
+/// A `Vec` per key rather than one buffer per key, because the shapes that come back are **rings**: three
+/// buffers of one size and usage arrive together and three are wanted together, so a pool that could hold
+/// one of a shape would miss every time.
+type BufferPool = HashMap<(u64, u32), Vec<Box<wgpu::Buffer>>>;
+
+/// What the pool keeps: how many buffers of one shape, how many in total, and how many bytes.
+///
+/// The per-shape count is sized by the case this exists for: `MappableRingBuffer` - the cloud face buffers
+/// and the dynamic uniform rings - is **three** buffers of one size and usage, closed together and built
+/// together again (`BUFFER_COUNT`), so four holds a whole ring and one more.
+///
+/// **The totals were measured rather than reasoned, and the measurement is a negative one.** Four runs
+/// (32 chunks, `logging` on) created 200, 422, 323 and 465 buffers and the pool reused **0 of them** - and
+/// one of those ran with the quarantine removed entirely and another through a full resource reload, so this
+/// is not the half-second delay; the last of them held 293 shapes at once, so it is not the bound either.
+/// What the churn actually is, from the labels a run logs:
+///
+///  - `Chunk Sections UBO x128 #0..#2` - ten ring rebuilds in 23 s, and every rebuild is at a **new size**:
+///    `DynamicUniformStorage#resizeBuffers` doubles the capacity and closes the ring it replaces, so the
+///    shape a rebuild wants has never existed before;
+///  - `Particle Vertices #0..#2` - a `MappableRingBuffer` whose size is the particle mesh's own
+///    (`byteBuffer.remaining()`), so it is a different size every time;
+///  - `SpriteAnimationInfo` - the one shape that does repeat *exactly* (fifteen sizes, each created twice
+///    in 23 s), and it is the one this pool cannot take: `createBuffer(..., 128, data)` carries no
+///    `COPY_DST` and no `MAP_WRITE`, so there is no way to fill a reuse of it, and `poolable` refuses it.
+///    Adding `COPY_DST` to every buffer would pool it - for about fifteen allocations saved per run, which
+///    is not worth a flag on every buffer in the renderer.
+///
+/// So the pool is kept small, and the number that says whether it is ever right is on the stat line:
+/// `reused of created`. A run that shows a hit rate is a run whose churn is close-and-rebuild, which is the
+/// one shape of churn this helps. **The 512-entry bound this had for one measurement run held 24 MB of
+/// buffers for the same zero hits**, which is what "the count total is loose" costs when nothing is reused.
+const POOL_PER_KEY: usize = 4;
+const POOL_MAX_ENTRIES: usize = 64;
+const POOL_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Buffers the driver was asked for, buffers the pool answered instead, and buffers the pool refused.
+///
+/// The three are what says whether any of this is worth doing: `reused of created` is the hit rate, and
+/// `refused` is the pool being too small for the shapes a session actually closes. Reported and drained per
+/// second; see `report_device_resources`.
+static BUFFER_CREATES: AtomicU64 = AtomicU64::new(0);
+static POOL_REUSES: AtomicU64 = AtomicU64::new(0);
+static POOL_REUSE_BYTES: AtomicU64 = AtomicU64::new(0);
+static POOL_REFUSED: AtomicU64 = AtomicU64::new(0);
+
+/// Whether this frame may let one more entry of `size` go, having already released `released` entries
+/// totalling `bytes`.
+///
+/// The `released == 0` arm is the whole of the subtlety: **an entry larger than the entire per-frame size is
+/// released on its own** rather than waiting for a frame that can afford it, which never comes. It is the
+/// same rule [`quarantine_buffer`] makes about a buffer larger than the whole quarantine, and the reason is
+/// the same one - a single entry bigger than the budget would otherwise sit there for ever, which is the
+/// leak the budget exists to prevent.
+fn within_the_allowance(released: usize, bytes: u64, size: u64) -> bool {
+    released == 0
+        || (released < QUARANTINE_RELEASE_PER_FRAME
+            && bytes + size <= QUARANTINE_RELEASE_BYTES_PER_FRAME)
+}
+
+/// Ages the quarantine at the frame boundary, and lets go of what is due.
+///
+/// **What it lets go of is not dropped but offered to the pool** ([`offer_to_the_pool`]), which is where a
+/// buffer that has served its quarantine becomes reusable instead of becoming an allocation again later.
+/// The two are one mechanism with two halves: the quarantine is what makes the address safe to reuse, and
+/// the pool is what makes reusing it cheaper than building another.
+///
+/// **Called once a frame from [`present_surface`], and that is a change from where this used to be.** The
+/// time rule ran inside [`quarantine_buffer`] - which is to say, only when the *next* buffer happened to be
+/// closed - so an entry whose half second was up sat there until a drop arrived to notice it, and every
+/// entry that had expired in the meantime went in that one frame. A cluster, in other words, whose size is
+/// whatever the drop burst behind it was: the runs where the cloud ring was rebuilt every frame left 207
+/// entries and 31 MB waiting in this queue, and the frame that followed the next close paid for all of it.
+/// Aging every frame makes an entry leave at the first frame boundary after it is due, and the allowance
+/// turns "everything due, now" into a bounded share of it per frame.
+///
+/// **One `Instant::now()` and one walk of the due prefix**, which is all the age rule costs: the due entries
+/// are the front of the queue (see [`QUARANTINED_BUFFERS`]), so nothing behind them is looked at and the
+/// entries still inside their 500 ms are not visited at all.
+pub fn age_the_quarantine() {
     let now = std::time::Instant::now();
+    let mut quarantined = QUARANTINED_BUFFERS.lock();
+
+    let mut released = 0usize;
+    let mut bytes = 0u64;
+
+    while let Some(entry) = quarantined.front() {
+        // A copy of the stamp, so the borrow of the queue ends here and the `pop_front` below can take it
+        // mutably. `Instant` is `Copy`; the entry is not, which is why the buffer is not read here at all.
+        let closed_at = entry.1;
+
+        // Entries are admitted in time order and age by the same duration, so the first one that is not
+        // due is the end of the due set - there is nothing behind it to look for.
+        if now.duration_since(closed_at) < BUFFER_QUARANTINE {
+            break;
+        }
+
+        let size = entry.0.size();
+
+        if !within_the_allowance(released, bytes, size) {
+            QUARANTINE_THROTTLED_FRAMES.fetch_add(1, Ordering::Relaxed);
+            break;
+        }
+
+        let Some((buffer, _)) = quarantined.pop_front() else {
+            break;
+        };
+
+        bytes = bytes.saturating_add(size);
+        released += 1;
+
+        // **This is where the buffer stops being quarantined**, and it is written out rather than left to
+        // the end of the iteration because it is the point of the function: the entry is out of the queue,
+        // the only owner is this binding, and what happens next is the pool keeping it or the drop
+        // destroying it. See `offer_to_the_pool`.
+        offer_to_the_pool(buffer);
+    }
+
+    QUARANTINE_RELEASED.fetch_add(released as u64, Ordering::Relaxed);
+    QUARANTINE_RELEASE_BYTES.fetch_add(bytes, Ordering::Relaxed);
+    QUARANTINE_PEAK_FRAME_BYTES.fetch_max(bytes, Ordering::Relaxed);
+}
+
+/// Whether a buffer may be kept for reuse: **whether this side can write into it**, which is what handing
+/// one out requires.
+///
+/// The zeroing a reuse costs is a `Queue::write_buffer`, and wgpu refuses that on a buffer without
+/// `COPY_DST` - so the flag is not a nicety. A pooled buffer without it could only be handed out holding
+/// whatever its last owner left there, and "a fresh buffer is zeroed" is a guarantee vanilla is allowed to
+/// lean on: `GpuDevice#createBuffer` with a size and no data is a buffer wgpu zeroes, and a caller that draws
+/// a range it never wrote is drawing zeroes today.
+///
+/// What this leaves out is small and worth naming: a buffer created with nothing but `VERTEX` (Minecraft's
+/// crosshair vertex buffer is usage 32) has no `COPY_DST` and is not pooled at all. It is also the flag that
+/// keeps the cloud face buffer in - `USAGE_MAP_WRITE | USAGE_UNIFORM_TEXEL_BUFFER` becomes `MAP_WRITE |
+/// COPY_DST | STORAGE`, because every write this backend makes into a mapped buffer goes through
+/// `write_to_buffer`.
+fn poolable(usage: wgpu::BufferUsages) -> bool {
+    usage.contains(wgpu::BufferUsages::COPY_DST)
+}
+
+/// Whether the pool has room for one more buffer of `size`, given what it already holds of that shape and
+/// in total.
+fn the_pool_has_room(per_key: usize, entries: usize, total: u64, size: u64) -> bool {
+    per_key < POOL_PER_KEY && entries < POOL_MAX_ENTRIES && total.saturating_add(size) <= POOL_BYTES
+}
+
+/// Hands out a buffer of exactly this size and these usage flags if one is waiting, filled with `contents`.
+///
+/// `contents` is the caller's initial data where there is any (`create_buffer_init`), and `None` for a
+/// buffer whose contents the caller will write itself - which is zeroed, because that is what a fresh
+/// buffer holds. A caller whose data does not cover the whole buffer is zeroed as well rather than
+/// partially written: the tail of a fresh buffer is zeroes, and half-written contents are the one outcome
+/// nothing can reason about afterwards.
+fn take_from_the_pool(
+    queue: &wgpu::Queue,
+    size: u64,
+    usage: wgpu::BufferUsages,
+    contents: Option<&[u8]>,
+) -> Option<Box<wgpu::Buffer>> {
+    if size == 0 || !poolable(usage) {
+        return None;
+    }
+
+    let key = (size, usage.bits());
+
+    let buffer = {
+        let mut pool = POOLED_BUFFERS.lock();
+        let pool = pool.as_mut()?;
+
+        let waiting = pool.get_mut(&key)?;
+        let buffer = waiting.pop()?;
+
+        if waiting.is_empty() {
+            pool.remove(&key);
+        }
+
+        buffer
+    };
+
+    match contents {
+        Some(data) if data.len() as u64 == size => queue.write_buffer(&buffer, 0, data),
+        _ => {
+            // One write of the whole buffer, from a zeroed slice. It is a copy the CPU makes once, and the
+            // allocation it replaces also zeroed: a backend that cannot promise fresh memory has the whole
+            // of `create_buffer`'s size cleared, which is the same bytes moved without the driver call.
+            let zeroes = vec![0u8; size as usize];
+            queue.write_buffer(&buffer, 0, &zeroes);
+        }
+    }
+
+    POOL_REUSES.fetch_add(1, Ordering::Relaxed);
+    POOL_REUSE_BYTES.fetch_add(size, Ordering::Relaxed);
+
+    Some(buffer)
+}
+
+/// Keeps a buffer that has finished its quarantine, or destroys it if the pool has no room.
+///
+/// The refusal is the pool being *bounded* rather than a failure: what it holds is memory nothing is
+/// drawing from, and a session that closes more shapes than the bound allows is a session that would rather
+/// have the memory back. `POOL_REFUSED` counts them, so "the pool is too small" is a number rather than a
+/// suspicion.
+fn offer_to_the_pool(buffer: Box<wgpu::Buffer>) {
+    let size = buffer.size();
+    let usage = buffer.usage();
+
+    if size == 0 || !poolable(usage) {
+        // Dropped here, which destroys it: it is a buffer nothing here could write into, so a hand-out
+        // would be handing out someone else's bytes.
+        return;
+    }
+
+    let key = (size, usage.bits());
+
+    let mut pool = POOLED_BUFFERS.lock();
+    let pool = pool.get_or_insert_with(Default::default);
+
+    let per_key = pool.get(&key).map_or(0, Vec::len);
+    let entries: usize = pool.values().map(Vec::len).sum();
+    let total: u64 = pool.values().flatten().map(|buffer| buffer.size()).sum();
+
+    if !the_pool_has_room(per_key, entries, total, size) {
+        POOL_REFUSED.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+
+    pool.entry(key).or_default().push(buffer);
+}
+
+/// How many buffers the pool holds and how many bytes they are.
+///
+/// Computed rather than counted: the pool is a few dozen entries and this is read once a second, where a
+/// running total would be one more number to keep in step with every insert and every take.
+fn pooled_size() -> (usize, u64) {
+    let pool = POOLED_BUFFERS.lock();
+    let Some(pool) = pool.as_ref() else {
+        return (0, 0);
+    };
+
+    (
+        pool.values().map(Vec::len).sum(),
+        pool.values().flatten().map(|buffer| buffer.size()).sum(),
+    )
+}
+
+fn quarantine_buffer(buffer: Box<wgpu::Buffer>) {
     let size = buffer.size();
     let mut quarantined = QUARANTINED_BUFFERS.lock();
 
-    quarantined.retain(|(_, closed_at)| now.duration_since(*closed_at) < BUFFER_QUARANTINE);
+    // **Stamped inside the lock, and that is the invariant [`age_the_quarantine`] reads the queue by.**
+    // Buffers are closed from more than one thread, so a stamp taken before the lock can be handed a queue
+    // position in the other order - a few microseconds of skew, which is nothing against a 500 ms
+    // quarantine and is exactly the kind of nothing that makes "the due entries are the front of the queue"
+    // untrue and leaves an entry behind a newer one for a frame longer than it had to be.
+    let now = std::time::Instant::now();
 
     // Oldest first, until the newcomer fits. `is_empty` and not `< budget - size`: a single buffer
     // larger than the whole budget still gets its quarantine, because dropping it would mean the
@@ -5549,11 +6091,14 @@ fn quarantine_buffer(buffer: Box<wgpu::Buffer>) {
     let mut bytes: u64 = quarantined.iter().map(|(buffer, _)| buffer.size()).sum();
 
     while !quarantined.is_empty() && bytes + size > BUFFER_QUARANTINE_BYTES {
-        let (evicted, _) = quarantined.remove(0);
+        let Some((evicted, _)) = quarantined.pop_front() else {
+            break;
+        };
+
         bytes = bytes.saturating_sub(evicted.size());
     }
 
-    quarantined.push((buffer, now));
+    quarantined.push_back((buffer, now));
 }
 
 #[unsafe(no_mangle)]
@@ -5581,4 +6126,153 @@ pub extern "C" fn max_texture_size(wm: &WmRenderer) -> u32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn min_uniform_offset_alignment(wm: &WmRenderer) -> u32 {
     wm.gpu.device.limits().min_uniform_buffer_offset_alignment
+}
+
+#[cfg(test)]
+mod quarantine_tests {
+    use super::*;
+
+    /// One frame's worth of the drain, computed the way [`age_the_quarantine`] computes it: the due
+    /// entries are a prefix, and the frame takes as many of them as the allowance fits.
+    ///
+    /// The real function is a loop over a lock and a `VecDeque` of live wgpu buffers, which a unit test has
+    /// no device to build - so what is tested here is the *rule*, and the loop that applies it to a queue
+    /// is three lines beside it. The rule is the part that can be wrong in a way nobody notices: an
+    /// allowance that hands back everything, or one that hands back nothing.
+    fn one_frame(sizes: &[u64]) -> (usize, u64) {
+        let mut released = 0usize;
+        let mut bytes = 0u64;
+
+        for size in sizes {
+            if !within_the_allowance(released, bytes, *size) {
+                break;
+            }
+
+            bytes += size;
+            released += 1;
+        }
+
+        (released, bytes)
+    }
+
+    /// **The load spike, which is what the allowance is for.** A world being loaded reached 207 entries
+    /// and 31 MB in this project's runs, and all of it used to be released in one frame - the report's
+    /// largest single-frame release was the whole queue.
+    #[test]
+    fn a_burst_of_two_hundred_releases_a_bounded_share() {
+        let sizes = vec![150 * 1024u64; 207];
+        let (released, bytes) = one_frame(&sizes);
+
+        assert_eq!(
+            released, QUARANTINE_RELEASE_PER_FRAME,
+            "the count is what stops this queue: {released} entries left"
+        );
+        assert!(
+            bytes <= QUARANTINE_RELEASE_BYTES_PER_FRAME,
+            "{bytes} bytes left in one frame, and the size allowance is {QUARANTINE_RELEASE_BYTES_PER_FRAME}"
+        );
+        assert!(
+            released < sizes.len(),
+            "the rest of the queue waits for the next frame, which is the whole point"
+        );
+    }
+
+    /// A buffer larger than the whole per-frame size is let go of on its own, and that is not an
+    /// oversight: waiting for a frame that can afford it means never, and the entry would sit in the
+    /// quarantine for ever - the leak the byte budget exists to prevent.
+    #[test]
+    fn one_huge_buffer_leaves_and_leaves_alone() {
+        let huge = 128 * 1024 * 1024;
+        let sizes = [huge, 64 * 1024];
+        let (released, bytes) = one_frame(&sizes);
+
+        assert_eq!(released, 1, "the huge one, and nothing else");
+        assert_eq!(bytes, huge);
+        assert!(!within_the_allowance(1, huge, 64 * 1024));
+    }
+
+    /// The settled case, where nothing binds: a handful of small entries all leave in the frame they are
+    /// due. A cap that held these back would be holding memory for no reason - the queue is 6-12 entries
+    /// under a megabyte in a settled 32-chunk world.
+    #[test]
+    fn a_settled_world_releases_everything_due() {
+        let sizes = vec![64 * 1024u64; 12];
+        let (released, bytes) = one_frame(&sizes);
+
+        assert_eq!(released, 12);
+        assert_eq!(bytes, 12 * 64 * 1024);
+    }
+
+    /// Both arms of the rule, at the boundary. The size arm is a *total*, not a per-entry size: an entry
+    /// is refused when adding it would take the frame over, which is what makes the budget a budget.
+    #[test]
+    fn the_allowance_is_a_count_and_a_size() {
+        assert!(within_the_allowance(0, 0, 1));
+
+        let last = QUARANTINE_RELEASE_PER_FRAME - 1;
+        assert!(within_the_allowance(last, 0, 1));
+        assert!(!within_the_allowance(QUARANTINE_RELEASE_PER_FRAME, 0, 1));
+
+        let nearly = QUARANTINE_RELEASE_BYTES_PER_FRAME - 1;
+        assert!(within_the_allowance(1, nearly, 1));
+        assert!(!within_the_allowance(1, nearly, 2));
+
+        assert!(!within_the_allowance(
+            1,
+            QUARANTINE_RELEASE_BYTES_PER_FRAME,
+            1
+        ));
+    }
+}
+
+#[cfg(test)]
+mod buffer_pool_tests {
+    use super::*;
+
+    /// **The flag the pool is gated on is the flag the zeroing needs**, which is this claim in code: a
+    /// pooled buffer is one a `Queue::write_buffer` can be aimed at, because a reuse has to leave the buffer
+    /// holding what a fresh one holds.
+    #[test]
+    fn a_buffer_is_pooled_exactly_when_it_can_be_zeroed() {
+        // `CloudRenderer`'s face buffer: `USAGE_MAP_WRITE | USAGE_UNIFORM_TEXEL_BUFFER`. The `MAP_WRITE`
+        // arm of `wgpu_buffer_usages` is what puts `COPY_DST` on it - every write into a mapped buffer goes
+        // through `write_to_buffer` - and this is the buffer the pool exists for: a ring of three, closed
+        // and built again together whenever the cloud mesh's size changes.
+        let cloud = wgpu_buffer_usages(2 | 256);
+        assert!(cloud.contains(wgpu::BufferUsages::COPY_DST));
+        assert!(poolable(cloud));
+
+        // `Lighting`'s UBO: `USAGE_UNIFORM | USAGE_COPY_DST`, written whole whenever the lights change.
+        assert!(poolable(wgpu_buffer_usages(128 | 8)));
+
+        // A vertex buffer that is only ever drawn from: `DebugScreenOverlay`'s crosshair is usage 32. It has
+        // no `COPY_DST`, so a reuse of it could not be zeroed, and it is not pooled.
+        assert!(!poolable(wgpu_buffer_usages(32)));
+
+        // A readback buffer (`USAGE_MAP_READ | USAGE_COPY_DST`, what `Screenshot` and `TextureUtil` ask
+        // for) is filled by a copy and is poolable; `MAP_READ` on its own cannot be filled at all.
+        assert!(poolable(wgpu_buffer_usages(1 | 8)));
+        assert!(!poolable(wgpu_buffer_usages(1)));
+    }
+
+    /// The three bounds, at the boundaries - and the one thing the pool deliberately does *not* inherit from
+    /// the quarantine.
+    ///
+    /// The quarantine takes a single buffer larger than its whole budget, because the alternative is a write
+    /// into freed memory that kills the process. The pool has no such reason - what it would be keeping is
+    /// memory nothing is drawing from - so a shape bigger than the pool is not kept, and the caller allocates
+    /// it again the next time it wants one.
+    #[test]
+    fn the_pool_is_bounded_by_shape_count_and_size() {
+        // A ring of three (`MappableRingBuffer::BUFFER_COUNT`) fits, and the buffer after it fits too.
+        assert!(the_pool_has_room(3, 0, 0, 1024));
+        assert!(!the_pool_has_room(POOL_PER_KEY, 0, 0, 1024));
+
+        assert!(the_pool_has_room(0, POOL_MAX_ENTRIES - 1, 0, 1024));
+        assert!(!the_pool_has_room(0, POOL_MAX_ENTRIES, 0, 1024));
+
+        assert!(the_pool_has_room(0, 0, POOL_BYTES - 1024, 1024));
+        assert!(!the_pool_has_room(0, 0, POOL_BYTES - 1024, 2048));
+        assert!(!the_pool_has_room(0, 0, 0, POOL_BYTES + 1));
+    }
 }

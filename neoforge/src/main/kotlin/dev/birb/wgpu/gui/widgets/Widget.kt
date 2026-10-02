@@ -71,6 +71,17 @@ abstract class Widget(x: Int, y: Int, var width: Int, var height: Int) {
         @JvmField
         val WHITE = getColor(255, 255, 255, 255)
 
+        /**
+         * A row that is drawn but cannot be used, which is what a setting another row decides is shown as.
+         *
+         * Vanilla's own answer for the same case is one value: it greys the caption and the value and leaves
+         * the row in place, so a player can see that the setting exists and read what it is set to. Hovering
+         * is what this one gives up - see `IntWidget` - because the hover state is what draws the slider,
+         * and a slider that cannot be dragged is a control that invites a click it will refuse.
+         */
+        @JvmField
+        val DISABLED = getColor(160, 160, 160, 255)
+
         @JvmField
         val ACCENT = getColor(225, 220, 144, 255)
 

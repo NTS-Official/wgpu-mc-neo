@@ -13,7 +13,10 @@ import dev.birb.wgpu.rust.WgpuNative
 import net.minecraft.client.AttackIndicatorStatus
 import net.minecraft.client.CloudStatus
 import net.minecraft.client.GraphicsPreset
+import net.minecraft.client.InactivityFpsLimit
 import net.minecraft.client.Minecraft
+import net.minecraft.client.PrioritizeChunkUpdates
+import net.minecraft.client.TextureFilteringMethod
 import net.minecraft.client.resources.language.I18n
 import net.minecraft.network.chat.Component
 import net.minecraft.network.chat.contents.TranslatableContents
@@ -239,6 +242,18 @@ class OptionPages : Iterable<OptionPages.Page> {
             .setStep(10)
             .build())
 
+        // The other half of the frame-rate pair in vanilla's Display group, and the renderer already
+        // has the field for it: `Options#inactivityFpsLimit` is what throttles the game when the
+        // window is minimized or the player is away, and `settings.rs` carries `inactivity_fps_limit`
+        // beside `max_fps` for exactly that. Until this row existed the stored value was still
+        // honoured by the game, but a player had no way to change it from inside the renderer's own
+        // video settings page - which is the only video settings page this backend opens.
+        page.add(EnumOption.Builder(InactivityFpsLimit::class.java)
+            .setName(Component.translatable("options.inactivityFpsLimit"))
+            .setOption(options.inactivityFpsLimit())
+            .setFormatter { limit -> limit.caption() }
+            .build())
+
         page.space()
         page.add(BoolOption.Builder()
             .setName(Component.translatable("options.viewBobbing"))
@@ -254,6 +269,20 @@ class OptionPages : Iterable<OptionPages.Page> {
         page.add(BoolOption.Builder()
             .setName(Component.translatable("options.autosaveIndicator"))
             .setOption(options.showAutosaveIndicator())
+            .build())
+
+        // **How much the menu background is blurred, which reaches this screen as well as the game's own.**
+        // It is pure interface code - no picture the renderer draws depends on it - and this screen already
+        // gets the game's background through `Screen#extractBackground`, which is what applies the blur, so
+        // the row is the whole of it. Vanilla lists the same option on the Accessibility page too, which
+        // this backend does not replace, so a player can reach it from either place.
+        page.add(IntOption.Builder()
+            .setName(Component.translatable("options.accessibility.menu_background_blurriness"))
+            .setOption(options.menuBackgroundBlurriness())
+            .setFormatter { amount ->
+                if (amount == 0) Component.translatable("options.off")
+                else Component.literal(amount.toString())
+            }
             .build())
 
         return page
@@ -313,6 +342,33 @@ class OptionPages : Iterable<OptionPages.Page> {
             .setName(Component.translatable("options.renderClouds"))
             .setOption(options.cloudStatus())
             .setFormatter { cloudStatus -> cloudStatus.caption() }
+            .build())
+
+        // How far the clouds are drawn, in chunks - the other half of the cloud row above, and the
+        // option vanilla's own Quality group puts beside it. Its range and step come from the option
+        // itself (`IntSlider.of` in `Option.Builder#setOption`), so nothing here guesses at them.
+        page.add(IntOption.Builder()
+            .setName(Component.translatable("options.renderCloudsDistance"))
+            .setOption(options.cloudRange())
+            .setFormatter { integer -> Component.translatable("options.chunks", integer) }
+            .build())
+
+        // How far the rain and snow are drawn, in blocks. Only the weather *rendering* is this
+        // renderer's business here: the row sets the game's own option and the game's own weather
+        // pass reads it, which is how every other non-terrain option on this page works.
+        page.add(IntOption.Builder()
+            .setName(Component.translatable("options.weatherRadius"))
+            .setOption(options.weatherRadius())
+            .setFormatter { integer -> Component.translatable("options.blocks", integer) }
+            .build())
+
+        // Whether leaves are drawn with their cut-out texels tested or as solid cubes. The game
+        // re-meshes every section when this flips (`LevelRenderer::allChanged`), and this renderer's
+        // bake reads the same option - `FACES_FORCED_OPAQUE` in `mc/chunk.rs` is the branch it takes,
+        // and a leaves face that goes through it is counted rather than silently drawn.
+        page.add(BoolOption.Builder()
+            .setName(Component.translatable("options.cutoutLeaves"))
+            .setOption(options.cutoutLeaves())
             .build())
 
         page.add(EnumOption.Builder(ParticleStatus::class.java)
@@ -377,6 +433,68 @@ class OptionPages : Iterable<OptionPages.Page> {
             .setFormatter { integer -> Component.literal("${integer}x") }
             .setRange(0, 4)
             .build())
+
+        // **Where a chunk rebuild goes when the player is waiting on one.** The row is Minecraft's and
+        // Minecraft's own section dispatcher reads it - which is the dispatcher the terrain arena is
+        // fed from (`BlockCache`), so the choice reaches this renderer along the path it already had:
+        // a rebuild the option defers is a rebuild this side is asked for later.
+        page.add(EnumOption.Builder(PrioritizeChunkUpdates::class.java)
+            .setName(Component.translatable("options.prioritizeChunkUpdates"))
+            .setOption(options.prioritizeChunkUpdates())
+            .setFormatter { updates -> updates.caption() }
+            .build())
+
+        // **How the block atlas is sampled, and how much anisotropy that is worth** - the pair vanilla's
+        // Quality group puts together, and they belong together here too because the renderer reads them
+        // as one line of `LevelRenderer`:
+        //
+        // ```java
+        // int maxAnisotropy = textureFiltering == ANISOTROPIC ? maxAnisotropyValue : 1;
+        // ```
+        //
+        // `textureFiltering` was wired in the renderer before either row existed - `TerrainPass` pushes it
+        // every frame and the terrain shader implements all three answers, `NONE` as a plain fetch, `RGSS`
+        // as the game's four-tap rotated grid and `ANISOTROPIC` as the sampler's own filter. The bit is the
+        // half that was missing: the clamp used to be the constant 4, which is the option's *default* and
+        // not its value, so `options.maxAnisotropy` moved nothing. See `setMaxAnisotropyBit`.
+        page.add(EnumOption.Builder(TextureFilteringMethod::class.java)
+            .setName(Component.translatable("options.textureFiltering"))
+            .setOption(options.textureFiltering())
+            .setFormatter { method -> method.caption() }
+            .build())
+
+        // **Disabled unless the answer above is `ANISOTROPIC`, which is what vanilla does and what the
+        // arithmetic says.** The sampler's anisotropy is `1` under the other two answers whatever this bit
+        // is, so an enabled slider would be a control that changes nothing - and the row that *does* decide
+        // it is directly above. See `setEnabledWhen`, whose subject is the *option* rather than the row
+        // above it: a row the player has edited but not applied is showing a value the game does not have
+        // yet, so greying this one on a pending edit would be the screen disagreeing with itself. It
+        // follows the change through Apply, which is when the sampler changes anyway.
+        page.add(IntOption.Builder()
+            .setName(Component.translatable("options.maxAnisotropy"))
+            .setOption(options.maxAnisotropyBit())
+            // The option's own formatter: "Off" at 0 and `2x`, `4x`, `8x` above it, because the stored value
+            // is the exponent and the player is shown the multiplier. `options.off` and `options.multiplier`
+            // are Minecraft's own two strings - the game's own formatter for this option is
+            // `CommonComponents.optionStatus(caption, false)` for the zero branch, and the caption half of
+            // that is the row's own name, which this widget draws separately. So the zero branch here is the
+            // value half of the same line, and no new translation is invented for either.
+            .setFormatter { bit ->
+                if (bit == 0) Component.translatable("options.off")
+                else Component.translatable("options.multiplier", (1 shl bit).toString())
+            }
+            .setEnabledWhen { options.textureFiltering().get() == TextureFilteringMethod.ANISOTROPIC }
+            .build())
+
+        // The other two rows vanilla's Quality group has that this page does not draw, named so that the
+        // gap is a decision rather than an oversight:
+        //
+        //  - `options.improvedTransparency` is the Fabulous preset, which `GraphicsPresets` hides with a
+        //    reason of its own (the transparency post chain samples depth through a filterable float);
+        //  - `options.vignette` is the same kind of post-processing the backend cannot run yet.
+        //
+        // `fullscreen.resolution` and `options.exclusiveFullscreen` are the display pair, covered by the
+        // window-mode row on the General page and the display-mode picker `DisplayMode` replaces.
 
         return page
     }

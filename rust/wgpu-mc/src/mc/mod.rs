@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicU32, AtomicU64};
 
 use arc_swap::ArcSwap;
 use chunk::SectionStorage;
@@ -28,6 +28,8 @@ pub mod chunk;
 pub mod direction;
 pub mod entity;
 pub mod resource;
+pub mod visibility;
+pub mod world_extent;
 /// Take in a block name (not a [ResourcePath]!) and optionally a variant state key, e.g. "facing=north" and format it some way
 /// for example, `minecraft:anvil[facing=north]` or `Block{minecraft:anvil}[facing=north]`
 pub type BlockVariantFormatter = dyn Fn(&str, Option<&str>) -> String;
@@ -78,11 +80,31 @@ pub enum Block {
 }
 
 impl Block {
-    pub fn get_model(&self, key: u16, _seed: u8) -> Option<Arc<ModelMesh>> {
+    /// The mesh a variant key's list holds at `variant`, or the list's first entry.
+    ///
+    /// **`variant` is the game's choice, and it is asked for per position.** A blockstate whose variant
+    /// is a list of models is `WeightedVariants` at runtime, and the entry drawn for a given block is
+    /// `WeightedList#getRandomOrThrow` on a `RandomSource` seeded with `blockState.getSeed(pos)`. The
+    /// JVM has both, so it sends the *index* with the section rather than this side reproducing a
+    /// random number generator and a weight table - see the `variants` field of
+    /// `section::SectionBlocks`.
+    ///
+    /// **The list is the same order the JVM counted in**: both are the blockstate's own list, and a
+    /// key whose models all failed to bake is dropped whole rather than shortened, so an index cannot
+    /// point at a different model than the one the game picked. An index past the end is answered with
+    /// the first entry: a list the two sides disagree about the length of is a model drawn at the
+    /// variant it would have had without this channel, which is a wrong angle rather than a hole.
+    pub fn get_model(&self, key: u16, variant: u8) -> Option<Arc<ModelMesh>> {
         Some(match &self {
             Block::Multipart(multipart) => multipart.keys.read().get_index(key as usize)?.1.clone(),
-            //TODO, random variant selection through weight and seed
-            Block::Variants(variants) => variants.get_index(key as usize)?.1[0].clone(),
+            Block::Variants(variants) => {
+                let meshes = &variants.get_index(key as usize)?.1;
+
+                meshes
+                    .get(variant as usize)
+                    .or_else(|| meshes.first())?
+                    .clone()
+            }
         })
     }
 
@@ -246,31 +268,98 @@ pub(crate) const ARENA_USAGE: wgpu::BufferUsages = wgpu::BufferUsages::COPY_DST
     .union(wgpu::BufferUsages::STORAGE)
     .union(wgpu::BufferUsages::INDEX);
 
-/// **How much video memory the arena may use in total**, which is the bound that was missing.
+/// **The ceiling on what the arena may hold in total**, as policy rather than as a measurement.
 ///
 /// A per-buffer limit is not a memory bound: `ARENA_BUFFERS` of them is four times whatever the device
 /// will make in one, and with the arena appending rather than refusing, a player flying forward grew it
-/// without an upper limit. That stopped being a bug about holes and became one about memory, so the
-/// budget is stated here and enforced where growth happens (`WmRenderer::grow_arena`).
+/// without an upper limit. That stopped being a bug about holes and became one about memory, so there is a
+/// bound stated here and enforced where growth happens (`WmRenderer::grow_arena_if_asked`).
 ///
-/// **5 GB, which is `ARENA_BUFFERS` x `max_buffer_size` on the machine this was measured on** - that is,
-/// the arena is allowed to use every buffer it may create, and the count of buffers is what bounds it.
-/// An earlier 3.5 GB was a guess, and a run at 32 chunks showed it was the wrong one: the arena reached
-/// the budget and handed **6,462** sections to Minecraft, which is a visible difference - those sections
-/// come out of the game's own mesher, and the point of this renderer is that they do not.
+/// **It bounds what the pool holds, and that is not the same as what it asks for.** A run died in
+/// `create_buffer` with this budget nowhere near being reached: the pool held 312 MB of the 5 GB, and the
+/// *request* was `arena_cap_slots` slots - **seventeen gigabytes**, because that ceiling is
+/// `max_buffer_size / 4` clamped to a `u32` and this device's `max_buffer_size` is past 16 GB. A budget on
+/// the total cannot catch a single oversized allocation; sizing the allocation can, and that is what
+/// `grow_arena_if_asked` does now. The other numbers are in [`Scene::arena_memory_budget`].
 ///
-/// It cannot be derived from the device: wgpu reports a per-buffer limit and, in this version, no total
-/// budget (`MemoryBudgetThresholds` only turns memory pressure into OOM errors and a lost device, which
-/// is a worse failure than a bound). So it is a constant and the honest thing is to say so - the number
-/// to lower if a driver starts refusing allocations, and the number to read the log for:
+/// The number that actually binds is `Scene::arena_memory_budget` - this, or
+/// `max_buffer_size` x [`ARENA_BUFFERS`], whichever is smaller - because this constant alone is a budget
+/// for the machine it was written for. On this one the policy is the smaller and prints as:
+///
+/// ```text
+/// wgpu-mc: the section arena: up to 4 buffer(s) of 4294967295 slot(s) (16383 MB each, the device's own
+/// `max_buffer_size`), a budget of 4768 MB, of which the device's limits allow 65535 MB
+/// ```
+///
+/// **And no total can be read off a Vulkan device.** `MemoryBudgetThresholds` - the one API for "start
+/// returning OOM at a percentage of the native budget" - is implemented for **DX12 only**
+/// (`wgpu-hal/src/dx12/device.rs`, reading `DXGI_MEMORY_SEGMENT_GROUP_LOCAL`); the Vulkan backend has no
+/// equivalent and neither exposes the budget as a number. That is why `grow_arena_if_asked` also *catches*
+/// a refused allocation instead of trusting any of this.
+///
+/// The number to read in the log is this one being reached:
 ///
 /// ```text
 /// Rebuilds: ... N left to Minecraft because the arena is full, ...
 /// ```
 ///
-/// That count climbing is this budget being reached, and it is the one number that says whether the
-/// arena is holding the view the player asked for.
+/// That count climbing is the budget, and it is the one number that says whether the arena is holding the
+/// view the player asked for.
 pub const ARENA_MEMORY_BUDGET: u64 = 5_000_000_000;
+
+/// The arena's budget **for this device**, from the two numbers a device actually gives.
+///
+/// `max_buffer_size` is a *per-buffer* limit, and [`ARENA_BUFFERS`] of them is the most the device's own
+/// limits would let the arena hold; [`ARENA_MEMORY_BUDGET`] is the policy ceiling on top of that, so a
+/// device that will make a very large buffer does not get an arena several times that by arithmetic alone.
+/// On the machine this was written on the two agreed; here the policy is the smaller and is what binds.
+///
+/// Separate from the constant and a function of one argument so that the arithmetic can be tested - the
+/// interesting cases are the two ends, where either the device or the policy decides.
+pub fn arena_memory_budget(max_buffer_size: u64) -> u64 {
+    max_buffer_size
+        .saturating_mul(ARENA_BUFFERS as u64)
+        .min(ARENA_MEMORY_BUDGET)
+}
+
+/// **How large an appended arena should be: what the view asks for, not what the device allows.**
+///
+/// This is the function that decides whether a full arena asks the driver for something it can have. It
+/// used to be `Scene::arena_cap_slots` - the device's own `max_buffer_size` over four, clamped to a `u32` -
+/// and on the machine this was found on that ceiling is `u32::MAX`, so every growth asked for **17 GB in
+/// one buffer**. The driver refused, wgpu treats a refused `create_buffer` as fatal, and the process died
+/// with `wgpu error: Out of Memory` and a terrain line as the last thing in the log. The same code on the
+/// machine it was written for asked for 2 GB (`536870911` slots, from the historical log line) and worked,
+/// which is exactly why the ceiling looked like a reasonable thing to ask for.
+///
+/// So the size comes from the world instead, in four numbers, each of which is a bound that can be
+/// explained on its own:
+///
+///  * **`target`** - what [`chunk::arena_slots`] says the current render distance wants. The pool should
+///    reach this and not more, and it is the number the growth exists for. This is the *size* now rather
+///    than the ceiling.
+///  * **`largest_section`** - a floor. An arena smaller than the largest section this session has meshed
+///    cannot hold one, and holding sections is the whole point.
+///  * **`cap_slots`** - the device's per-buffer ceiling, which is still a real limit and the reason the
+///    request is clamped at all. On this machine it is `u32::MAX` and therefore not the binding one.
+///  * **`budget`** - [`Scene::arena_memory_budget`], less what the pool already holds. The appended arena
+///    is what tips the pool over it otherwise, and the budget is the only bound on the *total*.
+///
+/// `0` means "do not append": nothing is wanted and nothing has been meshed, so there is no size to ask
+/// for and the caller should treat the refusal as one growth cannot answer.
+pub fn arena_growth_slots(
+    target: u32,
+    pool_slots: u32,
+    largest_section: u32,
+    cap_slots: u32,
+    budget: u64,
+) -> u32 {
+    // What the budget still allows, in slots. `u32::MAX` when it allows more than a `u32` can count.
+    let room = budget.saturating_sub(pool_slots as u64 * 4) / 4;
+    let room = room.min(u32::MAX as u64) as u32;
+
+    target.max(largest_section).min(cap_slots).min(room)
+}
 
 /// How many arena buffers the arena may grow to.
 ///
@@ -280,6 +369,81 @@ pub const ARENA_MEMORY_BUDGET: u64 = 5_000_000_000;
 /// device with an unusually large `max_buffer_size` cannot reach the byte budget with a single buffer
 /// and then stop growing before a second would have fit.
 pub const ARENA_BUFFERS: usize = 4;
+
+/// One terrain pass's own draw buffers, and why one pair for the whole frame is not enough.
+///
+/// The terrain pass draws its sections with `multi_draw_indexed_indirect`, and a multi-drawn section
+/// cannot be handed anything per draw except through a buffer or the indirect record itself - an
+/// immediate is set once for the whole call. So each draw's section position and its slot in the arena
+/// travel in [`SectionDraw`], the vertex stage reads them by `instance_index`, and the pass writes that
+/// buffer once per pass.
+///
+/// **One pair of buffers per pass rather than one for the frame**, and the reason is where
+/// `Queue::write_buffer` lands:
+///
+/// ```text
+/// Calls to `write_buffer()` do *not* submit the transfer to the GPU immediately. They begin GPU
+/// execution only on the next call to `Queue::submit()`, just before the explicitly submitted
+/// commands.
+/// ```
+///
+/// So every write a frame makes is applied at the head of that frame's submission, before every draw
+/// recorded in it. A single buffer written twice in one frame - which is what the opaque group is, two
+/// terrain pipelines recorded into one encoder by one `render` call - has the *second* pipeline's
+/// records in it when the *first* pipeline's draws execute. They would both draw the last pass's
+/// sections, out of the last pass's arena slots. Two buffers are the whole fix: pass A's writes land in
+/// A's buffer and pass B's in B's, and the submission's ordering stops mattering.
+///
+/// The cost is the memory, which is a few hundred kilobytes per pass - see [`SECTION_DRAW_CAPACITY`].
+pub const SECTION_DRAW_SLOTS: usize = 3;
+
+/// How many draws one pass may hand to the GPU *indirectly*, which is the capacity of every slot's
+/// `DrawIndexedIndirectArgs` buffer: 10,000 records of five `u32`s.
+///
+/// Above this the pass falls back to one `draw_indexed` per section rather than dropping anything - the
+/// indirect buffer is a batching device, not a limit on what can be drawn. It is the number this buffer
+/// has always been sized for.
+pub const INDIRECT_DRAW_CAPACITY: usize = 10_000;
+
+/// How many draws one pass may make at all, indirect or not, which is the capacity of every slot's
+/// [`SectionDraw`] buffer.
+///
+/// **It is larger than [`INDIRECT_DRAW_CAPACITY`] because the fallback needs it to be.** A pass that
+/// exceeds the indirect capacity still draws every section - one call at a time - and each of those
+/// calls still reads its own `SectionDraw` out of this buffer, because the shader reads the section's
+/// position there in both paths. A common capacity would make the fallback impossible and turn the
+/// batched path's limit into a hole in the world.
+///
+/// Past *this* count the extra draws are dropped and said so in the log, once a second. Four thousand
+/// draws is a 32-chunk view's whole surface, so the ceiling is four times a case that has not been
+/// reached; it is here so that the failure is a line in a log rather than a read past the end of a
+/// buffer.
+pub const SECTION_DRAW_CAPACITY: usize = 1 << 14;
+
+/// One terrain draw's arguments, as the vertex stage reads them: `section_draws[instance_index]`.
+///
+/// Sixteen bytes, four `u32`s, and the layout is the shader's - `SectionDraw` in `terrain.wgsl` and
+/// `terrain_solid.wgsl` spells the same four members in the same order. A struct with a `vec3` in it was
+/// the other shape this could have had and it is the one to avoid: `vec3<i32>` is sixteen bytes of
+/// storage for twelve bytes of data, and three scalars say what the four offsets are without anyone
+/// having to know the alignment rule.
+///
+/// **`word_base` was `@builtin(instance_index)`.** Every section's draw used to pass its arena slot as
+/// the instance number, which is exactly what `first_instance` is for in an indirect record - except
+/// that `instance_index` now has a job of its own: it is the index of the record being drawn, because a
+/// multi-draw cannot be told anything per draw any other way.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct SectionDraw {
+    /// The section's position relative to the camera's section, in sections - the number the immediate
+    /// used to carry for one draw at a time. See [`Scene::camera_section_pos`].
+    pub x: i32,
+    pub y: i32,
+    pub z: i32,
+    /// The u32 slot in the arena the section's vertices start at: the old `instance_index`, and what
+    /// `chunk_data` is indexed by in the shader.
+    pub word_base: u32,
+}
 
 pub struct Scene {
     pub section_storage: RwLock<SectionStorage>,
@@ -325,14 +489,40 @@ pub struct Scene {
     /// write the rest of its sections into the wrong one. See `WmRenderer::grow_arena`.
     pub pending_arena_growth: AtomicU32,
 
-    /// The largest pool this device can have in one buffer, in u32 slots: `max_buffer_size / 4`.
+    /// The largest pool this device can have in **one** buffer, in u32 slots: `max_buffer_size / 4`,
+    /// clamped to what a `u32` can count.
     ///
-    /// Read once, from the device the arena's buffer is created on. It is the ceiling `grow_arena`
-    /// stops at, and a ceiling rather than a policy: growth only happens because a section did not fit,
-    /// so a session that never refuses never reaches it.
+    /// Read once, from the device the arena's buffer is created on. What it caps is a single *appended*
+    /// arena - growth is sized by the shortfall and never asks for more than this - and a ceiling rather
+    /// than a policy: growth only happens because a section did not fit, so a session that never refuses
+    /// never reaches it.
+    ///
+    /// **`u32::MAX` is a real value here and it was a real bug.** `max_buffer_size` is past 16 GB on the
+    /// device this was found on, so the clamp decides and the ceiling is 17 GB - which every growth used to
+    /// request in one buffer, because an appended arena was created at this size "because there is no
+    /// reason for one to be smaller". The driver refused, and wgpu treats a refused `create_buffer` as
+    /// fatal. See `WmRenderer::grow_arena_if_asked`: it is a *cap* now, not a size.
     pub arena_cap_slots: u32,
 
-    pub indirect_buffer: Arc<wgpu::Buffer>,
+    /// **How much video memory this arena is allowed to use, on this device.** See
+    /// [`arena_memory_budget`] for the arithmetic and [`ARENA_MEMORY_BUDGET`] for why a total cannot be
+    /// read off a Vulkan device at all.
+    ///
+    /// Read beside `max_buffer_size` rather than derived where it is used, because growth happens on the
+    /// render thread and the plan should not be recomputed - or drift - per refusal burst. What enforces
+    /// it is `WmRenderer::grow_arena_if_asked`.
+    pub arena_memory_budget: u64,
+
+    /// **The draw arguments, one pair of buffers per terrain pass.** See [`SECTION_DRAW_SLOTS`] for why
+    /// there is a pair per pass rather than one for the frame, and [`SectionDraw`] for what is in them.
+    ///
+    /// `section_draws[i]` is the storage buffer the vertex stage reads a draw's section position and
+    /// arena slot out of, and `indirect_buffers[i]` is the `DrawIndexedIndirectArgs` array the batched
+    /// path draws from. Index `i` is a *slot*, not a pipeline: `BoundPipeline::draw_slot` says which
+    /// pass owns which, and two passes may not share one - which is the whole of what the slot
+    /// assignment has to get right.
+    pub section_draws: Vec<Arc<BindableBuffer>>,
+    pub indirect_buffers: Vec<Arc<wgpu::Buffer>>,
 
     pub entity_instances: Mutex<HashMap<String, BundledEntityInstances>>,
     pub sky_state: ArcSwap<SkyState>,
@@ -363,20 +553,136 @@ pub struct Scene {
     ///
     /// [`SectionOcclusionGraph`]: https://minecraft.wiki/w/Occlusion_culling
     pub visible_sections: RwLock<Option<HashSet<IVec3>>>,
+
+    /// How many times the list above has been replaced. See [`Scene::set_visible_sections`].
+    ///
+    /// **The terrain frame cache keys on this**, because the list is one of the things the gather reads:
+    /// a new list is a gather that has to run again. A counter rather than the list itself, because
+    /// comparing two `HashSet`s is the same walk as the gather it would be deciding about - see
+    /// `TerrainFrameKey` in `render/graph.rs`.
+    ///
+    /// It is a revision and not a "dirty" flag, so a cache that is several revisions behind cannot be
+    /// mistaken for a current one; and it is bumped by the only writer rather than by the reader, so a
+    /// list that is set twice in one frame invalidates twice.
+    pub visible_sections_revision: AtomicU64,
+
+    /// **The sections the arena has taken over since the list above was last replaced.**
+    ///
+    /// This is the only thing that tells a *stale* answer apart from an *occluded* one, and without it
+    /// the gather has to choose between two wrong answers. `visibleSections` is refilled only when the
+    /// camera has turned by more than two degrees or the game's occlusion graph reports a change
+    /// (`LevelRenderer#applyFrustum`), so between refills it is a snapshot - and a section this side has
+    /// just taken over is exactly what it has not caught up with. Minecraft's mesh for that section has
+    /// already been dropped (`SectionCompilerMixin` does that when the bake is taken), so reading "not
+    /// named" as "occluded" for it leaves a section neither renderer draws: a 16x16x16 hole, appearing
+    /// while terrain streams in. See the README's "the occlusion list is a snapshot".
+    ///
+    /// A position lands here when it enters the arena - the publish in the section drain, which is where
+    /// this side's claim on it becomes true - and the set is **emptied whenever a list arrives**, which
+    /// is exactly "the game's answer has caught up". A section in it that the list does not name is
+    /// answered by the frustum instead; every other unnamed section is still culled, so the occlusion
+    /// culling survives for the steady state, where all of its value is.
+    pub sections_since_the_list: RwLock<HashSet<IVec3>>,
 }
 
 impl Scene {
+    /// Replaces the list of sections the game's own occlusion graph says are visible.
+    ///
+    /// **The one writer of [`Scene::visible_sections`]**, so that the revision beside it cannot fall out
+    /// of step with the list: the two are one fact - what the gather reads - and a second place that
+    /// wrote the list without bumping the revision would be a frame drawn from a stale one.
+    ///
+    /// **The set is kept, and the positions arrive as they are read.** The JVM sends a whole list every
+    /// time the game rebuilds it, so the set that holds it is cleared and refilled rather than replaced -
+    /// `HashSet::clear` keeps the table's capacity and its control bytes, which is the allocation and the
+    /// growth this does not pay twice - and the section positions are taken as an iterator, so the only
+    /// thing that happens to a key between the JVM's array and the set is the hashing that a set costs
+    /// anyway. Building a set on the JVM's side of this call only to move it in here was one allocation
+    /// and one extra pass over the list per rebuild.
+    pub fn set_visible_sections<I>(&self, visible: I)
+    where
+        I: IntoIterator<Item = IVec3>,
+    {
+        // **And the list has caught up**, so nothing is "too new to have been seen" any more: a section
+        // this side took over before this call is the list's business like any other, and if the game's
+        // graph still does not name it, it is occluded rather than unseen. See
+        // [`Scene::sections_since_the_list`].
+        self.sections_since_the_list.write().clear();
+
+        let mut visible = visible.into_iter();
+
+        // The guard is dropped before the revision moves, which is the order that carries the guarantee: a
+        // reader decides whether to use its cached gather from the revision and reads the list afterwards, so
+        // the new list has to be *visible* before the revision that says it is there. Dropping the guard
+        // first makes exactly that ordering true - the list is published, and only then does the count move.
+        {
+            let mut slot = self.visible_sections.write();
+
+            match slot.as_mut() {
+                Some(set) => {
+                    set.clear();
+                    set.extend(&mut visible);
+                }
+                // The first list of a session, and the only one that has to build the set.
+                None => *slot = Some(visible.collect()),
+            }
+        }
+
+        self.visible_sections_revision
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Records that the arena has taken one section over. See [`Scene::sections_since_the_list`].
+    ///
+    /// Called from the section drain at the publish, which is the moment the claim becomes true: before
+    /// it the section is not in the arena and the gather cannot reach it, and after it the section is
+    /// this side's while the game's list may not have heard of it yet.
+    pub fn note_section_taken(&self, pos: IVec3) {
+        self.sections_since_the_list.write().insert(pos);
+    }
+
+    /// The revision [`Scene::set_visible_sections`] last left behind.
+    pub fn visible_sections_revision(&self) -> u64 {
+        self.visible_sections_revision
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
     pub fn new(wm: &WmRenderer, framebuffer_size: wgpu::Extent3d) -> Self {
-        let indirect_buffer = wm.gpu.device.create_buffer(&wgpu::BufferDescriptor {
-            label: None,
-            size: 4 * 5 * 10000,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::INDIRECT,
-            mapped_at_creation: false,
-        });
         // Sized for a large render distance up front, so that a session which never reports one still
         // works, and resized to the one the game reports with [`Scene::set_arena_slots`] - which
         // happens when a world is joined, before anything has been baked. A buffer that is too large
         // is video memory; one that is too small is sections that cannot be baked.
+        //
+        // The two buffers a terrain pass draws out of, allocated for every slot up front: a slot is
+        // claimed when the graph builds its pipelines and a buffer created then would have to be
+        // created on a rebuild, which is a resource the frame in flight may still be reading. See
+        // `SECTION_DRAW_SLOTS`.
+        //
+        // `min_binding_size` is left open in the layout, so the whole of each is bound and the shader
+        // indexes it by `instance_index`; the arena's storage buffer is declared the same way.
+        let section_draws = (0..SECTION_DRAW_SLOTS)
+            .map(|_| {
+                Arc::new(BindableBuffer::new_deferred(
+                    wm,
+                    (SECTION_DRAW_CAPACITY * std::mem::size_of::<SectionDraw>()) as u64,
+                    wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::STORAGE,
+                    "section_draws",
+                ))
+            })
+            .collect::<Vec<_>>();
+
+        let indirect_buffers = (0..SECTION_DRAW_SLOTS)
+            .map(|_| {
+                Arc::new(wm.gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("terrain indirect draw arguments"),
+                    size: (INDIRECT_DRAW_CAPACITY
+                        * std::mem::size_of::<wgpu::util::DrawIndexedIndirectArgs>())
+                        as u64,
+                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::INDIRECT,
+                    mapped_at_creation: false,
+                }))
+            })
+            .collect::<Vec<_>>();
+
         Self {
             section_storage: RwLock::new(SectionStorage::new(crate::mc::chunk::ARENA_SLOTS)),
             camera_section_pos: RwLock::new(IVec3::ZERO),
@@ -390,7 +696,9 @@ impl Scene {
             pending_arena_growth: AtomicU32::new(0),
             arena_cap_slots: (wm.gpu.device.limits().max_buffer_size / 4).min(u32::MAX as u64)
                 as u32,
-            indirect_buffer: Arc::new(indirect_buffer),
+            arena_memory_budget: arena_memory_budget(wm.gpu.device.limits().max_buffer_size),
+            indirect_buffers,
+            section_draws,
 
             entity_instances: Default::default(),
             sky_state: Default::default(),
@@ -413,6 +721,8 @@ impl Scene {
             // `None` rather than an empty set: nothing has been sent yet, and an empty set means "the
             // game looked and saw nothing", which would draw no terrain at all. See the field.
             visible_sections: RwLock::new(None),
+            visible_sections_revision: AtomicU64::new(0),
+            sections_since_the_list: RwLock::new(HashSet::new()),
         }
     }
 
@@ -652,5 +962,55 @@ impl MinecraftState {
         }
 
         block_atlas.upload(wm);
+    }
+}
+
+/// The one thing a blockstate's variant *list* is picked with. See [`Block::get_model`] for why the
+/// index comes from the JVM rather than from a random number generator on this side.
+#[cfg(test)]
+mod variant_pick_tests {
+    use super::*;
+    use crate::mc::block::ModelMesh;
+
+    fn mesh(cull: u8) -> ModelMesh {
+        ModelMesh {
+            north: vec![],
+            south: vec![],
+            west: vec![],
+            east: vec![],
+            up: vec![],
+            down: vec![],
+            any: vec![],
+            cull,
+            ambient_occlusion: None,
+        }
+    }
+
+    #[test]
+    fn a_list_is_picked_by_the_index_the_jvm_counted() {
+        let mut variants: IndexMap<Vec<(String, StateValue)>, Vec<Arc<ModelMesh>>> =
+            IndexMap::new();
+        variants.insert(
+            vec![],
+            vec![Arc::new(mesh(1)), Arc::new(mesh(2)), Arc::new(mesh(3))],
+        );
+
+        let block = Block::Variants(variants);
+
+        for (index, expected) in [(0u8, 1u8), (1, 2), (2, 3)] {
+            assert_eq!(
+                block.get_model(0, index).expect("a model").cull,
+                expected,
+                "variant {index} is entry {expected} of the list"
+            );
+        }
+
+        // **Past the end is the first entry, not a hole.** A list the two sides disagree about the
+        // length of - a blockstate this loader dropped an entry of, a mod's list - would otherwise be a
+        // face that is not drawn at all, and a wrong angle is the smaller failure of the two.
+        assert_eq!(block.get_model(0, 9).expect("the first entry").cull, 1);
+
+        // And a key no state selected has no model, which is the same answer as before this existed.
+        assert!(block.get_model(4, 0).is_none());
     }
 }

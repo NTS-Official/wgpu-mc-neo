@@ -88,6 +88,22 @@ pub trait BlockStateProvider {
 
     fn get_block_color(&self, pos: IVec3, tint_index: i32) -> u32;
 
+    /// **Which model variant the block at this position uses**, or `0` for the first one.
+    ///
+    /// A blockstate whose variant is a *list* - the lily pad's four quarter turns, a grass tuft's
+    /// weights - is one mesh per entry, and the game picks between them **per position**:
+    /// `ModelBlockRenderer#tesselateBlock` does `random.setSeed(blockState.getSeed(pos))` and lets
+    /// `WeightedVariants#collectParts` draw from a `WeightedList`. Neither the seed arithmetic nor the
+    /// weights are reproduced here; the JVM has the game's own `WeightedList` and `RandomSource`, so it
+    /// computes the *index* and sends it with the section. See `section::SectionBlocks::variants`.
+    ///
+    /// `0` is the default because that is what this side drew before the answer existed: a provider
+    /// that knows nothing about variants - every test - draws the first entry of a list, which is a
+    /// lily pad pointing the way a lily pad points in a world that never picks.
+    fn get_model_variant(&self, _pos: IVec3) -> u8 {
+        0
+    }
+
     /// **The colour a fluid's faces are tinted by**, which is not the block tint and not a constant.
     ///
     /// The game asks a *fluid* model, not a block one: `FluidRenderer#tesselate` calls
@@ -319,8 +335,52 @@ pub struct SectionStorage {
     /// section in `storage`, so there is nothing to cap: these are positions that are already in the
     /// map, and the set cannot outgrow it.
     refused_pending: std::collections::HashSet<IVec3>,
+    /// **The baked geometry of sections the arena had no room for**, waiting for a slot.
+    ///
+    /// This is the one place a bake's output outlives the frame that produced it, and it exists
+    /// because dropping that output is what made a refusal expensive. The drain used to throw the
+    /// layers away and hand the position to the JVM, whose only recovery was to have Minecraft
+    /// compile all 4096 positions of the section again and send a 27-section payload back over JNI -
+    /// for geometry this side had already computed and was holding at that moment.
+    ///
+    /// What it costs is memory the arena was about to hold anyway: the vertices and indices of one
+    /// section, which is exactly what [`BakedLayer`] is. [`SectionStorage::parked_bytes`] sums it, and
+    /// [`PARKED_LIMIT`] bounds how many of them may wait at once.
+    ///
+    /// A refusal that parks a section **takes it out of [`Self::refused_pending`]**, because the two
+    /// mean opposite things to the JVM: a refused section is one it has to mesh itself, and a parked
+    /// one is one this side is still going to draw.
+    parked: HashMap<IVec3, ParkedSection>,
+    /// The next [`ParkedSection::seq`]. A counter rather than a clock: the queue is only ever
+    /// compared with itself, and a clock would make the order depend on how long a frame took.
+    parked_seq: u64,
     width: i32,
 }
+
+/// One section's baked geometry, held until the arena has room for it.
+///
+/// See [`SectionStorage::park`] for why it is held rather than dropped.
+struct ParkedSection {
+    /// When it was parked, so the oldest can be offered the next free slot first. Oldest first
+    /// because a section that has been waiting is one whose ground has been stale for longer.
+    seq: u64,
+    layers: Vec<BakedLayer>,
+}
+
+/// How many refused sections may hold their baked geometry while they wait for a slot.
+///
+/// A bound rather than none, because the queue is fed by the rate the world changes and drained by
+/// the rate the arena grows. A player flying through new terrain while the pool is exhausted would
+/// otherwise park geometry for every section they pass, and the memory that was supposed to be the
+/// arena's would be this side's instead. Past this the refusal goes the old way - the layers are
+/// dropped and the JVM is told - which costs a rebuild rather than a hole.
+///
+/// **The number is a memory bound, not a latency one**, which is the opposite of
+/// `MAX_QUEUED_BAKES` in `wgpu-mc-jni`: a bake waiting in that queue holds 54 pointers, and a section
+/// waiting here holds its vertices and its indices. What one of those costs is not a constant this
+/// side knows, so the honest figure is the one the report prints - [`SectionStorage::parked_bytes`] -
+/// and this is the count that keeps it in the tens of megabytes rather than the hundreds.
+pub const PARKED_LIMIT: usize = 256;
 
 impl SectionStorage {
     pub fn new(range: u32) -> Self {
@@ -335,6 +395,8 @@ impl SectionStorage {
             refused: false,
             at_capacity: false,
             refused_pending: std::collections::HashSet::new(),
+            parked: HashMap::new(),
+            parked_seq: 0,
         }
     }
     /// Narrows or widens the pool to a render distance, which is only possible while it is empty.
@@ -407,6 +469,10 @@ impl SectionStorage {
     /// of one - which is what the arena needed: a 32-chunk view wants about 2.6 GB and one buffer stops
     /// at 1.31 GB on the machine this was measured on, so half the world could not be held and the
     /// sections that did not fit were drawn by neither renderer.
+    ///
+    /// **`slots` comes from the caller's own shortfall**, not from the device's ceiling: an arena sized to
+    /// the ceiling is a request for the ceiling, and one that was 17 GB on the machine that found this
+    /// killed the process in `create_buffer`. See `WmRenderer::grow_arena_if_asked`.
     ///
     /// `false` when the list is already at `limit`: the caller decides what the limit is, because it is
     /// the one that knows how much video memory it is willing to ask the driver for.
@@ -491,6 +557,13 @@ impl SectionStorage {
             std::sync::atomic::Ordering::Relaxed,
         );
         self.refused_pending.clear();
+
+        // The geometry waiting for a slot described the world that was just left, so it goes with
+        // the refusals above and for the same reason: the new world's sections are offered from
+        // scratch. Not counted as dropped the way a refusal is - a parked section was never handed to
+        // the JVM, so nothing in that sum refers to it.
+        self.parked.clear();
+        self.parked_seq = 0;
     }
     /// How far the arena reaches from the camera, in chunks.
     pub fn width(&self) -> i32 {
@@ -531,6 +604,37 @@ impl SectionStorage {
                 }
             }
         }
+        let storage = &self.storage;
+        let mut abandoned = 0u64;
+
+        // **And the geometry waiting for a slot goes with the section it was baked for.** A parked
+        // section is one the JVM still counts as drawn by this side, so dropping it silently is the
+        // hole this file has three separate comments about: nothing draws it and nothing ever will,
+        // because the JVM believes it is here. Reporting the position is what makes Minecraft's own
+        // mesh take over for it.
+        //
+        // Only the positions the loop above did not already report, which is exactly the parked ones
+        // with no section in the storage - and the predicate is the same one, so a parked position
+        // that *is* stored is reported once, by that loop.
+        self.parked.retain(|k, _| {
+            let dist = (k.xz() - pos).abs();
+            let radius = self.width + 2;
+
+            if dist.x > radius || dist.y > radius {
+                if !storage.contains_key(k) {
+                    to_remove.push(*k);
+                }
+
+                abandoned += 1;
+
+                return false;
+            }
+
+            true
+        });
+
+        PARKED_TRIMMED.fetch_add(abandoned, std::sync::atomic::Ordering::Relaxed);
+
         to_remove.iter().for_each(|pos| {
             self.storage.remove(pos);
         });
@@ -624,6 +728,110 @@ impl SectionStorage {
         REFUSED_REPORTED.fetch_add(refused.len() as u64, std::sync::atomic::Ordering::Relaxed);
 
         refused
+    }
+
+    /// **Keeps a section's baked geometry until the arena has room for it**, rather than letting the
+    /// refused allocation throw it away.
+    ///
+    /// The refusal this answers is the one where everything already went right: the section was
+    /// baked, the geometry is in hand, and the pool had no range to put it in. Dropping it there is
+    /// what turns a memory problem into a CPU one - the JVM has to be told, Minecraft compiles the
+    /// section's 4096 positions again, a 27-section payload crosses JNI, and the result is offered
+    /// back to a pool that is exactly as full as it was a moment ago.
+    ///
+    /// Answers whether it was kept. It is **not** kept in two cases, and both fall back to the old
+    /// path: when the arena is at the device's limit ([`Self::at_capacity`]), where there is no later
+    /// slot to wait for and Minecraft's own mesh has to take over for good; and when
+    /// [`PARKED_LIMIT`] sections are already waiting, where keeping another would be the queue
+    /// growing without bound while the player flies.
+    ///
+    /// **A parked section is removed from [`Self::refused_pending`]**, and that removal is what keeps
+    /// the two recoveries from running at once: the JVM is not told, so it goes on counting the
+    /// section as sent and goes on suppressing Minecraft's mesh - which is right, because this side
+    /// still means to draw it. Left in the set, the section would be meshed by Minecraft *and*
+    /// published here, which is one section drawn twice.
+    ///
+    /// **A section the arena has never held is parked the same way, and it is not the hole the notes
+    /// in this file warn about.** A first bake is only offered after the JVM has stopped drawing the
+    /// section itself, so the alternative to waiting is not Minecraft's mesh - it is a rebuild that
+    /// has to travel through the game's compiler and JNI before anything is drawn at all, which is
+    /// strictly slower than the growth this refusal asks for on the same frame.
+    pub fn park(&mut self, pos: IVec3, layers: Vec<BakedLayer>) -> bool {
+        if self.at_capacity {
+            return false;
+        }
+
+        // A second entry for a position already waiting is always allowed and costs nothing: the
+        // newer geometry is the one that should land, and the older is superseded rather than queued
+        // behind it. Two bakes of one section between two free slots is one section, not two.
+        if !self.parked.contains_key(&pos) && self.parked.len() >= PARKED_LIMIT {
+            return false;
+        }
+
+        // **A replacement keeps its place in the queue.** The geometry is newer, but the section has
+        // been waiting since it was first parked, and sending it to the back would be punishing it
+        // for having changed - the one section in the queue whose ground the player is most likely to
+        // be looking at.
+        let seq = match self.parked.get(&pos) {
+            Some(waiting) => waiting.seq,
+            None => {
+                self.parked_seq += 1;
+
+                self.parked_seq
+            }
+        };
+
+        self.parked.insert(pos, ParkedSection { seq, layers });
+
+        // See the note above: parked is the opposite of refused.
+        self.refused_pending.remove(&pos);
+
+        PARKED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        true
+    }
+
+    /// Hands back everything waiting for a slot, oldest first, and forgets it.
+    ///
+    /// Drained rather than peeked at, because every one of them is about to be offered the arena
+    /// again - and the ones that still do not fit are parked by the same code that parked them the
+    /// first time (see the section drain in `wgpu-mc/src/lib.rs`), which is also what puts them back
+    /// in order behind whatever arrived in the meantime.
+    pub fn take_parked(&mut self) -> Vec<(IVec3, Vec<BakedLayer>)> {
+        if self.parked.is_empty() {
+            return Vec::new();
+        }
+
+        let mut waiting: Vec<(IVec3, u64, Vec<BakedLayer>)> = self
+            .parked
+            .drain()
+            .map(|(pos, parked)| (pos, parked.seq, parked.layers))
+            .collect();
+
+        waiting.sort_by_key(|(_, seq, _)| *seq);
+
+        waiting
+            .into_iter()
+            .map(|(pos, _, layers)| (pos, layers))
+            .collect()
+    }
+
+    /// How many sections are holding their geometry, waiting for a slot. For the report.
+    pub fn parked_len(&self) -> usize {
+        self.parked.len()
+    }
+
+    /// How many bytes of baked geometry the parked sections are holding. For the report.
+    ///
+    /// The honest figure for what this queue costs, rather than an estimate per section: sections
+    /// differ by an order of magnitude between solid stone and leaves, so this is the sum of what is
+    /// actually held.
+    pub fn parked_bytes(&self) -> usize {
+        self.parked
+            .values()
+            .flat_map(|parked| parked.layers.iter())
+            .map(|layer| layer.vertices.len() + layer.indices.len())
+            .sum()
     }
 
     /// Gives one range back to the arena it came from.
@@ -826,6 +1034,17 @@ impl SectionStorage {
         self.storage.iter()
     }
 
+    /// Whether the arena is holding anything to draw for this section.
+    ///
+    /// "Holds" rather than "is in the map": a section whose layers were all taken by a range it could not
+    /// get is present with nothing in it, and the question a walk asks is whether a camera looking at the
+    /// section would see anything - which is the same question the draw loop answers when it finds no
+    /// layer to record.
+    pub fn holds(&self, pos: IVec3) -> bool {
+        self.storage
+            .get(&pos)
+            .is_some_and(|section| section.layers.iter().any(|layer| layer.is_some()))
+    }
     /// How many sections the arena holds geometry for.
     pub fn len(&self) -> usize {
         self.storage.len()
@@ -902,6 +1121,33 @@ pub fn sections_refused_dropped() -> u64 {
     REFUSED_DROPPED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// How many refused sections kept their baked geometry instead of being handed to the JVM.
+///
+/// This is the counter that says the expensive recovery did not happen. Every one of these is a
+/// section Minecraft was *not* asked to compile again, a 27-section payload that did not cross JNI,
+/// and a section whose `rustHas` stayed true - so it is also the number of round trips this queue
+/// removed. Read beside [REFUSED]: a run where the two are close is a run where parking is not
+/// keeping up with the refusals, and the arena growth is the thing to look at.
+static PARKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many parked sections were dropped because the player left them behind. See [`SectionStorage::trim`].
+///
+/// The other half of the same diagnostic: geometry that is parked and then abandoned was held for
+/// nothing, and a number that is large next to [PARKED] means the queue is filling with sections the
+/// view has already moved past - which is memory spent to no end, since their positions are reported
+/// to the JVM on the way out and Minecraft meshes them from scratch.
+static PARKED_TRIMMED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// See [PARKED].
+pub fn sections_parked() -> u64 {
+    PARKED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// See [PARKED_TRIMMED].
+pub fn sections_parked_abandoned() -> u64 {
+    PARKED_TRIMMED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 fn report_full_arena(pool: u32, used: u32) {
     let refused = REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if refused < 4 || refused.is_multiple_of(512) {
@@ -943,8 +1189,17 @@ impl Section {
     }
 }
 
+/// The mesh a state is drawn with, at the variant the world chose for the position it stands at.
+///
+/// `variant` is the game's own per-position choice among a blockstate's list of models, and it is
+/// ignored by every state whose variant is not a list. See
+/// [`BlockStateProvider::get_model_variant`].
 #[inline]
-fn get_block(block_manager: &BlockManager, state: ChunkBlockState) -> Option<Arc<ModelMesh>> {
+fn get_block(
+    block_manager: &BlockManager,
+    state: ChunkBlockState,
+    variant: u8,
+) -> Option<Arc<ModelMesh>> {
     let key = match state {
         ChunkBlockState::Air => return None,
         ChunkBlockState::State(key) => key,
@@ -954,7 +1209,7 @@ fn get_block(block_manager: &BlockManager, state: ChunkBlockState) -> Option<Arc
         .blocks
         .get_index(key.block as usize)?
         .1
-        .get_model(key.augment, 0)
+        .get_model(key.augment, variant)
 }
 
 /// The face flags of a state, or none when the state was never described.
@@ -1061,7 +1316,13 @@ fn face_is_hidden(
 
     // No model is a neighbour drawn as something else - the fallback block - so the geometry test
     // has nothing to say about it and the face is kept.
-    let Some(mesh) = get_block(block_manager, neighbour) else {
+    //
+    // The neighbour's *variant* is asked for as 0, and that is deliberate: this is a culling question
+    // and every entry of a variant list answers it the same way - a lily pad's four quarter turns all
+    // cull the same six faces, because turning a quad does not move it off its plane. The world's own
+    // choice is not even available here: this runs for the neighbour a face looks at, and the blob the
+    // payload carries describes only the section being rebuilt.
+    let Some(mesh) = get_block(block_manager, neighbour, 0) else {
         return false;
     };
 
@@ -1230,10 +1491,10 @@ fn report_winding(pos: IVec3, layers: &[BakedLayer]) {
 
 /// One baked vertex's position and normal, decoded the way `terrain.wgsl` decodes them.
 ///
-/// The format is `Vertex::compressed`'s, and the two have to agree: the position is one byte per axis
-/// in sixteenths, with a coordinate of exactly sixteen stored as a flag instead (it does not fit in a
-/// byte), and the normal is three bits. `None` for anything that does not decode, which is a vertex
-/// this diagnostic has nothing to say about rather than a reason to stop.
+/// The format is `Vertex::compressed`'s, and the two have to agree: the position is sixteen bits an axis
+/// at 1/2048 of a block - x and y in the halves of the first word, z in the low half of the second - and
+/// the normal is three bits. `None` for anything that does not decode, which is a vertex this diagnostic
+/// has nothing to say about rather than a reason to stop.
 fn read_vertex(bytes: &[u8]) -> Option<(glam::Vec3, glam::Vec3)> {
     use glam::Vec3;
 
@@ -1241,17 +1502,13 @@ fn read_vertex(bytes: &[u8]) -> Option<(glam::Vec3, glam::Vec3)> {
         return None;
     }
 
-    let flags = bytes[11] >> 5;
+    let half = |low: u8, high: u8| u16::from_le_bytes([low, high]) as f32 / 2048.0;
 
-    let axis = |byte: u8, flag: u8| -> f32 {
-        if flags & flag != 0 {
-            16.0
-        } else {
-            byte as f32 / 16.0
-        }
-    };
-
-    let position = Vec3::new(axis(bytes[0], 1), axis(bytes[1], 2), axis(bytes[2], 4));
+    let position = Vec3::new(
+        half(bytes[0], bytes[1]),
+        half(bytes[2], bytes[3]),
+        half(bytes[4], bytes[5]),
+    );
 
     let normal = match (bytes[11] >> 2) & 0b111 {
         0b000 => Vec3::X,
@@ -1523,6 +1780,27 @@ fn report_bake(pos: IVec3, layers: &[BakedLayer]) {
     );
 }
 
+/// How many tinted faces took their colour from the block's own cache instead of asking the game again.
+///
+/// **One counter per mechanism in the cost of a per-face tint callback**, because they are removed by
+/// different changes and a run should say which one is doing the work: this one is the several faces of one
+/// block sharing one colour, and [`TINTED_FACES_CULLED`] is the cull that now runs before the tint. The
+/// other half of the story is the fall in `wgpu_mc_jni`'s tint count, which is the callbacks that are left.
+///
+/// See `bake_layers` for the cache itself, and `face_is_culled` for the order in `add_face`.
+pub static TINT_MEMO_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many culled faces carried a tint index, and so would have asked for a colour before this was moved.
+pub static TINTED_FACES_CULLED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Takes both counters, for the JVM's once-a-second atlas line. See [`TINT_MEMO_HITS`].
+pub fn take_tint_face_counts() -> (u64, u64) {
+    (
+        TINT_MEMO_HITS.swap(0, std::sync::atomic::Ordering::Relaxed),
+        TINTED_FACES_CULLED.swap(0, std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 /// Whether the renderer's diagnostic log lines are on.
 ///
 /// Set from the JVM side when the settings are applied - see `wgpu_mc_jni::debug` - because the
@@ -1551,8 +1829,26 @@ fn bake_layers<Provider: BlockStateProvider>(
         return layers;
     }
 
+    // **One biome tint per colour a block actually needs**, keyed by the model's own tint index and
+    // cleared per block. Neither half of that is decoration:
+    //
+    //  * *per block*, because the question is a property of the **position** - the game's answer for grass
+    //    is the biome at that block, and a section on a biome boundary holds two colours - so a cache that
+    //    outlived the block would have to be keyed by position as well, and one that lived shorter would
+    //    miss the repeat it exists for;
+    //  * *per tint index*, because the same block asks for the same index from several faces: a grass block
+    //    is one `up` face plus four side overlays, all `tintindex: 0`, and leaves are six faces of it. The
+    //    answer cannot change between them, and each one used to be a JNI callback into the JVM's
+    //    `BlockColors` - a `BlockPos`, a palette decode and a biome lookup, per face.
+    //
+    // `clear` rather than a fresh map: the allocation is kept, and a block with no tinted face never inserts
+    // at all, which is most of the world.
+    let mut tints: HashMap<i32, u32> = HashMap::new();
+
     for block_index in 0..16 * 16 * 16 {
         let pos = ivec3(block_index & 15, block_index >> 8, (block_index & 255) >> 4);
+
+        tints.clear();
 
         let fpos = vec3(pos.x as f32, pos.y as f32, pos.z as f32);
 
@@ -1588,7 +1884,11 @@ fn bake_layers<Provider: BlockStateProvider>(
         let mut faces_drawn = 0u32;
         let mut faces_culled = 0u32;
 
-        if let Some(model_mesh) = get_block(block_manager, block_state) {
+        // The variant the game picked for *this* position, which is what decides the mesh when the
+        // state's variant is a list. See [`BlockStateProvider::get_model_variant`].
+        let variant = state_provider.get_model_variant(pos);
+
+        if let Some(model_mesh) = get_block(block_manager, block_state, variant) {
             // **`ModelBlockRenderer#forceOpaque`, on this side of the fence.** The game sends a leaf
             // block's faces to the *solid* layer when the player has leaves cut out turned off
             // (`GraphicsPreset`'s `Fast`, `Options#cutoutLeaves`), whatever the leaf sprite says - and the
@@ -1655,81 +1955,88 @@ fn bake_layers<Provider: BlockStateProvider>(
                         .map(|vert_index| {
                             let model_vertex = face.vertices[vert_index as usize];
 
-                            let (occluders, light_level) = if model_mesh.any.is_empty() {
-                                let vertex_biases = ivec3(
-                                    if model_vertex.position.x as i32 == 0 {
-                                        -1
-                                    } else {
-                                        1
-                                    },
-                                    if model_vertex.position.y as i32 == 0 {
-                                        -1
-                                    } else {
-                                        1
-                                    },
-                                    if model_vertex.position.z as i32 == 0 {
-                                        -1
-                                    } else {
-                                        1
-                                    },
-                                );
+                            let (occluders, light_level) =
+                                if crate::mc::block::uses_ambient_occlusion(
+                                    model_mesh.ambient_occlusion,
+                                    model_mesh.any.is_empty(),
+                                ) {
+                                    let vertex_biases = ivec3(
+                                        if model_vertex.position.x as i32 == 0 {
+                                            -1
+                                        } else {
+                                            1
+                                        },
+                                        if model_vertex.position.y as i32 == 0 {
+                                            -1
+                                        } else {
+                                            1
+                                        },
+                                        if model_vertex.position.z as i32 == 0 {
+                                            -1
+                                        } else {
+                                            1
+                                        },
+                                    );
 
-                                let axis = dir_vec - vertex_biases; //equivalent to -(vertex_biases - dir_vec)
+                                    let axis = dir_vec - vertex_biases; //equivalent to -(vertex_biases - dir_vec)
 
-                                let mut axes: ArrayVec<IVec3, 2> = ArrayVec::new_const();
+                                    let mut axes: ArrayVec<IVec3, 2> = ArrayVec::new_const();
 
-                                if axis.x != 0 {
-                                    axes.push(ivec3(axis.x, 0, 0));
-                                }
+                                    if axis.x != 0 {
+                                        axes.push(ivec3(axis.x, 0, 0));
+                                    }
 
-                                if axis.y != 0 {
-                                    axes.push(ivec3(0, axis.y, 0));
-                                }
+                                    if axis.y != 0 {
+                                        axes.push(ivec3(0, axis.y, 0));
+                                    }
 
-                                if axis.z != 0 {
-                                    axes.push(ivec3(0, 0, axis.z));
-                                }
+                                    if axis.z != 0 {
+                                        axes.push(ivec3(0, 0, axis.z));
+                                    }
 
-                                let p1 = vertex_biases + pos;
-                                let p2 = p1 + axes[0];
-                                let p3 = p1 + axes[1];
+                                    let p1 = vertex_biases + pos;
+                                    let p2 = p1 + axes[0];
+                                    let p3 = p1 + axes[1];
 
-                                // The four blocks Minecraft averages for this corner
-                                // (`BlockModelLighter#prepareQuadAmbientOcclusion`): the neighbour
-                                // across the face at the corner, the two blocks beside it, and the
-                                // block the face looks at - `shade0`, `shade1`, the two corner
-                                // samples and `shadeCenter`, one `getShadeBrightness` each.
-                                //
-                                // The count is what the vertex carries, not a brightness: the
-                                // brightness is `1 - 0.2 * count`, which is the same average, and
-                                // counting it here keeps the curve in one place - the shader -
-                                // where a wrong number is one line rather than a re-bake.
-                                let b1 = shades_corners(block_manager, state_provider.get_state(p1))
-                                    as u8;
-                                let b2 = shades_corners(block_manager, state_provider.get_state(p2))
-                                    as u8;
-                                let b3 = shades_corners(block_manager, state_provider.get_state(p3))
-                                    as u8;
-                                let b4 = shades_corners(
-                                    block_manager,
-                                    state_provider.get_state(pos + dir_vec),
-                                ) as u8;
+                                    // The four blocks Minecraft averages for this corner
+                                    // (`BlockModelLighter#prepareQuadAmbientOcclusion`): the neighbour
+                                    // across the face at the corner, the two blocks beside it, and the
+                                    // block the face looks at - `shade0`, `shade1`, the two corner
+                                    // samples and `shadeCenter`, one `getShadeBrightness` each.
+                                    //
+                                    // The count is what the vertex carries, not a brightness: the
+                                    // brightness is `1 - 0.2 * count`, which is the same average, and
+                                    // counting it here keeps the curve in one place - the shader -
+                                    // where a wrong number is one line rather than a re-bake.
+                                    let b1 =
+                                        shades_corners(block_manager, state_provider.get_state(p1))
+                                            as u8;
+                                    let b2 =
+                                        shades_corners(block_manager, state_provider.get_state(p2))
+                                            as u8;
+                                    let b3 =
+                                        shades_corners(block_manager, state_provider.get_state(p3))
+                                            as u8;
+                                    let b4 = shades_corners(
+                                        block_manager,
+                                        state_provider.get_state(pos + dir_vec),
+                                    ) as u8;
 
-                                let l1 = state_provider.get_light_level(p1);
-                                let l2 = state_provider.get_light_level(p2);
-                                let l3 = state_provider.get_light_level(p3);
-                                let l4 = state_provider.get_light_level(pos + dir_vec);
+                                    let l1 = state_provider.get_light_level(p1);
+                                    let l2 = state_provider.get_light_level(p2);
+                                    let l3 = state_provider.get_light_level(p3);
+                                    let l4 = state_provider.get_light_level(pos + dir_vec);
 
-                                // The game's smooth lighting, per vertex: the three cells around the corner
-                                // and the cell in front of the face, with the game's rule for the zeroes
-                                // between them. See [`smooth_blend`] - this was a plain average of the four,
-                                // which is what made a corner read darker than the game's.
-                                let light_level = smooth_blend([l1, l2, l3], l4);
+                                    // The game's smooth lighting, per vertex: the three cells around the corner
+                                    // and the cell in front of the face, with the game's rule for the zeroes
+                                    // between them. See [`smooth_blend`] - this was a plain average of the four,
+                                    // which is what made a corner read darker than the game's.
+                                    let light_level = smooth_blend([l1, l2, l3], l4);
 
-                                (b1 + b2 + b3 + b4, light_level)
-                            } else {
-                                (0, state_provider.get_light_level(pos))
-                            };
+                                    (b1 + b2 + b3 + b4, light_level)
+                                } else {
+                                    (0, state_provider.get_light_level(pos))
+                                };
 
                             Vertex {
                                 position: [
@@ -1761,25 +2068,51 @@ fn bake_layers<Provider: BlockStateProvider>(
                 );
             };
 
-            let mut add_face = |face: &BlockModelFace, dir: Direction| {
-                let color = if face.tint_index != -1 {
-                    state_provider.get_block_color(pos + section_offset, face.tint_index)
-                } else {
-                    0xffffffff
-                };
+            // The colour this block's faces are tinted by, asked of the game once per tint index.
+            //
+            // See the note on `tints` at the top of the section loop for why the scope is a block and what
+            // the callback costs. `-1` is the model's own "no tint" and never leaves this side.
+            let mut tint_of = |index: i32| -> u32 {
+                if index == -1 {
+                    return 0xffff_ffff;
+                }
 
-                // Culling is the *model's* decision before it is the neighbour's - see
-                // `face_is_culled`, which is where the declared `cullface` is read.
+                if let Some(color) = tints.get(&index) {
+                    TINT_MEMO_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+                    return *color;
+                }
+
+                let color = state_provider.get_block_color(pos + section_offset, index);
+                tints.insert(index, color);
+
+                color
+            };
+
+            let mut add_face = |face: &BlockModelFace, dir: Direction| {
+                // **Culled first, because a cull is free and a tint is a callback.** The order here used to
+                // be the other way round - the colour was asked for at the top of this closure and the face
+                // was then found to be culled - so every hidden face in a section paid for a colour nobody
+                // would ever see. The two questions are independent: `face_is_culled` reads the model's own
+                // `cullface` and the neighbour's state, and a colour cannot change either.
                 if face_is_culled(face, block_manager, block_state, state_provider, pos) {
                     faces_culled += 1;
+
+                    if face.tint_index != -1 {
+                        TINTED_FACES_CULLED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+
                     return;
                 }
 
                 faces_drawn += 1;
 
+                let color = tint_of(face.tint_index);
+
                 // The light comes from the plane the face is *on*, which is what the bucket direction
                 // is for; it is not a culling question.
                 let light_level: LightLevel = state_provider.get_light_level(pos + dir.to_vec());
+
                 add_quad(face, light_level, dir, color);
             };
 
@@ -1804,11 +2137,7 @@ fn bake_layers<Provider: BlockStateProvider>(
             model_mesh.any.iter().for_each(|face| {
                 let light_level: LightLevel = state_provider.get_light_level(pos);
 
-                let color = if face.tint_index != -1 {
-                    state_provider.get_block_color(pos + section_offset, face.tint_index)
-                } else {
-                    0xffffffff
-                };
+                let color = tint_of(face.tint_index);
 
                 add_quad(face, light_level, Direction::Up, color);
             });
@@ -1892,17 +2221,26 @@ fn sort_translucent_quads(layer: &mut BakedLayer) {
 
     let quads = layer.vertices.len() / quad_bytes;
 
-    // The centroid of a quad, in the sixteenths a packed vertex stores its position in.
+    // The centroid of a quad, in the packed units the vertex writes its position in: **sixteen bits an
+    // axis at 1/2048 of a block**, x and y in the halves of the first word and z in the low half of the
+    // second. See `Vertex::compressed`. The scale is not applied because this is only ever compared with
+    // itself - the order of two quads is the same in steps as in blocks - and the integers stay exact.
     let centroid = |quad: usize| -> (i32, i32, i32) {
         let first = quad * quad_bytes;
         // The third vertex is two vertices further on, which is the pair the game averages.
         let third = first + VERTEX_LENGTH * 2;
 
-        let axis = |at: usize, channel: usize| -> i32 {
-            (layer.vertices[at + channel] as i32 + layer.vertices[third + channel] as i32) / 2
+        // `low` is the byte the axis starts at, and each one is the low half of a little-endian word.
+        let axis = |low: usize| -> i32 {
+            let at = |base: usize| {
+                u16::from_le_bytes([layer.vertices[base + low], layer.vertices[base + low + 1]])
+                    as i32
+            };
+
+            (at(first) + at(third)) / 2
         };
 
-        (axis(first, 0), axis(first, 1), axis(first, 2))
+        (axis(0), axis(2), axis(4))
     };
 
     let mut order: Vec<usize> = (0..quads).collect();
@@ -3105,21 +3443,15 @@ mod fluid_geometry_tests {
 
     /// One vertex of a baked layer, as the position inside the section, in blocks.
     ///
-    /// The format holds a byte an axis **in sixteenths of a block** - `Vertex::axis_to_sixteenths`, and
-    /// the shader's `f32(v1 & 0xffu) * 0.0625` on the other side of it - plus one flag bit that means
-    /// "sixteen blocks", which is what the byte cannot say.
+    /// The format holds **sixteen bits an axis at 1/2048 of a block** - `Vertex::axis_to_2048ths`, and the
+    /// shader's `f32(v1 & 0xffffu) * 0.00048828125` on the other side of it. A flag bit an axis used to say
+    /// "sixteen blocks", because a byte could not; see `Vertex::compressed` for what that byte became.
     fn position(vertex: &[u8]) -> [f32; 3] {
-        let flags = vertex[11] >> 5;
+        let half = |low: usize, high: usize| {
+            u16::from_le_bytes([vertex[low], vertex[high]]) as f32 / 2048.0
+        };
 
-        [0, 1, 2].map(|axis| {
-            let sixteenths = if flags & (1 << axis) != 0 {
-                256.0
-            } else {
-                vertex[axis] as f32
-            };
-
-            sixteenths / 16.0
-        })
+        [half(0, 1), half(2, 3), half(4, 5)]
     }
 
     /// Every quad of a layer, as its four corners in blocks.
@@ -5068,6 +5400,7 @@ mod face_culling_tests {
                     down: vec![],
                     any: vec![],
                     cull: *cull,
+                    ambient_occlusion: None,
                 })],
             );
 
@@ -5467,6 +5800,208 @@ mod arena_tests {
 
         assert!(storage.refused().is_empty());
         assert_eq!(storage.len(), 0, "and the arena is empty as well");
+    }
+
+    /// **A refused section's geometry is kept rather than thrown away**, which is the whole point:
+    /// the recovery becomes "wait for a free slot" instead of "have Minecraft compile the section
+    /// again, send a 27-section payload over JNI and offer the result to a pool that is exactly as
+    /// full as it was".
+    ///
+    /// Drained oldest first, because the section that has been waiting is the one whose ground has
+    /// been stale for longer.
+    #[test]
+    fn a_parked_section_keeps_its_geometry_and_comes_back_oldest_first() {
+        let mut storage = SectionStorage::new(pool_for(1));
+
+        // Room for one section of one quad, and not for a second one.
+        assert!(put(&mut storage, IVec3::new(0, 0, 0), 1));
+
+        let second = IVec3::new(1, 0, 0);
+        let third = IVec3::new(2, 0, 0);
+        let layers = vec![layer(1), layer(2)];
+        let bytes: usize = layers
+            .iter()
+            .map(|held| held.vertices.len() + held.indices.len())
+            .sum();
+
+        assert!(
+            storage.allocate(second, &layers).is_none(),
+            "the pool is full"
+        );
+        assert!(storage.park(second, layers));
+
+        assert_eq!(storage.parked_len(), 1);
+        assert_eq!(storage.parked_bytes(), bytes, "held, not estimated");
+
+        assert!(storage.park(third, vec![layer(1)]));
+
+        let waiting = storage.take_parked();
+
+        assert_eq!(
+            waiting.iter().map(|(pos, _)| *pos).collect::<Vec<_>>(),
+            vec![second, third],
+            "oldest first, so the section that has waited longest is offered the next slot"
+        );
+        assert_eq!(
+            waiting[0].1.len(),
+            2,
+            "and each one comes back with its own geometry rather than a placeholder"
+        );
+        assert_eq!(waiting[0].1[1].indices.len(), layer(2).indices.len());
+        assert_eq!(storage.parked_len(), 0, "taking them forgets them");
+        assert_eq!(storage.parked_bytes(), 0);
+    }
+
+    /// **A parked section is not a refused one**, and the difference is exactly what the JVM is told.
+    ///
+    /// A refused section is one this side will not draw, so Minecraft has to mesh it. A parked one is
+    /// one this side is *still* going to draw, so telling the JVM about it would have the section
+    /// meshed by Minecraft and published here - one section drawn twice.
+    #[test]
+    fn parking_a_section_takes_it_out_of_the_refusals_the_jvm_hears_about() {
+        let mut storage = SectionStorage::new(pool_for(1));
+
+        assert!(put(&mut storage, IVec3::new(0, 0, 0), 1));
+
+        let refused = IVec3::new(1, 0, 0);
+
+        assert!(storage.allocate(refused, &[layer(1)]).is_none());
+        assert_eq!(
+            storage.refusals_waiting(),
+            1,
+            "the refusal is recorded first"
+        );
+
+        assert!(storage.park(refused, vec![layer(1)]));
+
+        assert_eq!(
+            storage.refusals_waiting(),
+            0,
+            "parked is not refused: the JVM goes on counting this section as sent, because it is \
+             still going to be drawn from here"
+        );
+        assert!(
+            storage.refused().is_empty(),
+            "so there is nothing to hand over for it"
+        );
+
+        let counted = sections_parked();
+
+        assert!(storage.park(IVec3::new(2, 0, 0), vec![layer(1)]));
+        assert!(
+            sections_parked() > counted,
+            "and the run counts it, which is the number that says the expensive recovery did not \
+             happen"
+        );
+    }
+
+    /// Waiting does not become the memory. Past [`PARKED_LIMIT`] sections, and on an arena that has
+    /// reached the device's buffer limit, the refusal goes the old way and the JVM is told.
+    #[test]
+    fn parking_gives_up_at_its_limit_and_at_the_device_limit() {
+        let mut storage = SectionStorage::new(pool_for(1));
+
+        assert!(put(&mut storage, IVec3::new(0, 0, 0), 1));
+
+        for index in 0..PARKED_LIMIT {
+            let pos = IVec3::new(index as i32 + 1, 0, 0);
+
+            assert!(storage.park(pos, vec![layer(1)]), "parked {index}");
+        }
+
+        assert_eq!(storage.parked_len(), PARKED_LIMIT);
+
+        let one_too_many = IVec3::new(-1, 0, 0);
+
+        assert!(
+            !storage.park(one_too_many, vec![layer(1)]),
+            "the queue is a bound on memory rather than a hope: geometry for every section the \
+             player flies past is exactly what an exhausted arena must not accumulate"
+        );
+        assert_eq!(storage.parked_len(), PARKED_LIMIT);
+
+        // **A replacement keeps its place**, because the section has been waiting since it was first
+        // parked and its geometry having changed is not a reason to send it to the back.
+        assert!(storage.park(IVec3::new(1, 0, 0), vec![layer(3)]));
+
+        let waiting = storage.take_parked();
+
+        assert_eq!(waiting.len(), PARKED_LIMIT);
+        assert_eq!(
+            waiting[0].0,
+            IVec3::new(1, 0, 0),
+            "the replaced entry is still the oldest"
+        );
+        assert_eq!(waiting[0].1[0].indices.len(), layer(3).indices.len());
+
+        // **An arena at the device's limit has no later slot to wait for**, so nothing waits: the
+        // position has to reach the JVM, where Minecraft's own mesh is the fallback for good.
+        storage.set_at_capacity(true);
+
+        assert!(!storage.park(one_too_many, vec![layer(1)]));
+        assert_eq!(storage.parked_len(), 0);
+    }
+
+    /// The trim lets go of the geometry waiting for a slot, and **reports the position**: the JVM
+    /// still counts a parked section as drawn by this side, so a parked entry dropped in silence is
+    /// the hole this file has three comments about.
+    #[test]
+    fn the_trim_lets_go_of_geometry_waiting_for_a_slot() {
+        let mut storage = SectionStorage::new(pool_for(1));
+
+        storage.set_width(1);
+
+        let near = IVec3::new(0, 0, 0);
+        let far = IVec3::new(40, 0, 40);
+
+        assert!(storage.park(near, vec![layer(1)]));
+        assert!(storage.park(far, vec![layer(1)]));
+
+        assert_eq!(
+            storage.trim(IVec2::new(0, 0)),
+            vec![far],
+            "one report for the parked section the view left behind, which is what makes Minecraft \
+             mesh it"
+        );
+        assert_eq!(storage.parked_len(), 1, "and the near one still waits");
+        assert_eq!(storage.take_parked()[0].0, near);
+    }
+
+    /// A parked position that is **also** in the arena is reported once and not twice: the trim's own
+    /// loop over the storage reports it, and the sweep over the parked queue has to agree.
+    #[test]
+    fn a_parked_section_that_is_also_stored_is_reported_once() {
+        let mut storage = SectionStorage::new(pool_for(4));
+
+        storage.set_width(1);
+
+        let far = IVec3::new(40, 0, 40);
+
+        assert!(put(&mut storage, far, 1));
+        assert!(storage.park(far, vec![layer(1)]));
+
+        assert_eq!(
+            storage.trim(IVec2::new(0, 0)),
+            vec![far],
+            "the section was in the arena, so the arena's loop is the one that reports it"
+        );
+        assert_eq!(storage.parked_len(), 0, "and its geometry went with it");
+    }
+
+    /// Forgetting the arena forgets what was waiting for a slot along with it: it described the world
+    /// that has just been left, and the new world's sections are offered from scratch.
+    #[test]
+    fn clearing_the_arena_clears_what_was_waiting_for_a_slot() {
+        let mut storage = SectionStorage::new(pool_for(1));
+
+        assert!(storage.park(IVec3::new(0, 0, 0), vec![layer(1)]));
+        assert_eq!(storage.parked_len(), 1);
+
+        storage.forget();
+
+        assert_eq!(storage.parked_len(), 0);
+        assert_eq!(storage.parked_bytes(), 0);
+        assert!(storage.take_parked().is_empty());
     }
 
     /// The pool follows the render distance, and the render distance is capped.

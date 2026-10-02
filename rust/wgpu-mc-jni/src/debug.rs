@@ -323,6 +323,8 @@ pub fn apply(settings: &Settings) {
         terrain_no_cull,
         terrain_greater_depth,
         terrain_occlusion,
+        adv_culling,
+        terrain_indirect,
         atlas_base_mip_only,
         atlas_lod_bias,
         game_atlas_blend_mips,
@@ -366,6 +368,25 @@ pub fn apply(settings: &Settings) {
     // The occlusion switch is not one of those: it decides an `if` inside the gather, so it takes
     // effect on the next frame and nothing has to be rebuilt for it.
     wgpu_mc::render::graph::set_terrain_occlusion(terrain_occlusion);
+
+    // The occlusion walk's budget is the same kind of switch, one step further: it decides *which list*
+    // that `if` tests against, so it too takes effect on the next frame with nothing rebuilt.
+    wgpu_mc::render::graph::set_adv_culling(adv_culling);
+    // **Whether the terrain pass batches its draws, as far as the setting is concerned.**
+    //
+    // Where the setting and the device are *combined* is not here, and the reason is a measured one:
+    // this runs from the mod constructor, before there is a device, so a check made here reads a
+    // capability no adapter has answered for yet and answers "no" on every launch. The first run of the
+    // batched path did exactly that - `indirect draws: execution yes, real batched multi-draw yes,
+    // non-zero first instance yes` on one line and `the terrain pass is drawing one section at a time`
+    // on the next. The device half is recorded beside the caps that answer it
+    // (`device::try_create_renderer`) and the two are one answer in
+    // `wgpu_mc::render::graph::terrain_batches_draws`.
+    //
+    // Nothing is printed here either, for a second reason: `setPanicHook` has not installed
+    // `env_logger` yet, so a line written here is dropped. `device::report_device_capabilities` writes
+    // the answer once a world.
+    wgpu_mc::render::graph::set_terrain_indirect(terrain_indirect);
 
     // The atlas mip clamp *is* built into the samplers, which are created with the graph - so moving it
     // invalidates the same thing `terrain_no_cull` does, and for the same reason.
@@ -480,18 +501,34 @@ static PREVIOUS_WINDOW_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::At
 /// passes would draw half of that frame one way and half the other. Nothing happens on the frames
 /// where the switches have not moved, which is all of them but the one after an Apply.
 pub fn rebuild_pipelines_if_stale(wm: &wgpu_mc::WmRenderer) {
-    if !PIPELINES_STALE.swap(false, Ordering::Relaxed) {
+    // **The atlas mode is a second reason to rebuild, and it is not a switch.** `terrain.wgsl` has a
+    // fragment entry point that samples one atlas and one that picks between two, and the graph picks
+    // between them from what the bake actually did. A face that falls back to this side's copy moves that
+    // answer, and the graph has to be built again with the two-atlas shader before the face can be drawn.
+    //
+    // That it is safe to do this *here* rather than where the flag is set is the arena's own ordering, and
+    // it is worth writing down: the faces are fed into the arena at the blit, which is after the frame's
+    // terrain passes have been recorded, so a face baked during frame N is first drawn in frame N+1 - and
+    // this runs at frame N's present, in that gap. See `block::note_our_atlas_face`.
+    let atlas_moved = wgpu_mc::mc::block::take_atlas_mode_moved();
+
+    if !PIPELINES_STALE.swap(false, Ordering::Relaxed) && !atlas_moved {
         return;
     }
 
     log::info!(
-        "wgpu-mc: rebuilding the render graph (no-cull {}, greater depth {}, game block atlas {})",
+        "wgpu-mc: rebuilding the render graph (no-cull {}, greater depth {}, game block atlas {}{})",
         terrain_no_cull(),
         terrain_greater_depth(),
         if wgpu_mc::render::graph::game_atlas_bound() {
             "bound"
         } else {
             "not bound yet"
+        },
+        if atlas_moved {
+            ", atlas mode moved"
+        } else {
+            ""
         }
     );
 

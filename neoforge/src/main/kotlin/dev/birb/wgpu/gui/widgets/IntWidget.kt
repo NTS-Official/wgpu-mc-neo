@@ -14,7 +14,20 @@ class IntWidget(x: Int, y: Int, width: Int, private val option: IntOption) :
 
     override fun getOption(): Option<*> = option
 
+    /**
+     * Whether this row can be used right now, read afresh each time.
+     *
+     * Delegated to the option because the answer belongs to the setting rather than to the widget: see
+     * `IntOption.enabledWhen`, which is where the case it exists for is written down (`maxAnisotropy` is
+     * only meaningful while `textureFiltering` is `ANISOTROPIC`).
+     */
+    private fun enabled(): Boolean = option.isEnabled()
+
     override fun mouseClicked(mouseX: Double, mouseY: Double, button: Int): Boolean {
+        // A disabled row refuses the click rather than taking it and doing nothing, which is what vanilla
+        // does and what keeps the drag state from being entered on a slider that will not move.
+        if (!enabled()) return false
+
         if (isMouseOver(mouseX, mouseY)) {
             dragging = true
             calculateValue(mouseX.toInt())
@@ -66,24 +79,34 @@ class IntWidget(x: Int, y: Int, width: Int, private val option: IntOption) :
     }
 
     override fun render(renderer: WidgetRenderer, mouseX: Int, mouseY: Int, delta: Float) {
-        val hovered = isMouseOver(mouseX, mouseY) || dragging
+        // **A row another row decides does not hover.** The hover state is what draws the track and the
+        // handle, and drawing a slider a player cannot drag is the control inviting a click it will
+        // refuse - so the row keeps its background, drops the hover, and greys its text. See
+        // `Widget.DISABLED` for what it does *not* do: leave the row out. A setting that vanished when
+        // another row moved would be a setting a player cannot read the value of.
+        val usable = enabled()
+        val hovered = usable && (isMouseOver(mouseX, mouseY) || dragging)
 
         // Background
         renderer.rect(x, y, x + width, y + height, if (hovered) Widget.BG_HOVERED else Widget.BG)
+
+        val textColor = if (usable) Widget.WHITE else Widget.DISABLED
 
         val halfWidth = width / 2
 
         // Name
         if (hovered && renderer.textWidth(option.displayName()) > width / 3) {
             val trimmed = FormattedText.composite(renderer.trimText(option.displayName(), width / 3), Component.literal("..."))
-            renderer.text(Language.getInstance().getVisualOrder(trimmed), x + 6, centerTextY(renderer), Widget.WHITE)
+            renderer.text(Language.getInstance().getVisualOrder(trimmed), x + 6, centerTextY(renderer), textColor)
         } else {
-            renderer.text(option.displayName(), x + 6, centerTextY(renderer), Widget.WHITE)
+            renderer.text(option.displayName(), x + 6, centerTextY(renderer), textColor)
         }
 
-        // Value
+        // Value, through the option's own formatter - which for a disabled row is what says what the
+        // setting *is* rather than what it would do: `maxAnisotropy`'s own formatter reads `4x` whether or
+        // not the answer above it makes that value reach the sampler.
         val valueText = if (hovered) Component.literal(option.get().toString()) else option.formatter.apply(option.get())
-        renderer.text(valueText, alignRight(renderer.textWidth(valueText), if (hovered) halfWidth else width), centerTextY(renderer), Widget.WHITE)
+        renderer.text(valueText, alignRight(renderer.textWidth(valueText), if (hovered) halfWidth else width), centerTextY(renderer), textColor)
 
         if (hovered) {
             // Track

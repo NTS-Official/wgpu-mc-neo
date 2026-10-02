@@ -37,6 +37,38 @@ use crate::pia::PackedIntegerArray;
 /// than read as if it were this one.
 pub const PAYLOAD_MAGIC: u32 = 0x574D_5332; // "WMS2": the payload carries a fluid byte per palette entry
 
+/// The word pair that ends a payload which carries visibility answers: the magic, then the world.
+///
+/// A trailer rather than a record, and found from the **end** rather than from an offset in the
+/// header, because the blobs in front of it are variable length - a fixed offset would have to be
+/// reserved out of the blob area for it, and the end is where a trailer belongs anyway. A payload
+/// without one is not an error: it is what a writer that does not send one produces.
+pub const VISIBILITY_MAGIC: u32 = 0x574D_5356; // "WMSV"
+
+/// The bit that marks a slot as answered, above the 36 the pairs themselves use.
+///
+/// Without it "nothing is visible from this section" and "this payload said nothing about this
+/// section" are the same 36 zero bits - and they are opposite instructions: the first is a section
+/// you cannot see out of, the second is one nobody has judged yet. A section treated as the first
+/// when it is the second is a hole in the world.
+pub const VISIBILITY_PRESENT: u64 = 1 << 63;
+
+/// The 36 bits of the pairs: `from * 6 + to`, which is `VisibilitySet`'s own indexing.
+pub const VISIBILITY_BITS: u64 = (1 << 36) - 1;
+
+/// Words per slot in the trailer: the low half of the pair, then the high half.
+const VISIBILITY_WORDS_PER_SECTION: usize = 2;
+
+/// The whole trailer in words: the pairs, then the magic and the world.
+const VISIBILITY_TRAILER_WORDS: usize = SECTIONS * VISIBILITY_WORDS_PER_SECTION + 2;
+
+/// Whether the "a trailer arrived" line has been printed, so that it is printed once per run.
+///
+/// The counter is not in a diagnostic report, because there is nothing to report: nothing draws from
+/// these answers yet, so the only thing a number could say is whether the two sides agree about the
+/// trailer - and one line says that, while a count once a second would not say it any better.
+static VISIBILITY_SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// How many sections one call describes: the 3x3x3 around the one being rebuilt.
 pub const SECTIONS: usize = 27;
 
@@ -102,6 +134,26 @@ pub struct SectionBlocks {
     pub fluids: Box<[u8]>,
 }
 
+/// How many bytes one section's model variants are: one per position, in the same storage order as the
+/// palette - `x | z << 4 | y << 8`, Minecraft's own.
+///
+/// **The game picks that variant, and it is not a property of the state.** A blockstate whose variant
+/// is a *list* - the lily pad's four quarter turns, the weights of a grass tuft - is chosen per
+/// position by `ModelBlockRenderer#tesselateBlock`: `random.setSeed(blockState.getSeed(pos))` and then
+/// `WeightedVariants#collectParts` -> `WeightedList#getRandomOrThrow`. The choice is a pure function of
+/// the state and the position, so the JVM computes it with the game's own `WeightedList` and its own
+/// `RandomSource` while it assembles the payload, and this side only reads the answer - which is why
+/// there is no random number generator here and no weights: the index already accounts for both.
+pub const VARIANTS_BYTES: usize = 4096;
+
+/// The header word the variant blob's offset is written in. Zero - no blob - is every payload the JVM
+/// writes for a section whose models are not lists, and it is what keeps this channel free.
+///
+/// Words 6 and 7 of the header were unused, which is why this costs no record space: the block record
+/// is full (all sixteen words have a meaning), and a second record shape for one byte per position
+/// would be a layout change to every payload rather than a field in one of them.
+pub const VARIANT_OFFSET_WORD: usize = 6;
+
 /// The fluid a palette entry's byte describes: kind, `amount`, falling.
 ///
 /// The kind is 0 for "no fluid", 1 water, 2 lava, 3 anything else - a mod's fluid is a fluid this
@@ -163,6 +215,16 @@ pub struct WorldSections {
     /// The light of the same sections, kept separately because it changes on its own schedule: the
     /// JVM sends a section's blocks every time they change but its light only when the light does.
     light: HashMap<IVec3, Arc<SectionLight>>,
+    /// Which model variant each position of a section uses, kept **separately from its blocks** for
+    /// the same reason the light is.
+    ///
+    /// The JVM sends a section's blocks when they change and its variants on *every* payload about it,
+    /// because a section is usually sent long before it is baked - as a neighbour of whatever was being
+    /// built next to it - and by the time its own turn comes its blocks compare equal and no record is
+    /// written. Hanging the variants off the block record, which is what this did first, therefore lost
+    /// them for every section that was not first sent as its own target: measured, 92% of the lily pads
+    /// drawn still at variant 0 while the JVM's own picks were a flat 149/136/158/130 across the four.
+    variants: HashMap<IVec3, Arc<[u8]>>,
     /// Bumped every time a section is stored, so trimming can tell what has been in use.
     tick: u64,
     last_trim: u64,
@@ -210,6 +272,18 @@ impl WorldSections {
 
     pub fn light(&self, pos: IVec3) -> Option<Arc<SectionLight>> {
         self.light.get(&pos).cloned()
+    }
+
+    /// Stores one section's model variants, replacing whatever was there. See [`WorldSections::variants`].
+    pub fn set_variants(&mut self, pos: IVec3, variants: Arc<[u8]>) {
+        self.variants.insert(pos, variants);
+        self.tick += 1;
+    }
+
+    /// The variants of one section, which only the section being rebuilt ever has: the JVM sends them
+    /// for the middle of the 27 and for no other slot.
+    pub fn variants(&self, pos: IVec3) -> Option<Arc<[u8]>> {
+        self.variants.get(&pos).cloned()
     }
 
     /// Whether every section the JVM counts as sent is actually here.
@@ -262,16 +336,22 @@ impl WorldSections {
 
         self.blocks.retain(|pos, _| !far(pos));
         self.light.retain(|pos, _| !far(pos));
+        // The variants are trimmed with them: a section the JVM re-sends carries its variants again on
+        // every payload about it, so dropping one costs a re-bake rather than a wrong angle.
+        self.variants.retain(|pos, _| !far(pos));
     }
 
     pub fn len(&self) -> usize {
-        self.blocks.len().max(self.light.len())
+        self.blocks
+            .len()
+            .max(self.light.len())
+            .max(self.variants.len())
     }
 
     /// Read by the trim's own test rather than by the trim, which walks the maps it keeps directly.
     #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
-        self.blocks.is_empty() && self.light.is_empty()
+        self.blocks.is_empty() && self.light.is_empty() && self.variants.is_empty()
     }
 
     /// Drops every section, for a world this side is no longer describing.
@@ -281,6 +361,7 @@ impl WorldSections {
     pub fn clear(&mut self) {
         self.blocks.clear();
         self.light.clear();
+        self.variants.clear();
     }
 }
 
@@ -356,6 +437,22 @@ pub struct Payload {
     pub light_absent: u32,
     /// Which slots the JVM believes this side already has light for.
     pub known_light: u32,
+    /// What each slot's occlusion graph resolved to, where the payload answered for it: which faces of
+    /// the section you can see which other faces from, as `from * 6 + to` over DOWN, UP, NORTH,
+    /// SOUTH, WEST, EAST - `VisibilitySet`'s own pair indexing, so nothing has to agree about a
+    /// second one.
+    ///
+    /// `None` is "not answered", which is every slot of a payload that carries no trailer. Nothing
+    /// reads these yet: they are carried to the world cache and stored there, and the walk that will
+    /// read them (`wgpu-mc`'s `render::section_graph`) is written and tested but not wired to this.
+    pub visibility: [Option<u64>; SECTIONS],
+    /// The target section's model variants, if this payload carries them. See [`VARIANTS_BYTES`] for
+    /// what they are and [`WorldSections::variants`] for where they go.
+    ///
+    /// One blob per *payload* rather than one per record, because exactly one of the 27 slots is the
+    /// section being rebuilt ([`CENTER`]) and it is the only one whose mesh is built here: a
+    /// neighbour's variants would be bytes nobody reads.
+    pub variants: Option<Box<[u8]>>,
 }
 
 impl Payload {
@@ -462,6 +559,26 @@ impl Payload {
             payload.present |= 1 << index;
         }
 
+        // The target's model variants, which ride in one header word and one blob and go into the world
+        // **beside** its blocks rather than inside them: the payload that carries them usually carries
+        // no block record for the target at all. See [`WorldSections::variants`].
+        let variant_offset = read_word(bytes, VARIANT_OFFSET_WORD) as usize;
+
+        if variant_offset != 0 {
+            match bytes.get(variant_offset..variant_offset.saturating_add(VARIANTS_BYTES)) {
+                Some(blob) if blob.len() == VARIANTS_BYTES => {
+                    payload.variants = Some(blob.into());
+                }
+                _ => {
+                    log::warn!(
+                        "wgpu-mc: a payload names its model-variant blob at {variant_offset}, which is \
+                         not {VARIANTS_BYTES} bytes inside it; the section's models are drawn at their \
+                         first variant"
+                    );
+                }
+            }
+        }
+
         // The light records start after the *whole* block region, not after the block records that
         // are actually in this payload: the writer packs them from a fixed offset so that a payload
         // carrying fewer than 27 block records - which is every payload that is a diff - still has
@@ -511,7 +628,61 @@ impl Payload {
             ));
         }
 
+        payload.read_visibility(bytes, generation);
+
         Some(payload)
+    }
+
+    /// Reads the visibility trailer, if this payload has one.
+    ///
+    /// The last two words are the magic and the world; the 54 before them are 27 pairs. A trailer
+    /// stamped with another world is dropped whole rather than per slot, because the coordinates it
+    /// describes are not the ones the coordinates it names are about to be - the same reason a record
+    /// from another world is refused, and the same stamp decides it.
+    fn read_visibility(&mut self, bytes: &[u8], generation: u32) {
+        // A payload length is a whole number of words by construction; anything else is a payload that
+        // was not written by this writer, and reading a trailer out of the middle of a byte is worse
+        // than reading none.
+        if !bytes.len().is_multiple_of(4) {
+            return;
+        }
+
+        let words = bytes.len() / 4;
+        if words < VISIBILITY_TRAILER_WORDS {
+            return;
+        }
+
+        let magic_at = words - 2;
+
+        if read_word(bytes, magic_at) != VISIBILITY_MAGIC
+            || read_word(bytes, magic_at + 1) != generation
+        {
+            return;
+        }
+
+        let entries = magic_at - SECTIONS * VISIBILITY_WORDS_PER_SECTION;
+
+        let mut answered = 0;
+
+        for (index, slot) in self.visibility.iter_mut().enumerate() {
+            let low = read_word(bytes, entries + index * VISIBILITY_WORDS_PER_SECTION) as u64;
+            let high = read_word(bytes, entries + index * VISIBILITY_WORDS_PER_SECTION + 1) as u64;
+            let pair = low | (high << 32);
+
+            if pair & VISIBILITY_PRESENT != 0 {
+                *slot = Some(pair & VISIBILITY_BITS);
+                answered += 1;
+            }
+        }
+
+        // Once per run: this is the one thing that says the JVM's occlusion answers crossed, and it is
+        // the absence of this line that says they did not.
+        if answered > 0 && !VISIBILITY_SEEN.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            log::info!(
+                "wgpu-mc: the first section payload carrying visibility answers arrived: {answered} \
+                 of {SECTIONS} sections answered"
+            );
+        }
     }
 
     /// Applies this payload to the world cache, and answers which of the 27 slots it refused.
@@ -537,9 +708,26 @@ impl Payload {
             world.set_light(target + neighbour_offset(*index), light.clone());
         }
 
+        // **The variants go in beside the blocks, not with them**, and the target is the only section
+        // they are ever sent for. See [`WorldSections::variants`] for why they cannot ride on the
+        // block record: the payload that carries them usually carries no record for the target at all.
+        if let Some(variants) = self.variants.take() {
+            world.set_variants(target + neighbour_offset(CENTER), variants.into());
+        }
+
         for index in 0..SECTIONS {
             if self.light_absent & (1 << index) != 0 {
                 world.remove_light(target + neighbour_offset(index));
+            }
+        }
+
+        // Only the slots the payload actually answered for, which is what keeps a section's visibility
+        // from being replaced by the silence of a payload that carried no trailer. The answers are kept
+        // on the render side rather than here, because the walk that reads them lives there - beside
+        // the frustum and the game's own visible list - and this loop is their only writer.
+        for (index, pair) in self.visibility.iter().enumerate() {
+            if let Some(pair) = *pair {
+                wgpu_mc::mc::visibility::set(target + neighbour_offset(index), pair);
             }
         }
 
@@ -577,6 +765,9 @@ fn read_long(bytes: &[u8], index: usize) -> i64 {
 pub struct CachedBlockstateProvider {
     pub blocks: [Option<Arc<SectionBlocks>>; SECTIONS],
     pub light: [Option<Arc<SectionLight>>; SECTIONS],
+    /// The target section's model variants, or `None` for a section that has no list-variant block in
+    /// it. See [`VARIANTS_BYTES`].
+    pub variants: Option<Arc<[u8]>>,
     pub air: BlockstateKey,
 }
 
@@ -639,6 +830,27 @@ impl BlockStateProvider for CachedBlockstateProvider {
         }
 
         self.blocks[Self::slot(rel_pos * 16)].is_none()
+    }
+
+    /// Which model variant the position's block uses, from the blob the payload carried for the
+    /// section being rebuilt. See [`SectionBlocks::variants`].
+    ///
+    /// **The middle slot is the only one asked**, and this is why the blob is stored there alone: the
+    /// bake places meshes for the section it was queued for, and a neighbour's variant would be an
+    /// answer nobody reads. A section with no blob - every section whose models are single entries -
+    /// answers `0`, which is the first variant and what this side drew before the blob existed.
+    fn get_model_variant(&self, pos: IVec3) -> u8 {
+        let Some(variants) = &self.variants else {
+            return 0;
+        };
+
+        // Minecraft's own storage order, the same one the palette is indexed by and the same one the
+        // JVM writes the blob in. A position outside the section would be a *neighbour's* block, whose
+        // variant is the caller's mistake rather than this one's - the index masks, so it answers
+        // something in range rather than panicking on the bake thread.
+        let index = ((pos.y & 15) << 8 | (pos.z & 15) << 4 | (pos.x & 15)) as usize;
+
+        variants.get(index).copied().unwrap_or(0)
     }
 
     fn get_block_color(&self, _pos: IVec3, _tint_index: i32) -> u32 {
@@ -723,11 +935,11 @@ mod tests {
 
     /// The world the fixture's records are written for. A test that wants a stale record writes
     /// another number into it.
-    const TEST_GENERATION: u32 = 3;
+    pub(super) const TEST_GENERATION: u32 = 3;
 
     /// One section's worth of what the JVM writes, so the reader is tested against a writer rather
     /// than against itself.
-    struct BlockFixture<'a> {
+    pub(super) struct BlockFixture<'a> {
         index: usize,
         bits: u32,
         values_per_long: u32,
@@ -737,7 +949,10 @@ mod tests {
         fluids: &'a [u8],
     }
 
-    fn payload(blocks: &[BlockFixture<'_>], light: &[(usize, Vec<u8>, Vec<u8>)]) -> Vec<u8> {
+    pub(super) fn payload(
+        blocks: &[BlockFixture<'_>],
+        light: &[(usize, Vec<u8>, Vec<u8>)],
+    ) -> Vec<u8> {
         // Every record is stamped with the world the fixture describes; a test that wants a stale one
         // patches the word afterwards, which is also the shape of the race it stands for.
         let generation = TEST_GENERATION;
@@ -821,7 +1036,11 @@ mod tests {
     /// Sixteen four-bit values in one long, with the divide constants zeroed - which is the identity
     /// for the first sixteen positions and so is enough to exercise the decode, the palette
     /// translation and the reader together.
-    fn nibbles<'a>(longs: &'a [i64], palette: &'a [u32], fluids: &'a [u8]) -> BlockFixture<'a> {
+    pub(super) fn nibbles<'a>(
+        longs: &'a [i64],
+        palette: &'a [u32],
+        fluids: &'a [u8],
+    ) -> BlockFixture<'a> {
         BlockFixture {
             index: 13,
             bits: 4,
@@ -918,6 +1137,62 @@ mod tests {
         assert_eq!(parsed.light.len(), 1);
         assert_eq!(parsed.light[0].0, 0);
         assert_eq!(parsed.light[0].1.block[0], 0x3f);
+    }
+
+    #[test]
+    fn a_visibility_trailer_is_read_from_the_end_and_stored() {
+        // A payload with no records at all - both counts are zero - so the header and the trailer are
+        // the whole of it. That is what makes this a test of the trailer rather than of a reader that
+        // happens to walk past one.
+        let mut bytes = Vec::new();
+
+        for word in [PAYLOAD_MAGIC, 0, 0, 0, 0, 0, 0, 0] {
+            bytes.extend_from_slice(&word.to_le_bytes());
+        }
+
+        // The section being rebuilt - slot 13, whose offset is (0, 0, 0) - answered for, with one pair
+        // set: DOWN sees UP, which is `0 * 6 + 1`.
+        let pair = VISIBILITY_PRESENT | (1 << 1);
+
+        for index in 0..SECTIONS {
+            let value: u64 = if index == CENTER { pair } else { 0 };
+
+            bytes.extend_from_slice(&(value as u32).to_le_bytes());
+            bytes.extend_from_slice(&((value >> 32) as u32).to_le_bytes());
+        }
+
+        bytes.extend_from_slice(&VISIBILITY_MAGIC.to_le_bytes());
+        bytes.extend_from_slice(&7u32.to_le_bytes());
+
+        let mut payload = Payload::parse(&bytes, 7).expect("a payload with a trailer parses");
+        assert_eq!(payload.visibility[CENTER], Some(1 << 1));
+        assert_eq!(
+            payload.visibility[0], None,
+            "a slot the payload did not answer for"
+        );
+
+        wgpu_mc::mc::visibility::clear();
+
+        let mut world = WorldSections::default();
+        payload.apply(&mut world, IVec3::new(0, 0, 0));
+        assert_eq!(
+            wgpu_mc::mc::visibility::get(IVec3::new(0, 0, 0)),
+            Some(1 << 1)
+        );
+        assert_eq!(
+            wgpu_mc::mc::visibility::get(IVec3::new(-1, -1, -1)),
+            None,
+            "a neighbour the trailer said nothing about"
+        );
+        // The stamp decides, the same way it decides for a record: a trailer written for a world that
+        // was thrown away names coordinates the ones it is read at are not about any more.
+        let elsewhere = Payload::parse(&bytes, 8).expect("the payload still parses");
+        assert_eq!(elsewhere.visibility[CENTER], None);
+
+        // And a payload with no trailer is the older writer rather than an error: nothing is answered
+        // for, and nothing is refused over it.
+        let header_only = Payload::parse(&bytes[..32], 7).expect("a payload without a trailer");
+        assert_eq!(header_only.visibility[CENTER], None);
     }
 
     #[test]
@@ -1208,5 +1483,96 @@ mod tests {
              flowing half of the same fluid: the surfaces and the flow directions come out as one liquid \
              where the game steps"
         );
+    }
+}
+
+/// The model-variant channel: one byte per position of the section being rebuilt, sent because the
+/// game's own mesher picks between a blockstate's models per *position*. See
+/// [`SectionBlocks::variants`] for why the JVM makes the choice.
+#[cfg(test)]
+mod variant_tests {
+    use super::tests::{TEST_GENERATION, nibbles, payload};
+    use super::*;
+    use std::sync::Arc;
+
+    /// **The blob reaches the provider at the position the game's index counts to.** Minecraft's
+    /// storage order is `(y << 8) | (z << 4) | x`, and both sides have to agree about it or a lily pad
+    /// is turned to a rotation that belongs to a block four rows away.
+    #[test]
+    fn a_payload_carries_the_targets_variants_and_the_provider_answers_by_position() {
+        let longs = [0i64];
+        let palette = [0u32];
+        let mut bytes = payload(&[nibbles(&longs, &palette, &[0])], &[]);
+
+        // The blob goes where the JVM's cursor would put it - after everything already written - and is
+        // named by header word 6.
+        let offset = bytes.len();
+        let mut blob = vec![0u8; VARIANTS_BYTES];
+        blob[0] = 2;
+        blob[(5 << 8) | (3 << 4) | 1] = 7;
+        bytes.extend_from_slice(&blob);
+        bytes[VARIANT_OFFSET_WORD * 4..VARIANT_OFFSET_WORD * 4 + 4]
+            .copy_from_slice(&(offset as u32).to_le_bytes());
+
+        let parsed = Payload::parse(&bytes, TEST_GENERATION).expect("a payload this build writes");
+
+        assert_eq!(parsed.variants.as_ref().expect("the blob")[0], 2);
+
+        let provider = CachedBlockstateProvider {
+            blocks: parsed.blocks.map(|section| section.map(Arc::new)),
+            light: Default::default(),
+            variants: parsed.variants.map(Arc::from),
+            air: BlockstateKey::from(0u32),
+        };
+
+        assert_eq!(provider.get_model_variant(IVec3::new(0, 0, 0)), 2);
+        assert_eq!(provider.get_model_variant(IVec3::new(1, 5, 3)), 7);
+        assert_eq!(
+            provider.get_model_variant(IVec3::new(2, 0, 0)),
+            0,
+            "a position the blob left at zero is the first variant, which is what this side drew before \
+             the channel existed"
+        );
+    }
+
+    /// A payload with no blob names none, and every position answers the first variant - which is the
+    /// whole of what this channel costs a section that has no list-variant block in it.
+    #[test]
+    fn a_payload_without_the_word_names_no_variants() {
+        let longs = [0i64];
+        let palette = [0u32];
+
+        let bytes = payload(&[nibbles(&longs, &palette, &[0])], &[]);
+        let parsed = Payload::parse(&bytes, TEST_GENERATION).expect("a payload this build writes");
+
+        assert!(parsed.variants.is_none());
+
+        let provider = CachedBlockstateProvider {
+            blocks: parsed.blocks.map(|section| section.map(Arc::new)),
+            light: Default::default(),
+            variants: None,
+            air: BlockstateKey::from(0u32),
+        };
+
+        assert_eq!(provider.get_model_variant(IVec3::new(0, 0, 0)), 0);
+    }
+
+    /// **A blob that runs off the end of the payload is not a payload this side drops.** The blocks in
+    /// it are as good as any other's; what is lost is the section's rotations, which is a wrong angle
+    /// rather than a hole in the world.
+    #[test]
+    fn a_blob_offset_past_the_end_is_ignored_rather_than_fatal() {
+        let longs = [0i64];
+        let palette = [0u32];
+        let mut bytes = payload(&[nibbles(&longs, &palette, &[0])], &[]);
+        let past_the_end = (bytes.len() + 64) as u32;
+        bytes[VARIANT_OFFSET_WORD * 4..VARIANT_OFFSET_WORD * 4 + 4]
+            .copy_from_slice(&past_the_end.to_le_bytes());
+
+        let parsed =
+            Payload::parse(&bytes, TEST_GENERATION).expect("the blocks are still readable");
+
+        assert_eq!(parsed.present, 1 << CENTER);
+        assert!(parsed.variants.is_none());
     }
 }

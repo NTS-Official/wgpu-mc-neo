@@ -97,9 +97,23 @@ fn vert(
 
 @fragment
 fn frag(in: VO) -> @location(0) vec4<f32> {
-    if(in.og_pos.y > 0.0) {
-        return textureSample(sun_texture, sample, in.tex_coords);
-    } else {
-        return textureSample(moon_texture, sample, in.tex_coords);
-    }
+    // **Both are sampled, and the sign of `og_pos.y` picks between the results.**
+    //
+    // What was here instead read well and was undefined behaviour:
+    //
+    //     if (in.og_pos.y > 0.0) { return textureSample(sun_texture, sample, in.tex_coords); }
+    //     else                   { return textureSample(moon_texture, sample, in.tex_coords); }
+    //
+    // `textureSample` takes its level of detail from the derivatives of its coordinates, and WGSL
+    // defines those only in *uniform* control flow - so a `textureSample` under an `if` is undefined,
+    // whatever the condition looks like. It is not uniform here either: `og_pos` is an interpolated
+    // varying, so a quad straddling the horizon takes both sides of that branch.
+    //
+    // The cost of the fix is one extra fetch over a patch of sky a few dozen pixels across; the two
+    // textures are the sun's and the moon's. `select(moon, sun, ..)` rather than `mix`, because this is a
+    // choice and not a blend: a half-way value would be the sun bleeding through the moon at every edge.
+    let sun = textureSample(sun_texture, sample, in.tex_coords);
+    let moon = textureSample(moon_texture, sample, in.tex_coords);
+
+    return select(moon, sun, in.og_pos.y > 0.0);
 }

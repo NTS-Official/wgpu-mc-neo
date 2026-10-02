@@ -507,6 +507,23 @@ object WmNative {
         handle("terrain_arena_sections", FunctionDescriptor.of(INT, PTR))
 
     /**
+     * Hands the native side the box the game's own view covers: `ViewArea`'s render distance in chunks,
+     * and the level's lowest and highest section layers.
+     *
+     * The boundary of the native occlusion walk, which with only a frustum has none: the walk's rule is
+     * that a section nobody has described is open air - it has to be, because Minecraft never compiles a
+     * section that is all air and no payload carries an answer for one - and "open air" is then true of
+     * every position in the frustum, above the build limit and below the level included. See
+     * `wgpu_mc::mc::world_extent`.
+     *
+     * Three numbers rather than a list of sections, because the game's view is a square of chunk columns
+     * over the whole level - and the sections that matter here are exactly the ones the game never
+     * compiles, which are the air.
+     */
+    @JvmField val terrainWorldBounds: MethodHandle =
+        handle("terrain_world_bounds", FunctionDescriptor.ofVoid(INT, INT, INT))
+
+    /**
      * How many sections the render graph's terrain pass has drawn since the renderer started.
      *
      * Asked before the terrain layer is dumped: the pass runs from the first frame, when the section

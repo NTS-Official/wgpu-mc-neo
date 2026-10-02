@@ -274,6 +274,62 @@ mod tests {
         );
     }
 
+    /// **Every terrain pipeline in the shipped graph binds the draw records at group 2, and there are
+    /// enough draw-buffer slots for all of them.**
+    ///
+    /// Two contracts, and both are silent when broken. A terrain pipeline without group 2 is a pipeline
+    /// whose vertex stage reads a binding the layout does not declare, which wgpu refuses - and a
+    /// refusal on this path ends the process rather than the pass. A terrain pipeline that cannot claim
+    /// one of `SECTION_DRAW_SLOTS`' slots is skipped by `create_pipelines` with a line in the log, and
+    /// what that costs is a whole layer of the world: the count is in this yaml and the capacity is in
+    /// `wgpu_mc`, so this is the only place both are visible at once.
+    ///
+    /// The number of slots is also what the scene allocates its draw buffers from, so the assertion is
+    /// an upper bound rather than an equality: one fewer terrain pipeline than slots is wasted video
+    /// memory, and one more is a layer that does not draw.
+    #[test]
+    fn every_terrain_pipeline_has_a_draw_buffer_slot() {
+        let config: ShaderPackConfig =
+            serde_yaml::from_str(include_str!("../graph.yaml")).expect("graph.yaml parses");
+
+        let terrain = config
+            .pipelines
+            .pipelines
+            .iter()
+            .filter(|(_, pipeline)| {
+                matches!(
+                    pipeline.geometry.as_str(),
+                    "@geo_terrain" | "@geo_terrain_translucent"
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert!(
+            !terrain.is_empty(),
+            "the graph names no terrain pipeline at all, so this test is checking nothing"
+        );
+
+        assert!(
+            terrain.len() <= wgpu_mc::mc::SECTION_DRAW_SLOTS,
+            "the graph names {} terrain pipeline(s) and the scene has {} draw-buffer slot(s); the pass \
+             that cannot claim one draws nothing",
+            terrain.len(),
+            wgpu_mc::mc::SECTION_DRAW_SLOTS
+        );
+
+        for (name, pipeline) in terrain {
+            assert!(
+                matches!(
+                    pipeline.bind_groups.get(&2),
+                    Some(BindGroupDef::Resource(resource)) if resource == "@bg_section_draws"
+                ),
+                "the '{name}' pipeline has to bind the draw records at group 2: the section's position \
+                 travels in that buffer now, because a `multi_draw` cannot be handed an immediate per \
+                 draw"
+            );
+        }
+    }
+
     /// The graph the mod ships also carries the translucent terrain pipeline, and it is the *only*
     /// pipeline that blends without writing depth.
     ///

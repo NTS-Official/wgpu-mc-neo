@@ -84,6 +84,31 @@ struct FogEnvironment {
 
 @group(1) @binding(0) var<storage> chunk_data: array<u32>;
 
+// **What one draw of this pass is, indexed by `instance_index`**, which is the only channel a
+// `multi_draw_indexed_indirect` has for anything per draw: an immediate is set once for the whole call
+// and one call may cover thousands of sections.
+//
+// Both paths read it - the batched one and the one that issues a `draw_indexed` per section - so the
+// switch between them is a switch in the number of calls and not in the picture. The pass writes it
+// once per pass, before its first draw, and each dispatch entry's `first_instance` is the index of its
+// own record.
+//
+// See `SectionDraw` in `mc/mod.rs`, which is the same four members written by the other side.
+struct SectionDraw {
+    // The section, **relative to the section the camera is in** - the same relative position the
+    // immediate used to carry for one draw at a time, and for the same reason: `x + 30000` in `f32`
+    // steps by four thousandths of a block, and the depth test between the ground and a shadow lying on
+    // it is decided by exactly those bits. See `SectionPosition`.
+    x: i32,
+    y: i32,
+    z: i32,
+    // The u32 slot in the arena this draw's vertices start at. This was `@builtin(instance_index)`,
+    // which is the record's own index now.
+    word_base: u32,
+};
+
+@group(2) @binding(0) var<storage> section_draws: array<SectionDraw>;
+
 struct VertexResult {
     @builtin(position) pos: vec4<f32>,
     @location(0) tex_coords: vec2<f32>,
@@ -137,25 +162,26 @@ struct VertexResult {
     @interpolate(flat) @location(21) animated: u32,
     // How many levels this face may be pushed down the chain, decoded in the vertex stage because the
     // bits live in `v3` and `v3` is a vertex-local. Flat for the same reason the two above are.
-    @interpolate(flat) @location(22) lod_floor: u32
+    @interpolate(flat) @location(22) lod_floor: u32,
+    // Whether this face belongs to Minecraft's **`cutout_mipped`** pipeline rather than its `cutout`
+    // one: bit 6 of `v3`'s flag half, `UV_CUTOUT_MIPPED`. Flat for the same reason as the three above,
+    // and it is what picks between the game's two cutouts in the fragment stage - 0.1 against 0.5.
+    @interpolate(flat) @location(23) mipped: u32
 };
 
-// What one terrain draw is told about itself: the section it draws, and the alpha cutoff its layer
-// asks for. Three integers rather than a vec3i because an immediate has to be a struct for the HLSL
-// backend (push-constant ... has non-struct type is what a bare vector gets), and four members are
-// sixteen bytes with no padding - which is the size the pass declares for them (see
-// `@pc_section_position` in `graph.yaml` and the sizes in `RenderGraph::new`).
+// What one terrain draw is told about itself **beyond its own `SectionDraw`**: the alpha cutoff its
+// layer asks for, and the five per-frame numbers about the two atlases. Seven `u32`s, twenty-eight
+// bytes, and no padding - which is the size the pass declares for them (see `@pc_section_position` in
+// `graph.yaml` and the sizes in `RenderGraph::new`).
 //
-// The section is **relative to the section the camera is in**, not absolute, and that is the whole of
-// this renderer's positional precision: `x + 30000` in `f32` steps by four thousandths of a block, and
-// the ground and the shadow lying on it are two surfaces whose depth test is decided by exactly those
-// last bits. The view matrix carries the camera's offset inside its own section, so the big number is
-// never formed - which is what vanilla's `terrain.vsh` does with
-// `Position + (ChunkPosition - CameraBlockPos) + CameraOffset`. See `Scene::camera_section_pos`.
+// **The section's x, y and z are not here any more, and that is what the batched path cost.** They were
+// the first three members, written per draw, and `multi_draw_indexed_indirect` is one call: everything
+// an immediate holds is held for every draw in it, so the position had to move to something the vertex
+// stage can index per draw - `section_draws` above, by `instance_index`.
+//
+// The rest stays, because it is not per draw: the bias and the two texel sizes are frame constants, and
+// the cutoff is a property of the layer, which is one immediate write per layer.
 struct SectionPosition {
-    x: i32,
-    y: i32,
-    z: i32,
     // `0.5` for the cutout layer: Minecraft's own `CUTOUT_TERRAIN`, which declares `ALPHA_CUTOUT`.
     // The solid layer is **not** drawn with this shader - it has its own, with no test at all and no
     // `discard` in it, because a `discard` anywhere costs the whole pipeline its early-Z. See
@@ -208,7 +234,6 @@ struct SectionPosition {
     // drift apart. Two `f32` written consecutively read as one `vec2`.
     // The game's UseRgss: 1 when its textureFiltering option is RGSS, 0 otherwise. See `sample_rgss`.
     use_rgss: u32,
-    // Padding, so the struct is a size WGSL accepts rather than one it rounds. Carries nothing.
 };
 
 /// Whether a fragment's coordinates are being **stretched** rather than squeezed - which is exactly
@@ -238,30 +263,82 @@ fn is_magnified(coords: vec2<f32>, texel: f32) -> bool {
 // `pixel_size` is one texel of the atlas being sampled, as a fraction of it - `1.0 / TextureSize` in the
 // game, which is why the two numbers travel in the immediate instead of being written here.
 
-/// The game's `sampleNearest`: a fetch whose level the *hardware* picks, with the texel centres adjusted
-/// so that a surface being magnified does not drift off centre as it gets closer.
+/// **Everything the two sampling methods need that comes from a derivative**, taken once per fragment
+/// and - the whole reason this is a struct - *before any branch*.
 ///
-/// The adjustment is the part worth keeping. `uv / pixelSize` is texel coordinates, `round(..) - 0.5` the
-/// centre of the nearest texel, and the difference between the two is scaled down by how large a texel is
-/// on screen - so a magnified surface lands exactly on centres (where the answer is exact) and the
-/// correction fades out as the surface minifies (where the level is doing the filtering instead).
+/// `dpdx` and `dpdy` are defined only in uniform control flow, and the fragment stage has two choices
+/// ahead of it that are both per-vertex flags: which atlas a face samples, and which of the three
+/// samplers its level wants. So the derivatives, the levels and the adjusted coordinates are all taken
+/// at the top level of `frag`, and what is left inside the branches is `textureSampleLevel` and
+/// arithmetic, neither of which carries a uniformity requirement. See [`sample_at_level`], and
+/// `the_terrain_shaders_never_sample_a_texture_under_a_branch` in `graph.rs`, which is the test that
+/// holds the shape.
+struct SampleGeometry {
+    /// The coordinates `sampleNearest` fetches from, with the texel-centre correction applied.
+    nearest_uv: vec2<f32>,
+    /// The level `sampleNearest` fetches at.
+    nearest_level: f32,
+    /// The four coordinates `sampleRGSS` taps, on the game's own rotated grid.
+    taps: array<vec2<f32>, 4>,
+    /// The two levels `sampleRGSS` blends between, and the fraction between them.
+    low_level: f32,
+    high_level: f32,
+    level_blend: f32,
+    /// How much of the supersampled fetch survives against the plain one. Below about one texel per
+    /// pixel the surface wants the plain fetch's sharpening, which RGSS would only blur.
+    rgss_blend: f32,
+};
+
+/// The geometry for one fragment: the coordinates it samples, one texel of the atlas it samples, and
+/// the level-of-detail shift the draw handed over.
 ///
-/// **The game's `textureGrad` becomes a `textureSampleLevel` at a level this side computes**, because
-/// `textureSampleGrad` has no bias and the two things this renderer adds to the game's fetch are both
-/// shifts: `atlas_lod_bias`, which is the setting a player moves, and the per-sprite floor. The level is
-/// taken from the same derivatives the game's `textureGrad` would have used, so the two agree at a bias of
-/// zero and a floor of none - which is the state the comparison runs in.
-fn sample_nearest(
-    source: texture_2d<f32>,
-    samp: sampler,
-    uv: vec2<f32>,
-    pixel_size: vec2<f32>,
-    bias: f32,
-) -> vec4<f32> {
+/// **Called once, from the top level of `frag`, and nowhere else.** The derivatives under it are what
+/// every level here is computed from, and a derivative taken under a branch is undefined behaviour
+/// rather than a slightly wrong number.
+///
+/// The two levels it produces are the game's own two answers to "which level":
+///
+///  * `nearest_level` is the hardware's answer for these derivatives - what the game's `textureGrad`
+///    would have used - **plus the bias**. The game's fetch has no bias, and the two things this side
+///    adds to it are both shifts: the `atlas_lod_bias` setting and the per-sprite floor. At a bias of
+///    zero and a floor of none the two agree, which is the state the comparison runs in.
+///  * the RGSS pair comes from the **geometric mean** of the two derivative lengths rather than the
+///    worse of them, which is the whole of what the game's `sampleRGSS` does differently:
+///
+///    ```glsl
+///    float effectiveDerivative = sqrt(minDerivative * maxDerivative);
+///    ```
+///
+///    The hardware's implicit level is derived from the worst of the two, which at a grazing angle is
+///    the compressed one - so a surface seen edge-on is sampled from several levels coarser than its
+///    footprint needs, and a *moving* sprite's coarse levels are a running average of its animation
+///    rather than a smaller copy of it. That average is the fluid shimmer, and four levels is the order
+///    a player measured.
+fn sample_geometry(uv: vec2<f32>, pixel_size: vec2<f32>, bias: f32) -> SampleGeometry {
     let du = dpdx(uv);
     let dv = dpdy(uv);
-    let texel_screen_size = sqrt(du * du + dv * dv);
 
+    let derivative_x = length(du);
+    let derivative_y = length(dv);
+    let min_derivative = min(derivative_x, derivative_y);
+    let max_derivative = max(derivative_x, derivative_y);
+
+    let texel_screen_size = sqrt(du * du + dv * dv);
+    let max_texel_size = max(texel_screen_size.x, texel_screen_size.y);
+    let min_pixel_size = min(pixel_size.x, pixel_size.y);
+
+    let nearest_level = max(0.0, log2(max_derivative / min_pixel_size) + bias);
+
+    let mip_exact = max(0.0, log2(sqrt(min_derivative * max_derivative) / min_pixel_size) + bias);
+    let low_level = floor(mip_exact);
+    let high_level = low_level + 1.0;
+    let level_blend = fract(mip_exact);
+
+    // **The texel-centre correction, and it is not a detail.** `uv / pixel_size` is texel coordinates,
+    // `round(..) - 0.5` the centre of the nearest texel, and the difference between the two scaled down
+    // by how large a texel is on screen - so a magnified surface lands exactly on centres, where the
+    // answer is exact, and the correction fades out as the surface minifies, where the level is doing
+    // the filtering instead.
     let uv_texel = uv / pixel_size;
     let texel_center = round(uv_texel) - 0.5;
     var texel_offset = uv_texel - texel_center;
@@ -269,111 +346,312 @@ fn sample_nearest(
     texel_offset = (texel_offset - 0.5) * pixel_size / texel_screen_size + 0.5;
     texel_offset = clamp(texel_offset, vec2<f32>(0.0), vec2<f32>(1.0));
 
-    // The side's own level, which is the hardware's answer for these derivatives plus the bias.
-    let min_pixel_size = min(pixel_size.x, pixel_size.y);
-    let max_derivative = max(length(du), length(dv));
-    let level = max(0.0, log2(max_derivative / min_pixel_size) + bias);
+    // The game's own rotated grid - `vec2(0.125, 0.375)` and its three rotations - scaled by this
+    // atlas' texel here, once, rather than per tap and per branch.
+    let taps = array<vec2<f32>, 4>(
+        uv + vec2<f32>(0.125, 0.375) * pixel_size,
+        uv + vec2<f32>(-0.125, -0.375) * pixel_size,
+        uv + vec2<f32>(0.375, -0.125) * pixel_size,
+        uv + vec2<f32>(-0.375, 0.125) * pixel_size,
+    );
 
-    return textureSampleLevel(source, samp, (texel_center + texel_offset) * pixel_size, level);
+    return SampleGeometry(
+        (texel_center + texel_offset) * pixel_size,
+        nearest_level,
+        taps,
+        low_level,
+        high_level,
+        level_blend,
+        smoothstep(min_pixel_size, min_pixel_size * 2.0, max_texel_size),
+    );
 }
 
-/// The game's `sampleRGSS`: rotated-grid supersampling, four taps per level with the two neighbouring
-/// levels blended by the fractional part.
+/// The game's two sampling functions, chosen by its `UseRgss` flag, **fetching at levels the caller
+/// already has**.
 ///
-/// **The level it picks is the whole point.** The hardware's implicit level is derived from the worst of the
-/// two derivatives, which at a grazing angle is the compressed one - so a surface seen edge-on is sampled
-/// from a level several steps coarser than its footprint needs, and a *moving* sprite's coarse levels are a
-/// running average of its animation rather than a smaller copy of it. That average is the fluid shimmer.
-/// The game takes the **geometric mean** of the two derivative lengths instead:
+/// **Every fetch in here is a `textureSampleLevel`, and that is what makes it legal to call from inside
+/// a branch.** An explicit level takes no derivative, so WGSL's uniform-control-flow rule - the one that
+/// makes a `textureSample` under an `if` undefined behaviour however uniform the condition looks - does
+/// not apply to it. Everything that *does* need a derivative is in [`SampleGeometry`], taken before any
+/// branch is entered, and this function never calls `dpdx` or `dpdy`.
 ///
-/// ```glsl
-/// float effectiveDerivative = sqrt(minDerivative * maxDerivative);
-/// ```
-///
-/// which is far finer than the maximum at a grazing angle - four levels is the order a player measured -
-/// and is exactly what a `-4` bias was standing in for.
-///
-/// The four offsets are the game's, and the blend to `sample_nearest` near the transition is its too: below
-/// about one texel per pixel the surface wants the sharpening RGSS would only blur.
-fn sample_rgss(
+/// The two are ports of the game's own `sampleNearest` and `sampleRGSS`: the plain fetch at the
+/// hardware's level with the texel centres corrected, and the four taps on the rotated grid blended
+/// between the two levels the geometric mean straddles. Neither can be expressed with a sampler - a
+/// sampler has one `anisotropy_clamp` and no way to say "four taps on a rotated grid at this exact
+/// level", and nothing exposes the level at all.
+fn sample_at_level(
     source: texture_2d<f32>,
     samp: sampler,
-    uv: vec2<f32>,
-    pixel_size: vec2<f32>,
-    bias: f32,
+    geometry: SampleGeometry,
+    use_rgss: u32,
 ) -> vec4<f32> {
-    let du = dpdx(uv);
-    let dv = dpdy(uv);
+    // The plain fetch is taken either way, because the game's `sampleRGSS` ends by blending its result
+    // against this one rather than choosing between the two.
+    let plain = textureSampleLevel(source, samp, geometry.nearest_uv, geometry.nearest_level);
 
-    let texel_screen_size = sqrt(du * du + dv * dv);
-    let max_texel_size = max(texel_screen_size.x, texel_screen_size.y);
-    let min_pixel_size = min(pixel_size.x, pixel_size.y);
-
-    let blend_factor = smoothstep(min_pixel_size, min_pixel_size * 2.0, max_texel_size);
-
-    let min_derivative = min(length(du), length(dv));
-    let max_derivative = max(length(du), length(dv));
-    let effective_derivative = sqrt(min_derivative * max_derivative);
-
-    // **The side's own two shifts on top of the game's level**: the `atlas_lod_bias` setting and the
-    // per-sprite floor. At zero and none this is the game's own `mipLevelExact`, which is what makes the
-    // port comparable with it.
-    let mip_exact = max(0.0, log2(effective_derivative / min_pixel_size) + bias);
-    let mip_low = floor(mip_exact);
-    let mip_high = mip_low + 1.0;
-    let mip_blend = fract(mip_exact);
-
-    // The game's own rotated grid: `vec2(0.125, 0.375)` and its three rotations.
-    var offsets = array<vec2<f32>, 4>(
-        vec2<f32>(0.125, 0.375),
-        vec2<f32>(-0.125, -0.375),
-        vec2<f32>(0.375, -0.125),
-        vec2<f32>(-0.375, 0.125),
-    );
+    // **And the four-tap grid is skipped when it cannot change the answer**, which is the magnified case -
+    // the surfaces the player is looking at most closely.
+    //
+    // `rgss_blend` is `smoothstep(min_pixel_size, min_pixel_size * 2.0, max_texel_size)`, so it is
+    // *exactly* zero whenever a texel covers at least a pixel - and `mix(plain, rgss, 0.0)` is `plain`,
+    // bit for bit. Those eight fetches were being spent to compute a value that was then multiplied by
+    // zero: at the game's `Fancy` setting a magnified fragment cost **nine** fetches to return the first
+    // one, and a block face sixteen texels across stops being magnified only once it is a few blocks
+    // away, so this is most of the near and middle field rather than a corner case.
+    //
+    // The test is `rgss_blend` and not `magnified` on purpose. `magnified` is `|dpdx.x| < texel &&
+    // |dpdy.y| < texel`, which is a different question - it can be true while `max_texel_size`, the
+    // length of the whole derivative vector, is past `min_pixel_size`, and there the blend is not zero and
+    // the taps do matter. Skipping on `magnified` would be a picture change; skipping on the blend being
+    // zero is not.
+    if use_rgss == 0u || geometry.rgss_blend == 0.0 {
+        return plain;
+    }
 
     var low = vec4<f32>(0.0);
     var high = vec4<f32>(0.0);
 
     for (var i = 0u; i < 4u; i = i + 1u) {
-        let tap = uv + offsets[i] * pixel_size;
-        low = low + textureSampleLevel(source, samp, tap, mip_low);
-        high = high + textureSampleLevel(source, samp, tap, mip_high);
+        low = low + textureSampleLevel(source, samp, geometry.taps[i], geometry.low_level);
+        high = high + textureSampleLevel(source, samp, geometry.taps[i], geometry.high_level);
     }
 
-    let rgss = mix(low * 0.25, high * 0.25, mip_blend);
-    let plain = sample_nearest(source, samp, uv, pixel_size, bias);
+    let rgss = mix(low * 0.25, high * 0.25, geometry.level_blend);
 
-    return mix(plain, rgss, blend_factor);
-}
-
-/// One atlas fetch, by the game's own rule: RGSS when the option asks for it, the plain graded fetch
-/// otherwise.
-fn sample_atlas(
-    source: texture_2d<f32>,
-    samp: sampler,
-    uv: vec2<f32>,
-    pixel_size: vec2<f32>,
-    use_rgss: u32,
-    bias: f32,
-) -> vec4<f32> {
-    if use_rgss == 1u {
-        return sample_rgss(source, samp, uv, pixel_size, bias);
-    }
-
-    return sample_nearest(source, samp, uv, pixel_size, bias);
+    return mix(plain, rgss, geometry.rgss_blend);
 }
 
 var<immediate> section_pos: SectionPosition;
 
+/// Everything the fragment stage needs from the derivatives, for the atlas it is going to sample.
+///
+/// `atlas_texel` is one texel of that atlas as a fraction of it - `section_pos.texel_ours` or
+/// `section_pos.texel_game` - and it is the only thing about the two entry points that differs before the
+/// sampling itself: the level-of-detail floor, the bias and the geometry are the same arithmetic for both.
+///
+/// **The `select` over the two texel sizes is not in here.** It is a `select` on a varying, and the whole
+/// point of the second entry point is that it does not exist there.
+struct FragmentGeometry {
+    geometry: SampleGeometry,
+    /// Whether this fragment is magnified, which picks the sampler.
+    magnified: bool,
+};
+
+fn fragment_geometry(in: VertexResult, atlas_texel: f32) -> FragmentGeometry {
+    let magnified = is_magnified(in.tex_coords, atlas_texel);
+
+    // The level-of-detail floor, which is what a bias could not express. See the note in `frag` for the
+    // whole of it: four bits the bake wrote, and `LOD_FLOOR_IS_LEVEL_ZERO` picking which floor.
+    const LOD_FLOOR_IS_LEVEL_ZERO: bool = false;
+
+    let floor = select(
+        0.0,
+        select(64.0, f32(in.lod_floor), !LOD_FLOOR_IS_LEVEL_ZERO),
+        in.animated == 1u && !magnified,
+    );
+
+    let bias = section_pos.lod_bias - floor;
+
+    return FragmentGeometry(
+        sample_geometry(in.tex_coords, vec2<f32>(atlas_texel), bias),
+        magnified,
+    );
+}
+
+/// Everything the fragment stage does **after** it has a texel: the ambient occlusion, the light, the
+/// colour, the cutout test and the fog.
+///
+/// Shared by both entry points, which is what keeps the second one from being a second copy of the shader:
+/// the only thing that differs between them is which texture the texel came out of.
+fn shade(in: VertexResult, texel: vec4<f32>) -> vec4<f32> {
+    // The ambient-occlusion corner, blended across the quad's four corners - and then the curve.
+    //
+    // This read `0.6 + 0.4 * corner` for as long as the vertices carried a *brightness* step, and that
+    // is where the corners went wrong: Minecraft's own corner value is the average of four
+    // `getShadeBrightness` samples, each `0.2` for a block that fills its whole block and `1.0` for
+    // everything else - so its range is `0.2 .. 1.0` in five steps, and a shadowed corner in vanilla is
+    // five times darker than the brightest one. Against a curve that starts at `0.6`, the darkest a
+    // corner could get was 0.6: the shading was there, in the right places, and only about a third as
+    // deep as the game's - which reads as "the ambient occlusion is too weak" rather than as anything
+    // missing.
+    //
+    // The vertex carries the *count* - 0 to 4 of the four blocks that darken that corner - and the curve
+    // is `1 - 0.2 * count`, which is exactly that average. The four corners are blended here, where
+    // Minecraft's are what the rasterizer makes of four per-vertex colours: the curve is the game's, the
+    // blend is this renderer's (bilinear over the corners rather than linear across two triangles, which
+    // is why a face here has no diagonal seam through its shading).
+    var occluders = mix(mix(in.ao3, in.ao4, in.light_uv.x), mix(in.ao2, in.ao1, in.light_uv.x), in.light_uv.y);
+    var ao = 1.0 - 0.2 * occluders;
+
+    // The light is a colour now, not a number: the game's lightmap has a colour in it (the sky light
+    // goes blue at night, the darkness effect tints it), and the game's own shader multiplies it in as
+    // it stands. Everything else is this renderer's: the vertex colour carries the tint and the face
+    // shading, and the corner value is the ambient occlusion above.
+    let col = in.color * vec4(in.light_color, 1.0) * vec4(ao, ao, ao, 1.0) * texel;
+
+    // The cutout test, at the cutoff the layer being drawn declares.
+    //
+    // This read `if (col.a == 0.0f)` for as long as the atlas had one mip level, where "transparent"
+    // and "exactly zero alpha" are the same texel. The atlas has a mip chain now (`ATLAS_MIP_LEVELS`,
+    // sampled with `mipmap_filter: Linear`), and a hole in a leaf texture is only zero at level 0: at
+    // any level above it, the hole is an *average* of leaves and gaps, a small non-zero alpha - so
+    // nothing was discarded and the face was painted whole, at full strength, because this pass
+    // replaces the target rather than blending into it. Leaves therefore came out solid beyond the
+    // distance at which a sprite stops covering enough pixels to stay on level 0, and the boundary
+    // between the two moved with the camera's distance, angle and field of view.
+    //
+    // **This shader is only bound for layers that are cut out** - the cutout layer here, and the
+    // translucent one through the pipeline that names it. The solid layer draws with
+    // `terrain_solid.wgsl`, which has no test, because the mere presence of the `discard` below is
+    // what makes a driver drop early-Z for the entire pipeline. See `terrain_layers` in `graph.rs`.
+    // **Minecraft's cutoff, which is two numbers and not one.** `RenderPipelines` declares
+    // `pipeline/cutout_terrain` at `ALPHA_CUTOUT 0.5` and the mipped cutout family at `0.1`, and this
+    // renderer has one cutout layer for both - so the number comes from the face's own pipeline through
+    // the varying rather than from the layer alone. A mip of a leaf or a grass tuft is mostly the
+    // low-alpha fringe the game keeps and 0.5 discards, which is why the two renderers' frames differed
+    // most on exactly those sprites. See `UV_CUTOUT_MIPPED`.
+    let cutoff = select(section_pos.alpha_cutout, 0.1, in.mipped != 0u);
+
+    if (col.a < cutoff) {
+        discard;
+    }
+
+    // And the fog, in the same place the game's own fragment shader applies it: after the alpha test, so
+    // what is tested is the texture's own alpha rather than a fogged one. It is applied to the whole
+    // terrain pass, which is why the far edge of the loaded world fades into the sky instead of ending.
+    return apply_fog(
+        col,
+        in.fog_distances.x,
+        in.fog_distances.y,
+        fog.environmental_start,
+        fog.environmental_end,
+        fog.render_distance_start,
+        fog.render_distance_end,
+        fog.color,
+    );
+}
+
+@fragment
+fn frag(
+    in: VertexResult
+) -> @location(0) vec4<f32> {
+    // Which atlas this face samples, and the whole of what the flag does.
+    //
+    // A face whose sprite the game animates was baked with the game's coordinates and draws from the
+    // game's atlas, which the game is already animating; everything else draws from this side's copy
+    // of its sprite.
+    //
+    // **One texel of it, and the one `select` that stays.** This picks a *number* the level is computed
+    // from rather than a fetch, and it has to be decided before the derivatives are taken - so it cannot
+    // be one of the branches below, and there is nothing in it to branch over. Built from the fields
+    // that were already here rather than sent a second time: a duplicate of the same number is a second
+    // thing that can disagree, and it cost four bytes of padding in an immediate whose size has to match
+    // this struct exactly. **wgpu aborts the process when it does not** (`Not all immediate data
+    // required by the pipeline has been set ... missing byte ranges: 48..52`), which is how the
+    // duplicate was found.
+    let pixel_size = select(
+        vec2<f32>(section_pos.texel_ours, section_pos.texel_ours),
+        vec2<f32>(section_pos.texel_game, section_pos.texel_game),
+        in.game_atlas == 1u,
+    );
+
+    // **Every derivative, every level and every adjusted coordinate, taken once - here, and outside
+    // every branch.** `dpdx` and `dpdy` are defined only in uniform control flow, and the choice below is
+    // a per-vertex flag. See [`SampleGeometry`] for what this returns and for the two levels the game's
+    // own functions are built on.
+    let fg = fragment_geometry(in, min(pixel_size.x, pixel_size.y));
+
+    // **Which of the game's three sampling methods is in force**, as real branches.
+    //
+    // Those are twenty-four combinations - two atlases, three samplers, RGSS or not - that this used to
+    // reach by *evaluating all of them* and `select`ing between the results, on the argument that a
+    // `textureSample` in a branch is undefined behaviour. **The argument does not apply to a fetch at an
+    // explicit level**: `textureSampleLevel` takes no derivative, so it carries no uniformity
+    // requirement, and the things that do - `dpdx` and `dpdy` - are all in `sample_geometry` above. So
+    // the branches fetch only what they need, and nothing is computed per branch.
+    //
+    // `the_terrain_shaders_never_sample_a_texture_under_a_branch` in `graph.rs` holds the shape: it
+    // counts the *auto-level* fetches - `Auto` and `Bias`, the two that ask the hardware for a level -
+    // and requires none of them under a branch. A `textureSampleLevel` under one is not a finding; it is
+    // what this is made of.
+    var texel: vec4<f32>;
+
+    if in.game_atlas == 1u {
+        if fg.magnified {
+            texel = sample_at_level(t_game_atlas, t_game_sampler_magnify, fg.geometry, section_pos.use_rgss);
+        } else if in.animated == 1u {
+            texel = sample_at_level(t_game_atlas, t_game_sampler_animated, fg.geometry, section_pos.use_rgss);
+        } else {
+            texel = sample_at_level(t_game_atlas, t_game_sampler, fg.geometry, section_pos.use_rgss);
+        }
+    } else {
+        if fg.magnified {
+            texel = sample_at_level(t_texture, t_sampler_magnify, fg.geometry, section_pos.use_rgss);
+        } else if in.animated == 1u {
+            texel = sample_at_level(t_texture, t_sampler_animated, fg.geometry, section_pos.use_rgss);
+        } else {
+            texel = sample_at_level(t_texture, t_sampler, fg.geometry, section_pos.use_rgss);
+        }
+    }
+
+    return shade(in, texel);
+}
+
+/// **The same fragment stage with the atlas decided when the pipeline is built**, which is the one thing
+/// that can remove the branch rather than execute it.
+///
+/// It samples the game's block atlas and nothing else, so `t_texture` and the three samplers that go with
+/// it are not referenced here at all - and this is what the graph builds the terrain pipelines from
+/// whenever [`crate::mc::block::faces_are_all_the_games`] says the arena holds no face that fell back.
+/// The numbers, from a normal session: **204,878 faces baked against the game's atlas and 0 against this
+/// side's**, so the two-atlas shader is the exceptional one and this is the common one.
+///
+/// **Why an entry point and not a pipeline constant.** With `override atlas: u32` the source would still
+/// contain both atlases and both sampler sets; naga substitutes the override and the *backend compiler*
+/// would then fold the branch away - reliably, but somewhere this repository cannot check. A second entry
+/// point is smaller in the source itself, which is checkable: a test reads both shaders with naga and
+/// asserts that this entry point reaches exactly one texture and its three samplers, and that `frag`
+/// reaches both. See `the_single_atlas_entry_point_samples_one_atlas` in `graph.rs`.
+///
+/// The atlas is not the *sampler*, so the three-way choice between magnify, animated and plain is still
+/// here - those are properties of the fragment, not of the build.
+@fragment
+fn frag_game_atlas(
+    in: VertexResult
+) -> @location(0) vec4<f32> {
+    // `texel_game` is one texel of the game's atlas, which is the `pixel_size` this variant would have
+    // selected anyway - so this is the same number `frag` computes, without the `select`.
+    let fg = fragment_geometry(in, section_pos.texel_game);
+
+    var texel: vec4<f32>;
+
+    if fg.magnified {
+        texel = sample_at_level(t_game_atlas, t_game_sampler_magnify, fg.geometry, section_pos.use_rgss);
+    } else if in.animated == 1u {
+        texel = sample_at_level(t_game_atlas, t_game_sampler_animated, fg.geometry, section_pos.use_rgss);
+    } else {
+        texel = sample_at_level(t_game_atlas, t_game_sampler, fg.geometry, section_pos.use_rgss);
+    }
+
+    return shade(in, texel);
+}
+
 @vertex
 fn vert(
     @builtin(vertex_index) vi: u32,
-    @builtin(instance_index) base_vertex: u32
+    // **The index of this draw's record**, which is what the pass writes into `first_instance` of an
+    // indirect dispatch entry and into the instance range of a plain `draw_indexed`. It used to *be*
+    // the section's arena slot; the slot is in the record now, because a `multi_draw` cannot be told
+    // anything per draw except through a buffer.
+    @builtin(instance_index) instance: u32
 ) -> VertexResult {
 //    var vert1_i = (vi >> 2) << 4;
 //    var vert1_i = (vi << 2) & 0xfffffffc;
 //    var vert1_i = ((vi >> 2u) << 2u)+base_vertex;
 
+    let draw = section_draws[instance];
+    let base_vertex = draw.word_base;
     var offset = vi & 3;
     var vert1_i = vi & ~3u;
 
@@ -381,18 +659,22 @@ fn vert(
 
     var vert1_base = ((vert1_i) << 2u) + base_vertex;
 
-    var vert1_v4 = chunk_data[vert1_base + 3u];
-    var vert2_v4 = chunk_data[vert1_base + 7u];
-    var vert3_v4 = chunk_data[vert1_base + 11u];
-    var vert4_v4 = chunk_data[vert1_base + 15u];
-
-    // The ambient-occlusion count of each corner of this quad, straight out of the vertex: how many of
-    // the four blocks around that corner fill their whole block. The curve is applied in the fragment
+    // **The ambient-occlusion count of each corner of this quad, straight out of the vertex**: how many
+    // of the four blocks around that corner fill their whole block. The curve is applied in the fragment
     // stage, where the four are blended - see there for why.
-    var v1_ao = f32((vert1_v4 >> 8u) & 0xff);
-    var v2_ao = f32((vert2_v4 >> 8u) & 0xff);
-    var v3_ao = f32((vert3_v4 >> 8u) & 0xff);
-    var v4_ao = f32((vert4_v4 >> 8u) & 0xff);
+    //
+    // Three bits, because four is as high as the count goes. Those bits used to be the position's "this
+    // coordinate is exactly 16" flags, and the position used to hold its own count here; the two swapped
+    // when the position needed eight more bits an axis than a byte could hold.
+    var vert1_v3 = chunk_data[vert1_base + 2u];
+    var vert2_v3 = chunk_data[vert1_base + 6u];
+    var vert3_v3 = chunk_data[vert1_base + 10u];
+    var vert4_v3 = chunk_data[vert1_base + 14u];
+
+    var v1_ao = f32((vert1_v3 >> 29u) & 0x7u);
+    var v2_ao = f32((vert2_v3 >> 29u) & 0x7u);
+    var v3_ao = f32((vert3_v3 >> 29u) & 0x7u);
+    var v4_ao = f32((vert4_v3 >> 29u) & 0x7u);
 
     var uv = array<vec2<f32>,4>(
             vec2(1.0,1.0),
@@ -415,13 +697,22 @@ fn vert(
     var v3 = chunk_data[id + 2u];
     var v4 = chunk_data[id + 3u];
 
-    var x: f32 = f32(v1 & 0xffu) * 0.0625;
-    var y: f32 = f32((v1 >> 8u) & 0xffu) * 0.0625;
-    var z: f32 = f32((v1 >> 16u) & 0xffu) * 0.0625;
+    // **Sixteen bits an axis, at 1/2048 of a block.** That is the scale VulkanMod's compressed terrain
+    // vertex uses for the same three numbers (`POSITION_INV = 1.0 / 2048.0`), and it is eight bits an axis
+    // finer than what this format held before. The low half of the first word is x and its high half is y;
+    // z is the low half of the second, with u above it.
+    //
+    // There is no "this coordinate is exactly 16" flag to test any more. Eight bits could not name 16, so
+    // each axis carried one; sixteen bits reach 32 blocks, and 16.0 is 32768 like any other coordinate.
+    var x: f32 = f32(v1 & 0xffffu) * 0.00048828125;
+    var y: f32 = f32(v1 >> 16u) * 0.00048828125;
+    var z: f32 = f32(v2 & 0xffffu) * 0.00048828125;
 
-    var r: u32 = (v1 >> 24u) & 0xff;
-    var g: u32 = (v2 & 0xff);
-    var b: u32 = (v2 >> 8u) & 0xff;
+    // The colour, in the fourth word's low three bytes - and the light in its top one. Both moved when the
+    // position took the space they were in.
+    var r: u32 = v4 & 0xffu;
+    var g: u32 = (v4 >> 8u) & 0xffu;
+    var b: u32 = (v4 >> 16u) & 0xffu;
 
     vr.color = vec4(f32(r) * 0.003921568627451, f32(g) * 0.003921568627451, f32(b) * 0.003921568627451, 1.0);
 
@@ -445,6 +736,9 @@ fn vert(
     let animated = (v3 >> 17u) & 1u;
     // The level-of-detail floor: four bits at bit 18, written by the bake. See `UV_LOD_FLOOR_SHIFT`.
     let lod_floor = (v3 >> 18u) & 0xfu;
+    // And the mipped-cutout bit, two bits above the floor's four: bit 6 of the flag half, which is bit
+    // 22 of `v3`. See `UV_CUTOUT_MIPPED`.
+    let mipped = (v3 >> 22u) & 1u;
     let uv_scale = select(0.00048828125, 1.0 / 65535.0, game_atlas == 1u);
 
     // **A half-texel shift, under test.** Both are sent from the renderer rather than written here,
@@ -468,20 +762,33 @@ fn vert(
     var u: f32 = f32((v2 >> 16u) & 0xffffu) * uv_scale + half_texel;
     var v: f32 = f32(v3 & 0xffffu) * uv_scale + half_texel;
 
-    if(((v3 >> 29u) & 1u) == 1u) {
-        x = 16.0;
-    }
+    // **`v` is written through with no `1.0 - v`, and that is not an omission.** The flip everybody
+    // remembers - `texCoord0.y = 1.0 - texCoord0.y;` - was the OpenGL sampler's convention: GL's texture
+    // origin is the *bottom* of the picture, while a Minecraft UV is measured **downward from the top row**.
+    // Three things say so, and all three are checkable in this tree:
+    //
+    //  - the model's own tables put the sprite's `minV` on the *top* corners of a face: the game's
+    //    `CuboidFace.UVs.getVertexV` gives vertices 0 and 3 `minV`, and `defaultFaceUV(SOUTH)` is
+    //    `(from.x, 16 - to.y, to.x, 16 - from.y)` - `16 - to.y` is the top of the element. `sprite_vertices`
+    //    and `default_face_uv` in `mc/block.rs` are those two tables transcribed, and the README records
+    //    what turning them produced: every side face of every `defaultFaceUV` model upside down;
+    //  - `TextureAtlasSprite#v0 = (y + padding) / atlasHeight`, measured from the *top* of the atlas, so
+    //    `minV` is the sprite's first row in the image - and the game's own atlas is built by *rendering*
+    //    sprites into it under `ortho2D(0, w, 0, h)` with that same top-down `y`, which lands the sprite's
+    //    image row on the texel row `v0` names, the same orientation an upload of the PNG would give;
+    //  - this backend's sampler is wgpu's, and its texture origin is the first row of what was uploaded -
+    //    which is the PNG's first row. That is the convention above, so sampling it directly is what is
+    //    upright; 26.1's own `terrain.vsh` writes `texCoord0 = UV0;` and its `terrain.fsh` samples it with
+    //    no flip either, and `GlCommandEncoder#writeToTexture` uploads rows in order - the flip is gone from
+    //    vanilla too, because 26.1 samples through the same top-left convention this side does.
+    //
+    // Adding one here would therefore *introduce* the mirror: the green of a grass block's side at the
+    // bottom of the block, on every face of every model.
 
-    if(((v3 >> 30u) & 1u) == 1u) {
-        y = 16.0;
-    }
-
-    if((v3 >> 31u) == 1u) {
-        z = 16.0;
-    }
+    // No flag test and no `16.0` here any more: see the decode above for where those three bits went.
     var pos = vec3<f32>(x, y, z);
 
-    var section_origin = vec3<f32>(f32(section_pos.x), f32(section_pos.y), f32(section_pos.z)) * 16.0;
+    var section_origin = vec3<f32>(f32(draw.x), f32(draw.y), f32(draw.z)) * 16.0;
     var world_pos = pos + section_origin;
 
     vr.pos = mat4_persp * mat4_view * mat4_model * vec4(world_pos, 1.0);
@@ -502,6 +809,7 @@ fn vert(
     vr.game_atlas = game_atlas;
     vr.animated = animated;
     vr.lod_floor = lod_floor;
+    vr.mipped = mipped;
 
     // The lighting, fetched the way the game's own terrain shader fetches it: one lightmap texel per
     // vertex, and the rasterizer interpolates the *colour*, which is what `vertexColor = Color *
@@ -580,216 +888,4 @@ fn apply_fog(
     );
 
     return vec4<f32>(mix(color.rgb, fog_color.rgb, fog_value * fog_color.a), color.a);
-}
-
-@fragment
-fn frag(
-    in: VertexResult
-) -> @location(0) vec4<f32> {
-    // The ambient-occlusion corner, blended across the quad's four corners - and then the curve.
-    //
-    // This read `0.6 + 0.4 * corner` for as long as the vertices carried a *brightness* step, and that
-    // is where the corners went wrong: Minecraft's own corner value is the average of four
-    // `getShadeBrightness` samples, each `0.2` for a block that fills its whole block and `1.0` for
-    // everything else - so its range is `0.2 .. 1.0` in five steps, and a shadowed corner in vanilla is
-    // five times darker than the brightest one. Against a curve that starts at `0.6`, the darkest a
-    // corner could get was 0.6: the shading was there, in the right places, and only about a third as
-    // deep as the game's - which reads as "the ambient occlusion is too weak" rather than as anything
-    // missing.
-    //
-    // The vertex carries the *count* - 0 to 4 of the four blocks that darken that corner - and the curve
-    // is `1 - 0.2 * count`, which is exactly that average. The four corners are blended here, where
-    // Minecraft's are what the rasterizer makes of four per-vertex colours: the curve is the game's, the
-    // blend is this renderer's (bilinear over the corners rather than linear across two triangles, which
-    // is why a face here has no diagonal seam through its shading).
-    var occluders = mix(mix(in.ao3, in.ao4, in.light_uv.x), mix(in.ao2, in.ao1, in.light_uv.x), in.light_uv.y);
-    var ao = 1.0 - 0.2 * occluders;
-
-    // And the light is the lightmap's own colour - no curve of this renderer's is applied to it at all.
-    var light = in.light_color;
-
-    // Which atlas this face samples, and the whole of what the flag does.
-    //
-    // A face whose sprite the game animates was baked with the game's coordinates and draws from the
-    // game's atlas, which the game is already animating; everything else draws from this side's copy
-    // of its sprite.
-    //
-    // **Both are sampled, and the flag picks between the results.** `textureSample` takes an implicit
-    // level of detail from the derivatives of its coordinates, and WGSL only defines those in *uniform*
-    // control flow - a `textureSample` in a branch is undefined behaviour, full stop, whether or not the
-    // condition happens to be the same for every fragment of a primitive. This was the obvious shape
-    // instead:
-    //
-    //     var texel: vec4<f32>;
-    //     if (in.game_atlas == 1u) { texel = textureSample(t_game_atlas, ...); }
-    //     else                     { texel = textureSample(t_texture, ...); }
-    //
-    // and the flag *is* flat, so every fragment of one primitive takes the same branch and the
-    // derivative is the one it would have had - on the hardware it was tried on. That is an argument
-    // about the picture coming out right, not about the program being defined, and the difference
-    // between the two is a driver that decides to execute both sides of a uniform branch, or one that
-    // vectorises a quad across a primitive boundary. So the samples are hoisted out of the branch and
-    // the choice is a `select` on the values: one instruction more, and no undefined behaviour.
-    //
-    // Both fetch the same coordinates with the same sampler *shape* - nearest within a level, a blend
-    // between levels, the same address modes - so the pair cost the same work the branch did whenever
-    // both were live, and the two mip chains are indexed identically because the atlases are the same
-    // size. `select` on a `vec4<f32>` rather than `mix`, because this is a choice and not a blend: a
-    // half-way value would be one atlas bleeding into the other at every sprite edge.
-    // `textureSampleBias` rather than `textureSample`, with the immediate bias - zero unless a
-    // diagnostic run moved it, and the two behave identically at zero. See the constant for what moving
-    // it is for.
-    //
-    // **And each of the four fetches picks a sampler rather than being given one.** The pair is
-    // magnification and minification, and which one applies is decided per fragment by the test below -
-    // see `t_game_sampler_magnify` for why one sampler cannot do both jobs. The magnifying fetches use
-    // plain `textureSampleBias` on a sampler whose magnification is `Nearest`; the bias is harmless there
-    // because a magnified surface is at level 0 whatever the bias says (the sampler clamps at 0), and it
-    // is meaningless to a `Nearest` filter anyway.
-    let magnified = is_magnified(
-        in.tex_coords,
-        select(section_pos.texel_ours, section_pos.texel_game, in.game_atlas == 1u),
-    );
-
-    // **The level-of-detail floor, which is what a bias could not express.**
-    //
-    // A face's coordinates span its sprite's content - sixteen or thirty-two texels for a block - while the
-    // mip chain under the atlas is built once for the whole session and runs down to the atlas' own width.
-    // So a sprite stops being itself *in the atlas* long before the chain ends, and what is left below that
-    // point is not the sprite at a smaller size but a running average of it. For a **scrolling,
-    // frame-interpolated** sprite - water and lava are both - that average *moves* as the frames advance,
-    // so the same pixel changes over time with nothing moving. That is the fluid shimmer, and it is why the
-    // fluids shimmer and a static sprite never does: a still sprite's coarse levels are a consistent pyramid.
-    //
-    // **This began as a bias and the bias could not work.** `-4` was measured against the water: the water
-    // shimmer went and the lava's stayed. Both flow sprites are 32x32 texels - measured, not assumed, after
-    // an assumption that they differed was wrong - so one offset lands them at the same level, and what
-    // differs is what is *in* those levels: `lava_flow` animates at `frametime 3` against a much slower
-    // water and its frames differ far more. `-5` left the lava shimmering too.
-    //
-    // The reason is that a bias is a count of *levels*, and the level at which a sprite stops being itself
-    // is a property of the *sprite* - so one number cannot serve two sprites of different sizes, and no
-    // number at all can express "do not go past here". So the floor is computed where the sprite's size is
-    // known, at bake time, and carried in the vertex: see `UV_LOD_FLOOR_SHIFT` and `sprite_level_floor`.
-    //
-    // **Magnification keeps its own zero, and the near field is why.** A magnified surface is at level 0
-    // whatever any of this says, so a floor is meaningless there and a bias was actively harmful - the
-    // revision that applied one to every surface sharpened the distance into a moiré.
-    //
-    // **`LOD_FLOOR_IS_LEVEL_ZERO` picks which floor, and the pair is a real comparison rather than a
-    // leftover.** Both say "do not go below this" and differ only in how deep they allow:
-    //
-    //  * `true` clamps every minified animated face at **level 0** - the full-resolution sprite, no mip
-    //    chain at all. **This is the one that was measured to remove the lava shimmer**, and it is the blunt
-    //    one: it also throws away the minification the chain exists for, so a distant animated sprite stops
-    //    getting smaller and starts aliasing instead.
-    //  * `false` uses the per-sprite floor the bake computed - `log2` of the sprite's own texels, less
-    //    `LEVELS_OF_DETAIL_KEPT` - the precise form of the same idea, and what the four vertex bits are for.
-    //    **It has still never been measured**, which is the surprising part of this whole search: in every
-    //    round it was tried in, fluids did not carry `UV_ANIMATED`, so this branch was false for them and
-    //    the change was inert. See `FluidSprite::flags`.
-    //
-    // Whichever of these removes the shimmer while keeping the other properties is the answer.
-    //
-    // Four bits, so the field is what the bake wrote and nothing else has to agree with it.
-    const LOD_FLOOR_IS_LEVEL_ZERO: bool = false;
-
-    let floor = select(
-        0.0,
-        select(64.0, f32(in.lod_floor), !LOD_FLOOR_IS_LEVEL_ZERO),
-        in.animated == 1u && !magnified,
-    );
-
-    let bias = section_pos.lod_bias - floor;
-
-    // **Which of the game's three sampling methods is in force**, read from the immediate the draw hands
-    // over. `sample_atlas` is the game's own pair of functions; see them above for why this is not a sampler
-    // setting - the level RGSS computes is one the hardware would not have picked, and no sampler exposes
-    // the level at all.
-    //
-    // The bias now sits at 0 for almost every surface, because what it was standing in for is *here*: the
-    // game's geometric-mean level. It is still applied, and still subtracts the floor, so the two ways of
-    // asking for a finer level compose rather than one silently winning.
-    // One texel of the atlas this face samples, as a fraction of it - the `TextureSize` the game's own two
-    // functions are given. Built from the fields that were already here rather than sent a second time: a
-    // duplicate of the same number is a second thing that can disagree, and it cost four bytes of padding in
-    // an immediate whose size has to match this struct exactly. **wgpu aborts the process when it does not**
-    // (`Not all immediate data required by the pipeline has been set ... missing byte ranges: 48..52`),
-    // which is how the duplicate was found.
-    let pixel_size = select(
-        vec2<f32>(section_pos.texel_ours, section_pos.texel_ours),
-        vec2<f32>(section_pos.texel_game, section_pos.texel_game),
-        in.game_atlas == 1u,
-    );
-
-    // **Three cases, not two.** A magnified surface wants the crisp `Nearest` magnification; a minified
-    // *static* one wants the anisotropic sampler; and a minified **animated** one wants neither, because
-    // nearest magnification of a coarse level stretches the running average of the animation over the whole
-    // face and steps it as the frames advance - the "bright spots magnified into one big bright tile" a
-    // player described. See `t_game_sampler_animated`.
-    //
-    // The inner `select` picks between the two minified samplers and the outer one overrides both when the
-    // surface is magnified, so the three cases are reached as: magnified, animated-and-minified, rest.
-    //
-    // Every branch is evaluated and selected between rather than branched on, which is the same rule the
-    // two-texture choice below follows: an implicit derivative under non-uniform control flow is undefined,
-    // and `in.game_atlas` is per vertex.
-    let texel_from_game = select(
-        select(
-            sample_atlas(t_game_atlas, t_game_sampler, in.tex_coords, pixel_size, section_pos.use_rgss, bias),
-            sample_atlas(t_game_atlas, t_game_sampler_animated, in.tex_coords, pixel_size, section_pos.use_rgss, bias),
-            in.animated == 1u,
-        ),
-        sample_atlas(t_game_atlas, t_game_sampler_magnify, in.tex_coords, pixel_size, section_pos.use_rgss, bias),
-        magnified,
-    );
-    let texel_from_ours = select(
-        select(
-            sample_atlas(t_texture, t_sampler, in.tex_coords, pixel_size, section_pos.use_rgss, bias),
-            sample_atlas(t_texture, t_sampler_animated, in.tex_coords, pixel_size, section_pos.use_rgss, bias),
-            in.animated == 1u,
-        ),
-        sample_atlas(t_texture, t_sampler_magnify, in.tex_coords, pixel_size, section_pos.use_rgss, bias),
-        magnified,
-    );
-    let texel = select(texel_from_ours, texel_from_game, in.game_atlas == 1u);
-
-    // The light is a colour now, not a number: the game's lightmap has a colour in it (the sky light
-    // goes blue at night, the darkness effect tints it), and the game's own shader multiplies it in as
-    // it stands. Everything else is this renderer's: the vertex colour carries the tint and the face
-    // shading, and the corner value is the ambient occlusion above.
-    let col = in.color * vec4(light, 1.0) * vec4(ao, ao, ao, 1.0) * texel;
-
-    // The cutout test, at the cutoff the layer being drawn declares.
-    //
-    // This read `if (col.a == 0.0f)` for as long as the atlas had one mip level, where "transparent"
-    // and "exactly zero alpha" are the same texel. The atlas has a mip chain now (`ATLAS_MIP_LEVELS`,
-    // sampled with `mipmap_filter: Linear`), and a hole in a leaf texture is only zero at level 0: at
-    // any level above it, the hole is an *average* of leaves and gaps, a small non-zero alpha - so
-    // nothing was discarded and the face was painted whole, at full strength, because this pass
-    // replaces the target rather than blending into it. Leaves therefore came out solid beyond the
-    // distance at which a sprite stops covering enough pixels to stay on level 0, and the boundary
-    // between the two moved with the camera's distance, angle and field of view.
-    //
-    // **This shader is only bound for layers that are cut out** - the cutout layer here, and the
-    // translucent one through the pipeline that names it. The solid layer draws with
-    // `terrain_solid.wgsl`, which has no test, because the mere presence of the `discard` below is
-    // what makes a driver drop early-Z for the entire pipeline. See `terrain_layers` in `graph.rs`.
-    if(col.a < section_pos.alpha_cutout){
-        discard;
-    }
-
-    // And the fog, in the same place the game's own fragment shader applies it: after the alpha test, so
-    // what is tested is the texture's own alpha rather than a fogged one. It is applied to the whole
-    // terrain pass, which is why the far edge of the loaded world fades into the sky instead of ending.
-    return apply_fog(
-        col,
-        in.fog_distances.x,
-        in.fog_distances.y,
-        fog.environmental_start,
-        fog.environmental_end,
-        fog.render_distance_start,
-        fog.render_distance_end,
-        fog.color,
-    );
 }

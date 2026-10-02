@@ -727,6 +727,13 @@ mod block_atlas_sampler_tests {
             wgpu::MipmapFilterMode::Linear,
             "blending levels is what makes the mip filter linear"
         );
+
+        // **The bit is restored before it is asserted on, and set here rather than left to whatever the
+        // process happens to hold.** `MAX_ANISOTROPY_BIT` is process-global like the two switches around
+        // it, so a test that read it without setting it would answer differently depending on what ran
+        // first - and the assertion below is about `1 << bit`, which is the arithmetic the option adds.
+        set_max_anisotropy_bit(GAME_ANISOTROPY_BIT_DEFAULT);
+
         assert_eq!(
             blended.anisotropy_clamp, GAME_ANISOTROPY,
             "and it is then what lets the game's own anisotropy through - which is `1 << maxAnisotropyBit`, \
@@ -771,6 +778,87 @@ mod block_atlas_sampler_tests {
         // Left on: it is the default, and a test that changed a global and left it changed would decide
         // the filters of whatever ran next.
         set_game_atlas_blend_mips(true);
+    }
+}
+
+#[cfg(test)]
+mod max_anisotropy_bit_tests {
+    use super::*;
+
+    /// **The bit the JVM pushes is the exponent, and the sampler's clamp is `1 << bit`** - which is
+    /// `Options#maxAnisotropyValue` as the game computes it.
+    ///
+    /// The three values the game's own slider can produce are what is asserted, because they are the three
+    /// a player can actually reach: `maxAnisotropyBit` is an `IntRange(1, 3)`, so the answers are 2, 4 and
+    /// 8. Before this the clamp was the constant 4 whatever the option said, which is the state a row could
+    /// have moved in `options.txt` and nowhere else.
+    #[test]
+    fn the_clamp_is_the_option_s_own_power_of_two() {
+        for (bit, expected) in [(1u32, 2u16), (2, 4), (3, 8)] {
+            set_max_anisotropy_bit(bit);
+
+            assert_eq!(
+                game_anisotropy(),
+                expected,
+                "a bit of {bit} is `1 << {bit}`, which is the game's own answer"
+            );
+        }
+
+        set_max_anisotropy_bit(GAME_ANISOTROPY_BIT_DEFAULT);
+    }
+
+    /// **A bit past the game's own ceiling is clamped rather than shifted off the end of the `u16`**, and
+    /// the clamp is the largest `anisotropy_clamp` wgpu accepts.
+    ///
+    /// This is the half of the function that the option's own range does not cover: the range is 1..3, so
+    /// 8 and above arrive only from a hand-edited file or a caller that got the units wrong - and a
+    /// `1u16 << 16` would be a panic in a debug build and a zero in a release one, which is a sampler with
+    /// no anisotropy at all rather than a loud failure.
+    #[test]
+    fn a_bit_the_game_cannot_produce_is_clamped_to_what_the_api_accepts() {
+        for bit in [9u32, 16, 32, u32::MAX] {
+            set_max_anisotropy_bit(bit);
+
+            assert_eq!(
+                game_anisotropy(),
+                ANISOTROPY_CLAMP_MAX,
+                "a bit of {bit} is past what any device is asked for, so the answer is the ceiling"
+            );
+        }
+
+        set_max_anisotropy_bit(GAME_ANISOTROPY_BIT_DEFAULT);
+    }
+
+    /// **The two halves of the option multiply out the way `LevelRenderer` builds them**: the clamp is the
+    /// bit's own power of two under `ANISOTROPIC` and exactly 1 under the other two answers.
+    ///
+    /// `textureFiltering` is asserted here beside the bit because the pair is one line in the game and two
+    /// independent pushes on this side - so a change that wired the bit in and left the method comparison
+    /// alone would raise the anisotropy for "Fast" and "Fancy" as well, which is a picture nobody asked
+    /// for and nothing else in this file would notice.
+    #[test]
+    fn only_the_anisotropic_answer_raises_the_clamp() {
+        set_max_anisotropy_bit(3);
+
+        set_texture_filtering(TEXTURE_FILTERING_ANISOTROPIC);
+        assert_eq!(
+            game_atlas_sampler().anisotropy_clamp,
+            8,
+            "the only answer that wants a sampler filter is the one that gets the option's own value"
+        );
+
+        for method in [0, TEXTURE_FILTERING_RGSS] {
+            set_texture_filtering(method);
+
+            assert_eq!(
+                game_atlas_sampler().anisotropy_clamp,
+                1,
+                "texture filtering {method} asks the sampler for nothing"
+            );
+        }
+
+        set_texture_filtering(TEXTURE_FILTERING_ANISOTROPIC);
+        set_max_anisotropy_bit(GAME_ANISOTROPY_BIT_DEFAULT);
     }
 }
 
@@ -1198,7 +1286,7 @@ pub const TEXTURE_FILTERING_RGSS: u32 = 1;
 /// anisotropy. See [`TEXTURE_FILTERING`].
 pub const TEXTURE_FILTERING_ANISOTROPIC: u32 = 2;
 
-/// **The `anisotropy_clamp` the game''s own terrain sampler would be built with**, which is the whole of
+/// **The `anisotropy_clamp` the game's own terrain sampler would be built with**, which is the whole of
 /// what the `textureFiltering` option means to a sampler.
 ///
 /// `LevelRenderer` builds it as
@@ -1218,16 +1306,59 @@ pub const TEXTURE_FILTERING_ANISOTROPIC: u32 = 2;
 /// `the_game_atlas_never_asks_for_anisotropy_without_linear_filters`), and `game_atlas_blend_mips` is a
 /// player's switch that moves the mip filter. So the value is read per sampler creation rather than baked
 /// in, and the coupling is spelled out at each of the two places it is used.
+///
+/// **Both halves of that line are read now.** The bit was [`GAME_ANISOTROPY_BIT_DEFAULT`] for as long as
+/// there was no row to move it - see [`MAX_ANISOTROPY_BIT`] - and it is `1 << bit` clamped to 16, which is
+/// the largest `anisotropy_clamp` wgpu accepts.
 fn terrain_anisotropy() -> u16 {
     if texture_filtering() == TEXTURE_FILTERING_ANISOTROPIC {
-        // The game's default bit is 2, so its own answer is 4. `wgpu` clamps to what the adapter supports.
-        GAME_ANISOTROPY
+        // `Options#maxAnisotropyValue`, as the game computes it, with the ceiling the *API* has rather
+        // than the device: wgpu exposes no query for what the driver supports, and its own validation
+        // clamps a request above the limit instead of refusing it.
+        game_anisotropy()
     } else {
         1
     }
 }
 
-/// The game's own anisotropy, `Options#maxAnisotropyValue` at its default bit of 2: `1 << 2`.
+/// **The game's `maxAnisotropyBit` option, which is the exponent in `Options#maxAnisotropyValue`.**
+///
+/// Pushed by the JVM once per frame beside [`TEXTURE_FILTERING`], and for the same reason: it is an option
+/// object the player can move on the options screen, and a cached copy on this side would be one more
+/// thing to keep in step with a screen this side cannot see.
+///
+/// Held as a plain integer rather than a bit mask so that the value on this side is the same number the
+/// game stores, and the shift happens once, in [`game_anisotropy`]. The default is the game's own
+/// ([`GAME_ANISOTROPY_BIT_DEFAULT`]) so that a launch where the setting is never pushed - a test, or a
+/// frame before the first push - samples exactly as it did before the option existed.
+static MAX_ANISOTROPY_BIT: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(GAME_ANISOTROPY_BIT_DEFAULT);
+
+/// See [`MAX_ANISOTROPY_BIT`]. The game's own default bit, which makes its answer `1 << 2`.
+pub const GAME_ANISOTROPY_BIT_DEFAULT: u32 = 2;
+
+/// The largest `anisotropy_clamp` this side will ask for, from either half of the option.
+///
+/// 16 rather than "whatever the device has", because there is no such query: `Limits` has no anisotropy
+/// field, and `wgpu-core` clamps a value the driver cannot honour rather than failing the sampler. It is
+/// also the ceiling the game's own slider tops out at - `maxAnisotropyBit` is `1..3`, so its own maximum
+/// answer is 8 and this is slack rather than a limit anyone reaches.
+const ANISOTROPY_CLAMP_MAX: u16 = 16;
+
+/// See [`MAX_ANISOTROPY_BIT`].
+pub fn game_anisotropy() -> u16 {
+    let bit = MAX_ANISOTROPY_BIT
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .min(8);
+    (1u16 << bit).min(ANISOTROPY_CLAMP_MAX)
+}
+
+/// Sets [`MAX_ANISOTROPY_BIT`]. Pushed by the JVM, once per frame, beside [`set_texture_filtering`].
+pub fn set_max_anisotropy_bit(bit: u32) {
+    MAX_ANISOTROPY_BIT.store(bit, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The game's own anisotropy at its default bit of 2: `1 << 2`. See [`MAX_ANISOTROPY_BIT`].
 pub const GAME_ANISOTROPY: u16 = 4;
 /// **The sampler for the game's own block atlas**, which is the one every animation is drawn from.
 ///

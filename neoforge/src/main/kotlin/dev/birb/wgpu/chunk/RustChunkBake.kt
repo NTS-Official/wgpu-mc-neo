@@ -3,6 +3,7 @@ package dev.birb.wgpu.chunk
 import dev.birb.wgpu.WgpuMcMod
 import dev.birb.wgpu.backend.Diagnostics
 import dev.birb.wgpu.mixin.chunk.RenderSectionRegionAccessor
+import dev.birb.wgpu.mixin.chunk.WeightedVariantsAccessor
 import dev.birb.wgpu.mixin.world.PackedIntegerArrayMixin
 import dev.birb.wgpu.mixin.chunk.SectionCopyAccessor
 import dev.birb.wgpu.palette.RustBlockStateAccessor
@@ -12,9 +13,14 @@ import dev.birb.wgpu.rust.RendererSettings
 import dev.birb.wgpu.rust.WgpuNative
 import dev.birb.wgpu.rust.WmNative
 import net.minecraft.client.Minecraft
+import net.minecraft.client.renderer.block.dispatch.BlockStateModel
+import net.minecraft.client.renderer.block.dispatch.WeightedVariants
 import net.minecraft.client.renderer.chunk.RenderSectionRegion
+import net.minecraft.core.BlockPos
 import net.minecraft.core.SectionPos
+import net.minecraft.util.RandomSource
 import net.minecraft.util.SimpleBitStorage
+import net.minecraft.util.random.WeightedList
 import net.minecraft.world.level.LightLayer
 import net.minecraft.world.level.block.state.BlockState
 import net.minecraft.world.level.chunk.PalettedContainer
@@ -494,6 +500,29 @@ object RustChunkBake {
 	/** The slot of the 27 the rebuild is about. Must match `CENTER` in `wgpu-mc-jni/src/section.rs`. */
 	private const val CENTER = 13
 
+	/** Words per section in the visibility trailer: the low half of the pair, then the high half. */
+	private const val VISIBILITY_WORDS_PER_SECTION = 2
+
+	/** The trailer's own two words: the magic, then the world it was written for. */
+	private const val VISIBILITY_TRAILER_WORDS = SECTIONS * VISIBILITY_WORDS_PER_SECTION + 2
+
+	/** The trailer's size, which the writer checks the buffer still has room for. */
+	private const val VISIBILITY_TRAILER_BYTES = VISIBILITY_TRAILER_WORDS * 4L
+
+	/**
+	 * The bit above the 36 a pair uses, and the word that closes the trailer.
+	 *
+	 * `VisibilitySet`'s pairs are `from * 6 + to` over DOWN, UP, NORTH, SOUTH, WEST, EAST - 36 bits - so
+	 * the 64th is free to say "this slot was answered for at all". Without it "nothing is visible out of
+	 * this section" and "nothing was said about this section" are the same 36 zero bits, and they mean
+	 * opposite things to whoever reads them. The Rust side reads the same bit as
+	 * `section::VISIBILITY_PRESENT` and the same magic as `section::VISIBILITY_MAGIC`.
+	 */
+	private const val VISIBILITY_PRESENT = 1L shl 63
+
+	private const val VISIBILITY_MAGIC = 0x574D5356
+
+
 	/**
 	 * What one `send` got back, which is two questions and not one.
 	 *
@@ -715,6 +744,34 @@ object RustChunkBake {
 	private var lastPayloadBytes = 0
 
 	/** What Rust has been told about each section, so the next rebuild can send only what changed. */
+	/**
+	 * What the game's occlusion graph resolved for a section, keyed by `SectionPos.asLong`.
+	 *
+	 * Filed by [noteVisibility] from the mixin that resolves the graph, and read back when the next
+	 * payload about that section is written - the answer cannot ride on the payload that carried the
+	 * bake, because that payload left before the graph was resolved. See [writeVisibility] for the wire
+	 * format and `section.rs`'s reader for the other half of it.
+	 */
+	private val visibility = ConcurrentHashMap<Long, Long>()
+
+	/** Files the graph's answer for a section: the mixin's entry point. */
+	@JvmStatic
+	fun noteVisibility(section: Long, answer: Long) {
+		visibility[section] = answer
+	}
+
+	/** The answer filed for a section, or `null` where the graph has not resolved one yet. */
+	private fun getVisibility(section: Long): Long? = visibility[section]
+
+	/** Forgets a section's answer, for a section this side no longer holds. */
+	private fun setVisibility(section: Long, answer: Long?) {
+		if (answer == null) {
+			visibility.remove(section)
+		} else {
+			visibility[section] = answer
+		}
+	}
+
 	private val sent = ConcurrentHashMap<Long, Sent>()
 
 	/**
@@ -1184,6 +1241,11 @@ object RustChunkBake {
 		// The sections this call changes, applied to [sent] after it returns.
 		val updates = ArrayList<Update>(SECTIONS)
 
+		// What the graph has answered for each of the 27, gathered as the payload is walked and written
+		// as one trailer at the end. A section whose answer has not come back yet is sent as
+		// *unanswered* rather than as "nothing is visible out of it": see [VISIBILITY_PRESENT].
+		val visibilities = LongArray(SECTIONS)
+
 		val payload = Payload.ofThread()
 		payload.begin()
 
@@ -1208,6 +1270,11 @@ object RustChunkBake {
 			val states = statesOf(region, copies, index, x, y, z)
 			val blocks = if (states == null) null else describe(states)
 			val entry = sent[key]
+
+			// The one place the answer is read back. It is filed against the section's own key rather
+			// than carried through the bookkeeping, because the payload it has to ride on is not the
+			// one whose bake it came from - see [noteVisibility].
+			visibilities[index] = getVisibility(key)?.let { it or VISIBILITY_PRESENT } ?: 0L
 
 			if (!rustHas.contains(key)) {
 				firstLook[0] = true
@@ -1234,6 +1301,24 @@ object RustChunkBake {
 				knownBlocks = knownBlocks or (1 shl index)
 			}
 
+			// **The target's model variants go out with every payload about it, not with its blocks.**
+			//
+			// Riding on the block record, which is what this did first, is wrong for the commonest case
+			// there is: a section is usually *sent* long before it is *baked*, as a neighbour of whatever
+			// was being built next to it, and when its own turn comes its blocks compare equal and no
+			// record is written - so its variants would never go at all. Measured with that version: 546
+			// lily pads drawn, 34 of them at a variant the game had chosen, and every other one at zero,
+			// while the JVM's own picks were already a flat 149/136/158/130 across the four quarter
+			// turns. See [variants].
+			//
+			// It is 4 KB against a payload of a hundred kilobytes, once per rebuild of a section that has
+			// a list-variant block in it, and it also means a reload that changes the choice - the
+			// weights, the list, the seed arithmetic - corrects itself on the next rebuild rather than
+			// needing the blocks to change as well.
+			if (index == CENTER) {
+				states?.let { variants(it, x, y, z) }?.let { payload.writeVariants(it) }
+			}
+
 			if (timing) blockNanos += System.nanoTime() - blocksStarted
 
 			if (light == null) {
@@ -1253,6 +1338,7 @@ object RustChunkBake {
 			}
 		}
 
+		payload.writeVisibility(visibilities, stamp)
 		payload.finish(knownBlocks, knownLight)
 
 		lastPayloadBytes = payload.length
@@ -1343,6 +1429,120 @@ object RustChunkBake {
 
 		return Light(block ?: EMPTY_LIGHT, sky ?: EMPTY_LIGHT)
 	}
+
+	/**
+	 * Which model variant each position of a section uses, one byte per position, or `null` when no
+	 * state in it has a list of variants to choose from.
+	 *
+	 * **The choice is the game's, made with the game's own objects**: `ModelBlockRenderer#tesselateBlock`
+	 * does `random.setSeed(blockState.getSeed(pos))` and then `WeightedVariants#collectParts`, which is
+	 * `WeightedList#getRandomOrThrow`. Both are called here, on the blockstate's own baked list, so the
+	 * index that reaches Rust is the entry the game's own mesher would have drawn - weights, list order
+	 * and random number generator included. Rust bakes one mesh per list entry and picks by this index;
+	 * see `section::VARIANTS_BYTES`.
+	 *
+	 * The order is Minecraft's own storage order, `(y << 8) | (z << 4) | x`, which is both the order the
+	 * palette's longs are indexed in and the order the Rust baker walks blocks in.
+	 *
+	 * **The palette is checked first**, because this is a per-payload cost and almost no section has a
+	 * list-variant block in it: a lily pad pond does, a quarry does not. The walk itself is then 4096
+	 * `get`s on a container this call is already reading.
+	 *
+	 * The seed is the **block's own world position**, `SectionPos`'s origin plus the local offset. The
+	 * first version hashed the section's corner for every position, which is one seed for all 4096 of
+	 * them and turns every lily pad in a pond the same way - a mistake no counter could see, because the
+	 * JVM was answering exactly what it was asked.
+	 */
+	private fun variants(
+		states: PalettedContainer<BlockState>,
+		sectionX: Int,
+		sectionY: Int,
+		sectionZ: Int,
+	): ByteArray? {
+		val palette = ContainerData.palette(states) ?: return null
+
+		// Which palette entries are a list, keyed by the state's Rust index so that the walk below is
+		// one array read per position rather than a lookup of the state itself.
+		val lists = HashMap<Int, WeightedList<BlockStateModel>>()
+
+		for (index in 0 until palette.size) {
+			val state = palette.valueFor(index)
+			val key = rustStateIndex(state)
+
+			if (lists.containsKey(key)) {
+				continue
+			}
+
+			variantList(state)?.let { lists[key] = it }
+		}
+
+		if (lists.isEmpty()) {
+			return null
+		}
+
+		val out = VARIANT_SCRATCH.get()
+		java.util.Arrays.fill(out, 0)
+
+		val pos = VARIANT_POS.get()
+		val random = VARIANT_RANDOM.get()
+
+		for (index in 0 until 4096) {
+			val x = index and 15
+			val z = index shr 4 and 15
+			val y = index shr 8
+
+			val state = states.get(x, y, z)
+			val list = lists[rustStateIndex(state)] ?: continue
+			val entries = list.unwrap()
+
+			// **The block's own world position, which is what the seed hashes.** `SectionPos`'s origin
+			// plus the local offset - not the section's corner, which is the same seed for all 4096
+			// positions and turns every lily pad in a pond the same way.
+			pos.set((sectionX shl 4) + x, (sectionY shl 4) + y, (sectionZ shl 4) + z)
+
+			// The game's own seeding, byte for byte: `SectionCompiler` passes `blockState.getSeed(pos)`,
+			// which is `BlockBehaviour#getSeed` - overridden by a bed, a door and a double plant so that
+			// both halves of one share a choice. A *fresh* `RandomSource` is the same generator the game
+			// uses and `setSeed` replaces its whole state, so nothing has to be carried between
+			// positions.
+			random.setSeed(state.getSeed(pos))
+
+			val chosen = list.getRandomOrThrow(random)
+
+			out[index] = entries
+				.indexOfFirst { entry -> entry.value() === chosen }
+				.coerceIn(0, 255)
+				.toByte()
+
+			val pick = out[index].toInt()
+
+			if (pick != 0) {
+				variantPositions.incrementAndGet()
+				variantMask.getAndUpdate { it or (1 shl pick.coerceAtMost(31)) }
+			}
+		}
+
+		variantSections.incrementAndGet()
+
+		return out
+	}
+
+	/** The entries a state's model chooses between, or `null` when it is a single model. */
+	private fun variantList(state: BlockState): WeightedList<BlockStateModel>? {
+		val model = Minecraft.getInstance().modelManager.blockStateModelSet.get(state)
+
+		if (model !is WeightedVariants) {
+			return null
+		}
+
+		val list = (model as WeightedVariantsAccessor).`wgpu_mc$list`()
+
+		return if (list.unwrap().size > 1) list else null
+	}
+
+	/** The Rust registry's index for a state, which is what the palette's table holds. */
+	private fun rustStateIndex(state: BlockState): Int =
+		(state as? RustBlockStateAccessor)?.`wgpu_mc$getRustBlockStateIndex`() ?: 0
 
 	/**
 	 * Reads one snapshot section into the shape the cache compares and the payload writes.
@@ -1473,6 +1673,28 @@ object RustChunkBake {
 
 	private val paletteLava = java.util.concurrent.atomic.AtomicLong()
 
+	/** What the model-variant channel has carried: see [variantDiagnostics]. */
+	private val variantSections = java.util.concurrent.atomic.AtomicLong()
+
+	private val variantPositions = java.util.concurrent.atomic.AtomicLong()
+
+	private val variantMask = java.util.concurrent.atomic.AtomicInteger()
+
+	/**
+	 * The one buffer, block position and random number generator the variant walk uses, per thread.
+	 *
+	 * Per thread for the same reason the payload is: a section's payload is assembled on whichever
+	 * chunk-build worker Minecraft hands it to, and several are building at once. Reused because a
+	 * payload is written for every rebuild of every section, and 4 KB of a fresh array each time is
+	 * exactly the churn this path exists to avoid.
+	 */
+	private val VARIANT_SCRATCH = ThreadLocal.withInitial { ByteArray(4096) }
+
+	private val VARIANT_POS = ThreadLocal.withInitial { BlockPos.MutableBlockPos() }
+
+	/** Seeded per position, so what it holds between positions does not matter. See [variants]. */
+	private val VARIANT_RANDOM = ThreadLocal.withInitial { RandomSource.create() }
+
 	/**
 	 * Diagnostics: what the fluid bytes have said so far, for the line the terrain pass logs.
 	 *
@@ -1484,6 +1706,27 @@ object RustChunkBake {
 	val fluidDiagnostics: String
 		get() = "$sectionsDescribed section(s) described carrying $paletteFluids fluid palette " +
 			"entr(ies), $paletteLava of them lava"
+
+	/**
+	 * Diagnostics: what the model-variant channel has carried so far.
+	 *
+	 * The three numbers answer the three questions a wrong angle raises and a picture cannot: whether
+	 * any payload carried a blob at all (`0 section(s)` means the palette check never found a list),
+	 * whether the positions in them were all the first variant (`0 position(s) chose another` means the
+	 * walk ran and the game picked entry 0 everywhere), and whether the picks were a *mix* - the mask,
+	 * one bit per index the game has chosen, which for a pond of lily pads shows every bit the lists
+	 * have. A single bit set is the shape of a channel that is being written but not read.
+	 *
+	 * The measured shape of it, from the run that verified the channel: 358 payload(s) carried
+	 * variants, 613,810 positions chose another, indices seen `1110` - and the pads drawn came out
+	 * `242/206/238/208` across the four quarter turns, against the game's own `121/103/119/104` picks.
+	 */
+	@JvmStatic
+	val variantDiagnostics: String
+		get() =
+			"$variantSections section(s) carried model variants, $variantPositions position(s) chose " +
+				"another, indices seen " + Integer.toBinaryString(variantMask.get())
+
 	/**
 	 * The palette translation table: `keys[minecraft index]` is the Rust block key.
 	 *
@@ -1607,6 +1850,17 @@ object RustChunkBake {
 		var length = 0
 			private set
 
+		/**
+		 * Where this payload's model-variant blob is, or zero for a payload that carries none.
+		 *
+		 * Header word 6, which is the first of the two words the header had spare - the block record's
+		 * sixteen are all spoken for - and it is read on the other side as `section::VARIANT_OFFSET_WORD`.
+		 * One word rather than a field in the record because the blob belongs to the **target**, whose
+		 * record is usually not in the payload at all: a section is sent as a neighbour long before it
+		 * is baked, and by then its blocks compare equal.
+		 */
+		private var variantOffset = 0L
+
 		val address: Long get() = segment.address()
 
 		fun begin() {
@@ -1614,6 +1868,20 @@ object RustChunkBake {
 			blocks = 0
 			lights = 0
 			length = 0
+			variantOffset = 0
+		}
+
+		/**
+		 * The section's model variants: one byte per position, in `(y << 8) | (z << 4) | x` order.
+		 *
+		 * Written into the blob area and pointed at by a header word, so that a payload with no variants
+		 * is byte-for-byte what it was before this existed. See [variants] for where the bytes come from
+		 * and `section::VARIANTS_BYTES` for what they mean.
+		 */
+		fun writeVariants(variants: ByteArray) {
+			variantOffset = cursor
+			put(cursor, variants)
+			cursor += variants.size
 		}
 
 		/** A section Rust should keep, or replace what it had. */
@@ -1698,6 +1966,58 @@ object RustChunkBake {
 			lights++
 		}
 
+		/**
+		 * The visibility trailer: 27 answered-or-not pairs, then the magic and the world it was written for.
+		 *
+		 * Written where the blobs stop rather than at an offset reserved for it, because the blobs in front of
+		 * it are variable length - the reader finds it from the **end** of the payload, which is what the magic
+		 * being the second-to-last word is for.
+		 *
+		 * A payload with no room left for it goes without one rather than off the end of the segment. Nothing
+		 * is lost that cannot be re-sent: the reader takes a payload with no trailer as "answered nothing", and
+		 * the next payload that mentions these sections carries them again.
+		 */
+		fun writeVisibility(values: LongArray, generation: Int) {
+			val start = cursor
+
+			// Eight-aligned first, the way `writeBlock` aligns its longs: `word` is a `JAVA_INT` write and the
+			// segment refuses a misaligned one outright. The blobs in front are bytes, so the cursor stops
+			// wherever the last one ended.
+			val aligned = (start + 7L) / 8L * 8L
+
+			if (aligned + VISIBILITY_TRAILER_BYTES > PAYLOAD_BYTES) {
+				return
+			}
+
+			try {
+				cursor = aligned
+
+				for (index in 0 until SECTIONS) {
+					val value = values[index]
+
+					word(cursor, value.toInt())
+					word(cursor + 4, (value ushr 32).toInt())
+					cursor += VISIBILITY_WORDS_PER_SECTION * 4L
+				}
+
+				word(cursor, VISIBILITY_MAGIC)
+				word(cursor + 4, generation)
+				cursor += 8L
+			} catch (failure: RuntimeException) {
+				// Optional by design, so a mistake in it must not cost the bake that carries it. The cursor
+				// goes back so that the payload's length does not cover a half-written trailer - which would
+				// not have been read as one anyway, since the magic is written last.
+				cursor = start
+
+				if (TRAILER_FAILURE.compareAndSet(false, true)) {
+					WgpuMcMod.LOGGER.warn(
+						"wgpu: a section payload could not carry its visibility trailer and went without one",
+						failure
+					)
+				}
+			}
+		}
+
 		fun finish(knownBlocks: Int, knownLight: Int) {
 			word(0, MAGIC)
 			word(4, 0)
@@ -1705,6 +2025,7 @@ object RustChunkBake {
 			word(12, lights)
 			word(16, knownBlocks)
 			word(20, knownLight)
+			word(24, variantOffset.toInt())
 			length = cursor.toInt()
 		}
 
@@ -1733,6 +2054,9 @@ object RustChunkBake {
 		}
 
 		companion object {
+			/** Whether a trailer has already failed to be written, so the warning is printed once. */
+			private val TRAILER_FAILURE = java.util.concurrent.atomic.AtomicBoolean(false)
+
 			private val perThread = ThreadLocal.withInitial { Payload() }
 
 			fun ofThread(): Payload = perThread.get()

@@ -54,6 +54,7 @@ pipelines:
         12: "@sampler_mc_block_atlas_animated"
         13: "@sampler_block_atlas_animated"
       1: "@bg_ssbo_chunks"
+      2: "@bg_section_draws"
     immediates:
       0: "@pc_section_position"
 
@@ -86,6 +87,7 @@ pipelines:
         12: "@sampler_mc_block_atlas_animated"
         13: "@sampler_block_atlas_animated"
       1: "@bg_ssbo_chunks"
+      2: "@bg_section_draws"
     immediates:
       0: "@pc_section_position"
 
@@ -131,6 +133,7 @@ pipelines:
         12: "@sampler_mc_block_atlas_animated"
         13: "@sampler_block_atlas_animated"
       1: "@bg_ssbo_chunks"
+      2: "@bg_section_draws"
     immediates:
       0: "@pc_section_position"
 

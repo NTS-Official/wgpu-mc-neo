@@ -14,11 +14,15 @@ import org.spongepowered.asm.mixin.gen.Accessor;
  * game treats as close. The Rust terrain pass draws from the first - it stands in for the same draws -
  * so that is the one read here.
  *
- * <p>The list is rebuilt every frame, in {@code LevelRenderer#setupRender}, by
- * {@code SectionOcclusionGraph#update}: it walks outward from the camera through sections it can see,
- * so what it holds is a few hundred sections rather than the couple of thousand a frustum would name.
- * Reading it once per frame and handing it to the native side is the whole of the occlusion culling
- * this renderer does for terrain - see {@code RenderGraph::terrain_layers}' caller.
+ * <p>The list is <b>not</b> rebuilt every frame. It is filled by {@code LevelRenderer#applyFrustum},
+ * which {@code cullTerrain} runs only when the camera has turned two degrees or
+ * {@code SectionOcclusionGraph#consumeFrustumUpdate} says the graph's answer moved - so between rebuilds
+ * it is a snapshot that the frame reads as it stands, and {@code VisibleSectionsMixin} counts the
+ * rebuilds so the reader can tell a new list from the one it already has. What it holds when it is
+ * rebuilt is a few hundred sections rather than the couple of thousand a frustum would name, because
+ * the walk that fills it goes outward through sections it can actually see. Reading it once per frame
+ * and handing it to the native side is the whole of the occlusion culling this renderer does for
+ * terrain - see {@code RenderGraph::terrain_layers}' caller.
  *
  * <p>An accessor rather than a {@code @Redirect} or an {@code @Inject}, because nothing needs to
  * happen at any particular moment: the list is read when the frame is drawn, and it is the frame's own

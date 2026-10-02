@@ -213,6 +213,16 @@ object TerrainPass {
 		// test there rather than a picture that quietly sampled differently.
 		WgpuNative.setTextureFiltering(client.options.textureFiltering().get().ordinal)
 
+		// **And the other half of the same line of `LevelRenderer`.** The clamp above is only half of
+		// `maxAnisotropy = textureFiltering == ANISOTROPIC ? maxAnisotropyValue : 1`: `maxAnisotropyValue`
+		// is `1 << maxAnisotropyBit`, and the bit is a slider of its own (1..3, so 2, 4 and 8). Sending the
+		// bit rather than the value keeps the shift on the one side that also owns the clamp, and keeps
+		// what crosses the bridge the same number `options.txt` holds.
+		//
+		// Pushed every frame for exactly the reason above: it is read from an option object a screen can
+		// move, and a cached copy would be one more thing to keep in step.
+		WgpuNative.setMaxAnisotropyBit(client.options.maxAnisotropyBit().get())
+
 		// The camera state of the frame being drawn, which `GameRenderer.renderLevel` filled in before
 		// it called into the level renderer this pass belongs to.
 		val cameraState = client.gameRenderer.gameRenderState.levelRenderState.cameraRenderState
@@ -288,6 +298,7 @@ object TerrainPass {
 
 		WgpuNative.setCameraSection(sectionX, sectionY, sectionZ)
 		sendVisibleSections()
+		sendWorldBounds()
 
 		WgpuNative.setMatrix(MATRIX_PROJECTION, projection)
 		WgpuNative.setMatrix(MATRIX_VIEW, view)
@@ -295,17 +306,21 @@ object TerrainPass {
 
 		sendFog(cameraState, position.x - originX, position.y - originY, position.z - originZ)
 
-		// Diagnostics: the fog the shader is being handed, once a second.
+		// Diagnostics: the fog the shader is being handed, once a second, and the section list with it.
 		//
 		// This is the one number in the frame that decides what a distance is worth, and it arrives from
 		// the game whole - so a picture that is uniformly too dark or too washed out is either these
 		// values being wrong or the shader doing something else with them. Printing them is what tells
 		// the two apart, and it is the difference between "the fog is too strong" and "the fog is right
 		// and something else is darkening the world".
+		//
+		// The section list's own line rides the same second rather than having one of its own: both are
+		// about the frame path, both are worth reading next to the frame they came from, and one gate is
+		// one clock read per frame instead of two.
 		if (Diagnostics.loggingEnabled()) {
 			val now = System.nanoTime()
-			if (now - fogReportedAt >= 1_000_000_000L) {
-				fogReportedAt = now
+			if (now - diagnosticsReportedAt >= 1_000_000_000L) {
+				diagnosticsReportedAt = now
 				WgpuMcMod.LOGGER.info(
 					"wgpu: fog colour ({}, {}, {}, {}), environmental {}..{}, render distance {}..{}, fogType {}, waterVision {}",
 					fog[0], fog[1], fog[2], fog[3], fog[4], fog[5], fog[6], fog[7], cameraState.fogType,
@@ -317,14 +332,28 @@ object TerrainPass {
 					// "the fog is not brightened" from "the fog is fine and something else is dark".
 					(Minecraft.getInstance().player?.waterVision ?: -1.0f),
 				)
+
+				// The other half of this gate, and the same second: what the section list cost. It is here
+				// rather than on the terrain report because that one is the native side's, and this is the
+				// one number in the frame path the native side cannot see - the JVM's own walk of the list.
+				reportTheVisibleList()
+
+				// And the third thing this gate carries: a row of biome tints across the nearest biome
+				// change, which is the measurement the known tint gap is missing. See [TintProfile].
+				TintProfile.report()
 			}
 		}
 
 		bindLightmap()
 	}
 
-	/** When the fog line above last went out. See [sendFog]. */
-	private var fogReportedAt = 0L
+	/**
+	 * When the fog line above last went out, which is also when the section list's line did.
+	 *
+	 * A second timer of its own would be a second clock read per frame for nothing: the two lines answer
+	 * different questions about the same frame, and they are worth reading next to each other.
+	 */
+	private var diagnosticsReportedAt = 0L
 
 	/** The fog block the shader reads. See [sendFog] for what goes in it. */
 	private val fog = FloatArray(12)
@@ -363,11 +392,43 @@ object TerrainPass {
 		WgpuNative.setFogEnvironment(fog)
 	}
 
-	/** The packed section keys of the last frame that was sent, so an unchanged frame is no call. */
+	/** The packed section keys of the last list that was sent, so a list that came back the same is no call. */
 	private var lastVisibleSections: LongArray? = null
 
 	/**
-	 * Hands the renderer Minecraft's own answer to "what can be seen", once per frame.
+	 * The list's revision when those keys were taken, so a frame the game did not rebuild the list on is no
+	 * work at all.
+	 *
+	 * `-1` rather than `0`, because the game's count starts at zero and only moves when it rebuilds: a first
+	 * call that believed it had already sent revision zero would leave the native side with no list at all
+	 * until the camera happened to turn two degrees.
+	 */
+	private var lastVisibleSectionsRevision = -1
+
+	/** Asks the section list was made this second, and what came of them. See [sendVisibleSections]. */
+	private var visibleAsks = 0L
+	private var visibleRebuilds = 0L
+	private var visibleSends = 0L
+	private var visibleUnchanged = 0L
+	private var visibleRebuildNanos = 0L
+
+	/** How many sections the last list that was sent named. Reported; never read by the path itself. */
+	private var visibleLastSize = 0
+
+	/**
+	 * What one rebuild averaged, over the last second that had one, in nanoseconds.
+	 *
+	 * **Kept across reports rather than divided out per report, and that is the whole of the estimate's
+	 * usefulness.** The second a world settles is the second with no rebuilds in it - and a percentage
+	 * taken from *that* second's zero would report that the old path would have cost nothing, which is the
+	 * one second where it would have cost the most. The average is carried forward instead, and it is only
+	 * as good as the list not having changed size since: the walk is linear in the list, so an average
+	 * taken while the world was still meshing describes a shorter list than the settled one.
+	 */
+	private var visibleNanosPerRebuild = 0L
+
+	/**
+	 * Hands the renderer Minecraft's own answer to "what can be seen", on the frames it says it has a new one.
 	 *
 	 * The native terrain pass used to cull its sections against the camera's frustum, which is what the
 	 * game does *first* - and what its `SectionOcclusionGraph` then throws most of away. The graph walks
@@ -376,17 +437,54 @@ object TerrainPass {
 	 * section of a cave, a ravine or a forest floor, and the vertex stage transforms geometry the depth
 	 * test then discards.
 	 *
-	 * `LevelRenderer#visibleSections` is that graph's answer and it is rebuilt every frame in
-	 * `setupRender`, which is before this runs. It is read rather than recomputed because recomputing it
-	 * is what the game is already doing, and the game's version is the one with the graph in it.
+	 * `LevelRenderer#visibleSections` is that graph's answer. It is read rather than recomputed because
+	 * recomputing it is what the game is already doing, and the game's version is the one with the graph in
+	 * it.
+	 *
+	 * **That list is not rebuilt every frame, and this asks the game's own signal about it.** The one place
+	 * it is filled is `LevelRenderer#applyFrustum` - clear, then walk the octree - and `cullTerrain` runs
+	 * that only when the camera has turned two degrees or the graph reports that its answer moved (see
+	 * [VisibleSectionsRevision]). So the frame path here is a revision compare, and the rebuild below
+	 * happens on the frames the game itself decided something had changed, which is a handful per second
+	 * rather than sixty or more:
+	 *
+	 *  - the game's two rules are its *own* dirty flag, and it keeps neither for anyone else: the angle
+	 *    comparison is a local and `consumeFrustumUpdate` is consumed by the branch that reads it, so
+	 *    reading the flag is not an option - it has to be counted where it is decided
+	 *    (`VisibleSectionsMixin`);
+	 *  - the walk it removes is not the crossing: an allocation, one mixin getter per section and a compare
+	 *    of the whole array per frame, over a list of a few hundred to a few thousand sections. What the
+	 *    numbers are is what [reportTheVisibleList] prints;
+	 *  - **and it is a correctness fix before it is a saving.** `applyFrustum` clears the list before it
+	 *    refills it - unobservable, both inside one call on the render thread - but `allChanged` clears it
+	 *    *without* a refill (a render-distance change, a resource reload, the way into a world) and leaves it
+	 *    empty until the graph's next update lands. Sending that says something else entirely - `Some(empty)`
+	 *    is "the game looked and saw nothing", which makes the native side draw no terrain **and** drop the
+	 *    grace set for sections the arena has just taken over (`Scene::sections_since_the_list`) - and the run
+	 *    in `run-32chunks.log` caught it twice, one second apart, at the render-distance change: `0 section
+	 *    draw(s)` with 42 sections in the arena and "42 not named by the game's occlusion graph".
 	 *
 	 * The keys are `SectionPos.asLong`, taken straight off each section's own node: the same packing
 	 * `RustChunkBake` keys its records by and the native side unpacks, so a section cannot be named one
-	 * way here and another way there. A frame whose list is identical to the last one is not sent again -
-	 * the list only changes when the camera's view does, and the native side keeps the last one.
+	 * way here and another way there. A list identical to the last one sent is still not sent again: the
+	 * game can rebuild it and produce the same sections - the octree does not move when the camera turns
+	 * two degrees on the spot - and the check is only paid on the frames it rebuilt on.
 	 */
 	private fun sendVisibleSections() {
 		val levelRenderer = Minecraft.getInstance().levelRenderer
+		val revision = VisibleSectionsRevision.value()
+
+		visibleAsks++
+
+		// The whole of the per-frame cost: the game's own "the list is new" signal, and nothing else.
+		if (revision == lastVisibleSectionsRevision) {
+			return
+		}
+
+		lastVisibleSectionsRevision = revision
+		visibleRebuilds++
+
+		val startedAt = System.nanoTime()
 
 		val visible = (levelRenderer as VisibleSectionsAccessor).`wgpu_mc$visibleSections`()
 		val keys = LongArray(visible.size)
@@ -395,14 +493,111 @@ object TerrainPass {
 			keys[index] = (visible[index] as RenderSectionNodeAccessor).`wgpu_mc$sectionNode`()
 		}
 
-		// Identity of contents rather than of the array: the list is the same list most frames, and a
-		// native call per frame to hand over the same thousand longs is the cost this avoids.
-		if (lastVisibleSections?.contentEquals(keys) == true) {
+		// Identity of contents rather than of the array: a rebuild the camera's two degrees asked for can
+		// still name exactly the sections the last one did, and a native call to hand over the same
+		// thousand longs is what this avoids. See `describeFrame` for the same idea one level up.
+		val unchanged = lastVisibleSections?.contentEquals(keys) == true
+
+		visibleRebuildNanos += System.nanoTime() - startedAt
+
+		if (unchanged) {
+			visibleUnchanged++
 			return
 		}
 
+		visibleSends++
+		visibleLastSize = keys.size
 		lastVisibleSections = keys
 		WgpuNative.setVisibleSections(keys)
+	}
+
+	/**
+	 * Says what the section list cost in the last second, in the same breath as the fog line.
+	 *
+	 * The four counts are the mechanism, and the two microseconds are why it exists. `asks` is the frame
+	 * path and `rebuilds` is the work: the walk, the allocation and the compare. `rebuilt to the same
+	 * list` is the content check earning its keep - a rebuild the game asked for that named exactly the
+	 * sections the last one did, which is a crossing not made and a gather not invalidated.
+	 *
+	 * **The second number is an estimate and is labelled as one**: the average rebuild multiplied by the
+	 * asks, which is what the path would have cost had every ask rebuilt - which is what it did before the
+	 * revision gate. It assumes a rebuild costs the same at every ask, which is true enough when the list is
+	 * the same size from one ask to the next, and it is the *point* of the number: it is the size of what
+	 * was removed, not a measurement of the old code. See [visibleNanosPerRebuild] for why the average is
+	 * carried between reports rather than recomputed from this one.
+	 *
+	 * Drained rather than accumulated, so a report is a second and not a session - and so a run that turns
+	 * the log on late starts from zero rather than from a count nobody watched.
+	 */
+	private fun reportTheVisibleList() {
+		val asks = visibleAsks
+		val rebuilds = visibleRebuilds
+		val sends = visibleSends
+		val unchanged = visibleUnchanged
+		val nanos = visibleRebuildNanos
+		val size = visibleLastSize
+
+		visibleAsks = 0
+		visibleRebuilds = 0
+		visibleSends = 0
+		visibleUnchanged = 0
+		visibleRebuildNanos = 0
+
+		if (rebuilds > 0) {
+			visibleNanosPerRebuild = nanos / rebuilds
+		}
+
+		WgpuMcMod.LOGGER.info(
+			"wgpu: the section list - {} ask(s), {} rebuilt, {} sent, {} rebuilt to the same list; " +
+				"{} us in the rebuild, ~{} us had every ask rebuilt it; {} section(s) in the last one sent",
+			asks,
+			rebuilds,
+			sends,
+			unchanged,
+			nanos / 1000L,
+			visibleNanosPerRebuild * asks / 1000L,
+			size,
+		)
+	}
+
+	/** The world's box as it was last sent, so a frame that repeats it is no call. */
+	private var lastWorldBounds: Triple<Int, Int, Int>? = null
+
+	/**
+	 * Hands the renderer the box the game's own chunk view covers, once per frame and only when it moves.
+	 *
+	 * The native occlusion walk is bounded by this and by the frustum, and the frustum alone is not a
+	 * bound. Its rule is that a section nobody has described is open air - which it has to be, because
+	 * Minecraft never compiles a section that is all air and so no payload ever carries an answer for one -
+	 * and "open air" is then the answer for every position inside the frustum, above the build limit and
+	 * below the level included. Bounded by the world's own box the same walk polled 482 sections; without
+	 * it, 770,568.
+	 *
+	 * `ViewArea` is the game's own answer and it is three numbers. The square is the effective render
+	 * distance in chunks on each side of the camera's section - the option `LevelRenderer` builds its
+	 * section grid with, and the same square `ViewArea#containsSection` asks, not the diamond a server's
+	 * chunk tracking uses - and the column is the level's own section layers. The camera's own section is
+	 * deliberately not here: the native side is handed it by `setCameraSection` on the line above.
+	 *
+	 * Sent only when a number changes. A world's box holds still for minutes at a time and this runs on
+	 * the frame path, so the comparison is the point rather than an optimisation.
+	 */
+	private fun sendWorldBounds() {
+		val client = Minecraft.getInstance()
+		val level = client.level ?: return
+
+		val bounds = Triple(
+			client.options.getEffectiveRenderDistance(),
+			level.minSectionY,
+			level.maxSectionY,
+		)
+
+		if (lastWorldBounds == bounds) {
+			return
+		}
+
+		lastWorldBounds = bounds
+		WmNative.terrainWorldBounds.invokeExact(bounds.first, bounds.second, bounds.third)
 	}
 
 	/** The lightmap texture the graph was last handed, so the handover is one call rather than sixty a second. */
@@ -661,6 +856,7 @@ object TerrainPass {
 					", bobView=$lastBobView player=$lastIsPlayer walk=%.2f".format(lastWalk) +
 					"; $perLayer" +
 					"; ${RustChunkBake.fluidDiagnostics}" +
+					"; ${RustChunkBake.variantDiagnostics}" +
 					"; ${RustChunkBake.refusedDiagnostics}" +
 					(watched.takeIf { it.isNotEmpty() }?.let { "; watched $it" } ?: "") +
 					"; ${describeCamera()}"

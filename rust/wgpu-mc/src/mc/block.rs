@@ -493,6 +493,65 @@ pub static FACES_GAME_ATLAS: std::sync::atomic::AtomicU64 = std::sync::atomic::A
 /// See [`FACES_GAME_ATLAS`].
 pub static FACES_OWN_ATLAS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// **Whether every face the arena holds was baked with the game's atlas** - which is what lets the terrain
+/// shaders carry one atlas instead of two.
+///
+/// The difference is not a fetch: the two-atlas fragment stage branches on a per-vertex flag, and only one
+/// arm of that branch executes. It is *code* - three more `sample_at_level` call sites, a second texture
+/// and three more samplers in every terrain shader - and the answer to "which atlas" at bake time is not
+/// per face at all: [`decide_game_atlas`] ignores the sprite's animation and asks only whether the game's
+/// atlas is bound and whether the JVM registered a rectangle. In a normal session every face goes to the
+/// game's atlas, and the measurement says so: **204,878 faces for the game's atlas and 0 for this side's**.
+///
+/// **The two conditions that remain are the fallback, and they are of two different kinds.** "The atlas is
+/// not bound yet" and "the animation is off" are whole-session switches, and `render::graph` reads them
+/// directly. The third is per sprite - the game's atlas has no rectangle for it, so the face samples this
+/// side's frozen copy of its sprite - and *that* is what these two flags exist for: one for the answer
+/// (may a single-atlas pipeline be built?) and one to say the answer **moved**, so the graph is rebuilt
+/// with the two-atlas shader before the face can be drawn.
+///
+/// Cleared by [`forget_atlas_faces`], which the level change calls where it empties the arena: with no
+/// sections left, the next faces to be baked are baked under the current binding, and a session can
+/// therefore come *back* to the single-atlas shaders after a world change.
+static OUR_ATLAS_SINCE_RESET: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the atlas answer has moved since the last caller asked. See [`OUR_ATLAS_SINCE_RESET`].
+static ATLAS_MODE_MOVED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether every face in the arena was baked with the game's atlas, so a terrain pipeline may be built
+/// from a shader that samples only that one. See [`OUR_ATLAS_SINCE_RESET`].
+pub fn faces_are_all_the_games() -> bool {
+    !OUR_ATLAS_SINCE_RESET.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Says that a face has fallen back to this side's atlas. Called where one is baked.
+///
+/// It also records that the answer to [`faces_are_all_the_games`] has moved, and that is the half the
+/// renderer acts on: the graph is rebuilt from this flag rather than from the value, because a mode that
+/// moved has to reach the pipelines at a frame boundary - a terrain pass replaced half way through a frame
+/// would draw that frame's terrain in two different ways.
+pub fn note_our_atlas_face() {
+    OUR_ATLAS_SINCE_RESET.store(true, std::sync::atomic::Ordering::Relaxed);
+    ATLAS_MODE_MOVED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the atlas answer has moved since the last call, clearing it. See [`note_our_atlas_face`].
+pub fn take_atlas_mode_moved() -> bool {
+    ATLAS_MODE_MOVED.swap(false, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Forgets which atlases the arena's faces were baked for, for a level change that empties it first.
+///
+/// Both flags together: the answer is "no face has fallen back", and the move is announced so that a graph
+/// built for the two-atlas shaders is replaced by one built for a single atlas - which is the state a
+/// fresh world starts in and the one worth being in, since it is the common case by three orders of
+/// magnitude.
+pub fn forget_atlas_faces() {
+    OUR_ATLAS_SINCE_RESET.store(false, std::sync::atomic::Ordering::Relaxed);
+    ATLAS_MODE_MOVED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// **How many faces the leaves switch has moved out of their sprite's layer into the solid one.**
 ///
 /// The count of `ModelBlockRenderer#forceOpaque` firing, and the reason it exists: with the game's
@@ -776,6 +835,12 @@ fn face_data(
 
             FACES_OWN_ATLAS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
+            // **This face is why the terrain shaders still carry two atlases.** One of them is enough for
+            // every other face in the world, and the graph is rebuilt from this so that the two-atlas
+            // shader is in place before this face is drawn - see [`note_our_atlas_face`] for the ordering
+            // that makes that safe.
+            note_our_atlas_face();
+
             (uv, 0)
         }
     };
@@ -909,6 +974,22 @@ fn flatten_textures(value: &mut serde_json::Value) -> bool {
 /// This is the model's half of the answer and it is the *floor* under a face's layer: the sprite a
 /// face samples can put it in a stronger one, and does for everything a model says nothing about -
 /// ice, leaves, every plant. See [`BlockModelFace::layer`].
+/// Whether a model declares Minecraft's **mipped** cutout pipeline.
+///
+/// It is the same field [`declared_layer`] reads and a *different* question: both are `cutout` to this
+/// renderer, which has one cutout layer, and the game's two cutout pipelines differ in their alpha
+/// cutoff - 0.5 against 0.1. See [`crate::render::pipeline::UV_CUTOUT_MIPPED`].
+fn declared_mipped(json: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(json) else {
+        return false;
+    };
+
+    matches!(
+        value.get("render_type").and_then(|kind| kind.as_str()),
+        Some("minecraft:cutout_mipped" | "cutout_mipped")
+    )
+}
+
 fn declared_layer(json: &str) -> Option<RenderLayer> {
     let value: serde_json::Value = serde_json::from_str(json).ok()?;
 
@@ -1194,6 +1275,12 @@ fn default_face_uv(bounds: ElementBounds, declared: Direction) -> [f32; 4] {
 /// `uv` is the rectangle the face samples, in the model file's own units - the one it wrote, or the
 /// one [`default_face_uv`] derived from its element. It is handed in rather than read off the face,
 /// because by the time a face gets here the two are the same field and only the caller knows which.
+///
+/// **The arithmetic below is a straight `v0 + t * (v1 - v0)` on both axes, with no flip, and that is
+/// deliberate.** The `v` a model writes is measured downward from the top of the sprite, and so is the
+/// sampler this side hands it to; the `1.0 - v` that a Minecraft GLSL shader used to carry was OpenGL's
+/// bottom-left origin, not the game's convention. `terrain.wgsl` says the whole of it where it writes the
+/// varying, because that is where the question gets asked.
 fn get_atlas_uv(
     uv: [f32; 4],
     rotation: u32,
@@ -1449,6 +1536,75 @@ pub struct ModelMesh {
     pub down: Vec<BlockModelFace>,
     pub any: Vec<BlockModelFace>,
     pub cull: u8,
+    /// The model's own `ambientocclusion`, inherited through its parents, or `None` where none of
+    /// them said.
+    ///
+    /// **This is not the same question as "has the mesh a face off the cube's planes"**, which is what
+    /// the bucket layout answers, and the difference is the whole reason the field exists:
+    /// `models/block/door_bottom_left.json` says `false` and its faces *are* on the block's planes, so
+    /// it lands in `north`/`south` and used to be given ambient occlusion the game does not give it.
+    /// See [`uses_ambient_occlusion`] for the rule this is read by.
+    pub ambient_occlusion: Option<bool>,
+}
+
+/// Whether a mesh is drawn with ambient occlusion, which is the game's own rule:
+///
+/// ```java
+/// boolean useAO = this.ambientOcclusion && (perPartAO || switch (parts.getFirst().ambientOcclusion()) {
+///     case TRUE -> true;
+///     case DEFAULT -> blockState.getLightEmission(level, pos) == 0;
+///     case FALSE -> false;
+/// });
+/// ```
+///
+/// Three things about that are worth saying, because two of them are ours rather than the game's:
+///
+///  * `this.ambientOcclusion` is the video *option*, and the game's second clause is the model's own
+///    flag - which is the one this side never read at all, so every one of the 137 vanilla block
+///    models that turn it off (doors, panes, bars, ladders, levers, rails, tripwire, vines, glow
+///    lichen, crops, torches' templates, the lily pad) was being shaded as if it had not;
+///  * `DEFAULT` asks the state whether it emits light, which is a *position*-dependent query this side
+///    cannot make where the decision is needed. The answer here is `None` -> "occluded when the mesh
+///    has no face off the cube's planes", which is what this side did before the flag was read and is
+///    what keeps a cross-shaped plant flat - the case that rule was written for. A model that emits
+///    light *and* has no flag is the one shape that still differs;
+///  * the game reads the flag off `parts.getFirst()`, the *first* part of the multipart set, which is
+///    why [`ModelMesh::bake`] keeps the first model's answer rather than combining them.
+pub fn uses_ambient_occlusion(ambient_occlusion: Option<bool>, any_is_empty: bool) -> bool {
+    match ambient_occlusion {
+        Some(explicit) => explicit,
+        None => any_is_empty,
+    }
+}
+
+/// The rule above, over every combination it can be asked about.
+///
+/// A table rather than examples because the three answers are three different *reasons* and only one of
+/// them is the game's: an explicit flag is the game's, `None` with an inset face is this side's
+/// stand-in for the game's light-emission question, and `None` without one is what every cube in the
+/// world gets. The four `None`/`Some` cases have to stay distinguishable, which is exactly what a test
+/// written from the model files would not check.
+#[cfg(test)]
+mod ambient_occlusion_tests {
+    use super::uses_ambient_occlusion;
+
+    #[test]
+    fn the_flag_decides_when_it_is_there_and_the_buckets_decide_when_it_is_not() {
+        // A model that turns it off is flat whatever its faces look like - the door case, whose faces
+        // are on the block's planes and which used to be occluded.
+        assert!(!uses_ambient_occlusion(Some(false), true));
+        assert!(!uses_ambient_occlusion(Some(false), false));
+
+        // And one that turns it on is occluded even when every face is inset - which no vanilla model
+        // does, and the flag is the answer the game would give if one did.
+        assert!(uses_ambient_occlusion(Some(true), true));
+        assert!(uses_ambient_occlusion(Some(true), false));
+
+        // Said nothing: a face off the cube's planes is a cross or a lily pad and is drawn flat, a
+        // mesh of nothing but plane faces is a cube and is occluded.
+        assert!(!uses_ambient_occlusion(None, false));
+        assert!(uses_ambient_occlusion(None, true));
+    }
 }
 
 impl ModelMesh {
@@ -1472,6 +1628,11 @@ impl ModelMesh {
         resource_provider: &dyn ResourceProvider,
         block_atlas: &Atlas,
     ) -> Result<Self, MeshBakeError> {
+        // The *first* model's answer, kept as an `Option<Option<bool>>` so that "the first model said
+        // nothing" is not confused with "no model has been seen yet". See
+        // [`uses_ambient_occlusion`] for why it is the first that counts.
+        let ambient_occlusion: std::cell::Cell<Option<Option<bool>>> = std::cell::Cell::new(None);
+
         let mesh = model_properties
             .into_iter()
             .map(|model_properties: &ModelProperties| {
@@ -1498,11 +1659,19 @@ impl ModelMesh {
                     resource_provider,
                 )?;
 
+                // The model's two answers about its pipeline: the layer, and whether it is the *mipped*
+                // half of the cutout one. See [`declared_mipped`].
+                let mipped = declared_mipped(&model_json);
+
                 // What the model chain says every one of its faces is at least: `force_translucent`
                 // on a 26.1 texture entry, or the older `render_type`. The sprite a face samples can
                 // put it in a stronger layer than this, and does for everything the model says
                 // nothing about.
                 let model_layer = layer.unwrap_or(RenderLayer::Solid);
+
+                if ambient_occlusion.get().is_none() {
+                    ambient_occlusion.set(Some(model.ambient_occlusion));
+                }
 
                 // **The whole resolved grass model, dumped once per file.**
                 //
@@ -1764,7 +1933,15 @@ impl ModelMesh {
                                 normal: rotation.direction(direction.normal()),
                                 tint_index: face.tint_index,
                                 shade: face.shade,
-                                uv_flags: face.uv_flags,
+                                // **The mipped cutout bit, which is the model's answer and not the
+                                // sprite's**: see `declared_mipped`. It rides in `uv_flags` because the
+                                // shader already unpacks that field per face and this bit is free.
+                                uv_flags: face.uv_flags
+                                    | if mipped {
+                                        crate::render::pipeline::UV_CUTOUT_MIPPED
+                                    } else {
+                                        0
+                                    },
                                 layer: model_layer.stronger(face.layer),
                                 cull: face.cull,
                             })
@@ -1784,6 +1961,7 @@ impl ModelMesh {
             down: vec![],
             any: vec![],
             cull: 0,
+            ambient_occlusion: ambient_occlusion.get().flatten(),
         };
         mesh.iter().for_each(|face| {
             let full_face = (face.vertices[0].position.fract() == vec3(0.0, 0.0, 0.0)
@@ -3547,6 +3725,21 @@ mod cardinal_lighting_tests {
     /// the compiler reads as zero.
     const TOLERANCE: f32 = 0.001;
 
+    /// **The tests below write a table that is process-wide, so they may not run beside each other.**
+    ///
+    /// `set_cardinal_lighting` fills one static and `face_brightness` reads it, and `cargo test` runs a
+    /// module's tests on separate threads by default - so the test that sets the nether's table and the
+    /// test that sets the overworld's raced, and the one that read in between got 0.6 where it asked
+    /// for 0.9. It failed about one run in two and always in the *other* test, which is the shape a
+    /// flake takes and the reason it is worth a lock rather than a shrug: a suite that fails at random
+    /// is a suite nobody reads the failures of.
+    ///
+    /// A lock and not a redesign of the global, because the global is not the problem: there is one
+    /// device and one dimension at a time in a run, and the test is the only place two of them exist at
+    /// once. `unwrap_or_else` rather than `unwrap` so that a test that fails while holding this says
+    /// what it failed on rather than "poisoned".
+    static TABLE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// **The six values survive the packing**, which is the part a hand-written bit layout can get wrong.
     ///
     /// This is the test that should have existed before the table did: a packing bug shows as a face
@@ -3572,6 +3765,10 @@ mod cardinal_lighting_tests {
     /// And the per-direction answer is the one the game gives, in `Direction`'s own order.
     #[test]
     fn each_direction_gets_its_own_multiplier() {
+        let _table = TABLE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
         set_cardinal_lighting(CARDINAL_LIGHTING_DEFAULT);
 
         for (direction, expected) in [
@@ -3610,6 +3807,10 @@ mod cardinal_lighting_tests {
     /// A face with shading turned off is drawn at `up`, which is the game's own fallback.
     #[test]
     fn an_unshaded_face_uses_up() {
+        let _table = TABLE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
         set_cardinal_lighting(CARDINAL_LIGHTING_NETHER);
 
         // The nether is the table that makes this visible: `up` is 0.9 there and the sides are 0.6.
@@ -3618,5 +3819,94 @@ mod cardinal_lighting_tests {
 
         // Left as the overworld for whatever runs next.
         set_cardinal_lighting(CARDINAL_LIGHTING_DEFAULT);
+    }
+}
+
+#[cfg(test)]
+mod atlas_mode_tests {
+    use super::*;
+
+    /// **The atlas mode follows the bake, and a level change puts it back.**
+    ///
+    /// Three things have to hold together for the single-atlas shaders to be safe, and each one is a way
+    /// the picture can be wrong rather than a way it can be slow: a false "all the game's" draws a face
+    /// from the wrong texture, a moved answer nobody is told about leaves the pipelines on the shader that
+    /// cannot draw the face, and an answer that is never put back means a session pays for two atlases
+    /// forever after one sprite fell back.
+    ///
+    /// These flags are process-wide, so this is the only test that touches them - and it leaves them in
+    /// the state a session starts in.
+    #[test]
+    fn the_atlas_mode_follows_the_bake_and_a_level_change() {
+        forget_atlas_faces();
+        let _ = take_atlas_mode_moved();
+
+        assert!(
+            faces_are_all_the_games(),
+            "an empty arena has no face that could have fallen back"
+        );
+
+        note_our_atlas_face();
+
+        assert!(
+            !faces_are_all_the_games(),
+            "a face baked for this side's atlas has to take the two-atlas shaders with it"
+        );
+        assert!(
+            take_atlas_mode_moved(),
+            "and the graph has to be told, or the pipelines keep the shader that cannot draw it"
+        );
+        assert!(
+            !take_atlas_mode_moved(),
+            "the move is announced once, not once per frame for the rest of the session"
+        );
+
+        forget_atlas_faces();
+
+        assert!(
+            faces_are_all_the_games(),
+            "a level change empties the arena, so the next faces are baked under the binding that is \
+             there now - and that is how a session gets back to one atlas"
+        );
+        assert!(
+            take_atlas_mode_moved(),
+            "a level change is a move too, and the graph has to be rebuilt for it"
+        );
+    }
+}
+
+/// The two cutout pipelines the game declares and this renderer has one layer for. See
+/// [`declared_mipped`].
+#[cfg(test)]
+mod mipped_cutout_tests {
+    use super::*;
+
+    /// Both are `cutout` here and only one is mipped *there*, which is the whole point: the layer cannot
+    /// tell them apart and the cutoff can.
+    #[test]
+    fn the_two_cutout_pipelines_are_told_apart() {
+        let cutout = r#"{"render_type": "minecraft:cutout"}"#;
+        let mipped = r#"{"render_type": "minecraft:cutout_mipped"}"#;
+
+        assert_eq!(declared_layer(cutout), Some(RenderLayer::Cutout));
+        assert_eq!(declared_layer(mipped), Some(RenderLayer::Cutout));
+
+        assert!(!declared_mipped(cutout), "cutout is not mipped");
+        assert!(declared_mipped(mipped), "cutout_mipped is");
+        assert!(declared_mipped(r#"{"render_type": "cutout_mipped"}"#));
+    }
+
+    /// Everything else is not mipped, including a model that says nothing at all - the common case, and
+    /// the one where a wrong `true` would quietly drop half of every sprite in the world.
+    #[test]
+    fn nothing_else_is_mipped() {
+        for json in [
+            r#"{"render_type": "minecraft:translucent"}"#,
+            r#"{"render_type": "minecraft:solid"}"#,
+            "{}",
+            "not json at all",
+        ] {
+            assert!(!declared_mipped(json), "{json} must not be mipped");
+        }
     }
 }

@@ -88,18 +88,38 @@ pub struct Settings {
     /// next launch.
     #[serde(default = "two_frames_in_flight")]
     pub frames_in_flight: IntSetting,
-    /// The two switches that change how the frame is rendered, under the `Optimization` heading.
+    /// The switches that change how the frame is rendered, under the `Optimization` heading.
     ///
     /// **Field order here is the row order on the options screen**, and the sections have to come out
     /// contiguous: the page reads its rows from *this* struct - the config's own order, through
     /// `getSettings` - and its headings from [`SettingsInfo`], so a setting whose two orders disagree
     /// is drawn under the heading that happens to precede it. That is exactly what happened when
-    /// these two were declared after the debug switches but marked `Optimization`: the page drew
+    /// these were declared after the debug switches but marked `Optimization`: the page drew
     /// `Debug`, then `Optimization` over half of it, then `Debug` again for the rest.
+    ///
+    /// **The terrain's batched draw is the newest of them and was declared down with the debug
+    /// switches first**, which put a switch that is on by default and read only by the frame time
+    /// under a heading that means "something is wrong". It is here for the reason this section
+    /// exists at all; see [`OPTIMIZATION_SECTION`].
     #[serde(default)]
     pub bind_group_cache: BoolSetting,
     #[serde(default)]
     pub dynamic_offsets: BoolSetting,
+    /// Whether the terrain pass draws its sections with `multi_draw_indexed_indirect` rather than one
+    /// `draw_indexed` per section. See [`Settings::terrain_indirect`].
+    ///
+    /// **Off by default**, and the two reasons are different. The plumbing half: the batched path is
+    /// meant to draw the picture the per-section path draws, so a config that does not mention this key
+    /// is not asking for it either way - and an absent switch falling back to the path that has been
+    /// drawn all along is the answer that cannot surprise anyone. The working half: the terrain pipeline
+    /// is not what is being optimised right now, and a batching path that is not being measured should
+    /// not be what the frame time is measured through.
+    ///
+    /// Where the device or the backend *could not* batch, that is discovered where the device is created
+    /// and reported there - it is not the same question as this switch, and the log says which of the two
+    /// answered. See `device::try_create_renderer` and `wgpu_mc::render::graph::terrain_batches_draws`.
+    #[serde(default = "no_terrain_indirect")]
+    pub terrain_indirect: BoolSetting,
     /// Everything below is a debug switch, offered under the options screen's `Debug` heading.
     /// They are the marker files this renderer grew while it was being written, with a place in
     /// the UI: the marker still works (see [`crate::debug`]), and the setting is what a player can
@@ -201,6 +221,30 @@ pub struct Settings {
     /// differs from this renderer's own. See [Settings::game_atlas_blend_mips].
     #[serde(default = "off")]
     pub game_atlas_blend_mips: BoolSetting,
+    /// How many direction changes this renderer's own occlusion walk may take before it drops a section,
+    /// or **zero to draw from the game's own list** - which is the default, and what this renderer has
+    /// always done.
+    ///
+    /// **TODO: this is a net cost today, and it is under `Debug` rather than `Optimization` because of it.**
+    /// It was written as an optimisation - the walk in `render::section_graph` is this side's own occlusion
+    /// answer, with a budget that is a number rather than a property of the game's graph - and the
+    /// measurement says the opposite: **any value above zero lowers the frame rate.** The reason is
+    /// structural and no tuning fixes it: the game builds its own occlusion graph every frame and hands this
+    /// renderer the list for free, so the walk recomputes a subset of that answer *on top* of the frame's
+    /// work. Measured on the frame thread, per frame: **~2 ms at render distance 16 (~10,000 sections
+    /// polled) and ~8.2 ms at 32 (~40,000)**.
+    ///
+    /// What it would take to make the walk pay is for it to *replace* that graph, which means this side
+    /// owning the world's section grid and its build dispatch - VulkanMod's architecture, where there is no
+    /// game-built list to duplicate. That is a different project. See the README's "The walk had no world"
+    /// section for the measurements, and for what the walk reaches: everything the game's own list has that
+    /// this renderer's frustum would draw anyway, minus about 0.3%.
+    ///
+    /// One and up allows `adv_culling - 1` direction changes, which is the original's own `advCulling - 1`.
+    /// Above three the budget stops changing anything at all - with the world's own box in place, every
+    /// section of it is reachable within three turns - so **the values that mean something are 0, 1 and 2**.
+    #[serde(default = "no_adv_culling")]
+    pub adv_culling: IntSetting,
 }
 
 /// The default of [`Settings::atlas_lod_bias`]: **no bias at all**, which is the fetch a plain
@@ -255,6 +299,24 @@ fn on() -> BoolSetting {
     BoolSetting::of(true)
 }
 
+/// The default of `adv_culling`: **off**, which is the game's own occlusion list. See
+/// [`Settings::adv_culling`] - the walk is measured against that list rather than trusted in its place.
+fn no_adv_culling() -> IntSetting {
+    IntSetting::of(0, 16, 1, 0)
+}
+
+/// The default of `terrain_indirect`: **off**, which is one `draw_indexed` per section. See
+/// [`Settings::terrain_indirect`] - the batched path is kept behind the switch while the terrain
+/// pipeline is not the thing being worked on, and a player who wants it can still ask for it.
+///
+/// Named rather than `#[serde(default)]` so that the choice is *stated* here: `#[serde(default)]` would
+/// read as "whatever `BoolSetting` does", which is `true`, and that was in fact the old default - the
+/// one this reverses. The type default and this default have to be changed together, and a test beside
+/// [`Settings::debug`] says which way they are meant to agree.
+fn no_terrain_indirect() -> BoolSetting {
+    BoolSetting::of(false)
+}
+
 /// The default of `frames_in_flight`: one frame recorded ahead of the one being presented.
 ///
 /// Written out rather than left to `IntSetting::default`, whose range is 0..100 - and a zero here
@@ -289,12 +351,13 @@ pub struct SettingsInfo {
     /// in one place. See `OptionPages`' `DRAWN_ELSEWHERE`.
     animated_textures: EnumSettingInfo<AnimatedTextures>,
     frames_in_flight: SettingInfo,
-    /// The two switches that change *how* the frame is rendered rather than what is reported about
+    /// The switches that change *how* the frame is rendered rather than what is reported about
     /// it. **This order has to match [`Settings`]'s**, because the two halves of a row come from the
     /// two documents: the row itself and its order from the settings, and the heading it sits under
     /// from this schema. See the note on [`Settings::bind_group_cache`].
     bind_group_cache: SettingInfo,
     dynamic_offsets: SettingInfo,
+    terrain_indirect: SettingInfo,
     host_validation: SettingInfo,
     gpu_based_validation: SettingInfo,
     shader_debug_info: SettingInfo,
@@ -317,6 +380,9 @@ pub struct SettingsInfo {
     terrain_greater_depth: SettingInfo,
     atlas_lod_bias: SettingInfo,
     game_atlas_blend_mips: SettingInfo,
+    /// The occlusion walk's own budget: a recorded experiment, under `Debug` rather than `Optimization`
+    /// because it costs frame time rather than saving it. See [`Settings::adv_culling`].
+    adv_culling: SettingInfo,
 }
 
 /// The section the options screen puts a setting under, when it is not one of the plain ones.
@@ -327,25 +393,22 @@ const DEBUG_SECTION: &str = "Debug";
 
 /// The section for the switches that decide how the frame is rendered.
 ///
-/// They were debug switches because they were written to bisect a rendering bug, and they are not:
-/// one caches bind groups between draws and the other stops baking offsets into them, both are on by
-/// default, and turning either off is a performance decision - the diagnostic is the *frame time*.
-/// Putting them under `Debug` made them look like something to turn on when something is wrong.
+/// They were debug switches because they were written to bisect a rendering bug, and they are not: one
+/// caches bind groups between draws, one stops baking offsets into them, and one batches the terrain's
+/// draw calls - all three are on by default, and turning one off is a performance decision whose
+/// diagnostic is the *frame time*. Putting them under `Debug` made them look like something to turn on
+/// when something is wrong.
 const OPTIMIZATION_SECTION: &str = "Optimization";
 
 lazy_static! {
     pub static ref SETTINGS_INFO: SettingsInfo = SettingsInfo {
         backend: EnumSettingInfo::new(
-            "Graphics API wgpu renders with. Vulkan is available on Windows and Linux, \
-            DirectX 12 only on Windows. The two are not interchangeable at runtime: the wgpu \
-            instance, the adapter and every resource below it are created for one backend and \
-            live as long as the game does, so switching takes effect on the next launch.",
+            "The graphics API the renderer uses. Vulkan is the default; DirectX 12 is Windows only.",
             true,
         ),
         vsync: SettingInfo {
-            desc: "Whether or not to sync the framerate to the display's framerate.\
-            May reduce screen tearing, on the cost of added latency. Takes effect as soon as it \
-            is applied: the swapchain is reconfigured with the other present mode.",
+            desc: "Sync the framerate to the display's refresh rate. Fewer torn frames, at the cost \
+            of input latency. Takes effect the moment it is applied.",
             // Unlike `backend`, this is not a property of the wgpu instance: it only picks the
             // swapchain's present mode, and a surface can be reconfigured at any time. `sendSettings`
             // does exactly that, which is why this one is applied without a restart.
@@ -353,38 +416,26 @@ lazy_static! {
             section: None,
         },
         fullscreen_mode: EnumSettingInfo::new(
-            "How the window fills the screen.\n\n\
-            **Exclusive** is GLFW's monitor mode - a real display mode switch, and what the game's own \
-            fullscreen has always been. **Borderless** covers the monitor with no decorations and does \
-            not change the display mode, which is what to pick if you alt-tab. **Off** is a window.\n\n\
+            "How the window fills the screen. **Exclusive** is a real display mode switch, the same \
+            thing Minecraft's own Fullscreen does. **Borderless** covers the monitor with no \
+            decorations and does not change the display mode, which is what to pick if you alt-tab. \
+            **Off** is a window.\n\n\
             The game's own fullscreen key (F11 by default) toggles between Off and whichever mode is \
-            chosen here, so the key keeps working and the page decides what it returns to.\n\n\
-            Takes effect as soon as it is applied: none of the three touches the device or the \
-            swapchain's format, so there is nothing to restart for - the surface is reconfigured when \
-            the window's size changes, which this does.",
+            chosen here, so the key keeps working.",
             false,
         ),
         terrain: SettingInfo {
-            desc: "Draw the terrain from the Rust baker's meshes instead of from Minecraft's own. \
-            The sections are baked natively and drawn by the render graph in the pass Minecraft's own \
-            solid layer would have used, so the depth buffer, the cutout and translucent layers and \
-            everything drawn after them stay Minecraft's. Switching it on asks the level renderer to \
-            rebuild its sections, because the graph can only draw what the baker has baked; switching \
-            it off hands the terrain back on the next frame. This is what the `wgpu-geo-terrain` marker \
-            file used to be.",
+            desc: "Draw the terrain from the meshes the Rust baker builds, in the pass Minecraft's own \
+            solid and cutout layers would have used. The translucent layer, the entities and \
+            everything after them stay Minecraft's. Takes about a second to show, because the \
+            sections are meshed again.",
             needs_restart: false,
             section: None,
         },
         animated_textures: EnumSettingInfo::new(
-            "Whether the block textures Minecraft animates - fire, lava, the campfire, the sea lantern, \
-            every sprite with an `.mcmeta` that says so - move on the terrain this renderer draws. \
-            Minecraft animates its block atlas by rendering each due frame into it, and `Quality` draws \
-            those faces from that atlas, so they move exactly as they do in vanilla and nothing is \
-            copied per frame. `Fast` bakes them against this renderer's own copy of the sprite instead, \
-            which is a single frame: the picture this renderer drew before any of this existed. The two \
-            are a fidelity choice rather than a speed one - the game renders those frames either way - \
-            and switching takes effect after the block models are baked again, which is a second or two \
-            and re-meshes the loaded sections.",
+            "Fancy: these faces sample the game's own block atlas, which is animating, so they move. \
+            Fast: they sample one frame of this renderer's own copy - the picture this renderer drew \
+            before the animated-texture path existed.",
             false,
         ),
         frames_in_flight: SettingInfo {
@@ -395,301 +446,200 @@ lazy_static! {
             section: None,
         },
         host_validation: SettingInfo::debug(
-            "Load the graphics backend's own validation layer: D3D12's debug layer, Vulkan's \
-            validation layer, or GL's debug output. It is written by the graphics vendor rather than \
-            by wgpu, it reports through the driver's debug output, and it catches what wgpu cannot see \
-            - a barrier in the wrong place, a resource used before its GPU work finished, a \
-            descriptor the driver disagrees about. It was unconditional here, so every player loaded \
-            a vendor debug layer they were not reading; it is off by default now. `gpu based \
-            validation` needs it. \
-            **This does not switch wgpu's own validation on or off.** wgpu checks every call it is \
-            given whatever this says - that is what an error naming the call comes from, and it is \
-            what produces the `wgpu_core::validation` warnings in the log with this setting off. So \
-            turning this off does not make an invalid call silent; it removes the vendor's second \
-            opinion and its debug output. The wgpu instance is created with this flag, so switching \
-            takes effect on the next launch.",
+            "Load the graphics vendor's own validation layer - D3D12's debug layer, Vulkan's \
+            validation layer or GL's debug output - which catches what wgpu cannot see: a barrier in \
+            the wrong place, a resource used before its GPU work finished. \
+            **It does not switch wgpu's own validation on or off**, which runs either way. Off by \
+            default. GPU-based validation needs it.",
             true,
         ),
         gpu_based_validation: SettingInfo::debug(
-            "Ask the backend's validation layer to check what the GPU is actually asked to do, rather \
-            than only the commands that were recorded: it runs the same vendor layer as `host \
-            validation` above, but on the GPU. That is what catches a mistake only the hardware can \
-            see - a read of a resource whose earlier write has not landed, a shader reading past a \
-            binding, a missing barrier between two passes. It is the slowest thing here by a wide \
-            margin and it is a development tool, so it is off by default. \
-            **It needs `host validation`**, because it is that same layer doing more; asking for this \
-            alone turns that on with it rather than doing nothing. \
-            The wgpu instance is created with this flag, so switching takes effect on the next \
-            launch.",
+            "Ask the vendor layer to check what the GPU is actually asked to do rather than only the \
+            commands that were recorded, which catches mistakes only the hardware can see. The \
+            slowest thing here by a wide margin and a development tool, so it is off by default. It \
+            needs `host validation`, because it is that same layer doing more.",
             true,
         ),
         shader_debug_info: SettingInfo::debug(
-            "Build the instance with wgpu's `DEBUG` flag: debug information in shaders and objects. \
-            It does not validate anything and it does not cost anything per draw - what it decides is \
-            whether the objects this renderer creates carry the information a graphics debugger reads \
-            (RenderDoc, Nsight, PIX, `spirv-dis`). On by default, and worth turning off only if a \
-            driver is measurably slowed by the extra metadata, because a capture without it names \
-            things like `texture_47` instead of `wgpu-mc block atlas`. \
-            The wgpu instance is created with this flag, so switching takes effect on the next \
-            launch. `WGPU_DEBUG=0` still overrides it from outside the game.",
+            "Build the instance with wgpu's `DEBUG` flag, so the objects it creates carry the \
+            information a graphics debugger reads - RenderDoc, Nsight, PIX, `spirv-dis`. It validates \
+            nothing and costs nothing per draw; with it off a capture names things like `texture_47` \
+            instead of `wgpu-mc block atlas`. On by default.",
             true,
         ),
         validate_indirect_calls: SettingInfo::debug(
             "Check the arguments in an indirect draw buffer before issuing the draw, and turn the draw \
-            into a no-op when they are out of bounds: an index range that does not fit the bound index \
-            buffer, an instance range that does not fit an instance-stepped vertex buffer, and - the \
-            one that matters here - a non-zero `first instance` on a device without indirect-first-\
-            instance support. On by default and it should stay on: **without it, an out-of-bounds \
-            indirect argument is undefined behaviour rather than an error**, and on D3D12 the built-in \
-            `instance index` stops accounting for `first instance` at all, which would draw terrain \
-            from the wrong offsets rather than fail. What it costs is a bounds check on a handful of \
-            integers per indirect call, not per drawn section. \
-            The wgpu instance is created with this flag, so switching takes effect on the next \
-            launch. `WGPU_VALIDATION_INDIRECT_CALL=0` still overrides it from outside the game.",
+            into a no-op when they are out of bounds. On by default and it should stay on: without it \
+            an out-of-bounds indirect argument is undefined behaviour rather than an error, and on \
+            D3D12 it would draw terrain from the wrong offsets. What it costs is a check on a handful \
+            of integers per indirect call, not per section.",
             true,
         ),
         discard_backend_labels: SettingInfo::debug(
-            "Do not pass the labels this renderer gives its objects down to the graphics backend. Every \
-            buffer, texture, pipeline and bind group here is named, and a name is a string lookup and a \
-            driver call each time one is created - measurable in a world that allocates as it loads, and \
-            not measurable at all once it has settled. Off by default, because what the names buy is \
-            that a driver's own validation error and a graphics debugger both say `wgpu-mc section arena` \
-            instead of a handle, which is most of what makes either readable. \
-            The wgpu instance is created with this flag, so switching takes effect on the next \
-            launch. `WGPU_DISCARD_HAL_LABELS=1` still overrides it from outside the game.",
+            "Do not pass the labels this renderer gives its objects down to the graphics backend, which \
+            saves a string lookup and a driver call each time one is created. Off by default, because \
+            what the names buy is that a driver's validation error and a graphics debugger both say \
+            `wgpu-mc section arena` instead of a handle.",
             true,
         ),
         allow_noncompliant_adapter: SettingInfo::debug(
             "Allow wgpu to offer an adapter whose driver does not meet the graphics API's own \
-            requirements - in practice a Vulkan driver reporting a major compliance version of 0, which \
-            wgpu otherwise refuses to use at all. Off by default, because the point of the requirement \
-            is that such a driver may be broken in ways wgpu cannot see: it is an escape hatch for a \
-            machine where nothing else is offered, not a setting to leave on. With it off and no \
-            compliant adapter, the renderer reports that it could not create one and the game shows its \
-            \"no supported graphics backend\" screen. \
-            The wgpu instance is created with this flag, so switching takes effect on the next \
-            launch. `WGPU_ALLOW_UNDERLYING_NONCOMPLIANT_ADAPTER=1` still overrides it from outside the \
-            game.",
+            requirements - in practice a Vulkan driver reporting a major compliance version of 0. Off \
+            by default: it is an escape hatch for a machine where nothing else is offered. With it off \
+            and no compliant adapter, the game shows its \"no supported graphics backend\" screen.",
             true,
         ),
         logging: SettingInfo::debug(
-            "Write the renderer's diagnostic log lines: each pipeline the first time it is used, \
-            the plan its bindings resolve against, each render pass with its draw count, the draw \
-            and submission counters once a second, the sprite-animation pass counter, and the \
-            reports for the uploads and uniforms the renderer verifies as it goes. Off by default, \
-            because it is a line per pipeline and a line per second rather than a line per frame - \
-            and it is a *log* switch: the dumps below are a separate one, so a run can write a frame \
-            out without filling the log with counters. This is the `wgpu-logging` marker as a \
-            switch, and the `wgpu_mc.diagnostics` system property or `WGPU_MC_DIAGNOSTICS` \
-            environment variable still turns it on from outside the game.",
+            "Write the renderer's diagnostic log lines: each pipeline the first time it is used, the \
+            plan its bindings resolve against, each render pass with its draw count, and the draw and \
+            submission counters once a second. Off by default, because it is a line per pipeline on top \
+            of a line per second. The frame and texture files are the `diagnostics` switch, below.",
             false,
         ),
         diagnostics: SettingInfo::debug(
-            "Write the renderer's dumps out as files: the frame the game is showing, the textures \
-            it is showing it with, and a sprite atlas after the frame or two it takes Minecraft to \
-            compose one. The dump itself is asked for by a `wgpu-dump-now` file in the run \
-            directory, because a dump is about one specific frame and the interesting one is rarely \
-            the one a switch was flipped on at; this is the switch that lets the ask through, and \
-            `wgpu-dump-frames` turns both on. What the renderer *says* while it does it is the \
-            logging switch above, so a diagnostic session is usually both.",
+            "Let the renderer write its dumps out as files: the frame the game is showing, the \
+            textures it is showing it with, and a sprite atlas. The dump itself is still asked for by \
+            a `wgpu-dump-now` file in the run directory, because a dump is about one specific frame. \
+            A diagnostic session is usually this and `logging` together.",
             false,
         ),
         bind_group_cache: SettingInfo::optimization(
             "Reuse a bind group between draws that bind the same resources at different dynamic \
             offsets, instead of building one per draw. On by default, and worth about a \
-            `wgpu::BindGroup` per draw when it is turned off - which is what the frame time in a \
-            scene with many small draws is made of. Turning it off is also how the cache is ruled \
-            in or out as the cause of a rendering difference. This is the `wgpu-no-bind-group-cache` \
-            marker as a switch, and the marker still turns the cache off.",
+            `wgpu::BindGroup` per draw when it is turned off. Turning it off is also how the cache is \
+            ruled in or out as the cause of a difference.",
             false,
         ),
         dynamic_offsets: SettingInfo::optimization(
             "Bind uniform buffers with an offset instead of baking the offset into the bind group. \
             On by default, and it is what makes the bind group cache worth having: Minecraft \
-            re-binds a buffer at a new offset for almost every draw. Turning it off bakes the \
-            offset again, which is what the renderer did before dynamic offsets existed - a bind group \
-            per distinct offset, which in a world is thousands a frame, so off is for diagnosis \
-            rather than for play. This is the `wgpu-no-dynamic-offsets` marker as a switch, and like \
-            the marker it is read once: see the restart below.",
+            re-binds a buffer at a new offset for almost every draw. Off bakes the offset again, \
+            which is what the renderer did before dynamic offsets existed.",
             true,
+        ),
+        terrain_indirect: SettingInfo::optimization(
+            "Draw the terrain's sections with `multi_draw_indexed_indirect` - one draw call per run of \
+            sections that share an arena - instead of one `draw_indexed` per section. **Both paths are \
+            meant to draw the same picture**, so this switch answers \"did the batching break \
+            something\".\n\n\
+            It is forced off where it cannot be worth anything, with the reason in the log. \
+            **DirectX 12 never gets it: the call is broken in wgpu's DX12 backend** - wgpu's \
+            implementation, not D3D12 and not the driver, which is why no feature test can find it.",
+            false,
         ),
         trace_dynamic_offsets: SettingInfo::debug(
             "Log every draw's bindings - the plan, each binding in slot order, and the offset that \
-            travels with it - and the key the bind group cache was asked for. Very loud: it is a \
-            line per draw, so it is meant to be turned on for a few frames and read back. This is \
-            the `wgpu-trace-dynamic-offsets` marker as a switch.",
+            travels with it - and the key the bind group cache was asked for. Very loud, and it costs \
+            CPU time to write.",
             false,
         ),
         binding_verbosity: SettingInfo::debug(
             "Log how every binding name was resolved against a pipeline's binding plan, and what \
-            the plan was left holding: a name that only matched through the shim's `_wm_texshim` / \
-            `_wm_sampler` suffix, the names a plan can be bound under when one of them is not in \
-            it, and the slots a pipeline change left empty. This is the detailed version of the \
-            warning the renderer always prints when a binding is not in the plan at all, and it is \
-            the switch to turn on when a shader reads nothing and the question is which name it \
-            was looking for. This is the `wgpu-binding-log` marker as a switch.",
+            the plan was left holding. The detailed version of the warning the renderer prints when a \
+            binding is not in the plan at all.",
             false,
         ),
         dump_shaders: SettingInfo::debug(
             "Write the GLSL that reaches the shader compiler into `wgpu-shaders/`, after this \
-            renderer's preprocessing. The source naga sees is not the source Minecraft ships - \
-            uniforms are annotated with the binding the plan gave them, implicit blocks are added, \
-            samplers are split - and it is the only place that shows which of those went wrong. \
-            This is the `wgpu-dump-shaders` marker as a switch.",
+            renderer's preprocessing. The source naga sees is not the source Minecraft ships, and \
+            this is the only place that shows which step went wrong.",
             false,
         ),
         gpu_timestamps: SettingInfo::debug(
             "Measure how long each presented frame takes on the GPU, with timestamp queries at the \
-            start of the frame's first submission and the end of its last one. The number is the \
-            GPU's own clock, so it says what the driver actually spent - the frame's passes, not \
-            the CPU time spent recording them - and it is reported with the render stats. Nothing \
-            is measured while this is off: the queries are written into the frame's command stream, \
-            so a disabled switch costs nothing at all.",
+            start of the frame's first submission and the end of its last. The number is the GPU's own \
+            clock, reported with the render stats, and nothing is measured while this is off.",
             false,
         ),
         pix_capture: SettingInfo::debug(
-            "Load PIX's capture libraries into the game and let PIX inspect it: \
-            `WinPixGpuCapturer.dll`, so PIX can attach for a GPU capture at all, and \
-            `WinPixTimingCapturer.dll`, which programmatic timing captures run through. Both are \
-            loaded from the newest PIX installation on the machine, before the D3D12 device is \
-            created - which is why this needs a restart: a process that loads the GPU capturer \
-            after its device exists is one PIX refuses to attach to. With it on, the game can be \
-            attached to from PIX (or launched through it), and switching this off and on again \
-            while it runs takes a `wgpu-mc-capture-N.wpix` timing capture of 600 frames. That \
-            capture records through ETW providers, and only an elevated process may create sessions \
-            for them, so the game itself has to run as an administrator - starting `gradlew` from an \
-            administrator terminal is not enough, because Gradle reuses a daemon started without \
-            elevation and the game, forked by that daemon, inherits its token: run `gradlew --stop` \
-            first, or pass `--no-daemon`. Without it the capture is refused with E_ACCESSDENIED, and \
-            the log says whether the process was elevated. A capture holds everything the capture \
-            API can be asked for: GPU timing, CPU samples with call stacks at 4 kHz, and the memory \
-            events - file IO, VirtualAlloc, HeapAlloc, custom allocator and page faults - whose \
-            tables (`MemoryEventRanges`, `MemoryPairing`, `PageFaults`, `FileIORange`) are empty \
-            without them. That is also what makes a capture big and slow: 1.7 to 2.7 GB for 600 \
-            frames rather than a few hundred megabytes, and the frame rate during a capture drops to \
-            a few frames per second while those events are recorded. Function names come from a PDB \
-            the build writes beside the library (`rust/Cargo.toml` asks for line tables), which PIX \
-            reads when it opens the capture - without it every native frame in the capture is an \
-            address and its function information stays empty. `GPU resources`/API objects, memory \
-            access sampling and kernel image information are options only PIX's own timing-capture \
-            dialog has: they are not fields of the API's parameter struct, so a capture with them is \
-            one taken from PIX's UI, which is what the loaded GPU capturer makes possible. \
-            RivaTuner Statistics Server - MSI Afterburner's on-screen display - hooks D3D12 as well, \
-            and with its `RTSSHooks64.dll` in the process the game crashes inside RTSS's own present \
-            hook once these libraries are loaded, capture or no capture: the log says so, PIX's \
-            libraries are left unloaded in that case, and a `wgpu-pix-with-rtss` file next to the \
-            game overrules that. An RTSS profile for the `java.exe` the game runs as, with \
-            Application detection level `None`, is what makes the switch work with RTSS installed. \
-            Nothing happens at all on a machine without PIX: the log says which library was \
-            missing.",
+            "(DirectX only.) Load PIX's capture libraries into the game so PIX can attach to it, or \
+            launch it, for a GPU or a timing capture. They have to be loaded before the D3D12 device \
+            is created; a timing capture needs administrator rights, and its database is very large \
+            and very expensive.",
             true,
         ),
         upload_report: SettingInfo::debug(
             "Report what the renderer's buffer uploads did: what a mapped write put in the buffer, \
             whether those bytes are in it afterwards, and how much staging the writes went through. \
-            Off by default, because one of the three reads the buffer back from the GPU, and this is \
-            a line per upload rather than a line per second. This is the `wgpu-upload-report` marker \
-            as a switch.",
+            Off by default, because one of the three reads the buffer back from the GPU and this is a \
+            line per upload rather than a line per second.",
             false,
         ),
         dump_frames: SettingInfo::debug(
             "Write out the next N frames the renderer presents, as raw files under `wgpu-frames`, and \
-            zero for none. A dump is about the frame that is on screen - the world is reached after a \
-            different number of frames every run, so a fixed frame number is no use - and one frame \
-            rarely settles a flicker: a handful in a row is what says whether the terrain is there on \
-            every frame or on every other one. Turning it to zero and up again asks for another \
-            handful. This is the `wgpu-dump-now` marker as a setting, with a count instead of a file.",
+            zero for none. One frame rarely settles a flicker: a handful in a row is what says \
+            whether the terrain is there on every frame or on every other one. Turning it to zero and \
+            up again asks for another handful.",
             false,
         ),
         section_timing: SettingInfo::debug(
-            "Time the section feed, phase by phase, and report the averages. The feed is what runs \
-            on Minecraft's chunk-build threads - the light lookup, the block data and the call into \
-            the native side - so this is the switch that answers \"what does one section rebuild \
-            cost, and which part of it\" with three numbers instead of a guess. The averages appear \
-            on the F3 screen while it is on, and the counts are per offer, so a quiet frame is one \
-            with nothing to show. Off by default: it is a clock read per phase per section, and \
-            closing it costs nothing at all. This is the `wgpu-section-timing` marker as a switch.",
+            "Time the section feed, phase by phase, and report the averages on the F3 screen. The feed \
+            is what runs on Minecraft's chunk-build threads - the light lookup, the block data and the \
+            call into the native side - so this answers \"what does one section rebuild cost, and \
+            which part of it\". Off by default: it is a clock read per phase per section.",
             false,
         ),
         terrain_no_cull: SettingInfo::debug(
-            "Draw every pipeline the render graph builds without back-face culling, so nothing \
-            depends on the winding at all. This is a diagnostic for a picture that is inside out - \
-            with both faces rasterized, \"the winding is wrong\" and \"the depth test keeps the wrong \
-            end\" stop looking the same - and it is not a mode to play with: the second copy of every \
-            quad is shaded with the far side's lighting, and on a translucent quad the two copies land \
-            at the same depth, where which of them survives is not defined. It is read by every \
-            pipeline the graph builds and not only by the terrain one, because that is where the \
-            `wgpu-terrain-no-cull` marker it replaces was read; the name is the bug it was written \
-            for. Applying it rebuilds the graph's pipelines, because a cull mode is part of the \
-            pipeline rather than something a draw can change.",
+            "Draw every pipeline the render graph builds without back-face culling, so nothing depends \
+            on the winding at all. This is a diagnostic for a picture that is inside out: with both \
+            faces rasterized, \"the winding is wrong\" and \"the depth test keeps the wrong end\" stop \
+            looking the same.\n\n\
+            It is not a mode to play with: every quad gets a second copy, shaded with the far side's \
+            lighting. Applying it rebuilds the graph's pipelines.",
             false,
         ),
         terrain_occlusion: SettingInfo::debug(
-            "Honour the game's own occlusion graph - the list of sections `LevelRenderer` worked out \
-            are on screen - and skip the ones it did not name. On is the faster and, while the list is \
-            right, the correct answer; off draws every section the frustum contains.\n\n\
-            This is a switch because that list is a **snapshot**, and how stale it is decides whether \
-            trusting it costs a hole. `LevelRenderer.applyFrustum` is the only thing that refills it, \
-            and it runs only when the camera has turned by more than two degrees or the occlusion \
-            graph says something changed - so between those moments the list is whatever the last \
-            refill produced. A section this side has baked and the game's list has not caught up with \
-            is skipped by the terrain pass while the game's own mesh for it stays suppressed, and a \
-            section neither side draws is a 16x16x16 hole. With this off there are no holes to \
-            attribute and the difference says whether that is the mechanism.",
+            "Honour the game's own occlusion graph and skip the sections it did not name. On is the \
+            faster answer and, while that list is right, the correct one.\n\n\
+            It is a switch because the list is a **snapshot**: it is only refilled when the camera has \
+            turned by more than two degrees or the graph reports a change. A section it has not caught \
+            up with is skipped here while the game's own mesh for it stays suppressed, and a section \
+            neither side draws is a 16x16x16 hole. With this off every section the frustum contains is \
+            drawn.",
             true,
         ),
         atlas_base_mip_only: SettingInfo::debug(
             "Sample the game's own block atlas from its base mip level only, so a distant animated \
-            sprite resolves to a single texel of it rather than a blend of mip levels.\n\n\
-            Off, because the game animates the whole chain rather than one level of it: \
-            `TextureAtlas#uploadAnimationFrames` walks every level and renders the current frame of \
-            each animated sprite into each of them, through that level's own view and that level's own \
-            uniform buffer. No level is staler than any other, so there is no stale level for a clamp \
-            to avoid - and clamping to 0.0 does not make the animated textures fresher, it makes them \
-            alias: one texel of a 16x16 sprite per pixel is the temporal noise a mip chain exists to \
-            remove. It is a switch because the case for it is a picture rather than an argument, and a \
-            run with it on against a run with it off is what settles it. Applying it rebuilds the \
-            graph, because a sampler is built with the pipelines rather than per draw.",
+            sprite resolves to a single texel rather than a blend of levels. Off by default: the game \
+            animates the whole chain, so no level is staler than any other, and clamping to 0 only \
+            makes the animated textures alias. Applying it rebuilds the graph.",
             false,
         ),
         terrain_greater_depth: SettingInfo::debug(
             "Draw every pipeline the render graph builds with the depth test the opposite way round, \
-            so the faces *behind* are the ones kept. The other half of the pair above: it is what \
-            \"the depth values are the wrong way round\" would look like, which is the other reading \
-            of a picture whose front faces are missing. Depth writes are unchanged - the test is what \
-            moved - so the picture is the far side of everything the camera can see through, and the \
-            sky and the HUD are drawn over it as usual. This is the `wgpu-terrain-greater-depth` \
-            marker as a switch, and it too applies to every pipeline the graph builds. Applying it \
-            rebuilds the graph's pipelines.",
+            so the faces *behind* are the ones kept. The other half of the pair above, and the other \
+            reading of a picture whose front faces are missing.\n\n\
+            Depth writes are unchanged - the test is what moved - so the picture is the far side of \
+            everything the camera can see through. Applying it rebuilds the graph's pipelines.",
             false,
         ),
         game_atlas_blend_mips: SettingInfo::debug(
-            "Blend between mip levels when sampling the game's own block atlas. Off - which is what the \
-            renderer ships - picks one level and writes it, so a scrolling animated sprite is never shown \
-            as a mix of two of its moments. On blends them the way vanilla does \
-            (`GL_LINEAR_MIPMAP_LINEAR`), which is smoother for a static texture and is where the \
-            fluid shimmer comes from.\
-\
-\
-            The reason this is a switch and not a decision: the two differ only for content that moves, \
-            and which of the two a player prefers is a picture rather than an argument. It takes effect on \
-            the next frame - the sampler is built with the graph, so applying it rebuilds the graph's \
-            pipelines and nothing is baked.",
+            "Blend between mip levels when sampling the game's own block atlas. On - what the renderer \
+            ships, and what vanilla does (`GL_LINEAR_MIPMAP_LINEAR`) - blends them; off picks one \
+            level and writes it, which is sharper for a texture that holds still.\n\n\
+            **It does not affect the shimmer on flowing water and lava**, which a player measured \
+            under both settings. Takes effect on the next frame; applying it rebuilds the graph.",
             false,
         ),
         atlas_lod_bias: SettingInfo::debug(
-            "Shift the mip level the terrain shaders pick for the block atlases. `0` is no shift and \
-            the fetch a plain `textureSample` would make; **positive samples a coarser level and \
-            negative a finer one**, so a blurry picture that sharpens as this goes negative means the \
-            chosen level was too coarse, and one that never changes means the level was never the \
-            problem.\n\n\
-            It is a measure rather than a picture setting. The level comes from the screen-space \
-            derivative of the texture coordinates, and every reading of this renderer's coordinates \
-            says that derivative should match the game's - so the number is here to disagree with the \
-            reading if the picture does.\n\n\
-            Read per draw, so it takes effect on the next frame: nothing is baked and no pipeline is \
-            rebuilt. That is the point of it - the same value as a shader constant could not be told \
-            apart from one that never reached the GPU.",
+            "Shift the mip level the terrain shaders pick for the block atlases: `0` is no shift, \
+            positive is coarser and negative is finer. A blurry picture that sharpens as this goes \
+            negative means the chosen level was too coarse.\n\n\
+            It is a measure rather than a picture setting, read per draw, so it takes effect on the \
+            next frame - nothing is baked and no pipeline is rebuilt.",
+            false,
+        ),
+        adv_culling: SettingInfo::debug(
+            "**An experiment that costs frame time rather than saving it**, which is why it sits here \
+            rather than under `Optimization`. `0`: the game's own occlusion list, which is what this \
+            renderer has always obeyed. `1` and up: this renderer's own direction-aware walk, allowed that \
+            many direction changes before a section is dropped - but the walk recomputes an answer the game \
+            builds and hands over every frame anyway, so *any* value above zero lowers the frame rate.\n\n\
+            Measured on the frame thread, per frame: about 2 ms at render distance 16 and 8 ms at 32, on top \
+            of everything else the frame does. What it reaches is everything the game's own list has that \
+            this renderer's frustum would draw anyway, minus about 0.3%. It is kept as a measurement rather \
+            than as a setting to turn on: making it pay would mean the walk *replacing* the game's own \
+            graph, which is a different architecture. See the README.",
             false,
         ),
     };
@@ -863,9 +813,12 @@ impl Default for Settings {
             backend: EnumSetting::from_variant(GraphicsBackend::default()),
             vsync: BoolSetting::default(),
             fullscreen_mode: EnumSetting::from_variant(FullscreenMode::default()),
-            // `BoolSetting::default()` is `true`, which is the right default for the terrain path: it is
-            // what the renderer is being built towards, and the switch is here to turn it *off*.
-            terrain: BoolSetting::default(),
+            // **Off, because the path is experimental.** It is what this renderer is being built towards, but
+            // it is not yet the same picture as the game's own meshes, and the differences are measured rather
+            // than guessed: the README's "The experimental terrain pipeline" section lists them, with the
+            // numbers, as the TODO it is. So what ships is Minecraft's terrain, and this switch is what asks
+            // for ours instead - a player who wants the game's picture gets it by not touching anything.
+            terrain: off(),
             // `Fancy`: the animated textures move, which is what the game does and what a player who has
             // not been told about this row expects to see.
             animated_textures: EnumSetting::from_variant(AnimatedTextures::default()),
@@ -891,6 +844,18 @@ impl Default for Settings {
             diagnostics: BoolSetting::of(false),
             bind_group_cache: BoolSetting::of(true),
             dynamic_offsets: BoolSetting::of(true),
+            // **Off, and it is the third option here to change its mind.** It was on, on the argument
+            // that the batched path draws the same picture and that a config written before the switch
+            // existed was not asking for anything different - both still true. What moved it is what the
+            // frame time is for: the terrain pipeline is not being optimised at the moment, so the path
+            // that is *not* being measured should not be the one the frame goes through, and a batching
+            // path with nobody watching it is a place for a difference to hide. Asking for it is one
+            // setting away, and the picture is meant to be identical when it is on.
+            terrain_indirect: no_terrain_indirect(),
+            // Off, and by the same reasoning the switch above it is on: the walk is a stricter cull than
+            // the list this renderer has always obeyed, so a config written before it existed is asking
+            // for what the renderer did before it. See [`Settings::adv_culling`].
+            adv_culling: no_adv_culling(),
             trace_dynamic_offsets: BoolSetting::of(false),
             binding_verbosity: BoolSetting::of(false),
             dump_shaders: BoolSetting::of(false),
@@ -953,6 +918,15 @@ pub struct DebugSettings {
     /// Whether the terrain pass honours the game's occlusion graph rather than drawing every section
     /// the frustum contains. See [Settings::terrain_occlusion], which is the switch.
     pub terrain_occlusion: bool,
+    /// How many direction changes this renderer's own occlusion walk may take, or zero to draw from the
+    /// game's own list. See [`Settings::adv_culling`].
+    pub adv_culling: u8,
+    /// Whether the terrain pass draws its sections with one batched call per arena run rather than one
+    /// call per section. See [`Settings::terrain_indirect`] - and note that this is the *setting*, not
+    /// the answer: [`crate::debug::apply`] hands it to
+    /// `wgpu_mc::render::graph::set_terrain_indirect`, and what the device and the backend allow is
+    /// recorded separately, in `device::try_create_renderer`.
+    pub terrain_indirect: bool,
     /// Whether the game's block atlas is sampled from its base mip level only. See
     /// [`Settings::atlas_base_mip_only`].
     pub atlas_base_mip_only: bool,
@@ -991,6 +965,8 @@ impl Settings {
             section_timing: self.section_timing.value,
             terrain_no_cull: self.terrain_no_cull.value,
             terrain_occlusion: self.terrain_occlusion.value,
+            adv_culling: self.adv_culling.value.clamp(0, 16) as u8,
+            terrain_indirect: self.terrain_indirect.value,
             atlas_base_mip_only: self.atlas_base_mip_only.value,
             atlas_lod_bias: self.atlas_lod_bias.value as f32,
             game_atlas_blend_mips: self.game_atlas_blend_mips.value,
@@ -1454,6 +1430,9 @@ mod tests {
             "upload_report",
             "terrain_no_cull",
             "terrain_greater_depth",
+            // Moved here from `Optimization` once it was measured: the walk costs frame time rather than
+            // saving it. See [`Settings::adv_culling`].
+            "adv_culling",
         ] {
             assert_eq!(
                 info[name]["section"],
@@ -1462,10 +1441,17 @@ mod tests {
             );
         }
 
-        // The two that decide how the frame is rendered rather than what is said about it have a
-        // heading of their own, above the debug ones - they are on by default and turning one off is
-        // a performance decision, not a diagnostic.
-        for name in ["bind_group_cache", "dynamic_offsets"] {
+        // The three that decide how the frame is rendered rather than what is said about it have a
+        // heading of their own, above the debug ones - turning one off is a performance decision, not a
+        // diagnostic. **Not all three are on by default any more**: `terrain_indirect` is off, and the
+        // heading is about what the switch decides rather than about its default. See
+        // [`Settings::terrain_indirect`].
+        //
+        // **`terrain_indirect` is the one to check when this list grows.** It was written as a debug
+        // switch, because the batched draw path was being brought up and every switch written during
+        // that is one, and a switch that is on by default under a heading that means "something is
+        // wrong" reads as an instruction to turn it off.
+        for name in ["bind_group_cache", "dynamic_offsets", "terrain_indirect"] {
             assert_eq!(
                 info[name]["section"],
                 serde_json::json!("Optimization"),
@@ -1495,7 +1481,7 @@ mod tests {
         };
 
         let plain = ["backend", "vsync"];
-        let optimization = ["bind_group_cache", "dynamic_offsets"];
+        let optimization = ["bind_group_cache", "dynamic_offsets", "terrain_indirect"];
         let debug = [
             "gpu_based_validation",
             "logging",
@@ -1509,6 +1495,7 @@ mod tests {
             "terrain_occlusion",
             "atlas_base_mip_only",
             "terrain_greater_depth",
+            "adv_culling",
         ];
 
         for earlier in plain {
@@ -1575,7 +1562,7 @@ mod tests {
 
     /// Every setting's name, which is the same in both documents. Kept as a list because the two
     /// documents' own key order is not readable through `serde_json::Value` - see the test above.
-    const NAME_LIST: [&str; 30] = [
+    const NAME_LIST: [&str; 32] = [
         "backend",
         "vsync",
         "fullscreen_mode",
@@ -1584,6 +1571,8 @@ mod tests {
         "frames_in_flight",
         "bind_group_cache",
         "dynamic_offsets",
+        "terrain_indirect",
+        "adv_culling",
         "host_validation",
         "gpu_based_validation",
         "shader_debug_info",
@@ -2016,6 +2005,67 @@ mod tests {
         }
     }
 
+    /// **The two shipped languages have the same key set, and nothing was checking that.**
+    ///
+    /// The tests above are per-language: they ask whether each language has a name for each setting,
+    /// and a setting's *description* was never asked about at all. So `en_us` drifted eight tooltips
+    /// behind `zh_cn` - `backend`, `vsync`, `bind_group_cache`, `dynamic_offsets`,
+    /// `trace_dynamic_offsets`, `gpu_timestamps`, `pix_capture` and `dump_shaders` - and what an English
+    /// player saw for those was the renderer's own `desc` string out of the schema, while a Chinese
+    /// player saw the language file. Two texts for one row, and only one of them translated.
+    ///
+    /// The check is on the *key sets* rather than on the descriptions' text, because the text is a
+    /// translation and the two are not supposed to match. A key in one file and not the other is the
+    /// shape this can only fail in.
+    ///
+    /// A *new* language is not covered and should not be: a half-finished translation falling back to
+    /// English is the design, and it is what `OptionText` documents. This is about the two files this
+    /// mod ships and the tests already treat as a pair.
+    #[test]
+    fn every_language_has_the_keys_the_others_have() {
+        let english = translations(EN_US);
+        let chinese = translations(ZH_CN);
+
+        let keys = |value: &serde_json::Value| {
+            let mut keys = value
+                .as_object()
+                .expect("a language file is an object")
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>();
+            keys.sort();
+            keys
+        };
+
+        let english = keys(&english);
+        let chinese = keys(&chinese);
+
+        // Two empty sets are equal, so a test that compared two empty sets would pass while checking
+        // nothing - which is the one way this can go quietly wrong.
+        assert!(
+            english.contains(&"wgpu_mc.option.terrain_indirect".to_string()),
+            "the key set is empty, or the language file is not the one this test thinks it read"
+        );
+
+        let only_english = english
+            .iter()
+            .filter(|key| !chinese.contains(key))
+            .cloned()
+            .collect::<Vec<_>>();
+        let only_chinese = chinese
+            .iter()
+            .filter(|key| !english.contains(key))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        assert!(
+            only_english.is_empty() && only_chinese.is_empty(),
+            "en_us and zh_cn have different keys, so one language shows a row the other does not, or \
+             falls back to the renderer's own English. Only in en_us: {only_english:?}. Only in \
+             zh_cn: {only_chinese:?}"
+        );
+    }
+
     #[test]
     fn a_translation_only_has_keys_this_mod_owns() {
         // A key that names nothing is a typo that would show up as a missing translation somewhere
@@ -2076,6 +2126,9 @@ mod tests {
             // frame after it is applied.
             "terrain_no_cull",
             "terrain_greater_depth",
+            // Read once a frame by the gather, so a new value is a new frame's cull and nothing else. See
+            // [`Settings::adv_culling`].
+            "adv_culling",
         ] {
             assert_eq!(
                 info[name]["needs_restart"],
@@ -2136,6 +2189,49 @@ mod tests {
             "both pipeline-state diagnostics are off: the renderer culled back faces and tested the \
              usual way round"
         );
+    }
+
+    /// The batched terrain draw is off unless a player asks for it, and the two ways a config can fail
+    /// to ask are both covered here: a file that has never mentioned the key, and the type's own default
+    /// that `#[serde(default)]` would have taken.
+    ///
+    /// The second half is the one worth keeping. `BoolSetting::default()` is `true`, so the field's
+    /// serde default had to be *named* to say `false` - and a future change to `BoolSetting`'s `Default`
+    /// would silently move every config that omits the key, which is the failure this asserts against.
+    #[test]
+    fn the_batched_terrain_draw_is_off_unless_asked_for() {
+        assert!(
+            !Settings::default().terrain_indirect.value,
+            "the renderer draws one section at a time unless a player turns the batching on"
+        );
+        assert!(
+            !no_terrain_indirect().value,
+            "the named default is off: the per-section path is what the renderer draws unless a \
+             player asks for the batching"
+        );
+        assert!(
+            BoolSetting::default().value,
+            "**and the type's own default is still `on`**, which is why the serde default had to be \
+             named at all - `#[serde(default)]` would have taken `true`. If this ever becomes `false` \
+             the naming is redundant but harmless; if the assertion above ever fails, the renderer is \
+             drawing the batched path without being asked to"
+        );
+
+        // A config written before the switch existed - which is the shape an existing install has, since
+        // the file carries every key it was written with and no others.
+        let settings: Settings =
+            serde_json::from_str(r#"{ "vsync": { "type": "bool", "value": false } }"#)
+                .expect("config without the batching key");
+        assert!(
+            !settings.terrain_indirect.value,
+            "an absent switch takes the path the renderer has always drawn"
+        );
+
+        // And asking for it still works, in both directions, or the switch would be a constant.
+        let asked: Settings =
+            serde_json::from_str(r#"{ "terrain_indirect": { "type": "bool", "value": true } }"#)
+                .expect("config asking for the batching");
+        assert!(asked.terrain_indirect.value);
     }
 
     #[test]
