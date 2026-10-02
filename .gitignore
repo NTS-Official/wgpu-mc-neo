@@ -20,7 +20,7 @@ bin/
 # Project
 run/
 
-# Project references, including VulkanMod, Radiance(and its MCVR)
+# Project references, including VulkanMod, Radiance(and its MCVR), C2ME and Bye-Pregen
 references/
 
 # NeoGradle writes per-run directories for the generated run configs
