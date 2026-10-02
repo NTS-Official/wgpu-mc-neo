@@ -9,6 +9,94 @@ This module is the NeoForge port of the Fabric Electrum mod.
 - Java: 25
 - Mod loader metadata: `META-INF/neoforge.mods.toml`
 - Native bridge: reuses `rust/wgpu-mc-jni`
+- **Terrain: Minecraft's own meshes.** The Rust terrain baker is **experimental and off by default**
+  (`terrain` under the renderer's settings turns it on). It is what this renderer is being built
+  towards, it is measured rather than guessed, and it is not yet the same picture as the game's own
+  meshes - see [The experimental terrain pipeline](#the-experimental-terrain-pipeline) for the list
+  with the numbers. Turning the switch on is how you look at it; leaving it alone is how you play.
+
+## The experimental terrain pipeline
+
+The Rust baker builds each section's meshes, uploads them into the section arena and draws them
+through the graph's terrain passes, in place of Minecraft's own solid and cutout layers. It is a
+measured amount of the way there rather than a finished thing, and this section is its TODO: **what
+has been measured and cleared**, so nobody spends a session on it twice, and **what is open**, in the
+order I would take it.
+
+**How far it is from the game, in one number.** `diagnostics` dumps the frame the terrain pass draws
+and the same frame number with `terrain` off dumps Minecraft's own meshes of the same scene from the
+same camera (see the recipe at the end). At the pond the lily pad report came from, frame 900 - and
+frame 3000, which reads the same: **34.4% of the pixels differ by more than 20 per channel**, ours is
+darker overall (mean `(72, 79, 73)` against `(76, 89, 85)`), and the difference is **not uniform** -
+the *cutout* sprites are the ones that go dark (lily pads near-black, the tree canopy much darker, the
+grass tufts darker) while the solid terrain and the fluid differ far less.
+
+### Measured and cleared, with the numbers
+
+- **The biome tint, value and position.** Both tint tables are compared against the per-face path for
+  the same position while the diagnostics are on: the block table (`helperGetSectionTints` against
+  `helperGetBlockColor`) and the fluid table (`helperGetSectionFluidTints` against
+  `helperGetFluidColor`), **zero mismatches in 20,000 positions each** - the second one logging its
+  first comparison (`bulk 0x00e4763f, per-face 0x00e4763f`, which is `3f76e4`) so that "no mismatches"
+  cannot be "nothing compared". A mirrored position packing - invisible inside a biome, a *bump* of
+  colour centred on a boundary rather than a ramp across it - would have shown up as thousands.
+- **The shape of a transition.** `TintProfile` prints a row across the nearest biome boundary: biome
+  per block beside the grass tint's red channel and the water tint's blue channel. The swamp-to-forest
+  row ramps, in step on both paths, with `0 block(s) whose cached colour is not what the world now
+  says` and `0 not the tint source's answer`.
+- **A tinted face's whole colour chain.** The bake was made to print one: for a lily pad,
+  `tint 0x00308020` (which is `LILY_PAD_IN_WORLD` itself), `light 0xf0` (block 0, sky 15),
+  `shade true`, `variant n`, `scaled 0x00308020` - the tint with no shading factor in it and nothing
+  else. The tint, the light, the shading and the AO of that face are the game's.
+- **The model variant a blockstate's list is picked with.** Fixed, and it was three bugs: the loader
+  always took entry `[0]`; the method that would have answered was implemented on the inner provider
+  while the bake runs with the wrapper (the same trap the `get_fluid` comment describes); and the
+  answer rode on the target's *block record*, which a section usually does not have by the time it is
+  baked - it was sent as somebody's neighbour first. Now the JVM computes the index with the game's own
+  `WeightedList` and `RandomSource`, sends it as a 4 KB blob named by header word 6 of the existing
+  payload, and the bake draws `242/206/238/208` across the four quarter turns where the game's own
+  picks are `121/103/119/104`.
+- **The `ambientocclusion` flag.** Fixed: 137 of the 2392 vanilla block models turn AO off and this
+  side read none of them, so doors, panes, bars, ladders, levers, rails, tripwire, vines, glow lichen
+  and the crops were shaded with ambient occlusion the game does not give them.
+- **The two cutout pipelines.** Fixed: the game declares `cutout_terrain` at `ALPHA_CUTOUT` **0.5** and
+  the mipped cutout family at **0.1**, and this renderer has three chunk layers where the game has
+  four - so the difference travels per *face* now (`UV_CUTOUT_MIPPED`, bit 6 of `uv_flags`) and the
+  fragment's alpha test picks the cutoff with it.
+- **The mip level.** Excluded. Every frame measured here was taken with `atlas_lod_bias` at `-4.0` -
+  the slider's minimum, four levels finer - and the pads were still near-black, so it is not the level.
+- **The per-sprite mip clamp.** Measured, and it is *not* the cause: the JVM registers each sprite with
+  the coarsest level it has detail at (`log2` of its width) and the Rust side turns that into the
+  clamp, but the switch that applies it (`LOD_FLOOR`, described in the code as "THE COMPARISON") was
+  **false** - so the game's own clamp was never on. Turning it on moves near-black pixels from 3.67% to
+  3.08% against vanilla's 0.80% and the frame mean by one point: **about 16% of the excess, not the
+  cause**. It *is* the game's behaviour, so it is a candidate to leave on.
+
+### Open, in the order I would take it
+
+1. **The block path is about 0.88× the game's brightness overall** - the same-frame mean - while the
+   *fluid* path matches (1.03×). So the remaining candidates are on the branch the **majority of the
+   frame** takes and which has never been compared term by term: a cube face's **AO count**
+   (`shades_corners`: four `getShadeBrightness` samples) and its **smooth light blend**
+   (`smooth_blend`: three corner cells and the cell in front of the face). The `any`/flat branch - a
+   lily pad - was measured correct; the cube branch is the one to print next, against
+   `BlockModelLighter`'s own arithmetic for the same block.
+2. **The lily pad's ~0.3×**, which is the extreme end of the same darkening. With the vertex chain,
+   both tint tables and the mip level cleared, what is left is the **sampled texel** (the sprite rect
+   and the UVs the face is baked with, against the game's own `TextureAtlasSprite`) and the alpha path.
+3. **A frame comparison needs the camera pinned.** The quickplay script places the player, but between
+   two runs the view still differs - the slower path lets the player fall or slide somewhere else
+   before the dumped frame number arrives. Two attempts made while adding the layers above produced
+   45-50% "differences" that were exactly that, and one pair turned out to be the *same file* copied
+   twice. Check each dump's mtime and hash, or pin the camera (spectator, a fixed position from the
+   init script), before reading anything off a frame number from a changed build.
+4. **The diagnostic switches change the picture, so a picture judged under them is not the shipped
+   one.** `atlas_lod_bias` was left at `-4.0` by an earlier session and is now `0.0`; `LOD_FLOOR` is
+   back to `false`; `diagnostics` and `logging` are off. All four are in
+   `config/wgpu-mc-renderer.json` (or, for `LOD_FLOOR`, a `const` in `wgpu-mc/src/mc/chunk.rs`).
+5. **The dump recipe**, for whoever picks this up: set `terrain` and `diagnostics`, run the client
+   twice (once with each `terrain` value), and diff `runs/client/wgpu-frames/frame-900-source.raw`
+   (8-byte `width, height` header, then four bytes a pixel).
 
 ## What Was Migrated For 26.1
 
@@ -1888,7 +1976,7 @@ The caches are all bounded, and they report their size every 120 frames with the
 | dead-texture tombstones | 512, oldest first | a tombstone only has to outlive the frame that closed the texture |
 | placeholder textures | one per format, grown on demand | the stand-in for a closed texture; a window resize used to leave a full-size texture behind at every size it had ever been |
 | fan and quad index buffers | 64 sizes, then emptied | rebuilt on demand; the buffers are a few kilobytes |
-| quarantined buffers | 500 ms or 32 MB, oldest evicted first | a byte budget rather than a count: the entries are megabytes each, and a count of them was hundreds of megabytes |
+| quarantined buffers | 500 ms, 32 MB, oldest evicted first, and at most 16 entries / 4 MB released per frame | a byte budget rather than a count: the entries are megabytes each, and a count of them was hundreds of megabytes; the per-frame allowance is what keeps the release from arriving in one cluster - see "A closed buffer is aged once a frame" |
 | `CommandEncoder` | 1 | see above |
 | diagnostics sets | once per name, or one entry per second | the readback budget keeps its "already warned" second in a field, not in a set that grows once a second for the whole session |
 | interned names | one per name the game asks for | see "A name is encoded once" below; the set follows the loaded assets |
@@ -1940,6 +2028,115 @@ only how many. In the runs since, a world holds 100-odd quarantined buffers in 5
 same count could have been hundreds of megabytes. A single buffer larger than the budget still gets
 its quarantine - dropping it would mean the write Minecraft is about to make hits a buffer that is
 already gone, which is the fatal case this exists for - so the budget is a target, not a hard cap.
+
+### A closed buffer is aged once a frame, and only so much of it per frame
+
+The quarantine's *time* rule used to run inside `quarantine_buffer` - which is to say, only when the next
+buffer happened to be closed. An entry whose half second was up therefore waited for a close to arrive, and
+every entry that had expired in the meantime went in that one frame: a cluster whose size is whatever the
+drop burst behind it was. The runs where the cloud ring was rebuilt every frame (see "The cloud ring was
+rebuilt every frame") left **207 entries and 31 MB waiting** in that queue - the byte budget saturated - and
+the frame that followed the next close paid for all of it. Held is the measured half: the stat line samples
+the queue once a second, where what a single frame *released* was never counted, which is one of the things
+this change adds. It is also why the runs since do not show the burst: the cloud path that produced it is
+fixed, so what justifies the change now is the shape of it rather than a spike that can still be produced on
+demand.
+
+Two changes, and they answer two different questions:
+
+- **Aging moved to the frame boundary** - `present_surface`, the one point in a frame that happens exactly
+  once and the moment the frame being finished with has just been presented. An entry now leaves at the
+  first frame boundary after it is due, instead of at whenever the next close happens to arrive.
+- **The release is rate limited**: at most `QUARANTINE_RELEASE_PER_FRAME` (16) entries and
+  `QUARANTINE_RELEASE_BYTES_PER_FRAME` (4 MB) per frame, with the rest left for the next frame. Both,
+  because they bound different costs - the count bounds the per-frame free work, the size bounds how much
+  memory can go back at once. **One entry larger than the whole per-frame size is let go on its own**, the
+  same rule the admission budget makes about a buffer larger than the whole quarantine: waiting for a frame
+  that can afford it means never, and an entry that can never leave is the leak the budget exists to
+  prevent.
+
+**Aging per frame is cheaper than the `retain` it replaced, not more expensive.** Entries are admitted in
+time order and age by the same duration, so the due ones are exactly the front of the queue - and it is a
+`VecDeque` now, so the age rule is one `Instant::now()` and a walk of the due prefix, with the entries still
+inside their quarantine never visited at all. The one thing that had to be made true for that is the
+ordering itself: the stamp is taken **inside** the lock now, because buffers are closed from more than one
+thread and a stamp taken before the lock can be handed a queue position in the other order - microseconds of
+skew against a 500 ms quarantine, and exactly enough to leave an entry behind a newer one for one frame
+longer than it had to be.
+
+**Measured, and it is a negative result worth having**: two runs at 32 chunks with `logging` on released
+**84 and 107 buffers over 78 and 81 seconds**, with **0 frames over the allowance** and a peak of **1.5 MB
+released in any one frame**:
+
+```text
+live resources: ... 96 buffers (417 MB, 7 quarantined in 0 MB, 35 released in 1 MB,
+                 0 frame(s) over the allowance, peak 1018 KB/frame), ...
+```
+
+- **The allowance never bound**, in any of the 159 reports: the queue sat at 0-13 entries and reported 0 MB
+  throughout, so there is no burst left in this workload to flatten - the cloud path that produced the
+  207-entry one is fixed. What the change buys here is the **bound** rather than a saving: no frame releases
+  more than 4 MB plus the single entry the exemption lets through, whatever the burst behind it. The
+  evidence that it binds on a real burst is the unit test, which runs the same arithmetic over a 207-entry
+  queue and gets 16.
+- **The counters are what make the next regression visible.** `released`, its bytes, `frame(s) over the
+  allowance` and `peak KB/frame` are on the existing `live resources` line, drained per report because the
+  peak is what one *frame* was asked to do and the total is what a second was. A run whose peak climbs
+  towards 4 MB a frame is a burst arriving.
+- **The thresholds are all in one place now**: 500 ms, 32 MB held, 16 entries / 4 MB per frame. The first
+  two are unchanged - this is not a memory fix, and it does not change how much is held, only when and how
+  fast it leaves.
+
+### The buffer pool was built, measured, and reuses nothing
+
+The idea is the obvious one: a buffer that is repeatedly closed and created - the cloud UTB, a uniform ring -
+does not have to be destroyed and allocated again, it can go back into a pool keyed by **what a descriptor is
+made of** (the exact size and the usage flags) and be handed to the next caller that asks for that shape. It
+is implemented (`POOLED_BUFFERS`, `offer_to_the_pool`, `take_from_the_pool`), it is fed by the quarantine so
+that a reuse cannot land inside the window a closed buffer is still being written to, it zeroes what it hands
+out so a reuse holds what a fresh buffer holds, and it is bounded. **And in four measured runs it reused
+0 buffers out of 200, 422, 323 and 465 creations**, so what follows is the measurement rather than the
+feature:
+
+```text
+live resources: ... 101 buffers (674 MB, 0 quarantined in 0 MB, 0 released in 0 MB,
+                 0 frame(s) over the allowance, peak 0 KB/frame, 64 pooled in 1 MB,
+                 0 reused of 0 created, 0 refused a place), ...
+```
+
+- **It is not the quarantine's half second.** One of the four runs fed the pool straight from the close,
+  with no quarantine at all - the unsafe version, kept for one measurement - and it also reused 0 of 323.
+- **It is not the resource reload.** One of the runs went through a full `reloadResourcePacks` (the
+  `wgpu-reload-resources` marker), which is the "the game closes and rebuilds its buffers" moment, and it
+  reused 0 of 422.
+- **It is not the bound.** One run was given room for 512 shapes per session instead of 64 and held **293**
+  of them at once - and reused 0 of 465, while holding **24 MB** of buffers nothing asked for. That is the
+  measurement that set the bound back: a pool that is never right is a pool that should hold as little as
+  possible.
+- **Nothing is wrong with the mechanism: the churn is not the shape the pool can serve.** Three kinds, and a
+  run's own labels show all three:
+  - `Chunk Sections UBO x128 #0..#2` - ten ring rebuilds in 23 seconds, and **every rebuild is a new size**:
+    `DynamicUniformStorage#resizeBuffers` doubles the capacity and closes the ring it replaces, so the shape
+    a rebuild wants has never existed before;
+  - `Particle Vertices #0..#2` - a `MappableRingBuffer` sized by the particle mesh itself
+    (`byteBuffer.remaining()`), so it is a different size every time;
+  - `SpriteAnimationInfo` - **the one shape that repeats exactly** (fifteen sizes, each created twice in 23
+    seconds), and the one the pool cannot take: `createBuffer(..., 128, data)` carries no `COPY_DST` and no
+    `MAP_WRITE`, so a reuse of it could not be filled. Adding `COPY_DST` to every buffer would pool it - for
+    about fifteen allocations saved per run, which is not worth a flag on every buffer in the renderer.
+- **What is left is the honest summary: buffer creation is about 3 a second and almost none of it repeats.**
+  The churn that motivated this was the cloud ring being rebuilt *every frame*, and that was fixed at its
+  source ("The cloud ring was rebuilt every frame, because the buffer reported the wrong size") - what
+  remains is a handful of grow-only rings and one content-sized mesh. A pool can only pay on
+  close-and-rebuild-the-same-shape, and this renderer does not do that.
+
+The mechanism is kept, because it is bounded, it costs one hash lookup per creation, and it has one property
+the destroy path does not: **an address it reuses stays valid**, so a use-after-close that outlives the
+quarantine is aliasing rather than a dangling pointer - and it is the shape of change a mod or a resource
+pack that churns same-sized buffers would need. The number that says whether any of that is true of a given
+session is on the stat line: `{} reused of {} created`. **A session whose `reused` stays at 0 is a session
+this is not paying for** - and every run measured so far is one of those, which is why the honest state of
+this feature is "in the tree, instrumented, and doing nothing measurable".
 
 ### The cache was keyed on the wrong address
 
@@ -2790,6 +2987,19 @@ file and it silently re-defined what the neighbouring function was expected to s
 a question about a **named axis**; what sees a turn is a question about a **specific corner of the
 sprite** - and neither of them sees a test whose expectations were written from the same wrong premise.
 For that, the expectations have to come from data the code does not own.
+
+**And there is no `v` flip anywhere in the chain, which is worth writing down because the opposite is the
+natural guess.** A Minecraft GLSL shader used to sample at `texCoord0.y = 1.0 - texCoord0.y`, because
+OpenGL's texture origin is the *bottom* of the picture while the game's `v` is measured **downward from the
+sprite's top row** - `CuboidFace.UVs.getVertexV` hands vertices 0 and 3 the sprite's `minV` and
+`defaultFaceUV(SOUTH)`'s `16 - to.y` is the top of the element. 26.1 **has no such line in any of its 88
+shader files**, terrain's included (`terrain.vsh` writes `texCoord0 = UV0;`, `terrain.fsh` samples it
+directly), because the new backend samples through the same top-left origin this side does: wgpu's `uv.y =
+0` is the first row of what was uploaded, which is the first row of the PNG, which is the sprite's `v0`.
+`sprite_vertices` and both `get_atlas_uv` paths are therefore straight `v0 + t * (v1 - v0)` interpolations
+with no flip. **Adding one would create the mirror this pile of tests exists to prevent** - the green of a
+grass block's side at the bottom of the block, on every face of every model - so `terrain.wgsl` carries the
+whole argument where the varying is written.
 
 ### The title screen wrote a warning per frame
 
@@ -4065,6 +4275,34 @@ constructed.
 game still reads it at startup to decide what window to create, and `Window#isFullscreen` is answered from
 the mode actually applied - so a player who never opens the page gets exactly the behaviour they had.
 
+#### The tooltips were essays, and the restart line was printed twice
+
+A tooltip is a caption, and the renderer's had grown into documentation: 32 of them, **7,974 characters in
+Chinese**, the longest at 826. That is what this file is for, and a tooltip has room for what a setting
+*does* plus the one consequence that would change a decision.
+
+Three things were cut whole, because something else already says them:
+
+- **"The wgpu instance is created with this flag, so switching takes effect on the next launch."**
+  `TooltipWidget` draws that line itself - `RESTART_TEXT`, on its own row, whenever the schema marks a
+  setting `needs_restart` - so every tooltip that spelled it out was printing it twice.
+- **The `WGPU_*` overrides.** Real, and a developer's note; nobody reaching this page is setting
+  `WGPU_DISCARD_HAL_LABELS`.
+- **"This is the `wgpu-…` marker as a switch."** The markers are gone, so what is left of the sentence is
+  history.
+
+Where it landed: 32 tooltips, **3,027 characters in Chinese against 7,974 before** - 38% of what it was -
+the longest at 204 against 826, and the median at 102. Measured rather than estimated, because "shorter" is
+otherwise a claim about nothing. English is longer per string and fell out at 9,288.
+
+**And the two languages had drifted: `en_us` was eight tooltips short.** `backend`, `vsync`,
+`bind_group_cache`, `dynamic_offsets`, `trace_dynamic_offsets`, `gpu_timestamps`, `pix_capture` and
+`dump_shaders` had no English entry at all, so those rows fell back to the renderer's own `desc` string out
+of the schema - the long form, in the schema's voice - while a Chinese player read the language file. No
+test could see it: every one of them was per-language and none of them asked about a description.
+`every_language_has_the_keys_the_others_have` compares the two key *sets* now, and deliberately not the
+texts, which are translations and are not supposed to match.
+
 #### The mode has to be applied when the settings are read, not on the first frame
 
 The first version applied it from a client tick, `DisplayMode.applyOnFirstFrame`, and that is one frame too
@@ -4236,7 +4474,54 @@ reaching the baker**, which is exactly the state it was in before this. The laye
 show it, because leaves are a small part of a section and the solid layer is already the largest of the
 three by a wide margin.
 
-### The translucent layer's quads are sorted, which is the one thing that cannot be deferred
+### Nine of vanilla's video settings had no row, because the screen that owns them was replaced
+
+`OptionsScreenMixin` replaces the whole video settings screen - `VideoSettingsScreen` is never constructed,
+which the window-mode round already found the hard way (see "A row injected into `VideoSettingsScreen` is a
+row on a screen nothing opens"). The consequence is not limited to the fullscreen checkbox: **every vanilla
+video option this mod does not draw a row for is gone**, and the list was never reconciled against the real
+one.
+
+Read from `VideoSettingsScreen`'s own three groups, 26.1 has thirty rows. Four are replaced on purpose
+(`fullscreen` is the window-mode row on the General page, `exclusiveFullscreen` is that row's third state,
+`fullscreen.resolution` is the display-mode picker `DisplayMode` replaces, and `improvedTransparency` is the
+Fabulous preset `GraphicsPresets` hides with a reason of its own), and nine had no row at all:
+
+| row | what it is | where it went |
+| --- | --- | --- |
+| `options.inactivityFpsLimit` | the throttle when minimized or away | General, beside the frame-rate limit |
+| `options.accessibility.menu_background_blurriness` | how much the menu background is blurred | General, with the preferences |
+| `options.renderCloudsDistance` | cloud draw distance, 2..128 chunks | Quality, beside `renderClouds` |
+| `options.weatherRadius` | rain and snow draw distance, 3..10 blocks | Quality |
+| `options.cutoutLeaves` | the Fast/Fancy leaves switch | Quality - see the section above |
+| `options.prioritizeChunkUpdates` | which rebuild the player waits on | Quality |
+| `options.textureFiltering` | how the block atlas is sampled | Quality |
+| `options.maxAnisotropy` | how much anisotropy that buys | Quality, beside the row above |
+| `options.chunkFade` | how long a new section fades in | **still missing** |
+
+**Two of the nine needed engine work rather than a row**, and they are the pair this whole change is
+really about. `textureFiltering` has been read by the renderer since the sampling port
+(`TerrainPass` pushes it every frame, `terrain.wgsl` implements all three answers) but no row moved it -
+so `RGSS` and `ANISOTROPIC` were reachable only by editing `options.txt` or by picking a graphics preset,
+which is a setting a player could see in a video they could not open. `maxAnisotropy` was worse: the clamp
+was the constant 4, which is the option's *default*, so the row would have moved a number that reached no
+sampler. Both now travel, and both are described at `game_anisotropy`.
+
+**The two rows are drawn as a pair because the renderer reads them as one line**, and the second is greyed
+unless the first says `ANISOTROPIC` - which is what vanilla does
+(`maxAnisotropy.active = options.textureFiltering().get() == ANISOTROPIC` in `VideoSettingsScreen#tick`,
+re-read every tick rather than only when the other row is clicked) and what the arithmetic says, since the
+clamp is exactly 1 under the other two answers. That needed the first piece of widget state this screen has:
+`IntOption.enabledWhen`, a **predicate** rather than a value, read afresh each frame from the *other
+option* - so the pair agrees in the same frame, and before Apply, while a value captured when the page was
+built would grey the row on what the setting was when the screen opened.
+
+**`options.chunkFade` is the one still missing, and it is not a row.** It is
+`chunkSectionFadeInTime`, 0..2 seconds, and it needs a timestamp per section - when the arena last received
+one - before a row could do anything. VulkanMod implements the same feature from the same idea (a build
+time per section, turned into a fade factor in the vertex stage), so the shape is known; what is not is
+where it lives in this arena, which is a change to what a section's record carries rather than to a page.
+
 
 Blending is order-dependent and there is no depth test to hide it: two panes of glass or two surfaces of
 water inside one section blend in **the order they are drawn**, and this side drew them in bake order. The
@@ -5065,11 +5350,39 @@ graph updating, which is the refill.
 marker file and not a hard-coded decision, because which answer is right depends on the measurement: with
 it on, the frame does less work but every section the list is late for is a hole; with it off, every
 section the frustum contains is drawn and there is nothing to attribute. Turning it off and flying the same
-route is the experiment - if the holes go with it, this is the mechanism, and the fix is to stop treating a
-snapshot as an authority rather than to remove the culling.
+route is the experiment - if the holes go with it, this is the mechanism.
 
 With it off, the report's `not named by the game's occlusion graph` count still appears - the gather still
 counts what the list left out - so the two runs are comparable rather than the number simply vanishing.
+
+**The fix: the list is obeyed only for the sections it has had the chance to judge.** A section the arena
+has taken over *since the list was last sent* is one the game's graph may not have looked at yet, and for it
+the frustum decides instead - the same answer a session with the switch off gets, but only for the sections
+that need it. Everything else is untouched: a section the list named is drawn, and an unnamed section the
+list has had every chance to name is still culled. **The culling survives**, which is the point of doing it
+this way - it is where the few hundred sections that are not behind a hill come from.
+
+The state is one set, `Scene::sections_since_the_list`, filled at the publish in the section drain (the
+moment this side's claim becomes true) and **emptied by `Scene::set_visible_sections`**, which is the moment
+the game's answer has caught up. No new JNI call and no change on the JVM side: the list's one writer is
+already in Rust. `section_visibility` gained a third answer for it rather than losing the one it had.
+
+**The residual, stated rather than hidden.** `sendVisibleSections` only sends a list whose *contents*
+changed, so a refill that produces the same set does not clear the set above. An *occluded* section taken
+over inside that window is therefore drawn until the next list change. That errs in the safe direction - a
+wasted submission instead of a hole - and it cannot last: a newly taken-over section that is genuinely
+visible changes the list's contents, and that push clears the set.
+
+**The revision gate added later narrowed this rather than widening it** ("The section list is only rebuilt
+when the game rebuilds it"): the send that could clear the set without the game having decided anything - the
+*cleared* list, between `clearVisibleSections` and the refill inside `applyFrustum` - does not happen any
+more. Every remaining send is one the game itself asked for.
+
+**And the number that says it fires.** The terrain line carries `N too new for it to have judged`
+(`SECTIONS_TOO_NEW`), counted where the answer is decided rather than where it is used. A settled world
+reports zero; a run that streams terrain in reports it moving. The `not named by the game's occlusion graph`
+count beside it is now only the sections the list really did cull, which is what makes the pair readable:
+one is the culling working, the other is the snapshot being late.
 
 ### Two ways a refused section became a 16x16x16 hole, and one of them was the fix for the other
 
@@ -5318,9 +5631,19 @@ coordinates come from its own packing) and `ClampToEdge` for the game's. A descr
 which is the only reason the test can exist at all - the two samplers are created deep inside
 `RenderGraph::new` and `TextureManager::new`, both of which want a `Gpu`.
 
-**Anisotropy is missing entirely**, in either direction: there is no pipeline field for it the way there
-is one for `depth_write`, so a player on `ANISOTROPIC` does not get it. Kept here because it is the one
-part of the game's sampler that neither answer has.
+**Anisotropy is wired now, and both halves of the game's line are read.** The clamp is
+`Options#maxAnisotropyValue` under `ANISOTROPIC` and 1 under the other two answers, which is
+`LevelRenderer:678-681`; and `maxAnisotropyValue` is `1 << maxAnisotropyBit`, so the bit is pushed beside
+`textureFiltering` (`WgpuNative.setMaxAnisotropyBit`, sent every frame from `TerrainPass` the way the method
+is) and the shift happens once, in `game_anisotropy`. **The bit used to be the constant 4**, which is the
+option's *default* rather than its value - the row that moves it was missing, and now is not: the Quality
+page carries `Texture Filtering` and `Anisotropic Filtering` as the pair vanilla groups them as, with the
+second greyed unless the first says `ANISOTROPIC` - which is `maxAnisotropy.active = …` in
+`VideoSettingsScreen.tick`, and `IntOption.enabledWhen` here.
+
+What the clamp still is not is *queried*: `Limits` has no field for what a device really supports, so a
+request is clamped by wgpu-core rather than refused, and `game_anisotropy` tops out at the API's own 16.
+The game's slider is `1..3`, so its own maximum answer is 8 and nothing reaches that ceiling.
 
 ### The frustum is not occlusion culling, and the game already had the answer
 
@@ -5332,21 +5655,27 @@ the few hundred that are not behind a hill. Drawn with the frustum's set, every 
 system, a ravine or a forest floor is submitted, and the vertex stage transforms geometry the depth test
 then discards.
 
-`LevelRenderer#visibleSections` is that graph's answer and it is rebuilt every frame in `setupRender`,
-which is before the terrain pass runs. It is read rather than recomputed, because recomputing it is what
+`LevelRenderer#visibleSections` is that graph's answer, and it is filled by `applyFrustum` rather than every
+frame - see "The section list is only rebuilt when the game rebuilds it" below for the game's two reasons
+and for what the pass does with them. It is read rather than recomputed, because recomputing it is what
 the game is already doing and the game's version is the one with the graph in it:
 
 - `VisibleSectionsAccessor` reads the list, `RenderSectionNodeAccessor` reads each section's own
   `sectionNode` - a `SectionPos.asLong`, the same packing `RustChunkBake` keys its records by and
   `section_pos` unpacks, so a section cannot be named one way on one side and another way on the other;
-- `TerrainPass#sendVisibleSections` hands the keys over once per frame, and **only when they change** -
-  the list is the same list most frames, and a native call per frame to pass a thousand identical longs
-  is the cost that avoids;
+- `TerrainPass#sendVisibleSections` hands the keys over **when the game rebuilds the list**, and **only when
+  the rebuilt list differs from the last one sent** - the revision is the game's own dirty flag, counted by
+  `VisibleSectionsMixin`, so a frame the game did not rebuild the list on does not walk it, does not
+  allocate and does not cross the bridge; and a native call to pass a thousand identical longs is the cost
+  the comparison avoids;
 - the pass obeys it **including when it is empty**. `None` is "nothing has been sent", where a frustum
   is the best answer there is, and `Some(empty)` is "the game looked and saw nothing", where drawing the
   arena would be drawing exactly what the game decided not to. Read as "not told", the feature draws the
   whole world for a frame the game deliberately emptied and looks like it does nothing at all - which is
-  why `section_visibility` is a function with a test rather than three lines inside the draw loop.
+  why `section_visibility` is a function with a test rather than three lines inside the draw loop. **And
+  `Some(empty)` is only ever sent when the game said it**: `applyFrustum` clears the list before it refills
+  it, so there is a state - an empty list nothing has been decided about - that this side can no longer
+  report as an answer, which is what the section below is about.
 
 The frustum test stays. It is nearly free, and the two disagree in both directions: the graph's answer
 is a frame old and conservative about what a neighbour hides, so a section it left out may be one the
@@ -5977,7 +6306,7 @@ algorithms rather than one with a knob:
 | --- | --- | --- |
 | `NONE` ("Fast") | isotropic, hardware level | the same |
 | `RGSS` ("Fancy") | four taps on the game's rotated grid, at a level from **`sqrt(min * max)`** of the two derivative lengths | the same, ported |
-| `ANISOTROPIC` ("Fabulous") | `anisotropy_clamp = Options#maxAnisotropyValue`, which is `1 << maxAnisotropyBit` - **4 by default** | the same; it used to be a flat 16 |
+| `ANISOTROPIC` ("Fabulous") | `anisotropy_clamp = Options#maxAnisotropyValue`, which is `1 << maxAnisotropyBit` | the same, from the pushed bit; it used to be a flat 16, then the option's default 4 |
 
 The geometric mean is the part that matters and the reason a bias never fixed anything permanently: the
 hardware's implicit level comes from the *worst* of the two derivatives, which at a grazing angle is the
@@ -5986,9 +6315,214 @@ moving sprite's coarse levels are a running average of its animation. A player m
 of it, twice, on two builds.
 
 The port also made the uniformity test stronger: the shaders now take every level explicitly
-(`textureSampleGrad` and `textureSampleLevel`), so
+(`textureSampleLevel`), so
 `the_terrain_shaders_never_sample_a_texture_under_a_branch` asserts **zero** auto-level fetches where it used
 to assert exactly six.
+
+#### The six `select`s are real branches again, because the levels are taken first
+
+Those fetches were reached by **evaluating all of them and `select`ing between the results**: two atlases ×
+three samplers, each written out as a nested `select` over six `sample_atlas` calls. The reason was sound -
+a `textureSample` under a branch is undefined behaviour, because WGSL defines the implicit level of detail
+only in uniform control flow, and neither `in.game_atlas` nor `in.animated` is uniform in the language's
+sense (they are per-vertex varyings and a quad can straddle a primitive boundary).
+
+**It stops applying once the level is explicit.** `textureSampleLevel` takes no derivative, so it carries no
+uniformity requirement; only `dpdx`, `dpdy` and the auto-level fetches do. So the shape is now:
+
+```wgsl
+let geometry = sample_geometry(in.tex_coords, pixel_size, bias);   // every derivative, once
+
+if in.game_atlas == 1u {
+    if magnified           { texel = sample_at_level(t_game_atlas, t_game_sampler_magnify,  geometry, use_rgss); }
+    else if in.animated==1u{ texel = sample_at_level(t_game_atlas, t_game_sampler_animated, geometry, use_rgss); }
+    else                   { texel = sample_at_level(t_game_atlas, t_game_sampler,          geometry, use_rgss); }
+} else { … the same three over `t_texture` … }
+```
+
+`SampleGeometry` carries the two levels `sampleNearest` and `sampleRGSS` are built on - the hardware's
+answer plus the bias, and the geometric mean - along with the texel-centre correction, the four rotated-grid
+taps and the two blend factors. `sample_at_level` then contains nothing but `textureSampleLevel` and
+arithmetic, which is what makes it callable from a branch.
+
+What that buys, counted rather than asserted: **one of the six call sites is executed, not all six** - the
+six are two atlases times three samplers, and both splits are mutually exclusive arms - so a plain fetch is
+one texel per fragment and an RGSS one is nine, being one plain fetch and four taps at each of two levels.
+Before the restructure all six were evaluated and `select`ed between, which cost six and fifty-four. The
+level arithmetic - two `dpdx`, two `dpdy`, four `length`s, two `log2`s, the taps - happens **once** instead
+of six times, and it is the same numbers it always was, because the formulas are unchanged. The invariant is
+still asserted at **zero** auto-level fetches.
+
+**This paragraph used to say "three of the six are executed", so a plain fetch was three texels.** That was
+wrong, and it is worth leaving a note about rather than quietly editing: three is the number of call sites in
+the *taken atlas*, and they are an `if`/`else if`/`else` over the sampler, so only one of those three runs.
+The mistake came from counting the call sites that are *reachable* rather than the one that *executes*, which
+is exactly the kind of reading the shader's own structure is there to prevent - the branches are real, and a
+`textureSampleLevel` under one is what the whole restructure was for.
+
+#### Nine fetches for an answer the `mix` then multiplied by zero
+
+`sample_at_level` takes the plain fetch unconditionally - the game's `sampleRGSS` ends by blending its
+four-tap result against it rather than choosing between them - and then, if `use_rgss` is on, spends eight
+more fetches on the rotated grid. What was not noticed is that the last line is
+
+```wgsl
+return mix(plain, rgss, geometry.rgss_blend);
+```
+
+and `rgss_blend` is `smoothstep(min_pixel_size, min_pixel_size * 2.0, max_texel_size)`, which is **exactly
+zero whenever a texel covers at least a pixel**. `mix(x, y, 0.0)` is `x`, so at the game's `Fancy` setting a
+magnified fragment was costing **nine** fetches to return the first one - and a block face sixteen texels
+across stops being magnified only a few blocks away, so that is most of the near and middle field rather
+than a corner case.
+
+The fix is one clause:
+
+```wgsl
+if use_rgss == 0u || geometry.rgss_blend == 0.0 {
+    return plain;
+}
+```
+
+**The test is the blend being zero and not `magnified`, and that is not a stylistic choice.** `magnified` is
+`|dpdx.x| < texel && |dpdy.y| < texel` - two components of two derivative vectors - while `max_texel_size`
+is the length of the whole vector, and the two can disagree: `magnified` true with `max_texel_size` past
+`min_pixel_size` is a fragment whose blend is *not* zero, where the taps do change the answer. Skipping on
+`magnified` would be a picture change; skipping on `rgss_blend == 0.0` is the same number by the definition
+of `mix`, and `smoothstep` returns exactly `0.0` at or below its lower edge rather than merely something
+small.
+
+**And it did not remove the atlas axis**, which is the other half of what was asked for - see the section
+below for why that is a separate change, and why the branch costs code rather than a fetch.
+
+#### The terrain shaders have a single-atlas fragment entry point
+
+`terrain.wgsl` and `terrain_solid.wgsl` now each have two fragment entry points. `frag` is the one that has
+always been there: a per-vertex flag picks between the game's block atlas and this side's copy, in real
+branches over `textureSampleLevel`. `frag_game_atlas` samples the game's atlas and nothing else, so
+`t_texture` and its three samplers are not in its call graph at all - and `graph.rs` builds the terrain
+pipelines from it whenever that is certainly right.
+
+**A paint of the axis is code, not a fetch.** The two arms of the flag's branch are mutually exclusive, so
+the two-atlas shader already costs one fetch per plain fragment and nine per RGSS one - see the corrected
+count in the section above. What it costs is three extra `sample_at_level` call sites, a second texture and
+three more samplers, in every terrain pipeline. Removing them is worth doing and worth being honest about:
+it is shader size, register pressure and three sampler bindings, not a texture fetch per pixel.
+
+**Which is why it is an entry point and not a pipeline constant.** With `override atlas: u32` and
+`PipelineCompilationOptions::constants`, the source would still contain both atlases and both sampler sets;
+naga substitutes the override value and the *backend compiler* would then fold the branch away. That
+probably works, and it is not checkable from here. A second entry point is smaller **in the source**, which
+is checkable: `the_single_atlas_entry_point_samples_one_atlas` reads both shader files with naga, follows
+the calls out of each fragment entry point, and asserts that `frag_game_atlas` reaches `t_game_atlas` and
+its three samplers and reaches **none** of `t_texture`, `t_sampler`, `t_sampler_magnify`,
+`t_sampler_animated` - while `frag` still reaches all eight, so the fallback is still a fallback.
+
+**When it is chosen, and by what.** Not by a setting: by what the bake actually did.
+`decide_game_atlas` ignores the sprite's animation and sends every face to the game's atlas once it is
+bound and the JVM has registered a rectangle for the sprite, so the fallback is for three cases - the atlas
+is not bound yet, the animation is off, or *this sprite* has no rectangle - and only the third is per face.
+`block::faces_are_all_the_games` answers from the bake's own count, and the measurement that says this is
+worth doing at all is a run of a normal world:
+
+```text
+204878 face(s) are baked against the game's block atlas and 0 against this side's own
+```
+
+so the two-atlas shader is the exceptional one by three orders of magnitude.
+
+**The ordering that makes the switch safe.** A face that falls back sets a flag, and the graph is rebuilt
+from it at the next present - which is safe because of where the two things happen: faces are fed into the
+arena at the *blit*, after the frame's terrain passes have been recorded, so a face baked during frame N is
+first drawn in frame N+1, and the rebuild lands in between. Nothing has to be cancelled or re-recorded. The
+flag is cleared where the arena is emptied (a level change, `block::forget_atlas_faces`), so a session that
+fell back once is not stuck with two atlases for the rest of its life.
+
+**And it closed a real divergence between the two shaders.** `terrain_solid.wgsl` - the copy that draws the
+solid layer, which is most of the world - had kept its `sample_nearest` on `textureSampleGrad`, and
+`textureSampleGrad` has no bias. So `atlas_lod_bias` **did nothing on the solid layer**: a diagnostic run
+with `-4` sharpened the cutout layer's sprites and left the solid layer's alone, which makes the comparison
+it exists for a confounded one. The restructure removes the possibility - there is one `sample_geometry` and
+one `sample_at_level` per shader and the fragment stage has nothing else to fetch with - so **the solid
+layer now honours `atlas_lod_bias` and the per-sprite floor for the first time.** That is a visible change
+for anyone running a non-zero bias, and the symptom to look for is the one the bias's own note warns about:
+a negative bias applied to the whole world samples near level 0 everywhere, which sharpens the distance
+into a moiré. `atlas_lod_bias` at its default of `0` changes nothing.
+
+#### Every shader this renderer builds is created with naga's runtime checks off
+
+`WgslShader::init` is the one place this crate creates a shader module, and it now calls
+`create_shader_module_trusted(.., ShaderRuntimeChecks::unchecked())`. `create_shader_module` asks naga to
+make a shader safe against itself - every indexing of a runtime-sized array gets an `arrayLength` load and a
+`min` in front of it - and **on the terrain vertex stage that is nine clamped loads per vertex**: eight into
+the section arena and one into `section_draws`. The arena is bound with `min_binding_size: None` as one
+whole buffer, so the length that clamp compares against is the entire arena - it can only fire on an index
+wrong by more than the arena, which is not a mistake the indices can make. They are `word_base` (the slot
+the Rust baker allocated) plus offsets into the section it baked there, and the record number the pass chose,
+bounded by `SECTION_DRAW_CAPACITY`.
+
+The count is asserted rather than described, **because it is load-bearing now**: with the checks on, a read
+that went out of range was clamped and the picture was merely wrong; with them off it reads past the binding.
+`the_shaders_this_crate_builds_index_a_storage_buffer_only_where_it_is_listed` walks the shader directory
+and holds a table of every storage-buffer index expression in it:
+
+| shader | storage reads | what they are |
+| --- | --- | --- |
+| `terrain`, `terrain_solid` | 9 each | the quad's four corners, read twice (occlusion count, then position/light/colour), plus `section_draws[instance]` |
+| `entity` | 1 | the instance record |
+| everything else | 0 | - |
+
+A file that is not in that table must have none, so a new shader that indexes a buffer fails the test rather
+than quietly joining the unguarded set. `unchecked()` turns off more than bounds checks - loop bounding,
+signed integer division and overflow, the ray-query and mesh-shader checks - and the last two are inert
+here: no shader in this crate has a ray query or a mesh shader. The promise the safety comment makes is that
+every storage buffer is addressed by a value this side computed to be in range and every loop has a trip
+count the shader can see; what is given up is the backstop, which on Vulkan means an out-of-range read
+returns zeros - geometry at the origin - rather than a crash.
+
+**That the flag reaches the SPIR-V is checkable, and it was checked**, because otherwise the change is a
+line that reads well and does nothing. The default policies are in the Vulkan backend's `naga_options`
+(`vulkan/adapter.rs`):
+
+```rust
+index: naga::proc::BoundsCheckPolicy::Restrict,     // unconditional
+buffer: if self.private_caps.robust_buffer_access2 { Unchecked } else { Restrict },
+image_load: if self.private_caps.robust_image_access { Unchecked } else { Restrict },
+```
+
+so the clamp on `chunk_data[i]` comes from `index`, which is `Restrict` **whatever the device reports** -
+the two robust-access flags only shorten the texel-buffer and image-load paths. And `vulkan/device.rs` is
+where the caller's flag overrides all four:
+
+```rust
+if !runtime_checks.bounds_checks {
+    temp_options.bounds_check_policies = naga::proc::BoundsCheckPolicies {
+        index: Unchecked, buffer: Unchecked, image_load: Unchecked, binding_array: Unchecked,
+    };
+}
+```
+
+DX12 does the same through `restrict_indexing`. Nothing measures the frame time here: whether nine loads
+saved per vertex shows up at all depends on whether the terrain vertex stage is what the GPU is waiting on,
+and the `gpu timestamps` switch is what answers that.
+
+#### `sun_moon_cycle.wgsl` sampled its texture inside a branch, and the test that should have caught it named two files
+
+```wgsl
+if (in.og_pos.y > 0.0) { return textureSample(sun_texture, sample, in.tex_coords); }
+else                   { return textureSample(moon_texture, sample, in.tex_coords); }
+```
+
+That is the same undefined behaviour the terrain shaders were restructured to avoid, with the same
+non-uniform condition: `og_pos` is an *interpolated* varying, so a quad straddling the horizon takes both
+sides of the branch. It survived because `the_terrain_shaders_never_sample_a_texture_under_a_branch` named
+`terrain` and `terrain_solid` and read those two files by name - the detector was correct and proven
+(`uniformity_detector_tests` feeds it the branching shape and asserts it is reported, then the `select`
+shape and asserts it is not), and nothing was feeding it the third shader.
+
+The fix is the shape that test documents: sample both, `select` between them. The invariant is now a
+directory walk - `no_shader_this_crate_builds_samples_a_texture_under_a_branch` - so a file is covered the
+moment it is in the pack.
 
 ### A model face can turn shading off, and the schema had no such field
 
@@ -6013,7 +6547,1193 @@ by its direction's brightness where the game multiplies by 1.
 `Direction`'s own order rather than the record's - which is not the same order, and the mapping is spelled
 out at the call site.
 
+### The terrain pass draws in batches, and what that cost the immediate
+
+Every section used to be one `draw_indexed`: a few hundred to a few thousand calls a frame, each with the
+section's position written into the immediate and its arena slot passed as the instance number. It is now
+`multi_draw_indexed_indirect`, one call per run of consecutive draws that share an arena - and the reason
+it is not simply a different call is that **a `multi_draw` cannot be told anything per draw**:
+
+- **An immediate is set for the whole call.** `@pc_section_position` was ten `u32`s, three of which were
+  the section's position, written per section. Those three moved into a storage buffer (`SectionDraw`,
+  four `u32`s: `x`, `y`, `z`, `word_base`) which the vertex stage reads as
+  `section_draws[instance_index]`. The immediate is seven `u32`s now, set once per layer, and the section's
+  position is read out of the buffer **by both paths** - batched and one-call-per-section - so the switch
+  between them cannot change the picture.
+- **`instance_index` changed meaning.** It *was* the arena slot, because there was nothing else for a
+  single-instance draw to carry. It is now the index of the draw's own record, which is the only channel an
+  indirect draw has for anything per draw (`first_instance`), so the arena slot is inside the record
+  instead. Both paths pass the same number, and `base_vertex` is zero in both.
+- **`Features::INDIRECT_FIRST_INSTANCE` is what makes a non-zero `first_instance` legal**, and it is asked
+  for whenever the adapter has it. Without it every record would read record zero.
+
+**One pair of buffers per pass and not one for the frame.** `Queue::write_buffer` is documented as being
+applied at the next `submit`, *ahead of every command in it* - so every write a frame makes lands before
+every draw in that submission. Minecraft's opaque group is two terrain pipelines recorded into one encoder
+by one `render` call, so a single buffer would have the second pipeline's records in it when the first
+pipeline's draws execute: both would draw the last pass's sections out of the last pass's arena slots.
+`SECTION_DRAW_SLOTS` of them is the fix, each pass claims one when the graph builds its pipelines, and a
+terrain pipeline that cannot claim one is skipped loudly rather than sharing.
+
+**The records are what the fallback needs too**, which is why the record buffer (16,384 draws) is larger
+than the indirect one (10,000): a pass with more draws than the indirect buffer holds still draws every
+section, one call at a time, and each of those calls reads its own record. Past the record capacity the
+extra draws are dropped *and said so*, once a second, without the diagnostics switch - the gated lines are
+counters, and this would be geometry that is missing.
+
+**Three feature bits decide whether batching is worth anything**, and the answer is printed once per world:
+
+| bit | what it is for |
+| --- | --- |
+| `INDIRECT_EXECUTION` | the draw call itself |
+| `INDIRECT_FIRST_INSTANCE` | saying which record a draw is |
+| `MULTI_DRAW_INDIRECT_COUNT` | whether the call is *one* call |
+
+The third is the surprising one. `wgpu-hal`'s Vulkan backend expands `draw_count > 1` into one
+`vkCmdDrawIndexedIndirect` per record unless Vulkan's `multiDrawIndirect` is enabled, and that is what
+wgpu gates behind `MULTI_DRAW_INDIRECT_COUNT` - a "batch" that is really a loop of indirect draws, which is
+slower than the loop it replaces because each of them still reads its record.
+
+**DirectX 12 is excluded outright, and it is the one exclusion here that is a defect rather than a missing
+capability: `multi_draw_indexed_indirect` is broken in wgpu's DX12 backend.** The bug is in wgpu's
+implementation of that call on that backend - not in D3D12, which offers a perfectly good
+`ExecuteIndirect`, and not in the driver. That is the awkward case for a feature test, because the adapter
+there reports *all three* bits - `dx12/adapter.rs` enables `MULTI_DRAW_INDIRECT_COUNT` unconditionally -
+and the call underneath really is one `ExecuteIndirect` with `MaxCommandCount`. Every question this file
+can ask says yes and the answer is still no, so the test is on the backend and not on the features, and
+**the comment in `try_create_renderer` says not to delete it on the strength of those bits.** It is also
+the worst shape for a renderer to ship - the failure is a picture, not an error, so nothing in a log would
+have said it happened. The way back is a wgpu release that fixes the call on that backend, and that line is
+what to revisit when one lands.
+
+Nothing is lost but the batching: DX12 draws the same records, in the same order, through the same shader,
+one `draw_indexed` per section.
+
+The capability line names which of the reasons applied, one per branch, because the first version of it
+said "the switch is off, or it is DX12" and that ambiguity is what hid the wiring bug below for a run.
+
+**The setting and the device are two flags, and they are read in two different places.** The setting comes
+from the config when the run directory is sent - which is from the mod constructor, **before there is a
+device** - so resolving the pair there asks an adapter a question no adapter has answered yet. The first
+run of this path did exactly that, and what it printed is what found the bug:
+
+```text
+wgpu-mc: indirect draws: execution yes, real batched multi-draw yes, non-zero first instance yes
+wgpu-mc: the terrain pass is drawing one section at a time, and this device could batch
+```
+
+So the capability is recorded where the device is created (`try_create_renderer`) and the two are one
+answer in `graph::terrain_batches_draws`, which the draw path reads. Worth recording because **everything
+still worked** - the world loaded, the terrain drew, and the only symptom was a feature that silently did
+nothing.
+
+`terrain_indirect` on the options screen is the switch, **off by default**, and it decides which of two
+draw loops runs and nothing else. It is there to tell "the batching broke something" from "the terrain is
+wrong", because those are the two things a picture of missing terrain could mean.
+
+**It was on by default, and it was turned off for a reason that is not about the batching.** Both paths
+are meant to draw the same picture, so a config that does not mention the key is not asking for it either
+way - and the terrain pipeline is not what is being worked on at the moment, so the path that is *not*
+being measured should not be the one the frame goes through. A batching path with nobody watching it is
+a place for a difference to hide. Asking for it is one setting away, and the picture is meant to be
+identical when it is on.
+
+**A struct, not an offset table.** The immediate was a `[u8; 28]` with `constants[..4]`, `constants[4..8]`,
+... at the call site, and the change above left `constants[4..8]` - the atlas level-of-detail bias - with
+nothing writing it. The struct stayed twenty-eight bytes and the existing size test stayed green; the
+picture was a `lod_bias` of zero, which is a player's `-4` silently not applying, and the field next to it
+was one slot away having the bias written into it instead. It is `#[repr(C)]` with `bytemuck` now, and
+a test compares **every member by name, offset and size** against the member list naga reads out of both
+shipped shaders.
+
+### The frame gathers the world once, not once per terrain pass
+
+A frame is three terrain passes: `terrain_solid` and `terrain` in the game's opaque group, and
+`translucent_terrain` in its translucent one. Each of them walked the arena's whole `HashMap`, tested every
+section against the frustum and against the game's occlusion list, built its own draw records, uploaded
+them, and then drew. **None of that walk depends on which layer is being drawn** - the box, the frustum
+test and the occlusion answer are per section, and the three passes were producing the same list three
+times. `TerrainFrame` is that work kept for the frame: the first pass of a frame does it for every terrain
+pipeline the graph holds, and the other two draw from what it left.
+
+- **The gather is the part that was three times over.** It is one walk of the arena and one frustum test
+  per section, and it produces one list. The records are genuinely per layer - a section's arena ranges
+  differ per layer, and a layer the arena has nothing in for is a layer with no record - so they are built
+  per pass, but from the one list and in the same place.
+- **The uploads moved with them.** They are per pass because a pass owns a slot (see the section above),
+  and they now happen where the records are built, once per frame, instead of in the pass that draws them.
+- **There are two lists, and that is not redundancy.** The gather fills one in HashMap order and the
+  frame makes a far-to-near copy of it. The opaque passes draw from the first and the blending pass from
+  the second, and both orders are load-bearing: a blending layer mixes with what is already in the target,
+  so its order *is* the picture, while the opaque layers are 90% of the draws and their order decides how
+  many batched calls there are - `multi_draw_indexed_indirect` reads one index buffer and one arena bind
+  group per call, so a call may only span draws of one arena, and sorting the opaque list would interleave
+  arenas by distance and turn a handful of calls into one per section or worse. The sort used to be per
+  pass; it is once a frame now.
+- **The counters moved with the gather.** `culled`, `out of sight` and `empty` are properties of the walk
+  and are now counted once a frame - about a third of what they were, with the same ratio, which is what
+  they are read for. `drawn` is still per pass, because a pass is what draws.
+
+**The key is exact, and it is not a frame number.** `TerrainFrameKey` holds everything the gather reads -
+the frustum's six planes, the camera's *section*, the revision of the game's occlusion list, the model
+translation - plus a frame counter. A hit is therefore a list a fresh gather would have produced character
+for character, and a frame in which nothing has moved reuses it instead of rebuilding the same list. The
+two fields that look redundant and are not:
+
+- **The camera's section is not in the frustum.** The view matrix carries the camera's offset *within* its
+  own section and nothing else, so two sections with the same offset produce the same planes - while every
+  box being culled is stated relative to that section and moves with it.
+- **The frame counter is not inferable from the world.** A section's arena ranges stop being valid after
+  the frames that may still be drawing them (`SectionStorage` defers a freed range for as many frames as
+  are in flight), so a list may not outlive its frame even when the camera and the world have not changed.
+
+`begin_frame()` is called from `device::flush_shared_encoder` - the one submission point - so a frame is
+what the encoder says it is. `Scene::set_visible_sections` is the one writer of the occlusion list and
+bumps a revision beside it, so the two cannot fall out of step. Together those are what make a single
+gather per frame correct rather than lucky: the game sends its occlusion list once per frame and only when
+it changes, and the matrices both terrain groups are given are the same, because `TaaJitter` advances once
+per frame rather than once per call.
+
+**A rebuild in the middle of a frame leaves a pass that has already drawn alone.** `PassDraws::drawn` is
+set before a pass's draws, because a draw reads the record buffer at submission time rather than when it is
+recorded - so rewriting that buffer after the fact would leave the recorded counts and offsets describing a
+list that is no longer there. It cannot happen with one view per frame; it is what makes a second view in
+one frame (a caller that draws two cameras) degrade to a stale list for the pass that already went, instead
+of to garbage.
+
+A test pins that **every field of the key breaks the match on its own**, one at a time, because a field
+that does not is a cache that serves a list it should not - which is not a slow frame but a frame drawn
+from sections that are no longer there.
+
+### What that build costs, measured, and where the one redundant rebuild is
+
+The gather-once change above left three questions that the counters could not answer - what the build costs,
+how close the frame comes to the indirect path's capacity, and whether the cache is rebuilt for a reason -
+so the terrain report grew a second gated line and one always-on warning. Measured at 32 chunks with the
+diagnostics on, 120 presented frames a second, an arena of 8,135 sections:
+
+```text
+terrain build: 143 gather(s) (8135 section(s) walked each, 427574 kept in all - a pass builds records
+  from the kept ones, three of them a frame), 858 upload(s) in 33083 KB; 80421 us building it,
+  562 us a gather, 50202 us of it the gather and 14841 us the records and uploads;
+  143 rebuild(s), 28 of them because the submission counter moved and nothing else did;
+  the most calls any pass has had is 3319 of the 10000 the indirect path batches, 0 pass(es) over it so far
+```
+
+- **The gather is once per rebuild, and a frame makes 1.2-1.8 rebuilds.** 142-218 gathers against 120
+  presented frames - so the "three passes, three walks" this section is about is gone and was never three a
+  frame's worth: what is left is one walk per *rebuild*, and a rebuild happens for the camera or the world,
+  not per pass.
+- **Per rebuild: `~570 us`, split `~380 us` gather and `~95 us` records and uploads**, with the rest the sort
+  and the bookkeeping. That is `~800 us` a frame at 1.4 rebuilds - about **10% of a 120 fps frame** - and it
+  is linear in what is in view: the walk is 8,135 arena sections and the records are built from the ~2,900
+  the gather keeps, three times each.
+- **The uploads are exactly six per rebuild**, which is the number to have: one record set and one argument
+  list per terrain pass, 38 KB each on average and 33-51 MB a second. `Queue::write_buffer` allocates staging
+  memory per call, so that is six allocations of the render thread per rebuild, and the line is where that
+  stops being a suspicion.
+- **The indirect path's capacity was never reached: the session peak is 3,319 of 10,000 calls.** The cliff is
+  real - past the capacity a pass stops writing one argument list and submits one draw per section - so it now
+  has an always-on warning (a line, once a second, the way the truncated-draw report works) *and* a
+  `3,319 of 10,000` reading on the line above, which is what says whether a session is near it without
+  needing to catch the moment. The two share one predicate, `the_indirect_path_holds`, and a test pins the
+  boundary: exactly the capacity is batched, one call more is the cliff.
+- **And one rebuild in six is provably wasted.** `TerrainFrameKey::frame` is `begin_frame()`, which
+  `flush_shared_encoder` calls - **per submission**, and a presented frame makes 146 submissions per 120
+  frames. What the key's frame counter protects is the *arena's deferred free*, and that happens once per
+  presented frame, in the chunk drain (`submit_chunk_updates` → `SectionStorage::free_deferred`, "once per
+  frame, before the frame's own updates"). So a second submission inside one frame invalidates a list it
+  cannot have invalidated: **`{28} of {143}` rebuilds in the reported second, 185 of 1,070 over six seconds,
+  and up to 113 of 193 in a busy one** were a re-walk of 8,135 sections that produced the list it replaced.
+  The fix is to key on what the records must actually not outlive - a counter bumped where parked ranges are
+  handed back, and where the arena's buffers are replaced - rather than on the submission counter; it is not
+  done here because a missed hand-back path is a frame drawn from ranges that have been given to another
+  section, which is a wrong picture rather than a slow one, and every path that frees a range has to be
+  found first.
+
+### A full arena asked the device for a buffer it did not have, and the process died
+
+A run that filled the first arena reached this:
+
+```text
+wgpu: Section layers for opaque is drawn by the render graph now; ... arena 82,006,452 of 82,140,000
+slot(s) handed out (99%, 312 MB), the largest section 105,666 slot(s), 4 section(s) refused by the arena
+panicked at wgpu-30.0.1/src/backend/wgpu_core.rs:1619
+wgpu error: Out of Memory
+```
+
+`wgpu_core.rs:1619` is inside `create_buffer`, and the only buffer this renderer creates during a session is
+an arena. **The request was seventeen gigabytes**: `grow_arena_if_asked` created every appended arena at
+`Scene::arena_cap_slots`, which is `max_buffer_size / 4` clamped to a `u32` - and on this device
+`max_buffer_size` is past 16 GB, so the clamp is what decides and every growth asked for a 17 GB buffer. The
+log's `99%, 312 MB` is the *existing* pool, which reads like a small request failing and is unrelated to what
+was asked for. wgpu's default error handler treats a failed `create_buffer` as fatal, so it was the process
+that went rather than the frame.
+
+The plan line printed once per world is what made that visible, and it was worth adding for exactly this:
+
+```text
+wgpu-mc: the section arena: up to 4 buffer(s) of 4294967295 slot(s) (16383 MB each, the device's own
+`max_buffer_size`), a budget of 4768 MB, of which the device's limits allow 65535 MB
+```
+
+`ARENA_MEMORY_BUDGET` was supposed to bound this and could not: it is a bound on what the pool *holds*, and
+the pool held 312 MB - well inside the 5 GB - while the *request* was 65 GB past it. A budget is the wrong
+instrument for a per-allocation size. So the fix is three things, and only the first is about the budget:
+
+- **The appended arena is sized by the view, not by the device's ceiling** - `arena_growth_slots` takes
+  what `arena_slots(width)` says the render distance wants, floors it at the largest section the session has
+  meshed, and caps it at the device's per-buffer limit *and* at what the budget still allows. The old
+  reasoning - "there is no reason for one to be smaller" - is what made every growth a request for the
+  ceiling. The arithmetic is a separate function because it is pure, and the failing run's own numbers are a
+  test case.
+- **A refused allocation is caught, not fatal.** The creation is wrapped in
+  `push_error_scope(ErrorFilter::OutOfMemory)` and the scope is read with one poll - `wgpu-core` resolves it
+  immediately (`Box::pin(ready(scope.error))`), which is what "the pop takes effect immediately" means. A
+  failure becomes `SectionStorage::at_capacity`, the state this path already had for "there is no more
+  room", and the JVM keeps Minecraft's own mesh for whatever does not fit. **This is the part that would
+  have saved the run on its own**, and it is the part that cannot be replaced by arithmetic.
+- **The budget is derived from the device** rather than written for one machine -
+  `Scene::arena_memory_budget` is `min(ARENA_MEMORY_BUDGET, max_buffer_size x ARENA_BUFFERS)`, and growth is
+  also checked against `generate_allocator_report()`, which is the half the arena cannot see: the atlases,
+  the game's own targets and the upload staging all live in the same memory.
+
+**And no arithmetic here could have been exact.** That was worth finding out rather than assuming, because
+there *is* an API for exactly this - `MemoryBudgetThresholds`, "start returning OOM errors at a percentage
+of the memory budget reported by native APIs" - and it is implemented for **DX12 only**
+(`wgpu-hal/src/dx12/device.rs`, reading `DXGI_MEMORY_SEGMENT_GROUP_LOCAL`). The Vulkan backend has no
+equivalent, and neither backend exposes the budget as a number: `AdapterInfo` carries a name and a vendor
+and no memory at all. So a Vulkan device cannot be asked how much it has.
+
+**The order was wrong too, and that is the part that would have bitten later**: the pool used to be grown
+before the buffer was created, so a failed allocation left an allocator handing out ranges in a buffer
+nobody had. The buffer is created first now, and the pool only grows if the device made one.
+
+### A `@Redirect` replaces a call; it does not skip the call's arguments
+
+`SectionCompilerMixin` takes Minecraft's geometry away from a section the Rust baker has taken, and it did
+it with two redirects - on `ModelBlockRenderer.tesselateBlock(...)` and on `FluidRenderer.tesselate(...)` -
+that return without calling anything. **That is not where the per-block cost is.** A `@Redirect` replaces
+the *call*; the arguments are evaluated first, and at the call site the arguments include the model lookup
+and the seed:
+
+```java
+blockRenderer.tesselateBlock(
+    ...,
+    this.blockModelSet.get(blockState),   // still executed for every block
+    blockState.getSeed(pos)               // still executed for every block
+);
+```
+
+so a 4096-block section still paid `blockModelSet.get` per block, plus `getSeed`, plus - on the fluid side -
+`blockState.getFluidState()` and `this.fluidModelSet.get(fluidState).customRenderer()`. The redirects were
+saving the *vertex building*, which is the largest single item, and leaving the lookups that feed it.
+
+**The fix is two redirects on the predicates rather than on the calls.** `blockState.getRenderShape()` is
+what guards the block's `tesselateBlock` call, so answering it `INVISIBLE` (the enum's "draw no model" -
+`MODEL` is the only shape `SectionCompiler` turns into geometry) makes the guard false and the whole body
+disappears: `forceOpaque`, the three `SectionPos.sectionRelative` calls, the model lookup, the seed and the
+call. `blockState.getFluidState()` is what guards the fluid path, so answering it a cached empty state makes
+`!fluidState.isEmpty()` false and removes `fluidModelSet.get`, the custom-renderer check and the fluid
+tesselation together.
+
+**What is deliberately left paying.** Two things in that loop are load-bearing for this renderer and still
+run exactly as vanilla does: `blockState.isSolidRender()` feeding `visGraph.setOpaque(pos)`, because
+`results.visibilitySet` is what the game's `SectionOcclusionGraph` walks and this renderer's own
+visible-section list comes out of that graph - skipping it would make every section look transparent and the
+culling that this whole path exists for would be meaningless; and `hasBlockEntity`/`handleBlockEntity`,
+which is how a chest, a sign or a banner is found at all. What remains per non-air block is `isAir`,
+`isSolidRender`, `hasBlockEntity` and two redirect handlers that read a thread-local and return a constant.
+The two redirects on the calls stay as the fallback for the case where the predicates still answer `MODEL`
+or a non-empty fluid - they no longer earn anything on their own, and the javadoc says so rather than
+leaving the next reader to find out.
+
+### The vertex held a sixteenth of a block, and a model is free to put a face between the sixteenths
+
+A packed terrain vertex stored each axis of its position in **one byte, in sixteenths of a block**, plus one
+flag bit that meant "this coordinate is exactly 16" - because 16 does not fit in a byte. The baker's note on
+that encoder ended by naming its own fix:
+
+> Geometry thinner than half a line still collapses onto a line, and this format cannot tell those apart: the
+> honest fix for that is more bits rather than a cleverer rounding. `0.01/16` needs about 1/1024 of a block
+> to survive, which is four more bits an axis than this vertex has.
+
+**What that cost in a picture** is the leaf litter: `template_leaf_litter_*` is one quad at `0.25/16` of a
+block, and at 1/16 it does not fit the grid, so it was *nudged* a whole sixteenth off the block boundary to
+stop it flickering against the ground's own top face. The nudge kept such a face off the plane it shared with
+its neighbour; it did not put it where the model asked, and it could not help geometry thinner than half a
+step at all.
+
+**What VulkanMod does**, from its own `CustomVertexFormat` and `terrain.vsh` in `references/VulkanMod`:
+
+```java
+public static final VertexFormatElement ELEMENT_POSITION_INT16 =
+        new VertexFormatElement(0, 0, VertexFormatElement.Type.SHORT, VertexFormatElement.Usage.POSITION, 4);
+```
+```glsl
+layout (location = 0) in ivec4 Position;
+const vec3 POSITION_INV = vec3(1.0 / 2048.0);
+vec3 getVertexPosition() { return fma(Position.xyz, POSITION_INV, ModelOffset + baseOffset); }
+```
+
+so: **four signed sixteen-bit values, a fixed-point position at 1/2048 of a block, with the fourth component
+spent on the lightmap** (`sample_lightmap2(Sampler2, Position.a)`). Its compressed terrain vertex is sixteen
+bytes, the same as this one - it reaches the finer scale by *not having a per-vertex ambient-occlusion byte*
+and by putting the light where this format has an occlusion count.
+
+**This format now uses that scale**: sixteen bits an axis at 1/2048 of a block, unsigned, which reaches 32
+blocks - twice the section, so the "exactly 16" flag is not needed and is gone. The bits came from two places,
+both of them reclaiming slack rather than taking precision from anything:
+
+| field | was | is |
+| --- | --- | --- |
+| x, y, z | 8 bits each + 1 flag each | **16 bits each** at 1/2048 |
+| ambient occlusion | 8 bits per vertex | **3 bits** - the count only goes to four |
+| colour | 3 bytes in the first two words | 3 bytes in the fourth word |
+| lightmap | 1 byte in the fourth word | 1 byte in the fourth word's top byte |
+
+and the sixteen bytes are now full. `UV_GAME_ATLAS` did not move: it is still bit 16 of the third word, which
+is what the shader tests and what `a_faces_flags_survive_the_packing` pins. The shader's decode lost its three
+`if ((v3 >> 29u) & 1u) { x = 16.0; }` branches with the flags.
+
+**What the finer grid buys, in the numbers the old note used.** At 1/2048 a step is 0.00049 of a block, so the
+fire's `0.01/16` - 0.000625, the coordinate that whole note is about - is 1.28 steps and rounds *to* a step
+rather than onto a boundary; the litter's `0.25/16` is 32 steps exactly and is drawn where the model put it,
+with no nudge. The nudge is still there and still tested, because a value that rounds onto a multiple of 2048
+without being one would still be coplanar with the neighbour's face - it just fires for about one coordinate
+in five hundred now instead of one in two.
+
+**Everything that read those bytes had to move with them**, and the sweep for readers found four:
+
+- `Vertex::compressed` and both terrain shaders, which is the format itself.
+- `read_vertex` in `mc::chunk`, the winding diagnostic that decodes a baked quad's position and normal.
+- The translucent sort's centroid in `mc::chunk`, which read bytes 0, 1 and 2 as the three axes and would
+  have sorted water and glass by a key assembled from x's low byte, x's high byte and y's low byte - a
+  comparator that is still a total order, so it would have been a *wrong order* with nothing in the log.
+- `position` in the fluid geometry tests, which carried its own copy of the old decode.
+
+### The section compile did the same palette walk twice, once per pool
+
+A section rebuild asks two per-position questions that are this side's to answer and one that is not.
+The two: **which positions are full blocks** (they fill the `VisGraph`, and `results.visibilitySet` out of
+it is what `SectionOcclusionGraph` walks - this renderer's own visible-section list comes from that graph,
+so it cannot be skipped) and **which positions have a block entity** (the only way a chest, sign or banner
+is found). The one that is not: the geometry, which the Rust baker builds from the same section.
+
+The vanilla walk answers all three in one pass over the 4096 positions, and per non-air block it pays a
+palette dereference (`SectionCopy.getBlockState` → `PalettedContainer.get`), a virtual `isAir`, a virtual
+`isSolidRender`, a virtual `hasBlockEntity`, a `BlockPos` step in `BlockPos.betweenClosed`'s iterator, and
+both of this mixin's own predicate redirects - `getFluidState` and `getRenderShape` are asked per block too,
+and each of those reads a thread-local. Meanwhile the Rust side reads the same palette and the same bit
+storage to mesh the same blocks. **Two pools, one decode.**
+
+**The two questions are properties of the block state, not of the position.** A section has one state per
+palette entry - a handful - and the position-to-state mapping is the section's own palette and
+`BitStorage`, which this side already reads to write the Rust payload. So `SectionCompilerMixin` now builds
+a byte per palette entry (nothing / opaque / block entity / both), walks the storage once, and puts the
+opaque bits straight into the `VisGraph`:
+
+```java
+for (int position = 0; position < storage.getSize(); position++) {
+    byte bits = kind[storage.get(position) & 0xff];
+    if ((bits & OPAQUE_BIT) != 0) opaque.set(position);       // one BitSet set
+    if ((bits & ENTITY_BIT) != 0) entityAt[entities++] = position;
+}
+```
+
+What is left per position is `BitStorage.get` and an array read. The walk itself is skipped by answering
+`BlockPos.betweenClosed` an empty iterable, so the loop body - and the two redirects - never run; the block
+entities are added at `RETURN`, through the game's own `handleBlockEntity` (invoked, not copied, because it
+is what asks the block entity renderer registry whether the entity draws in the world at all).
+
+**Three things had to be right, and each is checkable, so each was checked rather than argued.**
+
+1. **The bit index is the storage index.** `VisGraph.getIndex(x, y, z)` is `x | y << 8 | z << 4`, and a
+   `PalettedContainer`'s storage orders its 4096 values `x | z << 4 | y << 8` - the same number, which is
+   why one pass over the storage fills the graph without de-interleaving anything.
+2. **The mask equals the walk.** With `BELIEVE_THE_MASK = false` the mixin computes the mask *and* runs the
+   vanilla walk, then compares the two bit sets position by position and logs the first disagreement with
+   both coordinates. On a real world it reported **0 disagreements over 2,514 sections and again over 1,664
+   sections** - about ten million positions each time. That is what the constant was flipped on.
+3. **The block entities are the same ones.** The same comparison build crosses the two lists, and the
+   production build logs how many the mask pass handed the game's filter: **2 in one run**, so the
+   de-interleaving (`x = index & 15`, `y = (index >> 8) & 15`, `z = (index >> 4) & 15`) and the
+   `region.getBlockEntity(pos)` lookup are exercised on real entities and not only on an argument.
+
+**What is deliberately still done by Minecraft, and what is not.** Kept: `resolve()` (the game's own flood
+fill over the set this side filled in, so the visibility answer itself is unchanged), `handleBlockEntity`,
+`ClientHooks.addAdditionalGeometry` (a mod's additional renderer builds geometry this renderer cannot build
+in Rust), the `ModelBlockRenderer` the hook is handed, and the `Results`/mesh plumbing - which for a section
+the baker took is an empty `CompiledSectionMesh`, the same state an all-air section compiles to. Gone: the
+4096-position walk, its three predicates, its palette dereference, its iterator, and both predicate
+redirects' per-block thread-local reads.
+
+**And it declines whenever it cannot be sure.** The mask is only used when the Rust baker took *this*
+section, the snapshot's middle section and its container can be reached, and the palette and storage
+interfaces are available; otherwise the walk runs exactly as vanilla, with the two redirects still blanking
+the geometry. A section this side cannot describe is a section Minecraft builds.
+
+### A refused bake waited for a slot instead of asking Minecraft to compile the section again
+
+Two different refusals both ended the same way, and neither of them had to.
+
+**The bake queue was full.** `BakeTask::new` takes a slot from a pool of `MAX_QUEUED_BAKES` (256) and answers
+`None` past it. But at that moment the payload has *already been applied*: `SectionWorld` holds the blocks and
+the light of all 27 slots, and the task holds 54 `Arc`s to them. The only thing missing is somewhere to run.
+What happened instead was `forget_one` plus the centre bit of the answer, which tells the JVM it may not record
+the section as sent - so the JVM marked the section dirty, had Minecraft schedule a rebuild, had a chunk-build
+worker assemble the 27-section payload and compile 4096 block positions, and applied every one of them back
+into the same cache, to arrive at the same queue.
+
+**The arena was full.** `SectionStorage::allocate` was called with the baked geometry in hand, answered `None`,
+and the drain dropped the `Vec<BakedLayer>` on the floor. That is the expensive one, because the geometry had
+just been computed and the recovery was the same four steps.
+
+Three changes, and the JVM has no part in the first two:
+
+1. **`SectionStorage::parked`.** The geometry a refused allocation could not place waits for a slot instead of
+   being dropped: keyed by position, bounded by `PARKED_LIMIT` (256), oldest first, with `parked_bytes()` so
+   the queue's cost is a number rather than an estimate. The drain offers the parked sections *before* the
+   frame's own updates, so one that has been waiting is not overtaken by one that has just been baked - and an
+   update for the same position in the same frame lands after it, which is the order that makes the newer
+   geometry win. **Parking takes the position out of `refused_pending`**, and that removal is what keeps the
+   two recoveries from both running: the JVM goes on counting the section as sent and goes on suppressing
+   Minecraft's mesh, which is right, because this side still means to draw it.
+2. **`BAKE_WAITERS` in `wgpu-mc-jni`.** A section whose bake met a full pool is queued by position and the
+   answer the JVM gets says nothing happened. `retryBakes(limit)`, one call a frame from `redirtyDue`, resolves
+   the 27 slots again out of the cache and offers the bake to the pool once more. A retry only *reads* the
+   cache: the payload was applied when it arrived, so there is nothing to send and nothing to apply.
+3. **`WORLD.write()` covers the apply and nothing else.** It used to be held across the 27-slot resolve as
+   well, which put every chunk-build thread in the game behind one lock for the length of a section's worth of
+   hash-map lookups - and they all offer sections at once exactly when the world is loading. The `missing`
+   check and the resolve now run under `WORLD.read()`, and the trim takes the write lock on its own at the end,
+   which is safe because by then the bake owns its 27 references (`SectionWorld::blocks` clones an `Arc`).
+
+**What still goes back to the JVM, and why.** A refusal that gains nothing from waiting: the arena clamped at
+the device's buffer limit (`at_capacity`), the waiters at `MAX_WAITING_BAKES`, or a section the cache no longer
+holds - which a retry can meet and a first offer cannot, because the cache is trimmed as the player moves.
+Those keep the old path, and it is the right one for them: growth cannot answer them, so Minecraft's own mesh
+is the fallback. `SectionStorage::park` documents the same boundary, including why a section the arena has
+never held is not the 16x16x16 hole the older notes in this file warn about - a first bake is only offered
+after the JVM has stopped drawing the section itself.
+
+**What is verified, and what is not.**
+
+- The storage half is unit-tested: `a_parked_section_keeps_its_geometry_and_comes_back_oldest_first`,
+  `parking_a_section_takes_it_out_of_the_refusals_the_jvm_hears_about`,
+  `parking_gives_up_at_its_limit_and_at_the_device_limit`, `the_trim_lets_go_of_geometry_waiting_for_a_slot`,
+  `a_parked_section_that_is_also_stored_is_reported_once` and
+  `clearing_the_arena_clears_what_was_waiting_for_a_slot`. `cargo test -p wgpu-mc --lib` is at **151 passed**.
+- The bridge half is unit-tested in `bake_queue_tests`: a section that meets a full pool waits, the same
+  section offered twice is one place in the queue and not two, the queue is oldest-first, and past
+  `MAX_WAITING_BAKES` an offer is refused while a section that already has a place is still answered `true`.
+- **The ABI test earned its keep.** `abi_tests::every_jni_declaration_has_an_implementation` failed the moment
+  `retryBakes` existed in Rust and not in `WgpuNative.kt`, naming the missing declaration - which is the one
+  way this kind of change goes wrong silently on the other side of the bridge.
+- **Not measured: CPU time.** There is no timing instrumentation on either side of the bridge, so what this
+  saves is an argument from the code rather than a number. The round trip it removes is one Minecraft chunk
+  build, one 4096-position compile, one 27-section payload and one `WORLD.write()`.
+- **What the live run said.** One client run - world load and flight - exit code 0, **0 panics, 0 validation
+  errors, 0 injection errors**, terrain being drawn (`solid 1375`, `cutout 1066`, `transparent 1015` sections
+  on the sampled line) with the arena at 86-89% of its pool and **0 refused**.
+
+  - **The bake waiters were exercised hard, and they absorbed the burst.** Twelve lines, ending at
+    `0 section bake(s) are waiting for a slot in the pool; 922 have waited over the run, 920 of them reached
+    the pool when it had room, and 2 could not be baked here and went back to Minecraft`. The peak in sight
+    was 189 waiting against a cap of 256, and the queue drained from 189 to 0 within a second - so for 920 of
+    those sections the four-step round trip through Minecraft's compiler, a 27-section payload and a
+    `WORLD.write()` did not happen. The 2 that went back are the case `queue_bake` documents: a section the
+    trimmed cache no longer held.
+  - **The parked geometry was not exercised at all**, because the arena never ran out - `0 refused` on every
+    sampled line and no `the arena is holding N section(s) of baked geometry` line in the whole log. The
+    storage half therefore rests on its six unit tests and on nothing else, which is why the line exists: a
+    run where the arena *does* run out says so, and this one did not.
+  - **The bound on that queue, next to the run's own numbers.** The largest section this run baked was
+    **83,996 slots (336 KB)**, so `PARKED_LIMIT` of 256 is at most **86 MB** of held geometry in the worst
+    case, and roughly 50 MB at this run's average section. It is a bound and not an allocation: only sections
+    that are actually refused are held, and they are let go as the arena grows or the view moves on.
+
+### The game's occlusion answer crosses the bridge, and nothing reads it yet
+
+Minecraft resolves every section's visibility as it compiles it - which of the section's six faces can see
+which other face, a 6x6 set of booleans - and that answer is the last input the direction-aware occlusion
+walk needs. It now travels to the Rust side and is stored there. **Nothing reads it**, which is the point of
+this step: the walk that will use it (`wgpu-mc`'s `render::section_graph`) is written and unit-tested, and
+this is the plumbing that carries its input.
+
+- **It rides at the end of the existing payload as an optional trailer**: 27 pairs of words - one 64-bit pair
+  per neighbour, `from * 6 + to` over `Direction.values()` - then a magic word and the world the answer was
+  written for. 224 bytes on a payload that is already tens of kilobytes of block data, on a call that was
+  happening anyway.
+- **The trailer is found from the end of the payload, not from an offset in the header.** The blobs in front
+  of it are variable length, so a fixed offset would have had to be reserved out of the blob area; "the
+  second-to-last word is the magic" needs neither a reservation nor a header change, and a payload that runs
+  out of buffer room goes without a trailer rather than off the end of the segment.
+- **A payload without one is not an error, and it is not a resync.** There is no "I am missing this" answer
+  for a trailer and nothing counts one. `Payload::parse` answers "nothing was said about this section" for
+  every slot, and `WorldSections::missing` deliberately does not ask for it again: asking would trade a
+  missed cull for a re-send of 27 sections' blocks.
+- **Bit 63 is "this slot was answered for".** Without it, "nothing is visible out of this section" and
+  "nothing was said about this section" are the same 36 zero bits, and a walk that conflates them is a hole
+  in the world rather than a missed cull.
+- **The answer waits beside the section it is about, not in a `ThreadLocal`.** A payload covers 27 sections
+  and 26 of them were compiled at other times, so a thread-local would file the answer under the wrong
+  section 26 times out of 27. `RustChunkBake.noteVisibility` writes it into the same `Sent` entry that
+  already carries "what have I told Rust about this section" - which is also what bounds its lifetime, since
+  it is cleared exactly where that table is cleared. That entry is rebuilt whenever a section's blocks or
+  light are re-sent, so the visibility is carried over into the replacement rather than reset with it -
+  otherwise every re-sent section would lose its answer until it happened to be compiled again.
+- **The ordering is the one thing to know about it.** Minecraft's compile for a section runs *after* that
+  section's bake was handed over, so a section's first payload carries nothing for it and the answer travels
+  in the next payload that mentions it. That is why the presence bit is not optional.
+- **Unit-tested on both sides of the format, with nothing testing the two against each other.**
+  `a_visibility_trailer_is_read_from_the_end_and_stored` builds a payload of nothing but a header and a
+  trailer, and pins the 56-word layout, the presence bit, the world stamp and the store; the pack is the 36
+  `visibilityBetween` calls the game's own public API answers, and the writer is read back by that test. What
+  no test does is hand one side's bytes to the other, because there is no harness that runs both - which is
+  what the one-shot log line below is for.
+- **The first live run of it lost 3,077 bakes, and the reason was one missing alignment.** `Payload.word` is
+  a `JAVA_INT` write and the blob area in front of the trailer is bytes, so the cursor stops wherever the
+  last blob happened to end - and the segment refuses a write at an odd offset outright
+  (`Target offset 8386 is incompatible with alignment constraint 4 (of i4)`). That exception left `send`, so
+  every payload whose blob area ended off a word boundary lost its *whole* bake and fell back to Minecraft:
+  **3,077 failures in one run, exactly one alignment exception each, and not one other kind of error**. The
+  fix is the alignment `writeBlock` already does for its longs, plus a `catch` that drops the trailer rather
+  than the bake - a field that is optional by design should not be able to take the call down with it. The
+  trailer is also written last with the magic last of all, so a half-written one cannot be read as one.- **What the live run said.** One client run - world load and flight - with the alignment fixed: **0 terrain
+  bake failures, 0 panics, 0 validation errors, 0 injection errors**, the world meshing (1,301,325 quads wound
+  over all bakes; 1,070 sections tested by the frustum cull on the sampled frame) and one line -
+  `the first section payload carrying visibility answers arrived: 1 of 27 sections answered`. That one line is
+  the whole of the evidence the trailer can produce today, and it is not nothing: it says the two sides agree
+  about the format, the stamp and the presence bit, which is the one thing no unit test on either side can say.
+  **How many of the 27 are usually answered is not measured.** The line reports the first payload that carried
+  *any* answer, and for a world being meshed from nothing that is naturally a payload with one neighbour behind
+  it. A count once a second would be a report about a field nothing reads yet - it belongs with the step that
+  reads it, not with this one. A third run, after the carry-over fix in the bullet above, came back the same
+  way: **0 bake failures, 0 panics, 0 validation errors**, terrain drawing (`solid 1443`, `cutout 1189`) at
+  85% of the arena with 0 refused - and the same one-line arrival report.
+### The flood is run beside the game's own answer, and it decides nothing
+
+The direction-aware walk (`wgpu-mc`'s `render::section_graph`) now has everything it needs to run against
+the live world, and it runs once a second **beside** the list the game pushes - never instead of it. That
+is the whole of step two: a measurement before a decision, because the rules being right is not the same
+as the cull being the one to ship.
+
+What it took, all on the render side of the bridge:
+
+- **The answers moved to `wgpu-mc`** (`mc/visibility.rs`), because the walk that reads them lives beside
+  the frustum and the game's list, and the JNI crate had them. `Payload::apply` still parses the trailer;
+  it now hands each pair to a function in the other Rust crate instead of keeping a copy - **so this added
+  no JNI surface at all**, which is the shape any further work here should keep: a new crossing is a
+  Panama downcall, not another `native` method.
+- **The frustum became the trait's third question** (`SectionSource::in_frustum`, default `true`), asked
+  **first** - before the budget - exactly where the original asks it. A node outside it is neither drawn
+  nor walked out of, and `Flood::out_of_frustum` counts what that rejected.
+- **`SectionStorage::holds`** answers "would a draw name this section", which is what `is_empty` means to
+  the walk (a section whose layers were all taken is present with nothing in it).
+- **`cross_check_the_flood`** snapshots the answers, borrows the arena and the frame's frustum, walks from
+  the camera's section at several budgets, and prints one line a second: the list's size, how much of it
+  the arena holds, how much of the arena has an answer, and per budget how much the two agree on.
+
+**The numbers, two runs.** They are different moments of the same world, so each row is compared within
+itself:
+
+```text
+run A, 1606 sections named:   budget 0:  86 drawn,  86 named   ( 5% of the list)
+                              budget 1: 357 drawn, 356 named   (22%)
+                              budget 2: 523 drawn, 522 named   (33%)
+run B, 1487 sections named:   budget 4: 710 drawn, 709 named   (48%)
+                              budget 8: 710 drawn, 709 named
+                              budget 16: 710 drawn, 709 named
+                              budget 127: 710 drawn, 709 named
+```
+
+- **Precision is essentially perfect and recall is not.** 709 of 710 drawn sections were named by the
+  game's own graph, and at budget 0 every one was. The walk almost never claims something vanilla did not
+  - the one that differed is the staleness the occlusion-list fix was about, a section that entered the
+  arena after the list was built.
+- **The turn budget stops mattering at four, and that is the surprising part.** Four budgets spanning 4 to
+  127 produce byte-identical results, with **0 sections over budget** at every one of them. So the walk is
+  not being limited by turns: it is being limited by the game's own visibility data, which refuses the step
+  before the budget could. Whatever reaches the list beyond this is reached by routes this data does not
+  describe as open, and no `advCulling` value will recover it.
+- **The floor matters as much as the ceiling.** 3031 of 3193 sections the arena held had an answer (95%),
+  so the walk is not starved for input; and a fresh world shows the other end of it - the first reports
+  have 6 sections held, 2 answered and the camera's own section unanswered, and a walk that cannot judge
+  its own start draws nothing at all.
+- **What this does not measure.** Frame time, on either side: there is still no timing instrumentation
+  here, so what the flood would save is an argument from the section count rather than a number. And
+  whether the 778 sections it does not reach are *actually* hidden is a question about a picture, which is
+  not mine to answer - a budget chosen from these numbers alone would be a budget chosen from a cull rate.
+### The occlusion walk is a debug experiment, and it costs frame time
+
+`adv_culling`, **on the `Debug` page** (it was written under `Optimization` and moved once it was measured):
+**0** draws from the game's own occlusion list, which is what this renderer has always done; **1 and up** runs
+this renderer's own direction-aware walk with that many direction changes allowed, and *its* answer decides
+instead. A config written before the setting existed gets 0 from the serde default.
+
+**It is a net cost, and that is structural rather than a matter of tuning.** The game builds its own occlusion
+graph every frame and hands this renderer the list for free - `visibleSections` exists before the terrain pass
+runs - so the walk recomputes a subset of an answer the frame already has, on top of everything else that
+frame does. Measured on the frame thread, per frame: **~2 ms at render distance 16 (~10,000 sections polled)
+and ~8.2 ms at 32 (~40,000)**. A player measured the same thing from the other side: any value above zero
+lowers the frame rate.
+
+Making it pay would mean the walk *replacing* the game's graph, which means this side owning the world's
+section grid and its build dispatch - VulkanMod's architecture, where there is no game-built list to compute
+twice. That is a different project, and it is the only version of this that could win.
+
+The cross-check that measures the walk against the game's list **runs only with the diagnostic-log switch on**:
+it walks up to four budgets a second, which was 8 ms a second of frame thread at 16 chunks and 33 ms at 32 -
+a hitch, once a second, in a feature that is off by default.
+
+**The A/B - same scripted flight, same world, one run each:**
+
+```text
+adv_culling = 0    solid 1102 + cutout 1027 = 2129 sections drawn on the sampled line
+adv_culling = 5    solid  886 + cutout  809 = 1695 sections drawn on the sampled line   (-20%)
+```
+
+- **Both runs: 0 terrain bake failures, 0 panics, 0 validation errors**, and the switch reached the render
+  side in both (`adv_culling` as loaded: `value 0` without the key, `value 5` with it).
+- **With the setting on, the report folds to the one budget it is deciding with**:
+  `[budget 4: 879 drawn, 868 of them named, 11 not named, 1001 of the list not drawn]`. So at that moment it
+  drew **99% of what the game named** and 1.3% that it did not - and those 11 are the walk disagreeing with a
+  list that is a frame old, which is the same staleness the occlusion-list fix was about.
+- **The two runs are not the same frame.** Each figure is one sampled line near the end of its own run, so
+  this is a directional number and not a controlled one: a controlled comparison needs a fixed camera, and
+  that is a harness this project does not have. The same caveat applies to any frame-time claim below.
+- **Frame time is still not measured for the frame as a whole**, on either side of this path. What exists to
+  get it is `gpu_timestamps` and the PIX/RTSS recipes in this file - neither of which this change ran. **The
+  walk's own cost is measured** - see "The walk had no world" below, which clocks it - and it is ~2 ms a frame
+  at 16 chunks and ~8.2 ms at 32, which is what the player's own verdict ("any value above zero lowers the
+  frame rate") is made of.
+- **The default is 0 and it stays 0.** The picture at `16` was looked at and reported correct, so the walk
+  itself is not drawing holes - it is simply a second copy of an answer the game hands over for free, and the
+  frame pays for both. See the section above.
+
+**TODO, recorded rather than scheduled:** the walk can only pay for itself if it *replaces* the game's
+occlusion graph - this side owning the section grid and the build dispatch, VulkanMod's architecture - and
+until then the honest place for it is `Debug` with the default at 0. There is no third option: while
+`visibleSections` keeps being computed for free, a walk on top of it can only ever cost.
+
+### The walk had no world, and the game's own view box is what it was missing
+
+The rule the walk runs on is "a section nobody has described is open air" - and that rule is right, measured:
+with it the walk draws 93% of what the game names, and with the opposite rule ("no answer is a wall") it drew
+48%, because sight lines go through air and Minecraft never compiles an all-air section, so no payload ever
+carries an answer for one. But that rule with **only the frustum** for a bound has no bound at all: "open air"
+is then true of every position in the frustum, above the build limit, below the level, and out to the far
+plane. The walk in the last run before this one polled **770,568** sections per walk.
+
+The missing input is not per-section data, it is the world's own extent - and the game has it in one place.
+`ViewArea` is a `(2 * renderDistance + 1)` square of chunk columns around the camera covering every section
+layer of the level, and Minecraft's own `SectionOcclusionGraph` refuses to leave it
+(`getRelativeFrom` asks `ChunkTrackingView#isInViewDistance` and the level's height before it looks at a
+neighbour; `ViewArea#containsSection` is the same square in the same coordinates). So the walk is bounded by
+the same three numbers: the horizon in sections, and the level's lowest and highest section layer.
+
+- **It crosses as three `i32`s on a new C-ABI export** (`terrain_world_bounds`, a Panama downcall from
+  `TerrainPass`, sent only when a number changes), **not as a list of section keys and not as a new JNI entry**.
+  The square *is* three numbers, and a list would be a second copy of what `mc::visibility` already holds
+  while still missing the sections this exists for - the air.
+- **`SectionSource::in_world` is asked before the frustum**, on the same terms: a node outside the world is
+  neither drawn nor walked out of. `Flood::outside_the_world` counts it separately from the frustum's own
+  refusals, which is what says which of the two bounds the walk is paying for.
+- **A camera above the build limit or below the level draws from the game's list for that frame**, because the
+  walk's seed is the camera's own section and a box that refuses its own seed is a walk that draws nothing.
+  Minecraft's own graph handles that case by seeding a whole plane of sections at the level's edge; this walk
+  has one seed, so it declines instead - and the once-a-second line says so when it happens.
+
+**Measured, same world, render distance 16, the cross-check's own walk (one sample near the end of each run):**
+
+```text
+before the box   budget 4..127 identical: 1257 drawn of 1347 named, 770,568 polled, 49,399 behind the camera
+with the box     budget 4..127 identical: 1806 drawn of 1875 named,   9,537 polled,    553 behind the camera,
+                                        1,382 outside the world, 1.78-1.90 ms per walk
+```
+
+- **81x fewer sections polled, and the walk is now affordable enough to clock**: 1.78-1.90 ms per walk, which
+  is the first measured cost of this path. It is paid *per frame* while `adv_culling` is above zero (0.18 us
+  per polled section), and it is additive to the game's own graph rather than a replacement for it.
+- **The reach was not bought with the cost**: recall stayed at 93.5-93.7% of the game's list and precision at
+  97-98% - the walk draws ~95% of what the game names, plus 30-50 sections it does not, which are the ones the
+  list is a frame too old to have judged (the same staleness the `SECTIONS_TOO_NEW` fix was about).
+- **What it "misses" is mostly this side's own frustum test, and that is not a hole.** The port is now the
+  game's rule for the way *out* of a node as well as the original's for the way in
+  (`Node::exits_through`: a node is left through **every** source direction it was reached by, which is
+  `SectionOcclusionGraph.Node#addSourceDirection`, where VulkanMod reads the one face `mainDir` names). The
+  cross-check now splits the misses by why, and the split says the rule was not where they were: of 316
+  missed sections at 32 chunks, **304 are ones this side's own per-section frustum test refuses** and 12 are
+  genuinely unreachable. 4176 named sections are drawn, and `4176 + 12 = 4188 = 4492 named - 304 behind the
+  frustum`: the walk reaches **everything the game named that this renderer's frustum would draw anyway,
+  minus 0.3%**. The game's list is filtered by an octree visit, which is coarser than a per-section box test -
+  and the gather applies the same per-section test to draw, so those 304 are not drawn either way. See the
+  next section for the two runs this comes from.
+- **The A/B on the pass's own layer counts** - `adv_culling = 0` (the game's list) against `16` (the walk),
+  same world, quickplay into the same spot: `solid 1565 + cutout 1398` against `solid 1477 + cutout 1177`.
+  Directional and not controlled: one sampled line each, in a scene whose cutout layer moves by about that
+  much between frames, and the two runs are not the same length. What the numbers do say is that the walk's
+  set is a *subset* of the list's, ~5% smaller, which is the whole of what the setting does.
+
+**The picture at 16 has been looked at since, on this build, and reported correct** - which is the judgement
+this section could not make: the numbers say what the walk dropped, and only a picture says whether what it
+dropped was visible. Two things that picture does not settle, and that are worth saying plainly:
+
+- **The slider is effectively a switch.** Budgets 4, 8, 16 and 127 produce *identical* draw sets, measured
+  three runs running: with the world's own box in place, any cell of it is reachable within three direction
+  changes, so a budget of 3 or more never binds. Only 0 (the game's list), 1 and 2 (which prune hard - 86,
+  357 and 523 sections drawn against 1606 named) are different settings, and the middle ones are the ones with
+  holes in them.
+- **Every number here is from a run whose render distance is named**, and the two measured ones are 16 and
+  32 chunks: **~2 ms per frame at 16 (~10,000 sections polled) and ~8.2 ms at 32 (~40,000, 0.2 us a
+  section)**. That is what settled the question this section was written to ask - see the section above,
+  which is why the setting is on the `Debug` page and the cross-check that produced these lines now runs only
+  with the diagnostic-log switch on.
+
+### Every tinted face re-resolved the class and the method it was asking
+
+`Wgpu.helperGetBlockColor` and `Wgpu.helperGetFluidColor` were called through
+`call_static_from_class_loader`, which is a **lookup**: `ClassLoader.loadClass` as a method call - a `String`
+allocation, a local reference and a virtual dispatch into the JVM - and then `GetStaticMethodID`, which walks
+the class's method table with a signature string. That is the right shape for a call made once per resource
+or per settings change, which is what every other caller of it is (`get_bytes`, `DisplayMode.reapply`,
+`BlockCache.blockTexturesChanged`). A tint is neither: it is per **face** - every grass side, every leaf,
+every water surface - and the run that added the cache counted **8,903,545** of them.
+
+They are resolved once now, in `setClassLoader` - the one place that has both the game's loader and a
+`JNIEnv` before any bake can ask - into a `OnceCell` holding the class as a `GlobalRef` and one
+`JStaticMethodID` per helper, and the calls go through `call_static_method_unchecked`. A `jmethodID` is valid
+for as long as the class that declares it is loaded, and this class is owned by the game's loader for the
+life of the process, so the id cannot go stale. The signature is checked once, by `get_static_method_id` at
+that resolution, rather than at a call that could not report anything about it.
+
+- **Measured on the run that added it**: `619,873 fluid tint(s) read from the game (0 tint(s) that looked the
+  helper up again)` and the same zero on every later line, against **8.9M tints** over the run. That pair is
+  the whole measurement - tints large, lookups zero - and `TINT_SLOW_LOOKUPS` is drained onto the atlas line
+  so any later run shows the same thing without a special build.
+- **A failure here is a cost and not a wrong answer**, which is why it is not fatal: the tint path keeps the
+  lookup it had and counts itself. The *reason* is kept rather than logged where it happens, because
+  `setClassLoader` runs as the native library loads - before the JVM side has a logger for these lines - so
+  the first tint, minutes later, is where it is said.
+- **`call_static_method_unchecked` does not check for a Java exception**, where the checked call did, so the
+  check is made by hand beside it: a pending exception left on a bake thread fails every later call on that
+  thread, which is the failure the tint path's own describe-and-clear exists for.
+- **The wall-clock saving is not measured.** What is measured is that 8.9M tints looked nothing up; what was
+  removed per face is named rather than timed - a `loadClass` call and a method-table lookup.
+
+### The face tint was asked once per face, and before the face was culled
+
+Two things were wrong with the per-face biome tint, and they compound: **how often** it was asked, and **where**
+in the bake it was asked. `add_face` in `bake_layers` asked `BlockStateProvider::get_block_color` at the top,
+for any face whose model carries a `tintindex`, and only then ran `face_is_culled` - so every hidden face in a
+section paid a full JNI callback into the JVM's `BlockColors` for a colour nothing would ever see. And the
+same block asked repeatedly: a grass block is one `up` face plus four side overlays, all `tintindex: 0`, and a
+leaf block is six faces of it - six callbacks for one answer that cannot change, because the answer is a
+property of the **position** (grass follows the biome under the block).
+
+Both are fixed in the baker:
+
+- **the cull runs first**, so a face that is dropped costs nothing - `face_is_culled` reads the model's own
+  `cullface` and the neighbour's state, and a colour cannot change either;
+- **the colour is memoized per block**, in a `HashMap` keyed by tint index that is `clear`ed at the top of
+  each block (the allocation is kept; a block with no tinted face never inserts, which is most of the world).
+  Per *block* and not per section, because the question is about the position: a section on a biome boundary
+  holds two colours, and a cache that outlived the block would have to be keyed by position too.
+
+The JVM side of the callback is lighter as well: `helperGetBlockColor` no longer allocates a `BlockPos` per
+call - it `set`s a thread-local `MutableBlockPos`, which rests on the documented assumption that a tint source
+reads the position rather than keeping it. What is left per call is the chunk lookup and palette decode in
+`level.getBlockState`, the tint source for the index, and the biome in `colorInWorld`; none of those can be
+cached above the position, and none of them are asked more than once per colour a block needs now.
+
+**Measured on two near-identical runs** (same world, same save, both reporting **204,878** baked faces), with
+a counter per mechanism - `TINT_MEMO_HITS` and `TINTED_FACES_CULLED`, both drained onto the atlas line:
+
+```text
+                       tint callbacks   faces that reused      tinted faces culled
+                                        their block's colour  before the colour was asked
+before                 8,903,545        -                     -
+after                  5,426,952        2,252,278             1,517,071
+```
+
+- **3,769,349 callbacks were not made**, and each is attributed: 2.25M by the memo and 1.52M by the order.
+  The pooled count fell 8.90M -> 5.43M, which is 3.48M - within 3% of the two counters, the difference being
+  run-to-run variation in what was baked.
+- **The counter is pooled over both tint paths.** `FLUID_TINTS` counts `helperGetBlockColor` and
+  `helperGetFluidColor` answers together, so the numbers above do not separate them.
+- **The fluid path has the same shape and was left alone**: `bake_fluid_faces_with` asks
+  `get_fluid_color` once per fluid *block*, before any of that block's faces is known to survive - correct,
+  but a water-dense area pays for blocks that draw nothing. It is a smaller version of the same bug and the
+  next thing to look at here.
+- **Nothing about the picture changes**: the colour a face gets is the same value from the same position, and
+  only the number of times it is asked moved. The Rust test suite passes unchanged.
+
+### The bake thread's attach is once per thread, and now it says so
+
+A bake may call back into Java for a biome tint, so each bake pool thread attaches itself to the JVM. That
+looks like a per-*bake* cost - attach, run, detach, thousands of times a second - and it is not one, for three
+reasons that are all in `jni` 0.21 rather than in this crate:
+
+- **`JNIEnv` owns nothing.** It is `{ internal: *mut sys::JNIEnv, lifetime: PhantomData<&'local ()> }` with no
+  `Drop` impl, so the value the attach returns neither holds a local frame nor detaches anything when it goes
+  out of scope;
+- **attaching from an attached thread is a `GetEnv` and nothing else.** `attach_current_thread_as_daemon` is
+  `match self.get_env() { Ok(env) => Ok(env), Err(_) => attach_current_thread_impl(Daemon) }`;
+- **the detach lives in the thread's own TLS**, filled on the first attach and dropped when the *thread*
+  exits. The pool is `static THREAD_POOL: Lazy<ThreadPool>` - rayon, one thread per core, built once - so the
+  attach happens once per core for the life of the process.
+
+**Measured:** `BAKE_THREADS_ATTACHED` is counted on the atlas line, and a run reads
+`0 -> 32 -> 32 -> 32 bake thread(s) attached in all` while baking **11,393 sections**. 32 is this machine's
+core count, which is the pool size, and it is the number of attaches the whole run did.
+
+- **`attach_current_thread_permanently` would be a regression here**, and it is worth saying because it looks
+  like the obvious fix: that variant attaches as `ThreadType::Normal`, and a non-daemon thread *blocks JVM
+  exit* - which is exactly what the panic hook wants (it attaches permanently, on purpose, because its job is
+  to run while the JVM is going down) and exactly what a pool thread must not do.
+- **Caching the `JNIEnv` in a thread-local is written down rather than done.** It would remove the one
+  `GetEnv` per bake - tens of nanoseconds against a bake measured in milliseconds - and cost another unsafe
+  pointer that has to be reasoned about.
+- **What was actually worth removing from this path was the callbacks themselves**, and that is the section
+  above: 3.77M tint callbacks per run that no longer happen.
+
+### The tints of a section are fetched in one call
+
+The bulk call that replaced the per-face callback: `Wgpu.helperGetSectionTints(x, y, z)` returns **every colour
+one section needs** as a `long[]`, packed `position index << 36 | tint index << 32 | colour` in Minecraft's own
+storage order (`x | z << 4 | y << 8`, which is the order the baker walks blocks in), and the Rust side answers
+every tinted face of that section from it. What is left of the tint callback is one call per *section*.
+
+**Measured on one run** - `501,971` tinted faces answered from a table, `1,169,038` more reused their block's
+colour, `874,033` culled before asking, `1,418,265` fluid tints on their own unchanged path:
+
+```text
+block-tint JNI calls   501,971 -> 5,018                  (100x fewer)
+colours returned       1,459,831 over 5,018 fetches      (291 a fetch, ~100 of them used)
+found / asked          501,971 / 501,971                 (the packing agrees, exactly)
+helper class lookups   0, bake-thread attaches 32        (for the whole run)
+```
+
+- **`found` equalling `asked` is the measurement that matters**, because a miss is a *white* face: a valid
+  colour, and therefore silent. That equality is the two sides agreeing on the packing, measured rather than
+  argued - and `TINT_TABLE_FOUND` is on the atlas line so any later run shows it again.
+- **And it proves the *keys* and not the values, which cost a day.** The first version of both tables stored
+  `colorInWorld`'s `ARGB` verbatim while the single-call helpers packed it into `BGR` (`r | g << 8 | b << 16`,
+  which is what `scale_rgb` on this side multiplies into a vertex). Every key was found and every colour was
+  red-blue swapped: a player measured vanilla water `6a8ecf` against this renderer's `de8954`, and grass
+  `2b4323` against `213924` - which is `23432b`, the same colour with R and B exchanged. There is one
+  `packTint` now, used by all four colour paths, so the two cannot drift apart again. **A counter that
+  compares shapes cannot see a wrong colour, and a wrong colour is silent.**
+- **A section with no tinted state is never asked about**: `hasOnlyAir` and `maybeHas` are answered from the
+  section's own palette before a single state is read, so stone and air cost nothing at all.
+- **The cost of the trade is about 3x the colour computations**: the JVM computes every index a state has a
+  source for at every position (1.46M colours), while the baker only wants the ones its *visible* faces use
+  (0.50M requests). That work is on the JVM's own thread, from the section's own storage - no `BlockPos`, no
+  chunk lookup per call - and it is what 100x fewer crossings cost.
+- **The fluid tint went the same way, in its own call.** A fluid is tinted by its *fluid* model rather than
+  its block model, and it is asked per **block** rather than per face, so it is a second bulk method
+  (`helperGetSectionFluidTints`) with its own table and its own key space - and it is only ever fetched for a
+  section the baker already knows holds water, which is why it is not folded into the first call. The fluid
+  walk reads the fluid off the block state it already has (`state.fluidState` rather than a second
+  `getFluidState` per position), so one palette read answers both questions.
+
+  ```text
+  per-call tint answers   1,418,265 fluid + 501,971 block  ->  0 and 0
+  section fetches         5,018 + 1,418,265 calls          ->  3,930 fetches of 1,956,105 colours
+  found / asked           279,204 + 990,779 block, 990,779 fluid - both pairs exact
+  ```
+
+  The `0` is the whole of what the old path did: `FLUID_TINTS` counts an answer that came back from Java per
+  call, and after this it is zero in every report while the atlas line still shows the colours arriving - so
+  no tint, block or fluid, crosses the bridge per request any more. What crosses is one call per section that
+  has a tint at all.
+
+### The section list is only rebuilt when the game rebuilds it
+
+`TerrainPass#sendVisibleSections` walked the whole list every time the terrain pass was handed over: a
+`LongArray` the size of `visibleSections` (about 1,600 longs at 16 chunks, 4,600 at 32), one accessor call
+per section to read its node, and a compare of the whole array against the last one sent. The compare was
+already doing the obvious work - the same list is not handed over twice - but the *walk* was on the frame
+path, and the game does not rebuild that list per frame at all:
+
+```java
+double camRotX = Math.floor(camera.xRot() / 2.0F);
+double camRotY = Math.floor(camera.yRot() / 2.0F);
+if (this.sectionOcclusionGraph.consumeFrustumUpdate() || camRotX != this.prevCamRotX || camRotY != this.prevCamRotY) {
+    this.applyFrustum(offsetFrustum(frustum));
+    this.prevCamRotX = camRotX;
+    this.prevCamRotY = camRotY;
+}
+```
+
+Two degrees of camera rotation, or the occlusion graph reporting that its answer moved - its full update
+landing, or a section compiled since the last rebuild landing inside the offset frustum. `applyFrustum` is
+the only thing that fills `visibleSections`, and **neither of the game's two reasons is observable from
+outside**: the angle comparison is a local, and `consumeFrustumUpdate` *consumes* the flag, so a second
+reader would silently take the game's own branch away from it. So the signal is counted where the game
+decides it - `VisibleSectionsMixin` injects at the tail of `applyFrustum` and bumps
+`VisibleSectionsRevision` - and the frame path becomes one `int` compare against the revision the last send
+was made at.
+
+**And the same signal closed a hole that was not a performance question.** `applyFrustum` *clears* the list
+before it refills it - which nothing outside can observe, since both happen in one call on the render thread -
+but `LevelRenderer#allChanged` clears it *without* refilling it, and that one is observable: a
+render-distance change, a resource reload and the way into a world all leave the list empty until the graph's
+next update lands. Empty is a *claim*, not an absence: `Scene::visible_sections` reads `Some(empty)` as "the
+game looked and saw nothing", so the native side drew no terrain **and** `set_visible_sections` emptied
+`sections_since_the_list`, the grace set that stops a section the arena has just taken over from being culled
+as occluded. The old code sent that list, because its contents had changed; the new code cannot, because it is
+not *new*. A run caught it happening - `run-32chunks.log`, at the render-distance change, two reports one
+second apart:
+
+```text
+wgpu-mc: terrain pass: 0 section draw(s) ..., 42 not named by the game's occlusion graph, 0 culled by the frustum
+```
+
+42 sections in the arena, none of them named by the game, nothing drawn: the list was empty because the game
+had not filled it yet, and this side reported it as an answer.
+
+**The Rust side stopped building a set in order to throw one away.** `setVisibleSections` inserted every key
+into a fresh `HashSet` and passed it to `Scene::set_visible_sections(Some(set))`, which replaced the stored
+one. The stored set is now cleared and refilled in place - `HashSet::clear` keeps the table's capacity and
+its control bytes - and the positions cross as an **iterator over the JNI array**, so a key is hashed once
+and a send allocates nothing at all.
+
+**Measured**, one run at 32 chunks with `logging` on and `adv_culling` 0 (120 presented frames a second, and
+the terrain pass handed over 351-392 times a second):
+
+```text
+the settled second        380 ask(s), 0 rebuilt, 0 sent, 0 us in the rebuild
+                          ~11,560 us had every ask rebuilt it    (4,158 section(s) in the list)
+while the world meshed    214 ask(s), 66 rebuilt, 1,548 us          (31% of asks rebuilt)
+per rebuild               30.5 us for 4,158 section(s), allocation and compare included
+rebuilt to the same list  0, in all 43 reports
+```
+
+- **The settled second is the whole of the point.** With the camera still and the world meshed, the game
+  does not rebuild the list, so the frame path is a revision compare and the walk is gone: 17 consecutive
+  reports of `0 rebuilt, 0 sent, 0 us`. What used to be paid on those frames is the estimate beside it -
+  **~11.6 ms a second, about 1.2% of the second, or ~96 us a frame at 120 fps** - and it is an estimate of
+  the *old* path rather than a measurement of it: the average rebuild (`30.5 us`) multiplied by the asks,
+  which is exactly what the old code did, once per ask. See the note on the carried average below.
+- **While terrain streams in, the saving is 2-3x and not free.** A section finishing its mesh sets
+  `needsFrustumUpdate`, and the world is only meshed for as long as it is being loaded, so the busy seconds
+  rebuilt on 11-50% of asks. That is the honest shape of it: `consumeFrustumUpdate` is doing real work
+  during the load, and the gate cannot beat a frame the game really did rebuild on.
+- **`rebuilt to the same list` was 0 in all 43 reports**, so the content compare never once suppressed a
+  send. That is what the game's own gate predicts - a rebuild happens because something *changed* - and it
+  stays anyway, because what a suppression buys is the cheaper of the two mistakes: without it, a rebuild
+  that named the same sections would cross the bridge with the whole list and, worse, empty
+  `sections_since_the_list` for a list that had not moved. Its cost is inside the 30.5 us.
+- **The gate itself is not in the `0 us`**, and saying so matters because the number is easy to over-read:
+  what is timed is the walk, the allocation and the compare. The gate is a `volatile` read of an
+  `AtomicInteger`, an `int` compare and one increment - about 380 of them a second.
+- **Under `logging` the numbers are conservative**, because that switch also turns the occlusion walk's
+  cross-check on: this run reports it at 29-82 ms a second, and a median of about 35 (four budgets of 7-20 ms
+  each), so its 120 fps is lower than a clean run's and its asks are proportional to that. Nothing about the
+  list changes with it.
+- **The state of the world did not change.** 0 reports of a frame that drew nothing, 0 panics, 0 validation
+  errors, and the arena finished at 77% of its slots with 0 sections refused - the same picture as before,
+  which is what a change to *how often* a list is read should look like.
+- **The first list either run sent already named sections** - 117 in the first run, 105 in the second - and
+  that is the correctness half showing up where it can be seen. Entering a world runs `allChanged`, which
+  clears `visibleSections` and does not refill it; there are frames between that and the first `applyFrustum`.
+  The only list this side sends now is one the game rebuilt, so the cleared state has no way to be reported
+  as an answer, and the first thing the native side ever hears is a real list. It is one observation of a
+  state that used to be sendable rather than a test of it - the run that *did* send it is the one quoted
+  above, at a render-distance change.
+
+**One thing about the estimate is worth writing down, because the first version of it was useless.** It
+divided this second's rebuild time by this second's rebuilds - and the second a world settles is the second
+with no rebuilds in it, so it reported that the old path would have cost `0 us` in exactly the second where
+it would have cost the most. The average is now carried between reports (`visibleNanosPerRebuild`) and is
+only as good as the list not having changed size since it was taken: the walk is linear in the list, so an
+average from while the world was still meshing describes a shorter list than the settled one. **And it is the
+same work, not necessarily the same compiled code**: the walk now runs a few times a second rather than on
+every frame, so the JIT is looking at a colder loop than the one it used to optimize - which is the one way
+this number can be wrong in the direction that flatters the change.
+
 ### Known gaps
+
+
+**TODO - three known problems on the tint path, all to be fixed after the rest of it: the two below, and the
+biome transition area. And a fourth, on the section list, of which the first two halves are now done and
+measured - see "The section list is only rebuilt when the game rebuilds it":**
+
+- **A large visible set is still sent whole.** Added and removed sets would be smaller, and the revision the
+  frame path keeps is what makes them worth doing at all: a delta is an assertion about what the receiver
+  already holds, and "the list is at revision N" is the reason to believe it. What a delta would save is the
+  *send* - the crossing and the hashing in `Scene::set_visible_sections` - and not the walk, which reads the
+  game's own list and has to happen either way. Unmeasured, and it is no longer a per-frame question: the
+  per-second line above reports the sends per second, which is the number a delta would divide.
+
+  The three costs that were written down here before any of it was done are worth saying what became of them,
+  because two of the three are now paid and the third changed shape:
+  - **`sendVisibleSections` rebuilt and compared its `LongArray` every frame** - paid, and the walk it removed
+    is what the settled second reports as `0 rebuilt, 0 us`;
+  - **the Rust side built a fresh set per frame** - paid: the set is cleared and refilled in place and the
+    positions cross as an iterator;
+  - **a bitmap keyed by section coordinates** was named as the shape of the gather's question, and it still
+    is - the gather walks the arena once and tests each section - but nothing sends per frame any more, so
+    what a bitmap would buy is per *send*. It is not worth a data-structure change to the read side until
+    the delta question above has an answer.
+
+- **A lily pad pointed the wrong way, and both halves of that are now in** - reported from two screenshots of
+  the same pond where the vanilla one is the later, and neither half is the tint: the lily pad's tint is a
+  *constant*, `BlockTintSources.constant(LILY_PAD_DEFAULT, LILY_PAD_IN_WORLD)`, so no biome is in it at all.
+
+  - **The orientation is the game picking a variant this side now picks too.**
+    `assets/minecraft/blockstates/lily_pad.json` has **four** entries for the empty variant - the same
+    `block/lily_pad` model turned `y` by 0, 90, 180 and 270 - so every lily pad gets one of four quarter turns,
+    chosen per *position* by `ModelBlockRenderer#tesselateBlock` (`this.random.setSeed(seed);
+    model.collectParts(..., this.random, ...)`, with `seed` = `blockState.getSeed(pos)`) reaching
+    `WeightedVariants#collectParts` → `WeightedList#getRandomOrThrow`. The loader baked all four as four meshes
+    and then picked entry `[0]` every time (an explicit `//TODO, random variant selection through weight and
+    seed`). **The index is asked of the JVM**, which has the game's own list, its own weights and its own
+    `RandomSource`, so nothing about the choice is reproduced here: `RustChunkBake.variants` walks the target
+    section's 4096 positions, does `random.setSeed(state.getSeed(pos))` and `list.getRandomOrThrow(random)`, and
+    writes the index of the chosen entry into a **4 KB blob named by header word 6** - `VARIANT_OFFSET_WORD`,
+    the first of the two the header had spare, since the block record's sixteen are all spoken for. The Rust
+    side reads it into the world cache *beside* a section's blocks rather than inside them
+    (`WorldSections::variants`) and `Block::get_model(key, variant)` picks the entry. The seed is the block's
+    own world position; hashing the section's corner for all 4096 positions was the first version, and it
+    turned every pad in a pond the same way - a mistake no counter could see, because the JVM was answering
+    exactly what it was asked.
+  - **It cost two more bugs to get the blob where the bake could see it, and both are worth knowing about.**
+    The first: `get_model_variant` was implemented on `CachedBlockstateProvider` while the bake runs with
+    `MinecraftBlockStateProviderWrapper`, so the trait's default answered `0` for every block - the *identical*
+    trap the `get_fluid` comment above it describes, found the same way (a provider's own test passing while the
+    game drew the old thing). The second: the blob rode on the target's *block record*, and a section is usually
+    sent long before it is baked - as a neighbour of whatever was built next to it - so by the time its own turn
+    came its blocks compared equal and no record was written. Measured with that version: the JVM's own picks
+    were already a flat `149/136/158/130` across the four quarter turns while the bake drew `1064/26/28/32`.
+    With both fixed, the same run draws `242/206/238/208` against the game's `121/103/119/104` - and the terrain
+    line carries the summary as `variantDiagnostics`.
+  - **And the pad's colour is not this side's vertex data.** The bake was made to print a pad's whole chain:
+    `tint 0x00308020` (which is `LILY_PAD_IN_WORLD`, the game's own answer), `light 0xf0` (block 0, sky 15),
+    `shade true`, `variant n`, `scaled 0x00308020` - the tint with no shading factor and nothing else in it.
+    So the tint, the light, the shading and the AO of a pad are all the game's, and the measured difference
+    against vanilla (~0.3× in the darkest tenth of the same pad) is *downstream* of the vertex: the sprite
+    sample, the atlas the quad points at, or the lightmap lookup. That is where the next look goes.
+  - **The model's own `ambientocclusion` flag is read now, and it is 137 models wide.**
+    `useAO = this.ambientOcclusion && (perPartAO || switch (parts.getFirst().ambientOcclusion()) { TRUE ->
+    true; DEFAULT -> lightEmission == 0; FALSE -> false })` is the game's rule; `ModelMesh` carries the
+    resolved flag and `uses_ambient_occlusion` applies it, with `None` keeping this side's older bucket rule
+    (a face off the cube's planes is flat). 137 of the 2392 vanilla block models say `false` - every
+    `cross`/crop model, bamboo leaves, cauldron, comparators, coral fans, **doors, ladders, levers, rails,
+    tripwire, vines, glow lichen, panes and bars** - so this was never only about lily pads: a door's faces
+    are on the block's planes and used to be given ambient occlusion the game does not give them. The one
+    place it still differs is a `DEFAULT` part that emits light, which is a *position*-dependent question this
+    side cannot ask where the decision is made.
+  - **Still measured and not attributed**: our *terrain* in the two screenshots is 0.75-0.9× vanilla's while the
+    water in the same frames matches (1.03-1.07×). The AO flag above is one candidate class - 137 models - and
+    the light is the other.
+
+- **The same scene, both renderers, one frame at a time - and the difference has a shape.** The `terrain` setting
+  and the `diagnostics` dumps make this an experiment rather than a hunt: with `terrain: true` and
+  `diagnostics: true` the frame is dumped to `runs/client/wgpu-frames/frame-N-source.raw` (an 8-byte
+  `width, height` header, then four bytes a pixel), and the same frame number with `terrain: false` dumps
+  **Minecraft's own meshes of the same scene from the same camera**. Frame 900 of both runs, at the pond the lily
+  pad report came from:
+  - **34.4% of the pixels differ by more than 20 per channel**, and the frame is darker overall - mean
+    `(72, 79, 73)` against `(76, 89, 85)`;
+  - **the difference is not uniform, and the pattern is the finding**: the *cutout* sprites are the ones that go
+    dark - the lily pads are near-black, the tree canopy is much darker, the grass tufts are darker - while the
+    solid terrain and the fluid differ far less.
+- **And there is a concrete difference in that exact place: this side has three chunk layers where the game has
+  four.** `RenderPipelines` declares `pipeline/cutout_terrain` at **0.5**, a family at **0.1** - the *mipped*
+  cutout pipelines among them - and `pipeline/translucent_terrain` at **0.01**; `graph.rs` draws `SOLID_TERRAIN`
+  (no cutoff), `CUTOUT_TERRAIN` **0.5** and `TRANSLUCENT_TERRAIN` **0.01**, and `block.rs` maps **both** `cutout`
+  and `cutout_mipped` onto the one cutout layer. So every sprite the game draws *mipped* is drawn here through a
+  cutoff **five times higher** than the game's, which discards the low-alpha fringe texels the game keeps - and a
+  mip of a leaf or a grass tuft is mostly that fringe, which is why the frames differ most exactly where they do.
+  **Fixed since**: the cutoff travels per *face* instead (`UV_CUTOUT_MIPPED`, bit 6 of `uv_flags`, picked up by
+  the terrain vertex stage and selected in the fragment's alpha test), which is the game's fourth layer's *result*
+  without changing the arena's three-layer layout. The lily pad - a `cutout` sprite at 0.5 on both sides - still
+  needs its own answer, and the running list of what is measured, cleared and open is in
+  [The experimental terrain pipeline](#the-experimental-terrain-pipeline) at the top of this file.
+- **How to run the comparison again**: set `terrain` and `diagnostics` in `config/wgpu-mc-renderer.json`, run the
+  client twice (once with each `terrain` value), and diff `wgpu-frames/frame-900-source.raw`. Both halves see the
+  same camera because the quickplay script places the player, so the two frames can be read as raw images - no
+  screenshot of a window nobody is watching is needed.
+- **A biome's transition area reads wrong** - reported from a picture, and both of the candidates written down
+  here have since been read out of the game's own code, which leaves the *report* as the thing to pin down.
+  **The tint this side asks for is the game's own answer, at the block's own position, through the blended
+  biome**, and the two chains are the same code:
+  - `ModelBlockRenderer#putQuadWithTint` is the game's own block baking, and it calls
+    `getTintColor(level, state, pos, tintIndex)` - the **block's** position, cached per tint index - so the
+    game does not sample per quad. The fluid renderer agrees: one `colorInWorld(fluidState, blockState, level,
+    pos)` per fluid block, used for every face of it, which is what `bake_fluid_faces` does too;
+  - `BlockTintSources.grass()/grassBlock()/foliage()/water()/...` are all
+    `BiomeColors.getAverage*Color(level, pos)`, which is `level.getBlockTint(pos, resolver)`, which is
+    `ClientLevel#getBlockTint` → `BlockTintCache#getColor` → on a miss `ClientLevel#calculateBlockTint` - the
+    `(2 * biomeBlendRadius + 1)²` average of `getBiome`, and `LevelReader#getBiome` *is*
+    `BiomeManager#getBiome`, the fiddled three-biome blend. So the blended biome is the one the tint goes
+    through, and the game's own mesher reaches it through the same `ClientLevel` (`RenderSectionRegion#
+    getBlockTint` is one line: `this.level.getBlockTint(pos, resolver)`);
+  - `Wgpu.helperGetBlockColor` and `helperGetSectionTints` call `tintSource.colorInWorld(state, client.level,
+    pos)` with the same `ClientLevel` and the same absolute position, which the bake forms as `pos +
+    section_offset` - the same position it puts the block's faces at. **The value cannot differ while the
+    inputs are the same**, so the question is whether the inputs are what this side thinks.
+  - **`TintProfile` is that measurement**, once a second behind the diagnostics switch: it finds the nearest
+    block where two neighbours disagree about their biome and prints, per block along a 33-block row, the
+    biome, the grass tint's red channel and the *water* tint's blue channel. At a swamp/forest/beach boundary
+    in a run with `biomeBlendRadius: 2` it reads:
+
+    ```text
+    biome      AAAAAAAAAAAAAAAAA BBBBBBBBBBBBBBB C            (A=swamp B=forest C=beach)
+    grass red  4c ×17            4f 55 5a 5f 65 68 6a 6c 6f 73 74 76 7a 7c 7d 7d 7f 81 83
+    water blue 64 ×17            6e 7d 8c 9c ab b5 bb c0 c5 cf d4 d9 de e4 e4 e4 e4 e4 e4
+    ```
+
+    which is the blend working, on both paths, in step: swamp's grass `4c763c` and swamp's water `617b64` are
+    the flat values on the left (their blue and red are exact), and both ramp across the change rather than
+    stepping at it. `0 block(s) whose cached colour is not what the world now says` and `0 not the tint
+    source's answer` are on the same line, so the cache is not stale either. **So the tint at a transition is
+    right, and what the picture showed is still to be located** - the fluid and block paths are both measured
+    here, which leaves a *stale bake* (a section meshed before a neighbour's biomes arrived, which this row
+    would not see because it reads the live world) or something that is not the tint at all (the light, the
+    AO, a seam at a section edge) as the places to look next.
+  - **A report of a *mirrored* transition is what closed the last gap in the block path.** Every measurement
+    above reads the *game's* functions; none of them could see what this side did with the answer. So the
+    wrapper now asks **both** paths for the same position while the diagnostics are on - the section's bulk
+    table and the per-face `helperGetBlockColor` - and reports a mismatch: **zero in 20,000 positions**. A
+    table whose position packing was mirrored (a bump of colour centred on the boundary rather than a ramp
+    across it, invisible inside a biome because the colour there is constant) would have shown up as
+    thousands of them. The per-face call is one JNI call per tinted face, so the check is behind the log
+    switch; the bulk table can also be taken out entirely with `USE_BULK_TINTS` in `wgpu-mc-jni/src/lib.rs`,
+    which is the only way to compare two *frames* built by the two paths.
+  - **The fluid table has had that check too now, and it is clean.** The fluid side has no key counters
+    and no `TintProfile` row that could see a mirrored position packing - and a mirrored *fluid* table
+    would show as water moving the wrong way across a biome boundary and as nothing else at all, which is
+    what a report of a *mirrored* transition describes. So `get_fluid_color` compares the section's bulk
+    table against the per-face `Wgpu.helperGetFluidColor` for the same position while the diagnostics are
+    on, and prints the first comparison so that "no mismatches" cannot be "nothing compared": the run
+    logged `bulk 0x00e4763f, per-face 0x00e4763f at [21088, 48, 20000]` - `3f76e4`, the biome's water
+    colour, identical on both paths - and **zero mismatches**. Both tint tables are therefore cleared at
+    the position level, which was the last place a *tint* could have been sampled from a mirrored
+    position.
+  - **The two cutout pipelines are now told apart, because three chunk layers could not tell them apart.**
+    `RenderPipelines` declares `cutout_terrain` at **0.5** and the mipped cutout family at **0.1**; this
+    renderer draws one cutout layer, so the number now travels per *face* instead: the model's
+    `render_type` sets `UV_CUTOUT_MIPPED` (bit 6 of `uv_flags`, the first free one - bits 0-1 are the
+    atlas and animation flags and 2-5 are the level-of-detail floor), the terrain vertex stage unpacks it
+    into a flat varying, and the fragment's alpha test selects `0.1` against the layer's own cutoff with
+    it. That is the *result* of the game's fourth layer without changing the arena's three-layer layout,
+    and the project's own shader tests hold it: the varyings must parse, no sample may sit under a branch,
+    and no variable may be declared and unread. **The picture is not verified yet**: the frame-dump
+    comparison below needs a camera-stable recipe first, and the two attempts made so far both turned out
+    to be different views - which is worth saying plainly rather than reading numbers off them.
+  - **A frame comparison needs the camera pinned, and that is not free.** The quickplay script places the
+    player, but between two runs the *view* still differs: the slower of the two paths lets the player
+    fall or slide somewhere else before the dumped frame number arrives, and a frame of a different place
+    reads as a huge difference for reasons that have nothing to do with the renderer. Both attempts made
+    while adding the layers above produced 45-50% "differences" that were exactly that. The recipe that
+    works is the one the first comparison used - same build, same load, same frame number - and the one
+    that would make it routine is a camera that cannot move: spectator mode and a fixed position from the
+    init script. Until then, treat any frame number from a *changed* build as unverified.
+
 
 - **A grass block's side reads brighter than the game's, and it is not the tint, the light, the sprite
   rectangle or the sampling - twelve candidates were each measured and each came back correct.** The
