@@ -27,7 +27,6 @@ references/
 # repository no longer has a copy of.
 rust/wgpu-mc-demo/tmp
 rust/wgpu-mc-demo/res/assets
-fabric/src/main/wgpu-mc.h
 
 # Ignore Gradle project-specific cache directory
 .gradle
