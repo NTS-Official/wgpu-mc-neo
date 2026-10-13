@@ -35,6 +35,13 @@
 //! frame time will say so later. It is read from `getThreadAllocatedBytes` on Linux and Windows, and
 //! absent elsewhere rather than guessed at.
 
+// The same limit, and for the same reason, as the one on the library's own crate root: an example is
+// a crate of its own, so this file needs its own copy. Building the waker below asks whether the
+// benchmark's own types are `Send`, which walks wgpu's auto-trait chain - `Gpu` -> `PipelineCache` ->
+// `Arc<CorePipelineCache>` -> `ContextWgpuCore` -> `Global` -> `Hub` -> every registry in it - and
+// the default limit of 128 runs out partway down. See `wgpu-mc`'s `lib.rs`.
+#![recursion_limit = "512"]
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;

@@ -12,11 +12,13 @@
 //!
 //! So the files are read at run time, out of a checkout found like this:
 //!
-//!   * `WGPU_MC_MOD_DIR`, when it is set: a path, absolute or relative to this repository's root.
+//!   * `WGPU_MC_MOD_DIR`, when it is set: a path, absolute or relative to this workspace's root.
 //!     Naming a directory that is not there is an **error**, because setting the variable is the
 //!     only way to say "the checkout is *here*" and a wrong answer to that has to be loud.
-//!   * otherwise the sibling checkout `../neolectrum` - where it is for anyone who clones both
-//!     repositories side by side, which is how the two are developed.
+//!   * otherwise, two places are tried in order: the sibling checkout `../neolectrum`, where it is
+//!     for anyone who clones both repositories side by side, which is how the two are developed; and
+//!     `neolectrum` inside this repository's root, which is the directory the mod occupied before it
+//!     was split out, and where a clone of it back into this engine lands.
 //!
 //! With neither, the checks that need those files **skip rather than fail**: this crate belongs to
 //! the engine, and a clone of the engine that has never seen the mod should still run `cargo test`.
@@ -43,19 +45,69 @@ pub const DIR_VARIABLE: &str = "WGPU_MC_MOD_DIR";
 /// Where the checkout is when nothing says otherwise: beside this repository.
 pub const DEFAULT_SIBLING: &str = "../neolectrum";
 
-/// This repository's root: this crate sits directly under it.
+/// This workspace's root - `rust/`, which is where `Cargo.toml` is. The repository root is its
+/// parent; both are needed, because the two documented ways to lay a checkout out put it beside one
+/// or the other.
 fn workspace_root() -> &'static Path {
     static ROOT: OnceLock<PathBuf> = OnceLock::new();
 
     ROOT.get_or_init(|| {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
-            .expect("`modtree` is a workspace member, so it lives under the repository root")
+            .expect("`modtree` is a workspace member, so it lives under the workspace root")
             .to_path_buf()
     })
 }
 
+/// The repository root, one level above the workspace - where the engine's own `Cargo.toml` is *not*.
+fn repo_root() -> &'static Path {
+    static ROOT: OnceLock<PathBuf> = OnceLock::new();
+
+    ROOT.get_or_init(|| {
+        workspace_root()
+            .parent()
+            .expect("the `rust` workspace sits directly under the repository root")
+            .to_path_buf()
+    })
+}
+
+/// The two places a checkout is looked for when nothing names one - see [`dir`].
+///
+/// Both are **absolute paths built by walking up with `parent()` rather than by joining `..`**, and
+/// that is not a style choice. Windows resolves a `..` component *lexically*: it takes the `..` off
+/// the preceding name and only then asks the filesystem, so `rust/../neolectrum` is looked for - and
+/// not found - beside `rust`, which is precisely where a sibling clone is not. Linux walks the
+/// filesystem instead and finds it. The same checkout in the same documented layout was therefore
+/// found on CI and missed on a Windows workstation, which is the bug this pair of candidates exists
+/// to make impossible: a `..` that one platform honours and another does not must not decide whether
+/// a checkout is there.
+enum Candidate {
+    /// Beside the workspace - where a clone lands when the two repositories sit side by side, which
+    /// is the layout the module note above documents.
+    BesideWorkspace,
+    /// Inside the repository, at its root. This is where the mod lived before it was split out, and
+    /// the directory people reach for when they clone it back beside the engine's sources.
+    InsideRepository,
+}
+
+impl Candidate {
+    /// The directory to test, as an absolute path with no `..` in it.
+    fn resolve(self) -> PathBuf {
+        match self {
+            Candidate::BesideWorkspace => repo_root()
+                .parent()
+                .expect("the repository root has a parent - the directory both clones sit in")
+                .join("neolectrum"),
+            Candidate::InsideRepository => repo_root().join("neolectrum"),
+        }
+    }
+}
+
 /// The checkout's root, or `None` when there is no checkout to read from.
+///
+/// A path that names a checkout is resolved and then asserted on, because naming one is the only way
+/// to say "it is *here*" and a wrong answer to that has to be loud. The candidates are only tested,
+/// never asserted on: their absence is the ordinary state of a clone that has never seen the mod.
 pub fn dir() -> Option<&'static Path> {
     static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
 
@@ -77,11 +129,13 @@ pub fn dir() -> Option<&'static Path> {
 
                 Some(named)
             }
-            None => {
-                let sibling = workspace_root().join(DEFAULT_SIBLING);
-
-                sibling.is_dir().then_some(sibling)
-            }
+            None => [Candidate::BesideWorkspace, Candidate::InsideRepository]
+                .into_iter()
+                .map(Candidate::resolve)
+                // Canonicalised so that the path handed to the checks is the real one - a checkout
+                // reached through a link prints as itself rather than as the link.
+                .map(|candidate| candidate.canonicalize().unwrap_or(candidate))
+                .find(|candidate| candidate.is_dir()),
         },
     )
     .as_deref()
