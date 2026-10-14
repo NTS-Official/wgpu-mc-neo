@@ -45,21 +45,31 @@ mod tests {
     }
 
     /// The version the mod file is stamped with - the `version` of the `minecraft` mod file, which is what
-    /// the checker keys `promos` on. NeoForge 26.1 versions are `<minecraft>-<hotfix>.<release>` (see the
-    /// note in `gradle.properties`), so the Minecraft version is that string without its last part.
+    /// the checker keys `promos` on.
+    ///
+    /// Which string that is depends on the line the mod is built against, and the NeoForge version says
+    /// which line it is, because the two are numbered together:
+    ///
+    /// - **26.1 onwards**, NeoForge is `<minecraft>.<hotfix>.<release>` (`26.1.2.109`) and the mod file is
+    ///   stamped with the Minecraft version *and* its hotfix (`26.1.2`). The last part is the release.
+    /// - **1.21.1 and before**, NeoForge is `<minecraft>.<release>` (`21.1.259`) and the mod file is
+    ///   stamped with the Minecraft version as the *game* reports it (`1.21.1`). NeoForge's own spelling
+    ///   of that version is `21.1` - the leading `1.` the game uses is not in it at all, so it cannot be
+    ///   read off the NeoForge version and has to be put back.
     fn minecraft_version(gradle: &str) -> String {
         let neo = property(gradle, "neoforge_neo_version");
+        let parts = neo.split('.').collect::<Vec<_>>();
 
-        let mut parts = neo.split('.').collect::<Vec<_>>();
-
-        assert!(
-            parts.len() == 4,
-            "the NeoForge version is four parts, `<minecraft>-<hotfix>.<release>`: {neo}"
-        );
-
-        parts.pop();
-
-        parts.join(".")
+        match parts.len() {
+            4 => parts[..3].join("."),
+            3 => format!("1.{}", parts[..2].join(".")),
+            count => panic!(
+                "the NeoForge version `{neo}` has {count} parts, and this knows two shapes: \
+                 `<minecraft>.<hotfix>.<release>` from 26.1 onwards, and `<minecraft>.<release>` before \
+                 it. A new line needs its shape added here, because the promo key the game looks up is \
+                 that Minecraft version"
+            ),
+        }
     }
 
     /// The build this tree produces is the one the update file offers, for the Minecraft version the game

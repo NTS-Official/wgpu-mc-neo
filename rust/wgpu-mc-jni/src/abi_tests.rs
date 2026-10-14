@@ -59,6 +59,11 @@ fn wgpu_native_kt() -> &'static str {
 }
 
 /// Every file that exports something across one of the two bridges.
+///
+/// `jni_abi.rs` is deliberately not in this list. It exports nothing over the C ABI - every function
+/// in it is a `#[jni_fn]` - and [`rust_c_abi_exports`] finds an export by looking for the literal
+/// marker text, which that module's own documentation mentions in prose. A file in this list that
+/// merely *talks* about the marker is read as one that contains it.
 const BRIDGE_SOURCES: &[&str] = &[
     include_str!("blaze.rs"),
     include_str!("device.rs"),
@@ -329,6 +334,30 @@ fn screaming_snake(name: &str) -> String {
 // ---------------------------------------------------------------------------------------------
 // The bridges.
 // ---------------------------------------------------------------------------------------------
+
+/// `acquire_next_texture` -> `acquireNextTexture`.
+///
+/// Every `#[jni_fn]` on the all-JNI branch is named after the export it wraps, so the wrapper's Java
+/// name is the export's name in the spelling Java gives a method. The mapping is mechanical and so it
+/// is checked rather than trusted: it is the only thing tying the two lists together, and a typo in it
+/// is a method the JVM cannot resolve.
+fn lower_camel_case(snake: &str) -> String {
+    let mut out = String::with_capacity(snake.len());
+    let mut capitalise = false;
+
+    for c in snake.chars() {
+        if c == '_' {
+            capitalise = true;
+        } else if capitalise {
+            out.extend(c.to_uppercase());
+            capitalise = false;
+        } else {
+            out.push(c);
+        }
+    }
+
+    out
+}
 
 /// Every `external fun name(args)` in `WgpuNative.kt`, with its JVM argument count.
 fn kotlin_jni_declarations(source: &str) -> Vec<(String, usize)> {
@@ -1038,6 +1067,137 @@ fn every_c_abi_binding_has_an_export() {
         assert!(
             bound.contains(&name),
             "{name} is exported by this crate but nothing in WmNative.kt binds it"
+        );
+    }
+}
+
+/// Every C-ABI export has a wrapper on `WmJni`, and every wrapper has an export.
+///
+/// This is the all-JNI branch's pairing, the one `every_c_abi_binding_has_an_export` checks for the
+/// FFM bridge. On Java 21 `java.lang.foreign` is preview-only and a mod cannot ask a launcher for
+/// `--enable-preview`, so the mod reaches the renderer through these wrappers instead - and the
+/// failure a missing or misspelled one produces is the reason this is a test rather than a comment:
+/// an `external fun` with no implementation throws `UnsatisfiedLinkError`, which is an `Error` and so
+/// is **not** caught by the `catch (e: Exception)` such a bootstrap is written with. It ends the
+/// process the first time that code path runs, and only then.
+///
+/// Nothing here needs the mod checkout: both sides of this pair are in this crate.
+#[test]
+fn every_c_abi_export_has_a_jni_wrapper() {
+    let exports: HashMap<String, usize> = rust_c_abi_exports(BRIDGE_SOURCES)
+        .into_iter()
+        .map(|(name, arguments)| (lower_camel_case(&name), arguments))
+        .collect();
+    let wrappers: HashMap<String, usize> = rust_jni_implementations(&[include_str!("jni_abi.rs")])
+        .into_iter()
+        .map(|(key, arguments)| {
+            let name = key
+                .strip_prefix(&format!("{}::", crate::jni_abi::WM_JNI))
+                .unwrap_or_else(|| {
+                    panic!("{key} is a #[jni_fn] in jni_abi.rs that does not resolve against WmJni")
+                })
+                .to_string();
+            (name, arguments)
+        })
+        .collect();
+
+    assert!(
+        !exports.is_empty(),
+        "no #[unsafe(no_mangle)] export was found; has a bridge file moved out of BRIDGE_SOURCES?"
+    );
+    assert!(
+        !wrappers.is_empty(),
+        "no #[jni_fn] was found in jni_abi.rs; has the module moved?"
+    );
+
+    for (name, arguments) in &exports {
+        let expected = format!("{}::{name}", crate::jni_abi::WM_JNI);
+        let wrapper_arguments = wrappers.get(name).unwrap_or_else(|| {
+            panic!(
+                "the C ABI exports {name}, and the wrapper for it would be {expected}, but \
+                 jni_abi.rs has no such function - so a Java 21 mod cannot reach it: calling it \
+                 would throw UnsatisfiedLinkError"
+            )
+        });
+
+        assert_eq!(
+            wrapper_arguments, arguments,
+            "WmJni.{name}: the wrapper takes {wrapper_arguments} Java arguments, the export takes \
+             {arguments} - a JNI entry point's first two parameters are the JNIEnv and the class"
+        );
+    }
+
+    // The reverse, which is the direction that compiles and then does nothing: a wrapper for an
+    // export that no longer exists is a method the JVM resolves and the linker does not.
+    let exported: Vec<&String> = exports.keys().collect();
+    for name in wrappers.keys() {
+        assert!(
+            exported.contains(&name),
+            "WmJni.{name} wraps nothing: no #[unsafe(no_mangle)] export in this crate is named that \
+             way. The wrapper is named after the export it wraps, in Java's spelling"
+        );
+    }
+}
+
+/// The same pairing as `every_jni_declaration_has_an_implementation`, for the Java 21 branch.
+///
+/// `every_c_abi_export_has_a_jni_wrapper` checks the Rust side against itself, which catches a wrapper
+/// that was never written. This one checks it against the Kotlin the mod actually calls, which is
+/// where a *name* or an *arity* mistake lives - and those are the two that survive everything else:
+/// Kotlin does not type-check a name against a library it has never seen, and the linker does not
+/// check anything at all until the first call.
+#[test]
+fn every_wm_jni_declaration_has_an_implementation() {
+    let Some(wm_jni) = wgpu_mc_modtree::wm_jni_kt() else {
+        wgpu_mc_modtree::skip("the WmJni-declaration check");
+        return;
+    };
+
+    let declarations = kotlin_jni_declarations(&wm_jni);
+    let implementations: HashMap<String, usize> =
+        rust_jni_implementations(&[include_str!("jni_abi.rs")])
+            .into_iter()
+            .map(|(key, arguments)| {
+                let name = key
+                    .strip_prefix(&format!("{}::", crate::jni_abi::WM_JNI))
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "{key} is a #[jni_fn] in jni_abi.rs that does not resolve against WmJni"
+                        )
+                    })
+                    .to_string();
+                (name, arguments)
+            })
+            .collect();
+
+    assert!(
+        !declarations.is_empty(),
+        "no external fun was found in WmJni.kt; has the file moved?"
+    );
+    assert!(
+        !implementations.is_empty(),
+        "no #[jni_fn] was found in jni_abi.rs; has the module moved?"
+    );
+
+    for (name, arguments) in &declarations {
+        let rust_arguments = implementations.get(name).unwrap_or_else(|| {
+            panic!(
+                "WmJni.{name} is declared but no #[jni_fn] implements it, so calling it throws \
+                 UnsatisfiedLinkError - which is an Error, and no caller catches it"
+            )
+        });
+
+        assert_eq!(
+            rust_arguments, arguments,
+            "WmJni.{name}: the JVM declares {arguments} arguments, Rust takes {rust_arguments}"
+        );
+    }
+
+    for name in implementations.keys() {
+        assert!(
+            declarations.iter().any(|(declared, _)| declared == name),
+            "WmJni.{name} is implemented in Rust but nothing in WmJni.kt declares it, so it is dead \
+             code on that side"
         );
     }
 }

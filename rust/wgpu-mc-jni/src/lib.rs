@@ -52,6 +52,7 @@ mod device;
 pub mod entity;
 mod gl;
 mod indirect;
+mod jni_abi;
 mod lighting;
 mod palette;
 mod pia;

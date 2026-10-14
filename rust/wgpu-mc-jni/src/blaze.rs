@@ -1958,6 +1958,23 @@ pub struct FfiStr {
     ptr: *const c_char,
 }
 
+impl FfiStr {
+    /// Borrows a C string that already exists, for the duration of one call.
+    ///
+    /// `FfiStr` is a bare pointer - it borrows, it does not own - and its field is private to this
+    /// module, so the JNI bridge cannot build one from the `CString` it copied a Java string into. It
+    /// is deliberately not a constructor that copies: [`Clone`] and [`From<&str>`] both leak a
+    /// `CString` on purpose, and a bridge that is handed a string per call must not.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must address a NUL-terminated string that outlives the returned value, and nothing may
+    /// free it while that value is alive.
+    pub(crate) unsafe fn from_raw(ptr: *const c_char) -> Self {
+        Self { ptr }
+    }
+}
+
 impl Clone for FfiStr {
     fn clone(&self) -> Self {
         Self {
@@ -2210,7 +2227,11 @@ pub struct RenderPipeline {
 
 #[repr(u64)]
 #[allow(non_camel_case_types)]
-#[derive(Copy, Clone, Debug)]
+// `FromRepr` is the checked way back from the number the ABI carries to the variant it names, which
+// the JNI bridge needs and a `transmute` must not be used for: the enum is `#[repr(u64)]` and its
+// discriminants are not contiguous by construction, so a number off the end of the list is undefined
+// behaviour rather than a wrong texture.
+#[derive(Copy, Clone, Debug, strum_macros::FromRepr)]
 pub enum GpuFormat {
     None = 0,
     R8_UNORM = 1,

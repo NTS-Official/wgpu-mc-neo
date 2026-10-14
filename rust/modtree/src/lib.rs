@@ -218,31 +218,92 @@ pub fn mods_toml() -> Option<String> {
 // ---------------------------------------------------------------------------------------------
 // The mod's own source: the two halves of the bridge, and the options screen and language files
 // that have to agree with the settings schema this crate compiles in.
+//
+// The mod is developed on a **branch per Minecraft version** now, and the halves are not the same on
+// each of them: `WmNative.kt` binds this crate's C ABI through `java.lang.foreign`, which is preview
+// on Java 21 and unusable from a mod there, so the 1.21.1 branch reaches the same functions through
+// `WmJni.kt` - JNI entry points, still resolved against this crate - instead. The files below that
+// exist on only some of those branches say which, and [`read_of`] turns "this checkout is a version
+// whose tree cannot have that file" into the `None` the caller's `skip` path is already written for.
+//
+// The strictness [`path`] carries is kept where it belongs: inside a *branch*, a file that moved is
+// drift and still an assertion. A branch tag is not a way to silence a rename - it is a statement
+// about which versions have the file at all.
 // ---------------------------------------------------------------------------------------------
 
+/// The Minecraft version the checkout builds against, out of its `gradle.properties`.
+///
+/// `None` when the file does not say, which is treated as "no opinion" by [`read_of`] rather than as a
+/// mismatch - a checkout whose version cannot be read is checked exactly as it was before there were
+/// branches.
+pub fn minecraft_version() -> Option<&'static str> {
+    static VERSION: OnceLock<Option<String>> = OnceLock::new();
+
+    VERSION
+        .get_or_init(|| {
+            gradle_properties()?.lines().find_map(|line| {
+                line.strip_prefix("neoforge_minecraft_version=")
+                    .map(|value| value.trim().to_string())
+            })
+        })
+        .as_deref()
+}
+
+/// A file that only some of the mod's branches have, named with the versions that do.
+///
+/// Anything else - a missing checkout, an unreadable `gradle.properties` - falls through to [`read`],
+/// which is the behaviour every accessor here had before there were branches.
+fn read_of(relative: &str, versions: &[&str]) -> Option<String> {
+    match minecraft_version() {
+        Some(version) if !versions.contains(&version) => None,
+        _ => read(relative),
+    }
+}
+
 /// `WmNative.kt`: the `java.lang.foreign` half, bound by name and by byte offset.
+///
+/// Only the 26.x branches have it. A new branch that does adds its version here.
 pub fn wm_native_kt() -> Option<String> {
-    read("src/main/kotlin/dev/birb/wgpu/rust/WmNative.kt")
+    read_of("src/main/kotlin/dev/birb/wgpu/rust/WmNative.kt", &["26.1"])
+}
+
+/// `WmJni.kt`: the same API declared as JNI entry points, for the branches that cannot use FFM.
+///
+/// The mirror of [`wm_native_kt`]: one of the two is on every branch, and which one is a property of
+/// the Minecraft version rather than of the mod.
+pub fn wm_jni_kt() -> Option<String> {
+    read_of("src/main/kotlin/dev/birb/wgpu/rust/WmJni.kt", &["1.21.1"])
 }
 
 /// `WgpuNative.kt`: the JNI half, whose `external fun`s are resolved against this crate.
+///
+/// On every branch: the gameplay bridge has always been JNI, on both sides of the split.
 pub fn wgpu_native_kt() -> Option<String> {
     read("src/main/kotlin/dev/birb/wgpu/rust/WgpuNative.kt")
 }
 
 /// `OptionPages.kt`: the options screen, which owns the page that carries the renderer's settings.
 pub fn option_pages_kt() -> Option<String> {
-    read("src/main/kotlin/dev/birb/wgpu/gui/OptionPages.kt")
+    read_of(
+        "src/main/kotlin/dev/birb/wgpu/gui/OptionPages.kt",
+        &["26.1"],
+    )
 }
 
 /// `RustChunkBake.kt`: this side of the section feed, and what it records about it.
 pub fn rust_chunk_bake_kt() -> Option<String> {
-    read("src/main/kotlin/dev/birb/wgpu/chunk/RustChunkBake.kt")
+    read_of(
+        "src/main/kotlin/dev/birb/wgpu/chunk/RustChunkBake.kt",
+        &["26.1"],
+    )
 }
 
 /// `RustChunkBakeMixin.java`: the hook that starts a bake, checked for not writing the answer twice.
 pub fn rust_chunk_bake_mixin_java() -> Option<String> {
-    read("src/main/java/dev/birb/wgpu/mixin/chunk/RustChunkBakeMixin.java")
+    read_of(
+        "src/main/java/dev/birb/wgpu/mixin/chunk/RustChunkBakeMixin.java",
+        &["26.1"],
+    )
 }
 
 /// One of the shipped language files, by locale: `language("en_us")`.
