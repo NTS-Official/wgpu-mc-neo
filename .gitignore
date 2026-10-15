@@ -52,3 +52,7 @@ result
 
 /.kotlin
 /logs
+/.acp
+/.graphflow
+/graphflow-out
+/.graphflow-cache
