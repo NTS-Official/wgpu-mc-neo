@@ -53,6 +53,12 @@ result
 /.kotlin
 /logs
 /.acp
+<<<<<<< Updated upstream
 /.graphflow
 /graphflow-out
 /.graphflow-cache
+=======
+/.graphflow-cache
+/.graphflow
+/graphflow-out
+>>>>>>> Stashed changes
