@@ -250,6 +250,7 @@ impl PresentBlit {
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
         pass.draw(0..4, 0..1);
+        drop(pass);
     }
 }
 
@@ -1203,6 +1204,22 @@ fn shared_encoder() -> *mut wgpu::CommandEncoder {
 fn with_shared_encoder<R>(body: impl FnOnce(&mut wgpu::CommandEncoder) -> R) -> R {
     let pointer = shared_encoder();
 
+    // Recording into the shared encoder while a render pass is open is the one thing this must not
+    // do, and wgpu says nothing when it happens: `CommandEncoderStatus::with_buffer` answers a
+    // recording call on a locked encoder by *invalidating* the encoder and returning `Ok(())`, so no
+    // validation error is raised at the call. The stored state only surfaces at the next `finish()`,
+    // as "Encoder is locked by a previously created render/compute pass", and it ends the frame -
+    // which reads as a leaked pass and is not one. The call still goes through, because a caller
+    // with nowhere else to put its bytes is better served by a frame that fails loudly here than by
+    // silence, but it is named.
+    let open = LIVE_PASS_COUNT.load(Ordering::Relaxed);
+    if open != 0 {
+        log::error!(
+            "wgpu-mc: recording into the shared encoder while {open} render pass(es) are open; wgpu \
+             invalidates the encoder for this and the frame will fail at the next flush"
+        );
+    }
+
     // Safety: every caller is called from the render thread, in the order Minecraft records, and
     // wgpu only allows one pass to be recording at a time - which is also what makes one encoder
     // enough for all of Minecraft's encoder objects.
@@ -1980,7 +1997,17 @@ pub unsafe extern "C" fn write_to_buffer(
     // The bytes go into the staging ring and travel as a copy inside the frame's own encoder, which
     // is ordered by the command stream and needs no submission at all. Only a staging ring with no
     // room left falls through to the queue-write path below, which does need one.
-    if stage_copy(wm, buffer, start, bytes) {
+    //
+    // A pass being open rules the staging copy out entirely, and it is the normal case rather than a
+    // corner one: `GlDraws` uploads a draw's uniforms with its own render pass already open. The
+    // copy would be a recording call on a locked encoder, which wgpu-core answers by invalidating
+    // the encoder silently and only reporting it at the next `finish()`. With a pass open the bytes
+    // go straight to the queue instead: the write is applied ahead of the next submission, which is
+    // the encoder the open pass is being recorded into, so that pass reads them. A write that lands
+    // on bytes an already recorded draw reads still needs the in-stream ordering `stage_copy`
+    // gives - that is what `write_needs_a_submission` below detects, and it is why a pass being open
+    // and a wrap in the ring at the same time is the one case this cannot order properly.
+    if LIVE_PASS_COUNT.load(Ordering::Relaxed) == 0 && stage_copy(wm, buffer, start, bytes) {
         return;
     }
 
@@ -2295,7 +2322,15 @@ fn dead_texture_description(texture: &wgpu::Texture) -> Option<(u32, u32, wgpu::
         .map(|dead| (dead.width, dead.height, dead.format))
 }
 
-/// A whole-texture view, which is all a clear needs.
+/// A level-0-only view of a texture, for a clear pass to attach.
+///
+/// `mip_level_count` is 1 and not `None`, which is a bug fix rather than a detail: `None` means
+/// *every* level, and wgpu refuses an attachment whose view spans more than one - "This texture
+/// view has more than one mipmap level" - so a clear of a mipped texture ended the process. It
+/// never showed on 26.1, whose render targets have a single level, and it appears the moment a
+/// game allocates a render target with a full chain: Minecraft 1.21.1's `RenderTarget` does, so
+/// its main target is 10 levels at 854x480 and the first `glClear` was fatal. A clear covers one
+/// level by definition, and level 0 is the only one it can mean.
 fn clear_view(texture: &wgpu::Texture) -> wgpu::TextureView {
     texture.create_view(&wgpu::TextureViewDescriptor {
         label: Some("<wm/mc clear>"),
@@ -2304,7 +2339,7 @@ fn clear_view(texture: &wgpu::Texture) -> wgpu::TextureView {
         usage: None,
         aspect: Default::default(),
         base_mip_level: 0,
-        mip_level_count: None,
+        mip_level_count: Some(1),
         base_array_layer: 0,
         array_layer_count: None,
     })
