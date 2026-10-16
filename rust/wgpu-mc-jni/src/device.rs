@@ -942,6 +942,22 @@ fn try_create_renderer(
         }
     };
 
+    // **A validation error is a report, not the end of the process.** wgpu's default handler for an
+    // error no scope caught logs `Handling wgpu errors as fatal by default` and then panics, and a
+    // panic on the render thread is a native abort - the game disappears with a C++ exception and an
+    // `hs_err` file that says nothing about which draw was wrong. That is what one shader the engine
+    // would not accept did on 1.21.1: `Error matching ShaderStages(VERTEX) shader requirements against
+    // the pipeline` while compiling `gl program 58`, twelve seconds into a world.
+    //
+    // **The error is still a bug, and this does not hide it**: it is logged at error level with the
+    // pipeline's own label, so the log names the program, and `draw_call` refuses the draw rather
+    // than recording it - a picture with a hole in it is a bug report, while a process that is gone
+    // is a mystery. Installed on the device itself rather than around one call, so the graph's
+    // terrain pipelines and the present blit are covered as well as the game's own programs.
+    device.on_uncaptured_error(std::sync::Arc::new(|error: wgpu::Error| {
+        error!("wgpu-mc: the engine refused something this renderer asked for, so it was not done: {error}");
+    }));
+
     let pipeline_cache = create_pipeline_cache(&device, &adapter);
 
     let gpu = Gpu {
@@ -1226,19 +1242,37 @@ fn with_shared_encoder<R>(body: impl FnOnce(&mut wgpu::CommandEncoder) -> R) -> 
     unsafe { body(&mut *pointer) }
 }
 
-/// Submits whatever the shared encoder has recorded and starts a new one.
+/// Which call site asked for the submission.
 ///
-/// This is the *only* submission point there is: the JVM side records clears, passes, copies and
-/// uploads into this one encoder and asks for a submit from two places - before a readback, and,
-/// through the blit below, before a present. Everything else used to flush after itself, which was
-/// ten submissions a frame, and the frame's own boundaries are cleaner for it: the start timestamp
-/// of a frame's GPU measurement now lands at the start of the frame rather than at whichever
-/// mid-frame flush happened last.
-///
-/// A render pass borrows the encoder while it is recording it, so finishing the encoder here would
-/// pull it out from under that borrow. The JVM side does not do that, and if it ever does, this
-/// refuses and says so rather than corrupting the recording.
-fn flush_shared_encoder(wm: &WmRenderer) {
+/// One submission a frame is the design - everything is recorded into the shared encoder and it goes
+/// out once, at the present - and this was measured at eighty-seven, which no single site can
+/// produce. The count alone cannot say which site it is, so the sites count themselves; the totals
+/// are reported beside the submission count and reset with it.
+static FLUSH_SITES: Mutex<Vec<(&'static str, u64)>> = Mutex::new(Vec::new());
+
+fn count_flush(site: &'static str) {
+    let mut sites = FLUSH_SITES.lock();
+    match sites.iter_mut().find(|(name, _)| *name == site) {
+        Some((_, count)) => *count += 1,
+        None => sites.push((site, 1)),
+    }
+}
+
+/// The flush sites since the last report, as `site xN` pairs, most used first.
+fn flush_sites_report() -> String {
+    let mut sites = FLUSH_SITES.lock();
+    let mut taken: Vec<(&'static str, u64)> = std::mem::take(&mut *sites);
+    taken.sort_by_key(|entry| std::cmp::Reverse(entry.1));
+    taken
+        .iter()
+        .map(|(name, count)| format!("{name} x{count}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Submits the shared encoder, saying which site asked for it. See [count_flush].
+fn flush_shared_encoder_from(wm: &WmRenderer, site: &'static str) {
+    count_flush(site);
     if LIVE_PASS_COUNT.load(Ordering::Relaxed) != 0 {
         error!(
             "wgpu-mc: refusing to submit while {} render pass(es) are open; the recording stays in \
@@ -1418,6 +1452,145 @@ fn stage_copy(wm: &WmRenderer, buffer: &wgpu::Buffer, start: u64, bytes: &[u8]) 
 
     STAGED_UPLOADS.fetch_add(1, Ordering::Relaxed);
     STAGED_BYTES.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+    true
+}
+
+/// Copies a rectangle of `bytes` through the staging ring and records the copy into `destination`.
+///
+/// This is [stage_copy] for a texture, and it exists because the alternative was measured: routing a
+/// texture upload through `Queue::write_texture` forces a submission of its own - the write is applied
+/// at the next submission, ahead of every command in it, so it has to go out before the frame's draws
+/// are recorded or those draws would sample the new texels. A hundred and eight uploads a frame turned
+/// into a hundred and eight submissions a frame, and a submission is a command buffer and a fence that
+/// stays alive until it is polled. The copy is a command instead, so it lands in the frame's own
+/// submission, after whatever was recorded before it and before whatever comes after - which is the
+/// ordering the forced submit was imitating.
+///
+/// Returns false when the upload cannot be staged, and the caller falls back to the forced submit.
+/// Where a texture upload lands: a level, a layer and a rectangle of it.
+///
+/// Six numbers that only ever travel together, and one struct rather than six arguments because nine
+/// of them is a signature nothing can be read against - the caller's own parameter list is the same
+/// six, and they are assigned in the same order there.
+struct TextureUpload {
+    mip_level: u32,
+    depth_or_layer: u32,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+}
+
+fn stage_texture_copy(
+    wm: &WmRenderer,
+    destination: &wgpu::Texture,
+    source: &[u8],
+    upload: &TextureUpload,
+) -> bool {
+    let TextureUpload {
+        mip_level,
+        depth_or_layer,
+        x: dest_x,
+        y: dest_y,
+        width,
+        height,
+    } = *upload;
+
+    if source.is_empty() || width == 0 || height == 0 {
+        return false;
+    }
+
+    // A destination without `COPY_DST` cannot be the target of a copy, and asking wgpu anyway would be
+    // a validation error - which ends the process here.
+    if !destination.usage().contains(wgpu::TextureUsages::COPY_DST) {
+        return false;
+    }
+
+    let Some(block) = destination.format().block_copy_size(None) else {
+        return false;
+    };
+
+    // `copy_buffer_to_texture` wants each row of the source at a 256-byte boundary, and Minecraft
+    // hands over tightly packed rows. The rows are re-laid into the staging buffer at the padding
+    // stride, which is what the readback path does in the other direction.
+    let unpadded = (block * width) as usize;
+    let padded = unpadded.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize)
+        * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize;
+    let wanted = (padded * height as usize) as u64;
+
+    if wanted > STAGING_BYTES {
+        return false;
+    }
+
+    let done = SUBMISSIONS_DONE.load(Ordering::Relaxed);
+    let mut guard = STAGING.lock();
+    let stages = guard.get_or_insert_with(|| {
+        (0..STAGING_BUFFERS)
+            .map(|_| new_stage(&wm.gpu.device))
+            .collect()
+    });
+
+    let Some(index) = stages
+        .iter()
+        .position(|stage| stage.busy_until <= done && stage.cursor + wanted <= STAGING_BYTES)
+    else {
+        return false;
+    };
+
+    let stage = &mut stages[index];
+    let offset = stage.cursor;
+    stage.cursor += wanted;
+    stage.dirty = true;
+
+    let buffer = stage.buffer.clone();
+    drop(guard);
+
+    // Row by row: the padding between two rows is never read by the copy, but leaving it as whatever
+    // the ring held would make two runs of the same upload differ in bytes nobody looks at, which is
+    // how a difference that is real gets lost in one that is not.
+    if padded == unpadded {
+        wm.gpu.queue.write_buffer(&buffer, offset, source);
+    } else {
+        let mut row = vec![0u8; padded];
+        for y in 0..height as usize {
+            let from = y * unpadded;
+            row[..unpadded].copy_from_slice(&source[from..from + unpadded]);
+            wm.gpu
+                .queue
+                .write_buffer(&buffer, offset + (y * padded) as u64, &row);
+        }
+    }
+
+    with_shared_encoder(|encoder| {
+        encoder.copy_buffer_to_texture(
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: TexelCopyBufferLayout {
+                    offset,
+                    bytes_per_row: Some(padded as u32),
+                    rows_per_image: Some(height),
+                },
+            },
+            wgpu::TexelCopyTextureInfo {
+                texture: destination,
+                mip_level,
+                origin: Origin3d {
+                    x: dest_x,
+                    y: dest_y,
+                    z: depth_or_layer,
+                },
+                aspect: Default::default(),
+            },
+            Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+    });
+
+    STAGED_UPLOADS.fetch_add(1, Ordering::Relaxed);
+    STAGED_BYTES.fetch_add(source.len() as u64, Ordering::Relaxed);
     true
 }
 
@@ -2015,7 +2188,7 @@ pub unsafe extern "C" fn write_to_buffer(
     // `Queue::write_buffer` is applied at the next submission, ahead of every command in it, so
     // without this the frame's draws would all read this write's value. See `WRITE_HIGH_WATER`.
     if write_needs_a_submission(buffer as *const wgpu::Buffer as usize, start, length) {
-        flush_shared_encoder(wm);
+        flush_shared_encoder_from(wm, "write-buffer");
     }
 
     wm.gpu.queue.write_buffer(buffer, start, bytes);
@@ -2862,7 +3035,7 @@ pub extern "C" fn dump_surface_texture_rgba(
 /// come from this side, so there is nothing to configure here.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn flush_encoder(wm: &WmRenderer, _encoder: &mut CommandEncoderHandle) {
-    flush_shared_encoder(wm);
+    flush_shared_encoder_from(wm, "end-frame");
 }
 
 #[unsafe(no_mangle)]
@@ -3591,9 +3764,10 @@ pub extern "C" fn log_render_stats() {
         "wgpu-mc: render stats: {passes} render passes ({empty} of them empty, last had {last} \
          draws), {pipelines} pipeline binds, {draws} draws ({batched} in batches, {refused_a_batch} \
          refused one; {bind_groups} bind groups built, {hits} cache hits and {misses} misses), \
-         {vertices} vertices, {submissions} submissions for {presents} presented frame(s); {numbered} \
+         {vertices} vertices, {submissions} submissions for {presents} presented frame(s) [{}]; {numbered} \
          of the draws came numbered ({tableless} of them without a binding table); uploads: {} staged \
          ({} MB), {} fell back to queue writes",
+        flush_sites_report(),
         STAGED_UPLOADS.swap(0, Ordering::Relaxed),
         STAGED_BYTES.swap(0, Ordering::Relaxed) / (1024 * 1024),
         STAGING_FALLBACKS.swap(0, Ordering::Relaxed),
@@ -5030,12 +5204,29 @@ pub extern "C" fn write_to_texture(
         return;
     }
 
-    // A texture write is the buffer case with no way to be clever about it: `Queue::write_texture`
-    // is applied at the next submission, ahead of the frame's commands, so a re-upload of a texture
-    // an already recorded draw samples would change what that draw sees. There is no offset to
-    // compare against - the write names a mip, a layer and a rectangle - so this submits first, and
-    // uploads are rare enough (a resource load, a skin, a font) for that to cost nothing.
-    flush_shared_encoder(wm);
+    // In the frame's own stream where it can be, so the upload costs no submission. See
+    // `stage_texture_copy`: a hundred and eight of these a frame, each forcing its own submit, was the
+    // whole of this renderer's submission count.
+    if stage_texture_copy(
+        wm,
+        destination,
+        unsafe { std::slice::from_raw_parts(source, source_size as _) },
+        &TextureUpload {
+            mip_level,
+            depth_or_layer,
+            x: dest_x,
+            y: dest_y,
+            width,
+            height,
+        },
+    ) {
+        return;
+    }
+
+    // The fallback: `Queue::write_texture` is applied at the next submission, ahead of the frame's
+    // commands, so a re-upload of a texture an already recorded draw samples would change what that
+    // draw sees. Nothing in the ring could take the bytes, so this submits first and pays for it.
+    flush_shared_encoder_from(wm, "write-texture");
 
     wm.gpu.queue.write_texture(
         wgpu::TexelCopyTextureInfo {
@@ -5070,7 +5261,7 @@ pub extern "C" fn write_to_texture(
 /// Submits what the shared encoder has recorded. The handle is an empty box and is dropped here.
 #[unsafe(no_mangle)]
 pub extern "C" fn submit_command_encoder(wm: &WmRenderer, _encoder: Box<CommandEncoderHandle>) {
-    flush_shared_encoder(wm);
+    flush_shared_encoder_from(wm, "submit-encoder");
 }
 
 /// Records the render graph's terrain pass: the sections the Rust baker meshed, drawn from the arena
@@ -5807,7 +5998,7 @@ pub extern "C" fn blit_from_texture(
         });
     };
 
-    flush_shared_encoder(wm);
+    flush_shared_encoder_from(wm, "blit-to-window");
 }
 
 #[unsafe(no_mangle)]
