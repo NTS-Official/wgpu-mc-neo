@@ -977,6 +977,33 @@ pub fn dumpTextureRgba(
     }
 }
 
+/// Reads a texture into memory the JVM owns, as raw RGBA rows.
+///
+/// The address is the game's own allocation - `NativeImage`'s pixels - and `capacity` is what the
+/// caller says it holds, so nothing is written past it. This exists so `glGetTexImage` does not have
+/// to go through a file: a readback that writes bytes to disk and reads them straight back is a
+/// screenshot taking a dependency on a writable working directory.
+#[jni_fn("dev.birb.wgpu.rust.WmJni")]
+pub fn readTextureRgba(
+    _env: JNIEnv,
+    _class: JClass,
+    wm: jlong,
+    texture: jlong,
+    address: jlong,
+    capacity: jint,
+    flip_y: jboolean,
+) -> jboolean {
+    unsafe {
+        crate::device::read_texture_rgba(
+            shared(wm),
+            shared::<wgpu::Texture>(texture),
+            address as *mut u8,
+            capacity.max(0) as usize,
+            flip_y != 0,
+        ) as jboolean
+    }
+}
+
 /// Writes the image a `SurfaceTexture` holds out as raw RGBA.
 #[jni_fn("dev.birb.wgpu.rust.WmJni")]
 pub fn dumpSurfaceTextureRgba(
