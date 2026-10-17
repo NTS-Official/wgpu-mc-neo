@@ -1611,7 +1611,15 @@ fn finish_staging(wm: &WmRenderer, submission: u64) {
         if stage.dirty {
             stage.dirty = false;
             stage.cursor = 0;
-            stage.busy_until = submission;
+            // One past the submission, because zero is this field's other meaning: a buffer nothing
+            // has ever been written to is free, and so is one whose submission has completed. What
+            // `SUBMISSIONS` returns for the *first* submission is zero as well, so without the shift
+            // a buffer that had just gone out looked like one never used - the ring handed it out
+            // again while the GPU was still reading it, and the next frame's bytes landed on top of
+            // the copy before the copy ran. Every texture the game re-uploads per frame came back as
+            // another frame's data: the block atlas went flat and the lightmap went black, which is
+            // the black world this was found by.
+            stage.busy_until = submission + 1;
             waiting = true;
         }
     }
@@ -1624,7 +1632,7 @@ fn finish_staging(wm: &WmRenderer, submission: u64) {
     // forwards: `on_submitted_work_done` fires when everything submitted so far has finished, so two
     // of these can arrive out of order.
     wm.gpu.queue.on_submitted_work_done(move || {
-        SUBMISSIONS_DONE.fetch_max(submission, Ordering::Relaxed);
+        SUBMISSIONS_DONE.fetch_max(submission + 1, Ordering::Relaxed);
     });
 }
 
