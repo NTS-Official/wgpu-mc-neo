@@ -3931,6 +3931,16 @@ struct VertexBufferAttributes {
 impl PipelineRecipe {
     /// Writes the pipeline for one depth state, which is `None` for a pass without a depth
     /// attachment.
+    ///
+    /// **A pipeline the driver refuses is replaced by one that draws nothing, rather than left
+    /// invalid.** wgpu hands back a pipeline object even when validation failed, and every
+    /// `set_pipeline` for that object fails - which does not fail one draw, it *invalidates the
+    /// render pass*, so the whole frame comes out black with the HUD gone with it. That is exactly
+    /// what one unbuildable entity pipeline did: the shader declares `in vec2 UV1` while the game
+    /// binds an integer attribute at that location, and the world, the hotbar and every overlay
+    /// disappeared rather than the one object that used it. Validation is therefore captured here,
+    /// the reason is logged, and the pipeline becomes a valid stand-in whose shader writes nothing:
+    /// the object that would have been drawn is missing instead of the frame.
     fn create(
         &self,
         wm: &WmRenderer,
@@ -3950,16 +3960,66 @@ impl PipelineRecipe {
             })
             .collect::<Vec<_>>();
 
+        let scope = wm.gpu.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let pipeline = self.build(
+            wm,
+            depth_stencil,
+            &self.vertex_module,
+            "main",
+            &self.fragment_module,
+            "main",
+            &vertex_buffers,
+        );
+
+        let refused = match block_on(scope.pop()) {
+            Some(refused) => refused,
+            None => return pipeline,
+        };
+
+        error!(
+            "wgpu-mc: the engine refused the pipeline '{}', so whatever draws with it comes out as \
+             nothing - instead of the frame, which is what an invalid pipeline used to cost: {refused}",
+            self.label
+        );
+
+        let stand_in = fallback_shader_module(&wm.gpu.device);
+
+        self.build(
+            wm,
+            depth_stencil,
+            &stand_in,
+            FALLBACK_VERTEX_ENTRY,
+            &stand_in,
+            FALLBACK_FRAGMENT_ENTRY,
+            &[],
+        )
+    }
+
+    /// One attempt at the driver's own `create_render_pipeline`, with the shaders it is given.
+    ///
+    /// Split out of [`Self::create`] so the same descriptor can be tried twice: once with the shaders
+    /// the JVM compiled, and - when the driver refuses those - once with the stand-in.
+    #[allow(clippy::too_many_arguments)]
+    fn build(
+        &self,
+        wm: &WmRenderer,
+        depth_stencil: Option<&BlazeDepthStencilState>,
+        vertex_module: &wgpu::ShaderModule,
+        vertex_entry: &str,
+        fragment_module: &wgpu::ShaderModule,
+        fragment_entry: &str,
+        vertex_buffers: &[Option<wgpu::VertexBufferLayout>],
+    ) -> wgpu::RenderPipeline {
         wm.gpu
             .device
             .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(&self.label),
                 layout: Some(&self.layout),
                 vertex: wgpu::VertexState {
-                    module: &self.vertex_module,
-                    entry_point: Some("main"),
+                    module: vertex_module,
+                    entry_point: Some(vertex_entry),
                     compilation_options: Default::default(),
-                    buffers: &vertex_buffers,
+                    buffers: vertex_buffers,
                 },
                 primitive: wgpu::PrimitiveState {
                     topology: self.topology,
@@ -4016,8 +4076,8 @@ impl PipelineRecipe {
                 }),
                 multisample: Default::default(),
                 fragment: Some(wgpu::FragmentState {
-                    module: &self.fragment_module,
-                    entry_point: Some("main"),
+                    module: fragment_module,
+                    entry_point: Some(fragment_entry),
                     compilation_options: Default::default(),
                     targets: &self.color_targets,
                 }),
@@ -4028,6 +4088,41 @@ impl PipelineRecipe {
                 cache: wm.gpu.pipeline_cache.as_ref(),
             })
     }
+}
+
+/// The shader a refused pipeline is rebuilt with: a vertex stage that emits one point placed off the
+/// near plane, and a fragment stage that writes nothing.
+///
+/// It keeps the descriptor it replaces - the same bind group layout, depth state and colour targets -
+/// because the pass it is bound in was built for those. A vertex stage that reads no attributes is
+/// still valid against a vertex buffer layout that declares some: wgpu only requires the attributes
+/// the shader actually reads.
+const FALLBACK_SHADER_WGSL: &str = r#"
+@vertex
+fn vs_main(@builtin(vertex_index) vertex_index: u32) -> @builtin(position) vec4<f32> {
+    // All vertices land on the same point, so every triangle of the draw has no area and nothing is
+    // rasterized. `vertex_index` is what keeps this a vertex stage rather than a constant.
+    let corner = f32(vertex_index) * 0.0;
+    return vec4<f32>(corner, corner, -1.0, 1.0);
+}
+
+@fragment
+fn fs_main() {}
+"#;
+
+const FALLBACK_VERTEX_ENTRY: &str = "vs_main";
+const FALLBACK_FRAGMENT_ENTRY: &str = "fs_main";
+
+/// The stand-in module for a pipeline the driver refused.
+///
+/// Built on demand rather than cached: a refusal is a bug being diagnosed, not a path a working
+/// renderer takes, and one module per refused pipeline is cheaper than the synchronization a cache
+/// would need to be reachable from here.
+fn fallback_shader_module(device: &wgpu::Device) -> wgpu::ShaderModule {
+    device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("wgpu-mc stand-in for a refused pipeline"),
+        source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(FALLBACK_SHADER_WGSL)),
+    })
 }
 
 /// Frees one compiled pipeline variant.
